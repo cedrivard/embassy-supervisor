@@ -1,0 +1,13 @@
+# Workspace build config. The supervisor lib and the firmware both target the
+# RP2350 (Cortex-M33). `probe-rs run` flashes + streams defmt-rtt logs over a
+# debug probe; the USB port is reserved for the CDC-NCM network link.
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+runner = "probe-rs run --chip RP235x"
+# Alternatives if you have no probe:
+#runner = "picotool load -u -v -x -t elf"
+
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[env]
+DEFMT_LOG = "info"

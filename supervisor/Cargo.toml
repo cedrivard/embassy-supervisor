@@ -1,0 +1,21 @@
+[package]
+name = "supervisor"
+version = "0.1.0"
+description = "A generic, HAL-agnostic task-lifecycle supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, and runtime start/stop/pause/resume control."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Pure-embassy dependencies only — no HAL, no allocator, no board crates, so the
+# supervisor compiles for any embassy target.
+# Version set aligned with embassy-rp 0.10 (the firmware's HAL): executor 0.10,
+# sync 0.8, time 0.5. The supervisor and firmware MUST share these so the
+# `Spawner`/`SpawnError` types match.
+embassy-executor = { version = "0.10" }     # Spawner / SpawnError types only
+embassy-sync = { version = "0.8" }
+embassy-time = { version = "0.5" }
+embassy-futures = { version = "0.1" }
+heapless = "0.8"
+portable-atomic = { version = "1", features = ["critical-section"] }
+defmt = "1"

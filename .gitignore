@@ -1,0 +1,8 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~

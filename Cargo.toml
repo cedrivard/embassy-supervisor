@@ -1,0 +1,26 @@
+# Workspace for the embassy task supervisor.
+#
+# - `supervisor` : the generalized, HAL-agnostic task-lifecycle supervisor. Pure
+#   embassy, no board or application specifics.
+# - `firmware`   : the RP2350 application that drives the supervisor over a
+#   USB-CDC-NCM network with an HTTP control plane and an elastic worker pool.
+#
+# TODO: a `bootloader` crate (embassy-boot-rp) for A/B OTA.
+[workspace]
+resolver = "2"
+members = ["supervisor", "firmware"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/cedrivard/embassy-supervisor"
+
+# Size/perf profile for the embedded binaries (mirrors the embassy templates).
+[profile.release]
+debug = 2
+lto = "fat"
+opt-level = "s"
+codegen-units = 1
+
+[profile.dev]
+opt-level = "s"          # 'z'/'s' so the unoptimized embassy build still fits/links

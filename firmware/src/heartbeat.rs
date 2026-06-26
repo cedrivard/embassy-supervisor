@@ -1,0 +1,102 @@
+//! Heartbeat — a `Mode::Pause` task that blinks the on-board LED.
+//!
+//! Exercises the supervisor's **Pause/Resume** lifecycle and a *retained
+//! resource* across a pause: the `Output` (the LED GPIO) is owned by the task
+//! and kept across pause→resume, never re-acquired. Pause/resume it at runtime
+//! with `POST /api/control?node=heartbeat&op=pause|resume`.
+//!
+//! The blink period is a runtime parameter held in `PERIOD_MS`, adjustable via
+//! [`set_period_ms`] (wired to `POST /api/heartbeat?ms=N`):
+//! - `ms > 0` — blink with that half-period.
+//! - `ms == 0` — hold the LED **off**.
+//! - `ms < 0` — hold the LED **on**.
+//!
+//! A change `Signal` wakes the task immediately, so steady states are responsive
+//! to a later change (a steady LED has no timer of its own to re-read on).
+
+use core::sync::atomic::{AtomicI32, Ordering};
+
+use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_rp::gpio::{Level, Output};
+use embassy_rp::peripherals::PIN_25;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Timer};
+use supervisor::{Mode, TaskNode};
+
+/// The heartbeat node. `Pause` mode; its spawner launches the task, which
+/// self-acquires the LED pin — so the supervisor starts it like any other node
+/// and `main` owns no hardware handle.
+pub static HEARTBEAT: TaskNode =
+    TaskNode::new("heartbeat", Mode::Pause, &[], |s| {
+        s.spawn(heartbeat_task(&HEARTBEAT)?);
+        Ok(())
+    });
+
+const DEFAULT_PERIOD_MS: i32 = 500;
+
+/// Current blink setting in milliseconds: `>0` blink half-period, `0` steady off,
+/// `<0` steady on. `AtomicI32` is native on this Cortex-M33 target (no
+/// `portable-atomic` needed).
+static PERIOD_MS: AtomicI32 = AtomicI32::new(DEFAULT_PERIOD_MS);
+
+/// Fired by [`set_period_ms`] so the task re-reads the setting immediately,
+/// instead of waiting out the current blink (or forever, when held steady).
+static CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Set the heartbeat behavior at runtime: `ms > 0` blinks with that half-period,
+/// `ms == 0` holds the LED off, `ms < 0` holds it on. Applies immediately. Called
+/// by `POST /api/heartbeat`.
+pub fn set_period_ms(ms: i32) {
+    PERIOD_MS.store(ms, Ordering::Relaxed);
+    CHANGED.signal(());
+}
+
+#[embassy_executor::task]
+pub async fn heartbeat_task(node: &'static TaskNode) {
+    // Self-acquire the on-board LED (PIN_25 on the Pico 2; adjust for your board).
+    // SAFETY: only heartbeat uses this pin, and the task is spawned exactly once
+    // (a Pause node parks on pause rather than exiting, so it's never re-spawned),
+    // so there is only ever one instance of this handle.
+    let mut led = Output::new(unsafe { PIN_25::steal() }, Level::Low);
+
+    loop {
+        // Active phase: drive the LED per `PERIOD_MS` until the supervisor requests
+        // a pause (`wait_shutdown` ends the phase). `CHANGED` makes a new setting
+        // take effect at once — including from a steady state, which has no timer.
+        'active: loop {
+            let ms = PERIOD_MS.load(Ordering::Relaxed);
+            if ms > 0 {
+                // Blink: toggle every `ms`, re-read on change, break on pause.
+                match select3(
+                    Timer::after(Duration::from_millis(ms as u64)),
+                    CHANGED.wait(),
+                    node.wait_shutdown(),
+                )
+                .await
+                {
+                    Either3::First(()) => led.toggle(),
+                    Either3::Second(()) => {}            // changed → re-read
+                    Either3::Third(()) => break 'active, // pause requested
+                }
+            } else {
+                // Steady: `0` off, `<0` on. Hold until a change or a pause.
+                if ms == 0 {
+                    led.set_low();
+                } else {
+                    led.set_high();
+                }
+                match select(CHANGED.wait(), node.wait_shutdown()).await {
+                    Either::First(()) => {}              // changed → re-read
+                    Either::Second(()) => break 'active, // pause requested
+                }
+            }
+        }
+
+        // Paused: park the LED off, ack the pause, then wait to be resumed. The
+        // `led` handle stays owned here — that's the retained resource.
+        led.set_low();
+        node.ack_dropped();
+        node.wait_resume().await;
+    }
+}

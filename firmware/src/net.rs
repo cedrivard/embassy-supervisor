@@ -1,0 +1,192 @@
+//! Network over the USB cable: embassy-usb CDC-NCM -> embassy-net TCP/IP stack.
+//!
+//! No extra hardware — the host sees a USB network interface (`usb0` on Linux).
+//!
+//! Ownership model: the supervised `net` task owns the **entire** USB + network
+//! bring-up and teardown. On start it allocates every buffer on the heap, builds
+//! the USB device / CDC-NCM class / embassy-net stack, and drives all three
+//! runners inside its own future (via `join`). On stop it drops them — releasing
+//! the USB peripheral and **freeing net's whole heap budget**. So `net` is a real
+//! budgeted resource: stopping it returns its memory, starting it re-allocates.
+//!
+//! The task re-acquires the USB peripheral on each bring-up with
+//! `USB::steal()` — sound because only `net` touches USB and it holds exactly one
+//! instance at a time (the previous `Driver` is dropped on stop, before the next
+//! bring-up). So `main` never has to hand the peripheral over.
+//!
+//! One `static` bridges the gap between the task-owned objects and the rest of
+//! the firmware, guarded by a documented single-core invariant:
+//!
+//! - `STACK` — the `Copy` stack handle, published for the `http` pool. The handle
+//!   is lifetime-extended to `'static`, valid only while the task's backing
+//!   buffers live. Sound because every stack user (`http`) depends on `net`, so
+//!   the supervisor tears them all down *before* `net` clears `STACK` and frees
+//!   the backing (dependency-ordered teardown).
+//!
+//! Static IPv4 so no host DHCP server is needed: set your host's `usb0` to
+//! `10.42.0.1/24` and reach the device at `10.42.0.61`.
+
+use core::ptr::{addr_of, addr_of_mut};
+
+use alloc::boxed::Box;
+use embassy_futures::join::{join, join3};
+use embassy_futures::select::select;
+use embassy_net::{Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
+use embassy_rp::bind_interrupts;
+use embassy_rp::peripherals::USB;
+use embassy_rp::usb::{Driver, InterruptHandler};
+use embassy_time::{Duration, Timer};
+use embassy_usb::class::cdc_ncm::embassy_net::State as NetState;
+use embassy_usb::class::cdc_ncm::{CdcNcmClass, State};
+use embassy_usb::{Builder, Config};
+use supervisor::{Mode, TaskNode};
+
+bind_interrupts!(struct Irqs {
+    USBCTRL_IRQ => InterruptHandler<USB>;
+});
+
+const MTU: usize = 1514;
+
+/// Device static IP (host-side `usb0` should be 10.42.0.1/24).
+const DEV_IP: Ipv4Address = Ipv4Address::new(10, 42, 0, 61);
+const GW_IP: Ipv4Address = Ipv4Address::new(10, 42, 0, 1);
+const PREFIX: u8 = 24;
+
+/// Number of concurrent sockets the stack can hold — the budget the elastic
+/// HTTP pool scales within (one socket per live worker).
+pub const SOCKET_BUDGET: usize = 6;
+
+// ─── Stack handle publication ──────────────────────────────────────────────
+
+// `Stack` is `Copy` but not `Sync` (it holds a `RefCell`), so it can't live in a
+// safe `static`. The handle's true lifetime is the net task's backing buffers; we
+// lifetime-extend it to `'static` for the global and uphold the contract by
+// clearing it before the backing is freed (see the module-level invariant).
+static mut STACK: Option<Stack<'static>> = None;
+
+/// The current network stack, or `None` until `net` has brought it up.
+pub fn try_stack() -> Option<Stack<'static>> {
+    // SAFETY: single-core; written only by the net task.
+    unsafe { *addr_of!(STACK) }
+}
+
+/// Await the network stack becoming available. Dependents must use this rather
+/// than assume `net` is up: the supervisor spawns nodes in topological order, but
+/// the executor polls a spawn batch in *reverse* (last-spawned first), so a
+/// dependent like `http` can be polled before `net`'s (synchronous) bring-up has
+/// published the stack. Resolves immediately once it's up; only spins during the
+/// brief startup window.
+pub async fn stack_ready() -> Stack<'static> {
+    loop {
+        if let Some(s) = try_stack() {
+            return s;
+        }
+        Timer::after(Duration::from_millis(2)).await;
+    }
+}
+
+/// SAFETY: the caller must guarantee the backing of `s` outlives every use of the
+/// published handle. Upheld by dependency-ordered teardown.
+unsafe fn publish_stack(s: Stack<'_>) {
+    // Lifetime-extend the `Copy` handle. `Stack<'a>`'s layout is independent of
+    // `'a`, so this is a pure lifetime cast.
+    let s: Stack<'static> = unsafe { core::mem::transmute(s) };
+    unsafe { *addr_of_mut!(STACK) = Some(s) };
+}
+
+fn unpublish_stack() {
+    // SAFETY: single-core; called on teardown after all dependents are down.
+    unsafe { *addr_of_mut!(STACK) = None };
+}
+
+// ─── The supervised net node ───────────────────────────────────────────────
+
+/// The supervised `net` node (root; everything depends on it). Its task owns the
+/// full USB + stack lifecycle, so stopping the node frees net's heap budget.
+pub static NET: TaskNode = TaskNode::new("net", Mode::Terminate, &[], |s| {
+    s.spawn(net_task(&NET)?);
+    Ok(())
+});
+
+#[embassy_executor::task]
+async fn net_task(node: &'static TaskNode) {
+    // ── Bring-up. All synchronous (no `.await`), so `STACK` is published on this
+    // task's first poll. Dependents must still `stack_ready().await` rather than
+    // assume net ran first — the executor polls a spawn batch last-first. ──
+    // SAFETY: only `net` uses USB, and it holds one instance at a time — the
+    // previous `Driver` was dropped on the last teardown before this re-spawn.
+    let driver = Driver::new(unsafe { USB::steal() }, Irqs);
+
+    let mut config = Config::new(0xc0de, 0xcafe);
+    config.manufacturer = Some("embassy-supervisor");
+    config.product = Some("task supervisor (USB-net)");
+    config.serial_number = Some("0001");
+    config.max_power = 100;
+    config.max_packet_size_0 = 64;
+
+    // Every buffer on the heap (net's heap budget), owned by this task → freed
+    // when it returns on teardown. Declared up front, before the objects that
+    // borrow them: embassy ties each buffer's lifetime into the borrowing object's
+    // type, so at scope-end (reverse-order) drop the buffers must outlive them.
+    // `net_state` (the ~12 KB packet pool) + `resources` are the bulk of the budget.
+    //
+    // Note `Box::new(NetState::new())` has no *guaranteed* placement-new: the
+    // language constructs the value as a temporary first, then moves it into the
+    // heap, so an unoptimized build copies ~12 KB through this poll's stack frame.
+    // In release (opt + LTO) the optimizer elides that copy and constructs in
+    // place — verified: the largest task-poll frame in the whole binary is ~2.9 KB,
+    // so there is no 12 KB stack spike here. (`StaticCell::init(v)` would be no
+    // different — it also takes the value by move.)
+    let mut config_desc = Box::new([0u8; 256]);
+    let mut bos_desc = Box::new([0u8; 256]);
+    let mut control_buf = Box::new([0u8; 128]);
+    let mut state = Box::new(State::new());
+    let mut net_state = Box::new(NetState::<MTU, 4, 4>::new());
+    let mut resources = Box::new(StackResources::<SOCKET_BUDGET>::new());
+
+    let mut builder = Builder::new(
+        driver,
+        config,
+        &mut config_desc[..],
+        &mut bos_desc[..],
+        &mut [],
+        &mut control_buf[..],
+    );
+
+    let our_mac = [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC];
+    let host_mac = [0x88, 0x88, 0x88, 0x88, 0x88, 0x88];
+    let class = CdcNcmClass::new(&mut builder, &mut state, host_mac, 64);
+    let mut usb_dev = builder.build();
+
+    let (ncm_runner, device) =
+        class.into_embassy_net_device::<MTU, 4, 4>(&mut net_state, our_mac);
+
+    let net_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
+        address: Ipv4Cidr::new(DEV_IP, PREFIX),
+        gateway: Some(GW_IP),
+        dns_servers: Default::default(), // embassy-net's heapless Vec, empty
+    });
+    // Fixed seed — fine for a USB-LAN link; use a hardware RNG in production.
+    let seed = 0x0123_4567_89ab_cdef;
+    let (stack, mut net_runner) = embassy_net::new(device, net_config, &mut resources, seed);
+
+    // Publish for the http pool. SAFETY: torn down before this backing is freed.
+    unsafe { publish_stack(stack) };
+
+    // ── Serve until the supervisor tears us down. The three runners never return;
+    // `ready` just logs once the link is up. `select` against `wait_shutdown`. ──
+    let ready = async {
+        stack.wait_config_up().await;
+        if let Some(cfg) = stack.config_v4() {
+            defmt::info!("net: up at {}", cfg.address);
+        }
+    };
+    let serve = join(join3(usb_dev.run(), ncm_runner.run(), net_runner.run()), ready);
+    let _ = select(serve, node.wait_shutdown()).await;
+
+    // ── Teardown: stop publishing, ack, then drop everything. The `Box`es, USB
+    // device, and runners all drop here — USB is disabled and net's heap budget
+    // (~the packet pool + socket storage + descriptors) is returned. ──
+    unpublish_stack();
+    node.ack_dropped();
+}

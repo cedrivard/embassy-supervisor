@@ -1,0 +1,334 @@
+//! HTTP control/observability plane — an **elastic pool** of HTTP/1.1 workers
+//! that also demonstrates the supervisor's **dynamic pool**, **socket budgeting**,
+//! and **heap budgeting** (stable Rust, no web framework).
+//!
+//! A floor worker (always-on `Terminate`) plus burst workers (`OnDemand`) all
+//! `accept` on port 80. Each worker owns one embassy-net socket and a set of
+//! heap-allocated I/O buffers, so the pool scales **within the fixed
+//! `StackResources` socket budget** and its heap footprint tracks the live pool
+//! size. `mark_busy`/`mark_idle` drive the supervisor's `ElasticPool`
+//! (`DeferredShrink`): it grows when every worker is serving a connection and
+//! shrinks a spare after a cooldown.
+//!
+//! Connections are **keep-alive**: a worker serves multiple requests on one TCP
+//! connection and only closes on the client's `Connection: close`, an idle
+//! timeout, or a supervisor teardown.
+//!
+//! Routes:
+//! - `GET /` — a page that polls the task list and offers stop/start
+//!   (pause/resume) buttons; the `http` workers are collapsed into one pool row
+//!   with a single control (the supervisor co-controls the whole pool anyway).
+//! - `GET /api/tasks` — JSON view of every supervised task.
+//! - `POST /api/control?node=<name>&op=<start|stop|pause|resume>` — drive a task
+//!   via the supervisor's dependency-honoring control (`request_control`).
+//! - `POST /api/heartbeat?ms=<n>` — set the heartbeat at runtime: `>0` blink
+//!   half-period, `0` LED off, `<0` LED on (`heartbeat::set_period_ms`).
+//!
+//! Depends on `net`.
+
+use core::fmt::Write as _;
+
+use alloc::string::String;
+use embassy_executor::{SpawnError, Spawner};
+use embassy_futures::select::{Either, select};
+use embassy_net::tcp::TcpSocket;
+use embassy_time::Duration;
+use embedded_io_async::Write as _;
+use supervisor::{ControlOp, DeferredShrink, ElasticPool, Mode, TaskNode};
+
+use crate::net::{self, NET};
+
+const HTTP_PORT: u16 = 80;
+const POOL_MAX: usize = 4;
+/// Close a keep-alive connection after this long with no request, freeing the
+/// worker (and its socket) back to the pool.
+const KEEPALIVE_IDLE_SECS: u64 = 10;
+
+/// The HTTP pool's nodes: `http0` is the always-on floor (`Terminate`); `http1..3`
+/// are burst capacity (`OnDemand`). All depend on `net`.
+pub static HTTP: [TaskNode; POOL_MAX] = [
+    TaskNode::new("http0", Mode::Terminate, &[&NET], spawn_http::<0>),
+    TaskNode::new("http1", Mode::OnDemand, &[&NET], spawn_http::<1>),
+    TaskNode::new("http2", Mode::OnDemand, &[&NET], spawn_http::<2>),
+    TaskNode::new("http3", Mode::OnDemand, &[&NET], spawn_http::<3>),
+];
+
+/// The elastic pool: floor 1, ceiling `POOL_MAX`, shrink a spare after 4 s idle.
+pub static HTTP_POOL: ElasticPool<DeferredShrink> = ElasticPool {
+    nodes: &[&HTTP[0], &HTTP[1], &HTTP[2], &HTTP[3]],
+    min: 1,
+    max: POOL_MAX as u8,
+    policy: DeferredShrink::new(Duration::from_secs(4)),
+};
+
+/// The pool registry handed to `Supervisor::with_pools`, so `run_pools` scales it
+/// and the control interface co-controls the whole pool from any member.
+pub static POOLS: &[&dyn supervisor::Pool] = &[&HTTP_POOL];
+
+/// Per-index spawn fn (monomorphized so each node spawns its own task instance).
+fn spawn_http<const I: usize>(s: Spawner) -> Result<(), SpawnError> {
+    s.spawn(http_task(&HTTP[I])?);
+    Ok(())
+}
+
+const INDEX_HTML: &str = "<!doctype html><meta charset=utf-8><title>task supervisor</title>\
+<style>body{font-family:monospace;background:#111;color:#0f0;padding:1em}\
+table{border-collapse:collapse}td,th{border:1px solid #333;padding:4px 8px;text-align:left}\
+button,input{font-family:inherit;background:#1a1a1a;color:#0f0;border:1px solid #0a0}\
+button{cursor:pointer}</style>\
+<h1>task supervisor</h1><div id=heap></div><table id=t></table>\
+<h3>heartbeat</h3>\
+<input id=hbms type=number value=500 style=width:5em> ms \
+<button onclick=\"hb(hbms.value)\">blink</button> \
+<button onclick=\"hb(0)\">off</button> \
+<button onclick=\"hb(-1)\">on</button>\
+<script>\
+async function ctl(n,o){await fetch('/api/control?node='+n+'&op='+o,{method:'POST'});\
+load();setTimeout(load,400);}\
+async function hb(ms){await fetch('/api/heartbeat?ms='+ms,{method:'POST'});}\
+async function load(){let d=await (await fetch('/api/tasks')).json();\
+let f=d.heap_free,tot=d.heap_total,u=tot-f;\
+document.getElementById('heap').textContent=\
+'heap: '+u+' used / '+f+' free / '+tot+' total B ('+Math.round(100*u/tot)+'% used)';\
+let h='<tr><th>task<th>mode<th>state<th>deps<th>';\
+let pool=null;\
+for(let t of d.tasks){\
+if(/^http[0-9]+$/.test(t.name)){\
+pool=pool||{n:0,r:0,b:0,dis:true,deps:t.deps};\
+pool.n++;if(t.running)pool.r++;if(t.busy)pool.b++;if(!t.disabled)pool.dis=false;continue;}\
+let st=t.disabled?'disabled':t.running?(t.busy?'busy':'running'):'stopped';\
+let pause=t.mode=='pause';let act=t.disabled||!t.running;\
+let op=act?(pause?'resume':'start'):(pause?'pause':'stop');\
+h+='<tr><td>'+t.name+'<td>'+t.mode+'<td>'+st+'<td>'+t.deps.join(',')+\
+'<td><button onclick=\"ctl(\\''+t.name+'\\',\\''+op+'\\')\">'+op+'</button>';}\
+if(pool){let op=pool.dis?'start':'stop';\
+h+='<tr><td>http (pool)<td>elastic<td>'+pool.r+'/'+pool.n+' up, '+pool.b+' busy<td>'+pool.deps.join(',')+\
+'<td><button onclick=\"ctl(\\'http0\\',\\''+op+'\\')\">'+op+'</button>';}\
+document.getElementById('t').innerHTML=h;}\
+load();setInterval(load,2000);\
+</script>";
+
+#[embassy_executor::task(pool_size = POOL_MAX)]
+async fn http_task(node: &'static TaskNode) {
+    // Await net's stack — the executor may poll this worker before net's bring-up
+    // has published it (spawn batches poll last-spawned first).
+    let stack = net::stack_ready().await;
+    // Heap-allocated I/O buffers — held while this worker runs, freed when it
+    // exits (pool shrink or teardown). So the heap budget tracks the live pool
+    // size: every grow consumes a buffer set, every shrink returns one.
+    let mut rx = alloc::vec![0u8; 1024];
+    let mut tx = alloc::vec![0u8; 1024];
+    let mut req = alloc::vec![0u8; 1024];
+
+    loop {
+        if node.shutdown_requested() {
+            node.ack_dropped();
+            return;
+        }
+
+        let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
+        socket.set_timeout(Some(Duration::from_secs(KEEPALIVE_IDLE_SECS)));
+
+        // Wait for a connection, but stay interruptible by a teardown.
+        match select(socket.accept(HTTP_PORT), node.wait_shutdown()).await {
+            Either::Second(()) => {
+                node.ack_dropped();
+                return;
+            }
+            Either::First(Err(_)) => continue, // accept error/timeout — relisten
+            Either::First(Ok(())) => {}
+        }
+
+        // Holding a connection means holding a socket, so mark busy for the whole
+        // keep-alive session: the pool grows to keep spare capacity within the
+        // socket budget, and a shrink never targets a worker with a live
+        // connection (shrink only stops non-busy workers).
+        node.mark_busy();
+        serve_connection(&mut socket, &mut req, node).await;
+        socket.close();
+        let _ = socket.flush().await;
+        node.mark_idle();
+    }
+}
+
+/// Serve requests on one keep-alive connection until the client closes, an idle
+/// read times out, the client asks to close, or the supervisor tears us down.
+async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &TaskNode) {
+    loop {
+        if node.shutdown_requested() {
+            return;
+        }
+        // One read per request. This assumes a small request arrives in a single
+        // segment (true for these routes over USB-net) — a general server would
+        // loop until the headers terminate.
+        let n = match select(socket.read(req), node.wait_shutdown()).await {
+            Either::Second(()) => return,                            // teardown
+            Either::First(Ok(0)) | Either::First(Err(_)) => return,  // closed / idle timeout
+            Either::First(Ok(n)) => n,
+        };
+
+        let request = core::str::from_utf8(&req[..n]).unwrap_or("");
+        let line = request.lines().next().unwrap_or("");
+        let mut parts = line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+        // Default to keep-alive (HTTP/1.1); honor an explicit `Connection: close`.
+        let keep = !connection_close_requested(request);
+
+        match (method, path) {
+            ("GET", "/") => send(socket, "text/html", INDEX_HTML, keep).await,
+            ("GET", "/api/tasks") => {
+                // Built on the heap (freed at the end of this match) so the worker
+                // future stays small — the JSON body is never inline in the future.
+                let mut body = String::with_capacity(512);
+                build_tasks_json(&mut body);
+                send(socket, "application/json", &body, keep).await;
+            }
+            ("POST", p) if p.starts_with("/api/control") => {
+                let body = handle_control(p);
+                send(socket, "application/json", &body, keep).await;
+            }
+            ("POST", p) if p.starts_with("/api/heartbeat") => {
+                let body = handle_heartbeat(p);
+                send(socket, "application/json", &body, keep).await;
+            }
+            _ => {
+                let _ = socket
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                return;
+            }
+        }
+
+        if !keep {
+            return;
+        }
+    }
+}
+
+/// Write a `200 OK` with `Content-Length` + the chosen `Connection` header, then
+/// the body. `Content-Length` is what makes keep-alive framing unambiguous.
+async fn send(socket: &mut TcpSocket<'_>, content_type: &str, body: &str, keep: bool) {
+    // Heap-built so the header isn't held inline in the worker future across the
+    // write `.await` below.
+    let mut header = String::with_capacity(128);
+    let _ = write!(
+        header,
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: {}\r\n\r\n",
+        content_type,
+        body.len(),
+        if keep { "keep-alive" } else { "close" },
+    );
+    let _ = socket.write_all(header.as_bytes()).await;
+    let _ = socket.write_all(body.as_bytes()).await;
+}
+
+/// True if the request carries a `Connection: close` header (ASCII case-insensitive).
+fn connection_close_requested(request: &str) -> bool {
+    for l in request.lines() {
+        let l = l.trim_start();
+        const KEY: &str = "connection:";
+        if l.len() >= KEY.len() && l[..KEY.len()].eq_ignore_ascii_case(KEY) {
+            return contains_ascii_ci(&l[KEY.len()..], "close");
+        }
+    }
+    false
+}
+
+/// ASCII case-insensitive substring search (`needle` must already be lowercase).
+fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle_lower.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    (0..=h.len() - n.len()).any(|i| h[i..i + n.len()].eq_ignore_ascii_case(n))
+}
+
+/// Build the task-state JSON straight from the static graph + each node's atomics.
+fn build_tasks_json(json: &mut String) {
+    let _ = write!(
+        json,
+        "{{\"heap_free\":{},\"heap_total\":{},\"tasks\":[",
+        crate::heap::free_bytes(),
+        crate::heap::HEAP_SIZE
+    );
+    for (i, node) in crate::ALL_NODES.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        let _ = write!(
+            json,
+            "{{\"name\":\"{}\",\"mode\":\"{}\",\"running\":{},\"busy\":{},\"disabled\":{},\"deps\":[",
+            node.name,
+            node.mode.as_str(),
+            node.is_running(),
+            node.is_busy(),
+            node.is_disabled()
+        );
+        for (j, dep) in node.deps.iter().enumerate() {
+            if j > 0 {
+                json.push(',');
+            }
+            let _ = write!(json, "\"{}\"", dep.name);
+        }
+        json.push_str("]}");
+    }
+    json.push_str("]}");
+}
+
+/// Parse `?node=&op=` and drive the supervisor; returns the JSON reply body.
+fn handle_control(path: &str) -> String {
+    let node_name = query(path, "node=");
+    let op_str = query(path, "op=");
+    let op = match op_str {
+        "start" | "resume" => Some(ControlOp::Activate),
+        "stop" | "pause" => Some(ControlOp::Deactivate),
+        _ => None,
+    };
+    let node = crate::ALL_NODES.iter().copied().find(|n| n.name == node_name);
+
+    let mut out = String::with_capacity(96);
+    match (node, op) {
+        (Some(node), Some(op)) => {
+            supervisor::request_control(node, op);
+            let _ = write!(out, "{{\"accepted\":true,\"node\":\"{}\",\"op\":\"{}\"}}", node.name, op_str);
+        }
+        _ => {
+            out.push_str("{\"accepted\":false,\"error\":\"unknown node or op\"}");
+        }
+    }
+    out
+}
+
+/// Parse `?ms=N` and set the heartbeat behavior (`>0` blink, `0` off, `<0` on);
+/// returns the JSON reply body.
+fn handle_heartbeat(path: &str) -> String {
+    let mut out = String::with_capacity(64);
+    match query(path, "ms=").parse::<i32>() {
+        Ok(ms) => {
+            crate::heartbeat::set_period_ms(ms);
+            let mode = if ms > 0 {
+                "blink"
+            } else if ms == 0 {
+                "off"
+            } else {
+                "on"
+            };
+            let _ = write!(out, "{{\"accepted\":true,\"ms\":{},\"mode\":\"{}\"}}", ms, mode);
+        }
+        Err(_) => out.push_str("{\"accepted\":false,\"error\":\"bad or missing ms\"}"),
+    }
+    out
+}
+
+/// Extract the value of `key` (e.g. `"node="`) from a query string, up to the
+/// next `&`/space/EOL.
+fn query<'a>(path: &'a str, key: &str) -> &'a str {
+    path.split(key)
+        .nth(1)
+        .and_then(|s| s.split(['&', ' ', '\r', '\n']).next())
+        .unwrap_or("")
+}

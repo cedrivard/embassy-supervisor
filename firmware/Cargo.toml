@@ -1,0 +1,59 @@
+[package]
+name = "firmware"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The generalized task supervisor (workspace lib).
+supervisor = { path = "../supervisor" }
+
+# embassy core. These versions are the latest crates.io releases that resolve
+# together with embassy-rp 0.10 (executor 0.10 / time 0.5 / sync 0.8); the
+# supervisor lib pins the same set, so the `Spawner`/`SpawnError` types match.
+embassy-executor = { version = "0.10", features = [
+    "platform-cortex-m",
+    "executor-thread",
+    "defmt",
+] }
+embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-sync = { version = "0.8", features = ["defmt"] }
+embassy-futures = "0.1"
+
+# RP2350 HAL. `rp235xb` matches the SparkFun IoT RedBoard RP2350 (48-GPIO B
+# variant); switch to `rp235xa` for a standard Raspberry Pi Pico 2.
+# `binary-info` embeds the RP2350 image-definition the boot ROM requires.
+embassy-rp = { version = "0.10", features = [
+    "defmt",
+    "unstable-pac",
+    "time-driver",
+    "critical-section-impl",
+    "rp235xb",
+    "binary-info",
+] }
+
+# Networking over the USB cable: embassy-usb CDC-NCM -> embassy-net stack.
+embassy-usb = { version = "0.6", features = ["defmt"] }
+embassy-net = { version = "0.9", features = [
+    "defmt",
+    "tcp",
+    "udp",
+    "dhcpv4",
+    "medium-ethernet",
+] }
+
+# Note on the HTTP control/observability plane: `picoserve` was evaluated, but
+# its ergonomic embassy router stores an `AppRouter` in a `static`, which needs
+# the nightly `impl_trait_in_assoc_type` feature. To stay on stable Rust, the
+# control plane is a small hand-rolled HTTP handler in `src/http.rs` over an
+# embassy-net `TcpSocket` instead.
+
+# Heap allocator (global). Heap is managed by per-subsystem budgets + supervisor
+# start/stop, not per-allocation fallibility, so the plain LlffHeap is enough.
+embedded-alloc = { version = "0.7", default-features = false, features = ["llff"] }
+
+embedded-io-async = "0.7"
+defmt = "1"
+defmt-rtt = "1"
+panic-probe = { version = "1", features = ["print-defmt"] }
+cortex-m-rt = "0.7"
