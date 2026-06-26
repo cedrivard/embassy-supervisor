@@ -8,7 +8,7 @@
 # TODO: a `bootloader` crate (embassy-boot-rp) for A/B OTA.
 [workspace]
 resolver = "2"
-members = ["supervisor", "firmware"]
+members = ["supervisor", "firmware", "bootloader"]
 
 [workspace.package]
 edition = "2024"

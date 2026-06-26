@@ -4,8 +4,9 @@
  * .end_block) are required on RP2350 — embassy-rp's `binary-info` feature fills
  * `.start_block` with the image definition the ROM checks before booting.
  *
- * TODO: OTA will repartition FLASH into BOOTLOADER/ACTIVE/DFU/STATE for
- * embassy-boot; this single-image layout is the starting point. */
+ * This is the standalone single-image layout (default build). The OTA build
+ * (`--features ota`) uses `memory-ota.x` instead, placing the firmware in the
+ * ACTIVE partition under the `bootloader` crate. */
 MEMORY {
     /* 2 MiB is a safe default (a Pico 2 has 4 MiB; the RedBoard has 16 MiB —
      * either way this image fits comfortably). */

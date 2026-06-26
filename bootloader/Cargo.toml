@@ -1,0 +1,30 @@
+# A/B OTA bootloader for the RP2350 firmware (embassy-boot-rp). The boot ROM boots
+# this image (it carries an RP2350 image-def via embassy-rp's `binary-info`); it
+# swaps DFU<->ACTIVE if an update is pending, then jumps to ACTIVE.
+[package]
+name = "bootloader"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "embassy-boot-rp A/B OTA bootloader for the RP2350 firmware."
+
+[dependencies]
+embassy-rp = { version = "0.10", features = [
+    "rp235xb",
+    "binary-info",
+    "time-driver",
+    "critical-section-impl",
+    "defmt",
+] }
+embassy-boot-rp = { version = "0.10", features = ["defmt"] }
+embassy-sync = "0.8"
+embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+embedded-storage = "0.3"
+# defmt is always linked: a workspace build unifies `embassy-rp/defmt` on (the
+# firmware enables it), so this binary must provide the defmt sink (defmt-rtt),
+# timestamp (embassy-time), and `_defmt_panic` (panic-probe) regardless.
+defmt = "1"
+defmt-rtt = "1"
+panic-probe = { version = "1", features = ["print-defmt"] }
