@@ -1,5 +1,8 @@
 # embassy-supervisor
 
+[![crates.io](https://img.shields.io/crates/v/embassy-supervisor.svg)](https://crates.io/crates/embassy-supervisor)
+[![docs.rs](https://docs.rs/embassy-supervisor/badge.svg)](https://docs.rs/embassy-supervisor)
+
 A generic, **HAL-agnostic** task-lifecycle supervisor for the [embassy](https://embassy.dev)
 async embedded framework. `no_std`, no allocator, no board crates — it compiles for any embassy
 target. The only third-party deps are pure-embassy crates (`embassy-executor`/`-sync`/`-time`/

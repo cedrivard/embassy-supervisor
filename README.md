@@ -1,5 +1,8 @@
 # embassy-supervisor
 
+[![crates.io](https://img.shields.io/crates/v/embassy-supervisor.svg)](https://crates.io/crates/embassy-supervisor)
+[![docs.rs](https://docs.rs/embassy-supervisor/badge.svg)](https://docs.rs/embassy-supervisor)
+
 **Supervision trees for bare-metal async Rust.** A composable architecture for real
 [embassy](https://embassy.dev) firmware — a dependency-ordered task lifecycle over layered
 executors, with a governed heap and coordinated power and OTA — the structure and guarantees of an
