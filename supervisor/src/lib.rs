@@ -1,5 +1,7 @@
 #![no_std]
-//! # supervisor — a task-lifecycle supervisor for [embassy](https://embassy.dev)
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+//! # embassy-supervisor — a task-lifecycle supervisor for [embassy](https://embassy.dev)
 //!
 //! Application- and HAL-agnostic primitives for orchestrating a set of embassy
 //! tasks: bringing them up in dependency order, tearing them down in reverse,
@@ -29,7 +31,7 @@
 //!     retain a resource across the pause (an open peripheral handle, a socket).
 //!   * [`Mode::OnDemand`] — like `Terminate`, but not started at boot and not
 //!     auto-respawned; the supervisor brings it up and down at runtime to scale
-//!     an elastic worker pool (the [`pool`] module) with load.
+//!     an elastic worker pool ([`ElasticPool`]) with load.
 //!
 //! ## What the supervisor does *not* do
 //!
@@ -40,12 +42,54 @@
 //!     `ack_dropped()`; a task that fails to ack within a timeout panics the
 //!     supervisor with the offending node's name.
 //!
-//! ## Logging
+//! ## Cargo features
 //!
-//! For readability the supervisor logs unconditionally via `defmt`. Making
-//! `defmt` an optional feature (via embassy's `fmt.rs` shim pattern) is a
-//! straightforward follow-up; it is required here to keep the orchestration code
-//! free of `cfg` noise.
+//!   * `control` *(default)* — the runtime control plane: [`ControlOp`],
+//!     [`request_control`], [`Supervisor::apply_control`].
+//!   * `pool` *(default)* — elastic worker pools: [`ElasticPool`],
+//!     [`Supervisor::with_pools`], [`Supervisor::run_pools`].
+//!   * `defmt` — route the supervisor's logs through `defmt`; without it the log
+//!     macros are no-ops.
+//!
+//! Build with `default-features = false` for a minimal core that only does
+//! dependency-ordered bring-up/teardown (drops the control plane and pools,
+//! trimming flash and a couple of statics).
+//!
+//! ## Example
+//!
+//! ```ignore
+//! use embassy_executor::Spawner;
+//! use embassy_supervisor::{task_graph, Mode, Supervisor, TaskNode, wait_control};
+//!
+//! // Each subsystem is a `TaskNode` wrapping a spawn fn; `app` depends on `net`.
+//! static NET: TaskNode = TaskNode::new("net", Mode::Terminate, &[], |s| {
+//!     s.spawn(net_task())?;
+//!     Ok(())
+//! });
+//! static APP: TaskNode = TaskNode::new("app", Mode::Terminate, &[&NET], |s| {
+//!     s.spawn(app_task())?;
+//!     Ok(())
+//! });
+//!
+//! task_graph! { &NET, &APP }   // emits `ALL_NODES` + `NODE_COUNT`
+//!
+//! #[embassy_executor::task]
+//! async fn supervisor_task(spawner: Spawner) {
+//!     let sup = Supervisor::new(&ALL_NODES).expect("no dependency cycle");
+//!     sup.start(spawner).expect("initial spawn"); // brings up `net`, then `app`
+//!     loop {
+//!         // Apply runtime start/stop/pause/resume requests in dependency order.
+//!         let cmd = wait_control().await;
+//!         sup.apply_control(cmd, spawner).await;
+//!     }
+//!     // With the `pool` feature you'd instead drive scaling and control together:
+//!     // `select(sup.run_pools(spawner), wait_control())` (see the `firmware` crate).
+//! }
+//! ```
+//!
+//! The `firmware` crate in the [repository](https://github.com/cedrivard/embassy-supervisor)
+//! is a complete working example (USB-net, an HTTP control plane, an elastic pool,
+//! and OTA).
 //!
 //! Docs:
 //!   - `heapless::Vec` (no-alloc stack vector): <https://docs.rs/heapless>
@@ -53,14 +97,15 @@
 //!   - Kahn's algorithm (topological sort):
 //!     <https://en.wikipedia.org/wiki/Topological_sorting#Kahn's_algorithm>
 
-use core::cell::Cell;
+#[macro_use]
+mod fmt;
+
 use core::sync::atomic::Ordering;
 
-use defmt::info;
 use embassy_executor::{SpawnError, Spawner};
 use embassy_futures::select::{Either, select};
-use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+#[cfg(feature = "control")]
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::Timer;
@@ -74,22 +119,26 @@ use portable_atomic::AtomicBool;
 // (`ElasticPool`). Single-consumer `Signal`: many tasks may `signal()`, only the
 // supervisor `wait()`s. This is the *only* path by which task status reaches the
 // supervisor — it never polls.
+#[cfg(feature = "pool")]
 static SCALE_REQ: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Fire the scale-request signal. Called by a task on a busy/idle transition.
+/// A no-op when the `pool` feature is disabled (no pools to re-evaluate).
 pub fn request_scale() {
+    #[cfg(feature = "pool")]
     SCALE_REQ.signal(());
 }
 
 /// Await the next scale request. The supervisor's driver loop selects this
 /// against its other wake sources and runs the scaling policy on each wake.
+#[cfg(feature = "pool")]
 pub async fn wait_scale() {
     SCALE_REQ.wait().await;
 }
 
 // ─── Runtime control commands (app → supervisor) ───────────────────────────
 //
-// An application's control surface (e.g. an HTTP endpoint) usually can't drive
+// An application's control surface (e.g. a network endpoint) usually can't drive
 // the supervisor directly: the `Supervisor` and the `Spawner` live on the
 // supervisor task's stack, not in a `static`. So control is decoupled via this
 // channel — the caller `request_control()`s a (node, op) pair and returns
@@ -101,34 +150,43 @@ pub async fn wait_scale() {
 /// Which way to drive a node. Higher-level verbs fold onto these two:
 /// `start`/`resume` → `Activate`, `stop`/`pause` → `Deactivate`. The concrete
 /// mechanism (respawn vs resume vs leave-to-pool) is then chosen per node `Mode`
-/// inside [`Supervisor::activate`] / [`Supervisor::deactivate`].
+/// by the supervisor when it applies the command ([`Supervisor::apply_control`]).
+#[cfg(feature = "control")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ControlOp {
+    /// Bring the node up (start a stopped `Terminate` node, resume a `Pause` node).
     Activate,
+    /// Take the node down (and its dependents, per the graph).
     Deactivate,
 }
 
 /// A runtime control request: drive `node` (and, per the dependency graph and
 /// pool membership, the nodes it implies) in the `op` direction.
+#[cfg(feature = "control")]
 #[derive(Clone, Copy)]
 pub struct ControlCommand {
+    /// The node to drive.
     pub node: &'static TaskNode,
+    /// The direction to drive it.
     pub op: ControlOp,
 }
 
 /// App → supervisor control mailbox. `&'static TaskNode` is `Copy + Sync`, so
 /// the target rides the channel directly — no name lookup needed supervisor-side.
+#[cfg(feature = "control")]
 static CONTROL_REQ: Channel<CriticalSectionRawMutex, ControlCommand, 4> = Channel::new();
 
 /// Enqueue a control request. Non-blocking; drops if the mailbox is full (4
 /// outstanding), which is harmless for low-frequency manual control. Called by
 /// the application's control surface.
+#[cfg(feature = "control")]
 pub fn request_control(node: &'static TaskNode, op: ControlOp) {
     let _ = CONTROL_REQ.try_send(ControlCommand { node, op });
 }
 
 /// Await the next control request. Selected by the supervisor's driver loop
 /// against pool scaling and any other application wake sources.
+#[cfg(feature = "control")]
 pub async fn wait_control() -> ControlCommand {
     CONTROL_REQ.receive().await
 }
@@ -154,8 +212,8 @@ pub enum Mode {
     Pause,
     /// Like `Terminate` (exits on shutdown), but **not** started at boot and
     /// **not** auto-respawned. The supervisor brings it up and down at runtime
-    /// via `start_node` / `stop_node` in response to load — see the elastic
-    /// [`pool`]. `start()` skips it; `respawn_terminate()` leaves it down (it
+    /// via `start_node` / `stop_node` in response to load — see [`ElasticPool`].
+    /// `start()` skips it; `respawn_terminate()` leaves it down (it
     /// re-grows under demand); `teardown()` only acts on it while it is running.
     OnDemand,
 }
@@ -173,6 +231,7 @@ impl Mode {
     }
 }
 
+#[cfg(feature = "defmt")]
 impl defmt::Format for Mode {
     fn format(&self, f: defmt::Formatter) {
         defmt::write!(f, "{}", self.as_str());
@@ -225,6 +284,14 @@ pub struct TaskHandle {
     /// Because it lives in a `static`, it also survives a power-state transition
     /// that retains RAM (e.g. a warm-resume from deep sleep).
     disabled: AtomicBool,
+    /// The node manages its own lifecycle and must NOT be torn down by a
+    /// dependency cascade. A dependency normally means "stop me when my dep stops",
+    /// but a node can declare a dep purely for *start* ordering and then intend to
+    /// outlive it — e.g. a node that needs a dependency up to initialize, then stops
+    /// that dependency to reclaim its resources, must survive that teardown. While
+    /// set, `deactivate` will not pull the node into a transitive-dependent teardown.
+    /// Self-managed, so `reset()` leaves it (the node clears it itself when done).
+    detached: AtomicBool,
 }
 
 impl TaskHandle {
@@ -238,6 +305,7 @@ impl TaskHandle {
             busy: AtomicBool::new(false),
             resume_wake: Signal::new(),
             disabled: AtomicBool::new(false),
+            detached: AtomicBool::new(false),
         }
     }
 }
@@ -353,6 +421,18 @@ impl TaskNode {
         self.handle.disabled.load(Ordering::Acquire)
     }
 
+    /// Mark/clear this node as **detached**: a node that manages its own lifecycle
+    /// and must not be torn down by a dependency cascade (see the field doc). Set it
+    /// before stopping a dependency the node has declared but intends to outlive.
+    pub fn set_detached(&self, detached: bool) {
+        self.handle.detached.store(detached, Ordering::Release);
+    }
+
+    /// True while this node is detached from dependency-cascade teardown.
+    pub fn is_detached(&self) -> bool {
+        self.handle.detached.load(Ordering::Acquire)
+    }
+
     // ── Supervisor-side API ──────────────────────────────────────────────
     //
     // Driven by the `Supervisor` struct. Kept `pub(crate)` so app code doesn't
@@ -375,7 +455,11 @@ impl TaskNode {
     /// cleared by `Supervisor::activate`. Deliberately *not* touched by
     /// `reset()`, so a manual stop survives respawn cycles and RAM-retaining
     /// power-state transitions.
-    pub(crate) fn set_disabled(&self, disabled: bool) {
+    ///
+    /// Public so an application can pre-disable a `Terminate` node *before*
+    /// `Supervisor::start`, making it a stopped-at-boot task that only comes up on
+    /// an explicit `Activate` control (a node started by control rather than at boot).
+    pub fn set_disabled(&self, disabled: bool) {
         self.handle.disabled.store(disabled, Ordering::Release);
     }
 
@@ -465,6 +549,7 @@ pub enum BuildError {
     Cycle,
 }
 
+#[cfg(feature = "defmt")]
 impl defmt::Format for BuildError {
     fn format(&self, f: defmt::Formatter) {
         match self {
@@ -487,6 +572,7 @@ pub struct Supervisor<const N: usize> {
     /// any one member (`apply_control` expands the target through
     /// [`Pool::members`]) — the same registry `run_pools` drives. Defaults
     /// empty; set via [`Supervisor::with_pools`].
+    #[cfg(feature = "pool")]
     pools: &'static [&'static dyn Pool],
 }
 
@@ -498,13 +584,19 @@ impl<const N: usize> Supervisor<N> {
     pub fn new(nodes: &'static [&'static TaskNode; N]) -> Result<Self, BuildError> {
         let order = topo_sort::<N>(nodes)?;
         let nodes: &'static [&'static TaskNode] = nodes;
-        Ok(Self { nodes, order, pools: &[] })
+        Ok(Self {
+            nodes,
+            order,
+            #[cfg(feature = "pool")]
+            pools: &[],
+        })
     }
 
     /// Register the elastic pools so runtime control co-controls each pool as a
     /// unit (stopping/starting any member affects the whole pool). The same
     /// `&[&dyn Pool]` registry passed to `run_pools`. Builder-style so the call
     /// site reads `Supervisor::new(..)?.with_pools(POOLS)`.
+    #[cfg(feature = "pool")]
     pub fn with_pools(mut self, pools: &'static [&'static dyn Pool]) -> Self {
         self.pools = pools;
         self
@@ -557,7 +649,7 @@ impl<const N: usize> Supervisor<N> {
         )
         .await
         {
-            defmt::panic!(
+            panic!(
                 "supervisor: task {} did not ack shutdown within {}ms",
                 node.name,
                 SHUTDOWN_ACK_TIMEOUT_MS,
@@ -640,6 +732,7 @@ impl<const N: usize> Supervisor<N> {
 // lifecycle-spanning `disabled` flag, so it sticks against the elastic policy and
 // the wake respawn.
 
+#[cfg(feature = "control")]
 impl<const N: usize> Supervisor<N> {
     /// Position of `node` in `self.nodes` (pointer identity — every node is a
     /// `&'static`). `None` only if the node isn't in this graph (impossible for
@@ -651,11 +744,13 @@ impl<const N: usize> Supervisor<N> {
     /// Seed a membership set with `target` plus — if `target` belongs to an
     /// elastic pool — every member of that pool, so control is applied to the
     /// whole pool atomically. Pool membership is read from the registry passed to
-    /// `with_pools`; with no pools registered this is just `{target}`.
+    /// `with_pools`; with no pools (the `pool` feature off, or none registered)
+    /// this is just `{target}`.
     fn seed(&self, target: &'static TaskNode, set: &mut [bool; N]) {
         if let Some(i) = self.index_of(target) {
             set[i] = true;
         }
+        #[cfg(feature = "pool")]
         for pool in self.pools {
             let members = pool.members();
             if members.iter().any(|m| core::ptr::eq(*m, target)) {
@@ -692,6 +787,11 @@ impl<const N: usize> Supervisor<N> {
         for i in self.order.iter() {
             let j = *i as usize;
             if set[j] {
+                continue;
+            }
+            // A detached node declares its dep only for start ordering and intends
+            // to outlive it, so it's never pulled into the cascade.
+            if self.nodes[j].is_detached() {
                 continue;
             }
             if self.nodes[j]
@@ -832,5 +932,7 @@ fn topo_sort<const N: usize>(
     Ok(order)
 }
 
+#[cfg(feature = "pool")]
 mod pool;
+#[cfg(feature = "pool")]
 pub use pool::*;

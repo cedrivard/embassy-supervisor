@@ -1,16 +1,22 @@
 [package]
-name = "supervisor"
+name = "embassy-supervisor"
 version = "0.1.0"
 description = "A generic, HAL-agnostic task-lifecycle supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, and runtime start/stop/pause/resume control."
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/embassy-supervisor"
+keywords = ["embassy", "async", "embedded", "supervisor", "no-std"]
+categories = ["embedded", "asynchronous", "no-std"]
 
 [dependencies]
 # Pure-embassy dependencies only — no HAL, no allocator, no board crates, so the
 # supervisor compiles for any embassy target.
 # Version set aligned with embassy-rp 0.10 (the firmware's HAL): executor 0.10,
-# sync 0.8, time 0.5. The supervisor and firmware MUST share these so the
+# sync 0.8, time 0.5. The supervisor and a firmware MUST share these so the
 # `Spawner`/`SpawnError` types match.
 embassy-executor = { version = "0.10" }     # Spawner / SpawnError types only
 embassy-sync = { version = "0.8" }
@@ -18,4 +24,19 @@ embassy-time = { version = "0.5" }
 embassy-futures = { version = "0.1" }
 heapless = "0.8"
 portable-atomic = { version = "1", features = ["critical-section"] }
-defmt = "1"
+defmt = { version = "1", optional = true }
+
+[features]
+# Full-featured out of the box; a footprint-constrained consumer trims with
+# `default-features = false` and opts back into what it needs.
+default = ["control", "pool"]
+# Runtime control plane: ControlOp, request_control/apply_control, activate/deactivate.
+control = []
+# Elastic worker pools: the `pool` module, with_pools, run_pools, load scaling.
+pool = []
+# Logging via defmt (otherwise the log macros are no-ops).
+defmt = ["dep:defmt"]
+
+[package.metadata.docs.rs]
+# Document every feature (control/pool/defmt) on docs.rs.
+all-features = true

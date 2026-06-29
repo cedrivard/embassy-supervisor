@@ -39,7 +39,9 @@ use supervisor::{ControlOp, DeferredShrink, ElasticPool, Mode, TaskNode};
 use crate::net::{self, NET};
 
 const HTTP_PORT: u16 = 80;
-const POOL_MAX: usize = 4;
+/// Pool ceiling, and also the socket budget (`net::SOCKET_BUDGET` derives from it):
+/// each worker owns one socket.
+pub const POOL_MAX: usize = 4;
 /// Close a keep-alive connection after this long with no request, freeing the
 /// worker (and its socket) back to the pool.
 const KEEPALIVE_IDLE_SECS: u64 = 10;
@@ -167,6 +169,7 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &Tas
             Either::First(Ok(n)) => n,
         };
 
+
         let request = core::str::from_utf8(&req[..n]).unwrap_or("");
         let line = request.lines().next().unwrap_or("");
         let mut parts = line.split_whitespace();
@@ -191,6 +194,22 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &Tas
             ("POST", p) if p.starts_with("/api/heartbeat") => {
                 let body = handle_heartbeat(p);
                 send(socket, "application/json", &body, keep).await;
+            }
+            ("POST", p) if p.starts_with("/api/ota") => {
+                // Control-only: record the download target, ack, and start the
+                // (stopped-at-boot) OTA node, which orchestrates the rest itself.
+                match crate::ota::set_target(query(p, "ip="), query(p, "port="), query(p, "path=")) {
+                    Ok(()) => {
+                        send(socket, "application/json", "{\"accepted\":true,\"status\":\"downloading\"}", false).await;
+                        supervisor::request_control(&crate::ota::OTA, ControlOp::Activate);
+                        return;
+                    }
+                    Err(e) => {
+                        let mut out = String::with_capacity(64);
+                        let _ = write!(out, "{{\"accepted\":false,\"error\":\"{}\"}}", e);
+                        send(socket, "application/json", &out, keep).await;
+                    }
+                }
             }
             _ => {
                 let _ = socket

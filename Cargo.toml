@@ -1,19 +1,20 @@
 # Workspace for the embassy task supervisor.
 #
-# - `supervisor` : the generalized, HAL-agnostic task-lifecycle supervisor. Pure
-#   embassy, no board or application specifics.
+# - `supervisor` : the generalized, HAL-agnostic task-lifecycle supervisor (the
+#   publishable `embassy-supervisor` crate). Pure embassy, no board specifics.
 # - `firmware`   : the RP2350 application that drives the supervisor over a
-#   USB-CDC-NCM network with an HTTP control plane and an elastic worker pool.
-#
-# TODO: a `bootloader` crate (embassy-boot-rp) for A/B OTA.
+#   USB-CDC-NCM network with an HTTP control plane, an elastic worker pool, and OTA.
+# - `bootloader` : the embassy-boot-rp A/B bootloader.
 [workspace]
 resolver = "2"
 members = ["supervisor", "firmware", "bootloader"]
 
 [workspace.package]
 edition = "2024"
-license = "Apache-2.0"
+authors = ["Cedric Rivard <cedric@rivard.info>"]
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/cedrivard/embassy-supervisor"
+rust-version = "1.85"
 
 # Size/perf profile for the embedded binaries (mirrors the embassy templates).
 [profile.release]

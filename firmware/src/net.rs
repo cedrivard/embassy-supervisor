@@ -52,9 +52,12 @@ const DEV_IP: Ipv4Address = Ipv4Address::new(10, 42, 0, 61);
 const GW_IP: Ipv4Address = Ipv4Address::new(10, 42, 0, 1);
 const PREFIX: u8 = 24;
 
-/// Number of concurrent sockets the stack can hold — the budget the elastic
-/// HTTP pool scales within (one socket per live worker).
-pub const SOCKET_BUDGET: usize = 6;
+/// Number of concurrent sockets the stack can hold: one per http worker (the pool
+/// ceiling) plus one for embassy-net's internal DNS socket (the `dns` feature
+/// reserves a slot, used by reqwless's `HttpClient`). The OTA download's TCP socket
+/// needs no extra slot — the supervisor drains the http pool before the OTA node
+/// runs, so it reuses a freed worker slot (they never coexist).
+pub const SOCKET_BUDGET: usize = crate::http::POOL_MAX + 1;
 
 // ─── Stack handle publication ──────────────────────────────────────────────
 

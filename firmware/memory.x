@@ -1,26 +1,32 @@
-/* RP2350 memory layout: single application image, no OTA partitions.
+/* RP2350 firmware linker layout. The firmware always runs from the ACTIVE
+ * partition under the `bootloader` crate (the ROM boots the bootloader, which
+ * swaps DFU<->ACTIVE on a pending update and jumps here). Keep these addresses in
+ * sync with `bootloader/memory.x`.
  *
- * The boot-ROM/picotool boot sections below (.start_block / .bi_entries /
- * .end_block) are required on RP2350 — embassy-rp's `binary-info` feature fills
- * `.start_block` with the image definition the ROM checks before booting.
- *
- * This is the standalone single-image layout (default build). The OTA build
- * (`--features ota`) uses `memory-ota.x` instead, placing the firmware in the
- * ACTIVE partition under the `bootloader` crate. */
+ * The DFU + STATE symbols are exported for `FirmwareUpdaterConfig`: the firmware
+ * streams a new image into DFU, the bootloader swaps it on the next reset. */
 MEMORY {
-    /* 2 MiB is a safe default (a Pico 2 has 4 MiB; the RedBoard has 16 MiB —
-     * either way this image fits comfortably). */
-    FLASH : ORIGIN = 0x10000000, LENGTH = 2048K
-    /* Main SRAM: 512 KiB across the striped banks SRAM0-7. */
+    /* FLASH == the ACTIVE partition. */
+    FLASH            : ORIGIN = 0x10021000, LENGTH = 892K
+    BOOTLOADER_STATE : ORIGIN = 0x10020000, LENGTH = 4K
+    DFU              : ORIGIN = 0x10100000, LENGTH = 896K
+
     RAM   : ORIGIN = 0x20000000, LENGTH = 512K
-    /* Direct-mapped banks 8 & 9 (unused here). */
     SRAM8 : ORIGIN = 0x20080000, LENGTH = 4K
     SRAM9 : ORIGIN = 0x20081000, LENGTH = 4K
 }
 
+/* Flash-relative OFFSETS (not absolute addresses) — embassy-boot feeds these
+ * straight to embassy-rp's Flash as offset-from-start. See bootloader/memory.x. */
+__bootloader_state_start = ORIGIN(BOOTLOADER_STATE) - 0x10000000;
+__bootloader_state_end   = ORIGIN(BOOTLOADER_STATE) + LENGTH(BOOTLOADER_STATE) - 0x10000000;
+__bootloader_dfu_start   = ORIGIN(DFU) - 0x10000000;
+__bootloader_dfu_end     = ORIGIN(DFU) + LENGTH(DFU) - 0x10000000;
+
+/* RP2350 boot blocks (binary-info fills the image-def). Unused by the ROM here
+ * since the bootloader jumps to ACTIVE directly, but the firmware links with
+ * `binary-info` so the section still needs a home. */
 SECTIONS {
-    /* Boot ROM info — kept in the first 4K of flash where the ROM/picotool
-     * look for it. */
     .start_block : ALIGN(4)
     {
         __start_block_addr = .;
@@ -29,11 +35,9 @@ SECTIONS {
     } > FLASH
 } INSERT AFTER .vector_table;
 
-/* Move .text to start after the boot info. */
 _stext = ADDR(.start_block) + SIZEOF(.start_block);
 
 SECTIONS {
-    /* Picotool 'Binary Info' entries. */
     .bi_entries : ALIGN(4)
     {
         __bi_entries_start = .;
@@ -44,7 +48,6 @@ SECTIONS {
 } INSERT AFTER .text;
 
 SECTIONS {
-    /* Boot ROM extra info — after everything, can hold a signature. */
     .end_block : ALIGN(4)
     {
         __end_block_addr = .;

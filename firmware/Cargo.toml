@@ -4,15 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
-[features]
-# Build to run from the ACTIVE partition under the OTA bootloader (partitioned
-# `memory-ota.x`). Default off = standalone single-image firmware. The OTA upload
-# route + FirmwareUpdater are a further increment on top of this layout switch.
-ota = []
-
 [dependencies]
-# The generalized task supervisor (workspace lib).
-supervisor = { path = "../supervisor" }
+# The generalized task supervisor (the publishable embassy-supervisor crate),
+# aliased to `supervisor` so the firmware keeps `use supervisor::…`. Enables the
+# `defmt` feature; `control` + `pool` come from the crate's defaults.
+supervisor = { package = "embassy-supervisor", path = "../supervisor", features = ["defmt"] }
 
 # embassy core. These versions are the latest crates.io releases that resolve
 # together with embassy-rp 0.10 (executor 0.10 / time 0.5 / sync 0.8); the
@@ -45,8 +41,15 @@ embassy-net = { version = "0.9", features = [
     "tcp",
     "udp",
     "dhcpv4",
+    "dns",
     "medium-ethernet",
 ] }
+
+# HTTP client for the OTA download (pull model). no_std + async over embassy-net.
+# Git (not 0.13): the published release pins embedded-nal-async 0.8 / io-async 0.6,
+# but embassy-net 0.9.1 is on nal-async 0.9; reqwless `main` bumped to 0.9 / 0.7.
+# Cargo.lock pins the exact commit.
+reqwless = { git = "https://github.com/drogue-iot/reqwless", default-features = false }
 
 # Note on the HTTP control/observability plane: `picoserve` was evaluated, but
 # its ergonomic embassy router stores an `AppRouter` in a `static`, which needs
@@ -59,7 +62,14 @@ embassy-net = { version = "0.9", features = [
 embedded-alloc = { version = "0.7", default-features = false, features = ["llff"] }
 
 embedded-io-async = "0.7"
+
+# OTA: A/B firmware update + zstd decompression (windowLog<=13, ~16 KB window).
+embassy-boot-rp = "0.10"
+embedded-storage = "0.3"
+ruzstd = { version = "0.8", default-features = false }
+
 defmt = "1"
 defmt-rtt = "1"
 panic-probe = { version = "1", features = ["print-defmt"] }
+cortex-m = "0.7"
 cortex-m-rt = "0.7"

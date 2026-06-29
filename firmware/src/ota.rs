@@ -1,0 +1,273 @@
+//! OTA update path — a supervisor-managed, control-started node that pulls a
+//! firmware image from a remote HTTP server with `reqwless`.
+//!
+//! `OTA` is a regular `Terminate` node that `main` pre-disables, so the boot-time
+//! `start()` skips it: it sits stopped until an explicit `Activate` control starts
+//! it. The node then orchestrates its own resource draining — the supervisor's
+//! drain-to-free-budget move. Flow:
+//!
+//! 1. `POST /api/ota[?ip=&port=&path=]` records the target ([`set_target`], each
+//!    part defaulting to the gateway / 8000 / `/fw.zst`) and issues `Activate(ota)`.
+//!    Starting the node straight from the dashboard (control `Activate`, no target)
+//!    works too — [`run`] falls back to the same defaults. The http server does
+//!    nothing else in the transfer.
+//! 2. [`run`] drains the http pool (waiting for the workers to fully stop), then
+//!    HTTP-GETs the `.zst` with `reqwless` over a socket it opens by IP and streams
+//!    it into a **scratch** flash region.
+//! 3. It then drains `net` (detached first, so net's teardown doesn't cascade back
+//!    into this still-running task) — the decode reads flash, not the network, so
+//!    net's ~16 KB is freed for the decoder. `ruzstd` decodes the scratch image into
+//!    DFU with nearly the whole arena free, arms the swap, and resets.
+//! 4. The bootloader swaps DFU->ACTIVE; [`mark_booted`] confirms once the network is
+//!    back (else the bootloader rolls back).
+//!
+//! Two-phase by necessity: `ruzstd` is a blocking decoder, so the compressed image
+//! is staged in flash and decoded from its synchronous XIP-mapped slice. The host
+//! must compress with `zstd --windowLog=11 fw.bin` — the window is capped at 11
+//! because ruzstd's heap ~doubles per `windowLog` while the image barely shrinks
+//! (measured decode peak ~27.6 KB; see the `zstd-heapcheck` tool). reqwless's
+//! socket/header/chunk buffers are heap-allocated, so they draw from the budgeted
+//! heap rather than bloating this task's future.
+
+use core::cell::RefCell;
+use core::fmt::Write as _;
+
+use alloc::boxed::Box;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use embassy_boot_rp::{BlockingFirmwareUpdater, FirmwareUpdaterConfig};
+use embassy_net::Ipv4Address;
+use embassy_net::dns::DnsSocket;
+use embassy_net::tcp::client::{TcpClient, TcpClientState};
+use embassy_rp::flash::{Blocking, ERASE_SIZE, FLASH_BASE, Flash};
+use embassy_rp::peripherals::FLASH;
+use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
+use embassy_time::{Duration, Timer};
+use embedded_io_async::Read as _;
+use reqwless::client::HttpClient;
+use reqwless::request::Method;
+use ruzstd::decoding::StreamingDecoder;
+use ruzstd::io::Read as _;
+use supervisor::{ControlOp, Mode, TaskNode};
+
+use crate::net::NET;
+
+const FLASH_SIZE: usize = 2 * 1024 * 1024;
+
+/// Scratch region for the compressed download: the 128 KiB tail of flash between
+/// the DFU partition end (`0x101E0000`) and the 2 MiB mark, unused by the layout.
+const SCRATCH_OFFSET: u32 = 0x1E0000;
+const SCRATCH_LEN: u32 = 128 * 1024;
+
+/// Default download server (the USB-LAN gateway / host), port, and path. Used when
+/// `POST /api/ota` omits a query part, or when the node is started straight from the
+/// dashboard (control `Activate`, no target set) — so the bare start button works.
+const DEFAULT_IP: Ipv4Address = Ipv4Address::new(10, 42, 0, 1);
+const DEFAULT_PORT: u16 = 8000;
+const DEFAULT_PATH: &str = "/fw.zst";
+
+fn default_target() -> Target {
+    Target { ip: DEFAULT_IP, port: DEFAULT_PORT, path: DEFAULT_PATH.to_string() }
+}
+
+struct Target {
+    ip: Ipv4Address,
+    port: u16,
+    path: String,
+}
+
+static TARGET: Mutex<CriticalSectionRawMutex, RefCell<Option<Target>>> =
+    Mutex::new(RefCell::new(None));
+
+/// Record the download target from `POST /api/ota` query parts (empty = default).
+/// Call before issuing `Activate(ota)`.
+pub fn set_target(ip: &str, port: &str, path: &str) -> Result<(), &'static str> {
+    let ip = if ip.is_empty() { DEFAULT_IP } else { parse_ip(ip).ok_or("bad ip")? };
+    let port = if port.is_empty() { DEFAULT_PORT } else { port.parse().map_err(|_| "bad port")? };
+    let path = if path.is_empty() { DEFAULT_PATH } else { path };
+    TARGET.lock(|c| *c.borrow_mut() = Some(Target { ip, port, path: path.to_string() }));
+    Ok(())
+}
+
+fn parse_ip(s: &str) -> Option<Ipv4Address> {
+    let mut it = s.split('.');
+    let a = it.next()?.parse().ok()?;
+    let b = it.next()?.parse().ok()?;
+    let c = it.next()?.parse().ok()?;
+    let d = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some(Ipv4Address::new(a, b, c, d))
+}
+
+/// The OTA node. A `Terminate` node that `main` disables before `start()`, so it
+/// only runs when control `Activate`s it (after the http pool has been drained).
+pub static OTA: TaskNode = TaskNode::new("ota", Mode::Terminate, &[&NET], |s| {
+    s.spawn(ota_task(&OTA)?);
+    Ok(())
+});
+
+#[embassy_executor::task]
+async fn ota_task(_node: &'static TaskNode) {
+    // http has been drained by now, so the heap has room for the ~16 KB window.
+    match run().await {
+        Ok(()) => defmt::info!("ota: image staged to DFU, resetting to swap"),
+        // No `mark_updated` on failure, so the reset just reboots the current
+        // image (clean recovery).
+        Err(e) => defmt::error!("ota: failed: {} - resetting, no swap", e),
+    }
+    Timer::after(Duration::from_millis(100)).await; // let the log drain over RTT
+    cortex_m::peripheral::SCB::sys_reset();
+}
+
+/// Download the compressed image to scratch, then decode it into DFU.
+///
+/// The decode reads the staged image from flash, not the network, so the task
+/// drains `net` to reclaim its ~16 KB: the decode peak becomes ruzstd alone
+/// (~28 KB measured for a `windowLog=11` image), matching the serving peak so the
+/// arena stays small. It detaches first so net's teardown doesn't cascade back into this
+/// task (net is a *start-only* dep here — needed for the download, not the decode).
+/// The sync decode blocks the executor anyway, so net couldn't serve during it.
+async fn run() -> Result<(), &'static str> {
+    // Fall back to the default target when started without one (e.g. the
+    // dashboard's Activate button, which doesn't call set_target).
+    let target = TARGET.lock(|c| c.borrow_mut().take()).unwrap_or_else(default_target);
+
+    // Drain the http pool and wait for it to fully stop before opening the download
+    // socket — else 4 workers + DNS + download = 6 would exceed the 5-socket budget.
+    // Poll `is_running` (false only once teardown completes and the sockets are
+    // freed), NOT `is_disabled` (set when the stop is merely *requested*, before the
+    // workers actually exit). Deactivating the floor seeds the whole pool.
+    supervisor::request_control(&crate::http::HTTP[0], ControlOp::Deactivate);
+    while crate::http::HTTP.iter().any(|n| n.is_running()) {
+        Timer::after(Duration::from_millis(20)).await;
+    }
+
+    let len = download_to_scratch(&target).await?;
+    defmt::info!("ota: downloaded {} B, draining net for the decode", len);
+    OTA.set_detached(true);
+    supervisor::request_control(&NET, ControlOp::Deactivate);
+    while crate::net::try_stack().is_some() {
+        Timer::after(Duration::from_millis(20)).await;
+    }
+    defmt::info!("ota: net down, {} B heap free, decoding", crate::heap::free_bytes());
+    apply(len)
+}
+
+/// HTTP client (reqwless): GET the image and stream the body into scratch flash.
+/// All transfer buffers are heap-allocated so they come from the drained budgeted
+/// heap, not this task's static future storage.
+async fn download_to_scratch(t: &Target) -> Result<usize, &'static str> {
+    let stack = crate::net::try_stack().ok_or("net not up")?;
+    let state: Box<TcpClientState<1, 512, 2048>> = Box::new(TcpClientState::new());
+    let tcp = TcpClient::new(stack, &state);
+    let dns = DnsSocket::new(stack);
+    let mut client = HttpClient::new(&tcp, &dns);
+
+    let mut url = String::with_capacity(64);
+    let _ = write!(url, "http://{}:{}{}", t.ip, t.port, t.path);
+
+    let mut hdr = vec![0u8; 1024];
+    let mut req = client.request(Method::GET, &url).await.map_err(|_| "http request")?;
+    let resp = req.send(hdr.as_mut_slice()).await.map_err(|_| "http send")?;
+
+    let mut reader = resp.body().reader();
+    let mut chunk = vec![0u8; 1024];
+    let mut scratch = Scratch::new();
+    let mut written: u32 = 0;
+    loop {
+        let n = reader.read(&mut chunk).await.map_err(|_| "http body read")?;
+        if n == 0 {
+            break;
+        }
+        scratch.write(written, &chunk[..n])?;
+        written += n as u32;
+    }
+    Ok(written as usize)
+}
+
+type Blk = Flash<'static, FLASH, Blocking, FLASH_SIZE>;
+
+/// Blocking flash handle. SAFETY: only the OTA path touches FLASH, one OTA at a
+/// time, and the download (scratch write) and decode (DFU write) phases never run
+/// concurrently, so stealing per phase is sound.
+fn flash() -> Blk {
+    Flash::new_blocking(unsafe { FLASH::steal() })
+}
+
+/// Streams the compressed download into scratch flash, erasing sectors on first
+/// touch (offsets grow monotonically).
+struct Scratch {
+    flash: Blk,
+    erased_sectors: u32,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Self { flash: flash(), erased_sectors: 0 }
+    }
+
+    fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), &'static str> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let end = offset + data.len() as u32;
+        if end > SCRATCH_LEN {
+            return Err("image larger than scratch");
+        }
+        let needed = end.div_ceil(ERASE_SIZE as u32);
+        while self.erased_sectors < needed {
+            let s = SCRATCH_OFFSET + self.erased_sectors * ERASE_SIZE as u32;
+            self.flash
+                .blocking_erase(s, s + ERASE_SIZE as u32)
+                .map_err(|_| "scratch erase")?;
+            self.erased_sectors += 1;
+        }
+        self.flash
+            .blocking_write(SCRATCH_OFFSET + offset, data)
+            .map_err(|_| "scratch write")
+    }
+}
+
+/// Decode the staged image (XIP-mapped scratch slice) into DFU and arm the swap.
+fn apply(compressed_len: usize) -> Result<(), &'static str> {
+    // SAFETY: scratch is flash-resident and XIP-mapped; the download is over, so
+    // reading it as a slice is sound.
+    let compressed = unsafe {
+        core::slice::from_raw_parts(
+            (FLASH_BASE as usize + SCRATCH_OFFSET as usize) as *const u8,
+            compressed_len,
+        )
+    };
+
+    let shared: Mutex<NoopRawMutex, _> = Mutex::new(RefCell::new(flash()));
+    let config = FirmwareUpdaterConfig::from_linkerfile_blocking(&shared, &shared);
+    let mut state_buf = [0u8; 1]; // == STATE::WRITE_SIZE
+    let mut updater = BlockingFirmwareUpdater::new(config, &mut state_buf);
+
+    let mut dec = StreamingDecoder::new(compressed).map_err(|_| "zstd header")?;
+    let mut buf = [0u8; 512];
+    let mut offset = 0usize;
+    loop {
+        let n = dec.read(&mut buf).map_err(|_| "zstd decode")?;
+        if n == 0 {
+            break;
+        }
+        updater.write_firmware(offset, &buf[..n]).map_err(|_| "dfu write")?;
+        offset += n;
+    }
+
+    updater.mark_updated().map_err(|_| "mark_updated failed")
+}
+
+/// Confirm the running image so the bootloader keeps it instead of rolling back
+/// on the next reset. Safe to call on a normal (non-updated) boot.
+pub fn mark_booted() -> Result<(), &'static str> {
+    let shared: Mutex<NoopRawMutex, _> = Mutex::new(RefCell::new(flash()));
+    let config = FirmwareUpdaterConfig::from_linkerfile_blocking(&shared, &shared);
+    let mut state_buf = [0u8; 1];
+    let mut updater = BlockingFirmwareUpdater::new(config, &mut state_buf);
+    updater.mark_booted().map_err(|_| "mark_booted failed")
+}

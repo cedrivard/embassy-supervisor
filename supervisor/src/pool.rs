@@ -13,14 +13,20 @@
 
 use super::*;
 
+use core::cell::Cell;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::{Duration, Instant};
 
 /// Aggregate state of a pool, handed to the policy.
 #[derive(Clone, Copy)]
 pub struct PoolStats {
+    /// Instances currently up (spawned and not exited).
     pub running: u8,
+    /// Of the running instances, how many are serving (marked busy).
     pub busy: u8,
+    /// Floor — the pool never shrinks below this.
     pub min: u8,
+    /// Ceiling — the pool never grows above this.
     pub max: u8,
 }
 impl PoolStats {
@@ -33,14 +39,18 @@ impl PoolStats {
 /// What a policy wants done this evaluation.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ScaleAction {
+    /// Leave the pool at its current size.
     None,
+    /// Start one more instance (if below `max`).
     Grow,
+    /// Stop one idle instance (if above `min`).
     Shrink,
 }
 
 /// Swappable scaling decision. `decide` is synchronous; stateful policies use
 /// interior mutability (the pool is a `static`, so `&self`).
 pub trait ScalingPolicy {
+    /// Decide what to do given the current pool `stats` at time `now`.
     fn decide(&self, stats: PoolStats, now: Instant) -> ScaleAction;
 
     /// The next instant at which the pool must be re-evaluated even without a
@@ -63,6 +73,8 @@ pub struct DeferredShrink {
     pending: Mutex<CriticalSectionRawMutex, Cell<Option<Instant>>>,
 }
 impl DeferredShrink {
+    /// Create a policy that defers each shrink by `cooldown` after the pool first
+    /// becomes over-provisioned.
     pub const fn new(cooldown: Duration) -> Self {
         Self { cooldown, pending: Mutex::new(Cell::new(None)) }
     }
@@ -107,16 +119,23 @@ impl ScalingPolicy for DeferredShrink {
 /// What the supervisor should do for a pool this tick. The async part (start /
 /// stop) is applied by the caller, keeping `Pool` object-safe without futures.
 pub enum PoolAction {
+    /// Nothing to do this tick.
     None,
+    /// Start this (currently down) pool member.
     Start(&'static TaskNode),
+    /// Stop this (running, idle) pool member.
     Stop(&'static TaskNode),
 }
 
 /// An elastic pool of single-instance nodes scaled by policy `P`.
 pub struct ElasticPool<P: ScalingPolicy> {
+    /// The pool's member nodes (each a single-instance `OnDemand`/`Terminate` node).
     pub nodes: &'static [&'static TaskNode],
+    /// Floor — keep at least this many members running.
     pub min: u8,
+    /// Ceiling — never run more than this many members.
     pub max: u8,
+    /// The scaling policy driving grow/shrink decisions.
     pub policy: P,
 }
 

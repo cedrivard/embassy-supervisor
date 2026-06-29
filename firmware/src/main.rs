@@ -3,14 +3,10 @@
 
 //! embassy-supervisor firmware (RP2350).
 //!
-//! Wires the generalized `supervisor` lib to a set of embassy tasks. This file
-//! builds the task graph and runs the supervisor's driver loop; each subsystem
-//! lives in its own module: `net` (USB-CDC-NCM), `http` (an elastic pool of
-//! keep-alive HTTP workers that is also the control/observability plane), and
-//! `heartbeat` (Pause-mode LED).
-//!
-//! TODO: an `ota` subsystem (embassy-boot-rp A/B update) once the bootloader
-//! crate lands.
+//! Wires the `supervisor` lib to embassy tasks: builds the task graph and runs the
+//! driver loop. Subsystems live in their own modules: `net` (USB-CDC-NCM), `http`
+//! (elastic pool of keep-alive workers + the control/observability plane),
+//! `heartbeat` (Pause-mode LED), `ota` (control-started A/B update via embassy-boot).
 
 extern crate alloc;
 
@@ -22,28 +18,24 @@ mod heap;
 mod heartbeat;
 mod http;
 mod net;
+mod ota;
 
 use heartbeat::HEARTBEAT;
 use http::HTTP;
 use net::NET;
 
-// Declare the supervisor task graph once. Emits `ALL_NODES` + `NODE_COUNT`.
-// `heartbeat` is standalone; the `http` pool's workers depend on `net`.
+// Supervisor task graph -> `ALL_NODES` + `NODE_COUNT`. `heartbeat` is standalone;
+// `http` and `ota` depend on `net`. `ota` is pre-disabled in `main`, control-started.
 supervisor::task_graph! {
-    &NET,
-    &HEARTBEAT,
-    &HTTP[0],
-    &HTTP[1],
-    &HTTP[2],
-    &HTTP[3],
+    &NET, &HEARTBEAT,
+    &HTTP[0], &HTTP[1], &HTTP[2], &HTTP[3],
+    &ota::OTA,
 }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // Init the HAL (sets up clocks, registers the peripheral singletons) then drop
-    // the `Peripherals` — every subsystem self-acquires the hardware it needs by
-    // stealing its peripheral (`USB` in net, `PIN_25` in heartbeat), so `main`
-    // holds no handles and just starts the supervisor.
+    // Init the HAL, then drop `Peripherals`: each subsystem steals the hardware it
+    // needs (USB in net, PIN_25 in heartbeat, FLASH/WATCHDOG here), so `main` holds none.
     let _ = embassy_rp::init(Default::default());
     heap::init();
     defmt::info!(
@@ -52,7 +44,9 @@ async fn main(spawner: Spawner) {
         heap::HEAP_SIZE
     );
 
+    spawner.spawn(defmt::unwrap!(watchdog_feed()));
     spawner.spawn(defmt::unwrap!(app_supervisor(spawner)));
+    spawner.spawn(defmt::unwrap!(ota_confirm()));
 }
 
 /// The supervisor task: build the graph, bring everything up in dependency
@@ -62,6 +56,9 @@ async fn app_supervisor(spawner: Spawner) {
     let sup = supervisor::Supervisor::new(&ALL_NODES)
         .expect("supervisor: dependency cycle")
         .with_pools(http::POOLS);
+    // `ota` is stopped-at-boot: pre-disable so `start()` skips it; control `Activate`
+    // (POST /api/ota or the dashboard start button) starts it.
+    ota::OTA.set_disabled(true);
     sup.start(spawner).expect("supervisor: initial spawn failed");
 
     loop {
@@ -71,5 +68,31 @@ async fn app_supervisor(spawner: Spawner) {
             Either::First(()) => {}
             Either::Second(cmd) => sup.apply_control(cmd, spawner).await,
         }
+    }
+}
+
+/// Feed the bootloader's 8 s watchdog (armed by `WatchdogFlash`, left running on
+/// jump): a healthy app keeps feeding; a crashed/hung one stops -> reset -> the
+/// bootloader rolls back an unconfirmed update.
+#[embassy_executor::task]
+async fn watchdog_feed() {
+    let mut wd = embassy_rp::watchdog::Watchdog::new(unsafe {
+        embassy_rp::peripherals::WATCHDOG::steal()
+    });
+    loop {
+        wd.feed(embassy_time::Duration::from_secs(8)); // `feed` also sets the timeout
+        embassy_time::Timer::after(embassy_time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Confirm the running image once the network is up. An update broken enough not to
+/// reach here never calls `mark_booted`, so the bootloader rolls back on next reset.
+#[embassy_executor::task]
+async fn ota_confirm() {
+    let stack = net::stack_ready().await;
+    stack.wait_config_up().await;
+    match ota::mark_booted() {
+        Ok(()) => defmt::info!("ota: image confirmed"),
+        Err(e) => defmt::warn!("ota: mark_booted failed: {}", e),
     }
 }
