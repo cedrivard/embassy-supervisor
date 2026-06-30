@@ -6,6 +6,12 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 
 ## [Unreleased]
 
+### Internal
+- Host-runnable unit + integration tests for the dependency-ordered topo sort, cycle
+  detection, and the `DeferredShrink`/`ElasticPool` scaling logic, plus a GitHub Actions CI
+  workflow (host tests, `thumbv8m` no_std build, clippy, fmt, doc). Test-only dev-dependencies
+  are gated to non-embedded targets, so the shipped crate stays `no_std` and driver-agnostic.
+
 ## [0.1.1]
 
 ### Fixed

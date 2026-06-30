@@ -649,6 +649,7 @@ dependencies = [
 name = "embassy-supervisor"
 version = "0.1.1"
 dependencies = [
+ "critical-section",
  "defmt 1.1.0",
  "embassy-executor",
  "embassy-futures",
@@ -684,6 +685,7 @@ dependencies = [
  "defmt 1.1.0",
  "document-features",
  "embassy-time-driver",
+ "embassy-time-queue-utils",
  "embedded-hal 0.2.7",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
