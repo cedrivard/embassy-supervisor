@@ -1,4 +1,6 @@
-#![no_std]
+// `no_std` for the shipped crate and the embedded build; under `cargo test` the
+// crate is built for the host, where the test harness and the unit tests need `std`.
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 //! # embassy-supervisor — a task-lifecycle supervisor for [embassy](https://embassy.dev)
@@ -345,7 +347,13 @@ impl TaskNode {
         deps: &'static [&'static TaskNode],
         spawn: fn(Spawner) -> Result<(), SpawnError>,
     ) -> Self {
-        Self { name, mode, deps, spawn, handle: TaskHandle::new() }
+        Self {
+            name,
+            mode,
+            deps,
+            spawn,
+            handle: TaskHandle::new(),
+        }
     }
 
     // ── Task-side API ────────────────────────────────────────────────────
@@ -639,11 +647,7 @@ impl<const N: usize> Supervisor<N> {
     /// exactly one), and marks it `running`. Returns `SpawnError::Busy` if the
     /// underlying embassy task pool is exhausted (the ceiling), which the caller
     /// treats as "can't grow".
-    pub fn start_node(
-        &self,
-        node: &'static TaskNode,
-        spawner: Spawner,
-    ) -> Result<(), SpawnError> {
+    pub fn start_node(&self, node: &'static TaskNode, spawner: Spawner) -> Result<(), SpawnError> {
         node.reset();
         (node.spawn)(spawner)?;
         node.set_running(true);
@@ -664,8 +668,7 @@ impl<const N: usize> Supervisor<N> {
         {
             panic!(
                 "supervisor: task {} did not ack shutdown within {}ms",
-                node.name,
-                SHUTDOWN_ACK_TIMEOUT_MS,
+                node.name, SHUTDOWN_ACK_TIMEOUT_MS,
             );
         }
         node.set_running(false);
@@ -926,10 +929,7 @@ fn topo_sort<const N: usize>(
             if in_degree[j] == 0 {
                 continue;
             }
-            let depends_on_i = nodes[j]
-                .deps
-                .iter()
-                .any(|d| core::ptr::eq(*d, nodes[i]));
+            let depends_on_i = nodes[j].deps.iter().any(|d| core::ptr::eq(*d, nodes[i]));
             if depends_on_i {
                 in_degree[j] -= 1;
                 if in_degree[j] == 0 {
@@ -949,3 +949,112 @@ fn topo_sort<const N: usize>(
 mod pool;
 #[cfg(feature = "pool")]
 pub use pool::*;
+
+// ─── Tests (host-only) ─────────────────────────────────────────────────────
+//
+// Run on the host: `cargo test -p embassy-supervisor --target x86_64-unknown-linux-gnu`
+// (the workspace `.cargo/config.toml` pins the embedded target, so `--target` is
+// required to override it). These cover the pure topo-sort / cycle logic — no
+// embassy executor or `Spawner` is constructed; the node `spawn` fns are never
+// invoked. The dev-dependency host shims (critical-section + embassy-time driver)
+// satisfy the crate's link-time requirements for the test binary.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A spawn fn that is never actually called by these tests (no executor runs).
+    fn noop(_: Spawner) -> Result<(), SpawnError> {
+        Ok(())
+    }
+
+    /// Position of node index `idx` within a sorted `order`.
+    fn pos<const N: usize>(order: &Vec<u8, N>, idx: u8) -> usize {
+        order
+            .iter()
+            .position(|&x| x == idx)
+            .expect("index present in order")
+    }
+
+    #[test]
+    fn linear_chain_orders_deps_before_dependents() {
+        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[], noop);
+        static B: TaskNode = TaskNode::new("b", Mode::Terminate, &[&A], noop);
+        static C: TaskNode = TaskNode::new("c", Mode::Terminate, &[&B], noop);
+        // Deliberately unsorted input order: C=0, B=1, A=2.
+        static NODES: [&TaskNode; 3] = [&C, &B, &A];
+
+        let order = topo_sort::<3>(&NODES).expect("acyclic");
+        assert_eq!(order.len(), 3);
+        assert!(pos(&order, 2) < pos(&order, 1), "A before B");
+        assert!(pos(&order, 1) < pos(&order, 0), "B before C");
+    }
+
+    #[test]
+    fn diamond_puts_root_first_and_join_last() {
+        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[], noop);
+        static B: TaskNode = TaskNode::new("b", Mode::Terminate, &[&A], noop);
+        static C: TaskNode = TaskNode::new("c", Mode::Terminate, &[&A], noop);
+        static D: TaskNode = TaskNode::new("d", Mode::Terminate, &[&B, &C], noop);
+        // A=0, B=1, C=2, D=3.
+        static NODES: [&TaskNode; 4] = [&A, &B, &C, &D];
+
+        let order = topo_sort::<4>(&NODES).expect("acyclic");
+        assert_eq!(order.len(), 4);
+        assert_eq!(order[0], 0, "A (no deps) sorts first");
+        assert_eq!(*order.last().unwrap(), 3, "D (depends on all) sorts last");
+        assert!(pos(&order, 0) < pos(&order, 1), "A before B");
+        assert!(pos(&order, 0) < pos(&order, 2), "A before C");
+        assert!(pos(&order, 1) < pos(&order, 3), "B before D");
+        assert!(pos(&order, 2) < pos(&order, 3), "C before D");
+    }
+
+    #[test]
+    fn independent_nodes_all_present() {
+        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[], noop);
+        static B: TaskNode = TaskNode::new("b", Mode::Pause, &[], noop);
+        static NODES: [&TaskNode; 2] = [&A, &B];
+
+        let order = topo_sort::<2>(&NODES).expect("acyclic");
+        assert_eq!(order.len(), 2);
+    }
+
+    #[test]
+    fn two_node_cycle_is_rejected() {
+        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[&B], noop);
+        static B: TaskNode = TaskNode::new("b", Mode::Terminate, &[&A], noop);
+        static NODES: [&TaskNode; 2] = [&A, &B];
+
+        assert!(matches!(topo_sort::<2>(&NODES), Err(BuildError::Cycle)));
+    }
+
+    #[test]
+    fn three_node_cycle_is_rejected() {
+        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[&C], noop);
+        static B: TaskNode = TaskNode::new("b", Mode::Terminate, &[&A], noop);
+        static C: TaskNode = TaskNode::new("c", Mode::Terminate, &[&B], noop);
+        static NODES: [&TaskNode; 3] = [&A, &B, &C];
+
+        assert!(matches!(topo_sort::<3>(&NODES), Err(BuildError::Cycle)));
+    }
+
+    #[test]
+    fn supervisor_new_ok_on_acyclic_graph() {
+        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[], noop);
+        static B: TaskNode = TaskNode::new("b", Mode::Terminate, &[&A], noop);
+        static NODES: [&TaskNode; 2] = [&A, &B];
+
+        assert!(Supervisor::<2>::new(&NODES).is_ok());
+    }
+
+    #[test]
+    fn supervisor_new_errs_on_cyclic_graph() {
+        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[&B], noop);
+        static B: TaskNode = TaskNode::new("b", Mode::Terminate, &[&A], noop);
+        static NODES: [&TaskNode; 2] = [&A, &B];
+
+        assert!(matches!(
+            Supervisor::<2>::new(&NODES),
+            Err(BuildError::Cycle)
+        ));
+    }
+}

@@ -76,7 +76,10 @@ impl DeferredShrink {
     /// Create a policy that defers each shrink by `cooldown` after the pool first
     /// becomes over-provisioned.
     pub const fn new(cooldown: Duration) -> Self {
-        Self { cooldown, pending: Mutex::new(Cell::new(None)) }
+        Self {
+            cooldown,
+            pending: Mutex::new(Cell::new(None)),
+        }
     }
 }
 impl ScalingPolicy for DeferredShrink {
@@ -149,7 +152,12 @@ impl<P: ScalingPolicy> ElasticPool<P> {
                 (r, b)
             }
         });
-        PoolStats { running, busy, min: self.min, max: self.max }
+        PoolStats {
+            running,
+            busy,
+            min: self.min,
+            max: self.max,
+        }
     }
 }
 
@@ -253,5 +261,172 @@ impl<const N: usize> Supervisor<N> {
             let next = drive_pools(self.pools, self, spawner).await;
             select(wait_scale(), deadline_timer(next)).await;
         }
+    }
+}
+
+// ─── Tests (host-only) ─────────────────────────────────────────────────────
+//
+// Pure scaling-policy logic: `decide` and `evaluate` take `now` as a parameter,
+// so no time driver is *called*; `Instant`s are built with `from_ticks` and offset
+// by `Duration`s. The policy's state cell is behind a `CriticalSectionRawMutex`, so
+// a critical-section impl is needed at link time — provided by the dev-dependency.
+// Run with `cargo test -p embassy-supervisor --target x86_64-unknown-linux-gnu`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Mode, TaskNode};
+    use embassy_executor::{SpawnError, Spawner};
+    use embassy_time::{Duration, Instant};
+
+    /// Spawn fn never invoked by these tests (no executor runs).
+    fn noop(_: Spawner) -> Result<(), SpawnError> {
+        Ok(())
+    }
+
+    /// A fixed base instant (tick 0); offset it with `Duration` arithmetic.
+    fn t0() -> Instant {
+        Instant::from_ticks(0)
+    }
+
+    fn stats(running: u8, busy: u8, min: u8, max: u8) -> PoolStats {
+        PoolStats {
+            running,
+            busy,
+            min,
+            max,
+        }
+    }
+
+    // ── DeferredShrink policy ──────────────────────────────────────────────
+
+    #[test]
+    fn grows_when_saturated_below_max() {
+        let p = DeferredShrink::new(Duration::from_secs(4));
+        // idle == 0 (all busy), running < max → grow immediately.
+        assert!(p.decide(stats(2, 2, 1, 4), t0()) == ScaleAction::Grow);
+    }
+
+    #[test]
+    fn does_not_grow_at_ceiling() {
+        let p = DeferredShrink::new(Duration::from_secs(4));
+        assert!(p.decide(stats(4, 4, 1, 4), t0()) == ScaleAction::None);
+    }
+
+    #[test]
+    fn defers_then_shrinks_after_cooldown() {
+        let cooldown = Duration::from_secs(4);
+        let p = DeferredShrink::new(cooldown);
+        let now = t0();
+
+        // Surplus (idle 2, running > min): first sight arms the cooldown, no action.
+        assert!(p.decide(stats(3, 1, 1, 4), now) == ScaleAction::None);
+        assert_eq!(p.deferred_until(), Some(now + cooldown));
+
+        // Still inside the window → hold.
+        assert!(p.decide(stats(3, 1, 1, 4), now + Duration::from_secs(2)) == ScaleAction::None);
+
+        // Cooldown elapsed → shrink one spare.
+        assert!(p.decide(stats(3, 1, 1, 4), now + cooldown) == ScaleAction::Shrink);
+    }
+
+    #[test]
+    fn cancels_pending_shrink_when_surplus_disappears() {
+        let cooldown = Duration::from_secs(4);
+        let p = DeferredShrink::new(cooldown);
+        let now = t0();
+
+        assert!(p.decide(stats(3, 1, 1, 4), now) == ScaleAction::None); // arm
+        assert!(p.deferred_until().is_some());
+
+        // idle drops to 1 (not saturated, not surplus) → pending cleared.
+        assert!(p.decide(stats(2, 1, 1, 4), now + Duration::from_secs(1)) == ScaleAction::None);
+        assert_eq!(p.deferred_until(), None);
+    }
+
+    #[test]
+    fn grow_clears_pending_shrink() {
+        let cooldown = Duration::from_secs(4);
+        let p = DeferredShrink::new(cooldown);
+        let now = t0();
+
+        assert!(p.decide(stats(3, 1, 1, 4), now) == ScaleAction::None); // arm
+        assert!(p.deferred_until().is_some());
+
+        // Becomes saturated → grow and cancel the pending shrink.
+        assert!(p.decide(stats(3, 3, 1, 4), now + Duration::from_secs(1)) == ScaleAction::Grow);
+        assert_eq!(p.deferred_until(), None);
+    }
+
+    // ── ElasticPool::evaluate ──────────────────────────────────────────────
+
+    #[test]
+    fn pool_grows_a_down_member_when_saturated() {
+        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, &[], noop);
+        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, &[], noop);
+        static N2: TaskNode = TaskNode::new("p2", Mode::OnDemand, &[], noop);
+        static POOL: ElasticPool<DeferredShrink> = ElasticPool {
+            nodes: &[&N0, &N1, &N2],
+            min: 1,
+            max: 3,
+            policy: DeferredShrink::new(Duration::from_secs(4)),
+        };
+
+        // Only the floor is up and it's busy → saturated, below max → start a spare.
+        N0.set_running(true);
+        N0.mark_busy();
+        match POOL.evaluate(t0()) {
+            PoolAction::Start(n) => assert!(core::ptr::eq(n, &N1), "first down OnDemand member"),
+            _ => panic!("expected Start"),
+        }
+    }
+
+    #[test]
+    fn pool_shrinks_an_idle_member_after_cooldown() {
+        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, &[], noop);
+        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, &[], noop);
+        static N2: TaskNode = TaskNode::new("p2", Mode::OnDemand, &[], noop);
+        static POOL: ElasticPool<DeferredShrink> = ElasticPool {
+            nodes: &[&N0, &N1, &N2],
+            min: 1,
+            max: 3,
+            policy: DeferredShrink::new(Duration::from_secs(4)),
+        };
+
+        // All three up, none busy → idle surplus.
+        N0.set_running(true);
+        N1.set_running(true);
+        N2.set_running(true);
+        let now = t0();
+
+        assert!(
+            matches!(POOL.evaluate(now), PoolAction::None),
+            "first tick arms cooldown"
+        );
+        match POOL.evaluate(now + Duration::from_secs(4)) {
+            PoolAction::Stop(n) => {
+                assert!(
+                    core::ptr::eq(n, &N1) || core::ptr::eq(n, &N2),
+                    "an idle OnDemand member"
+                );
+            }
+            _ => panic!("expected Stop"),
+        }
+    }
+
+    #[test]
+    fn pool_does_not_grow_a_disabled_member() {
+        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, &[], noop);
+        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, &[], noop);
+        static POOL: ElasticPool<DeferredShrink> = ElasticPool {
+            nodes: &[&N0, &N1],
+            min: 1,
+            max: 2,
+            policy: DeferredShrink::new(Duration::from_secs(4)),
+        };
+
+        N0.set_running(true);
+        N0.mark_busy(); // saturated → policy wants to grow
+        N1.set_disabled(true); // but the only candidate is manually disabled
+        assert!(matches!(POOL.evaluate(t0()), PoolAction::None));
     }
 }

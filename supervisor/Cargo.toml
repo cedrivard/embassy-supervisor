@@ -40,3 +40,16 @@ defmt = ["dep:defmt"]
 [package.metadata.docs.rs]
 # Document every feature (control/pool/defmt) on docs.rs.
 all-features = true
+
+# Test-only host shims, scoped to non-embedded targets so they never pull `std`
+# into the pinned `thumbv8m` (embedded) build. Dev-dependencies don't propagate to
+# consumers, and this target gate keeps the std-requiring features off the MCU target
+# entirely (so `cargo build`/analysis for thumbv8m stays no_std). Host tests need:
+#   * a critical-section impl, for the `CriticalSectionRawMutex` behind the pool's
+#     state cell (and `Signal`/`Channel`); and
+#   * an embassy-time driver, because the crate links `embassy_time::Timer`, which
+#     requires a registered global driver at link time even if a test never fires one.
+# (If `mock-driver` is ever unavailable, `features = ["std"]` is an equivalent fallback.)
+[target.'cfg(not(target_os = "none"))'.dev-dependencies]
+critical-section = { version = "1", features = ["std"] }
+embassy-time = { version = "0.5", features = ["mock-driver"] }
