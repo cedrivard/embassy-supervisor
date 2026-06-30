@@ -6,6 +6,13 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 
 ## [Unreleased]
 
+## [0.1.1]
+
+### Fixed
+- `task_graph!` accepts the final node with or without a trailing comma. The documented
+  `task_graph! { &A, &B }` form (no trailing comma) previously hit a macro recursion limit;
+  both styles now expand correctly.
+
 ## [0.1.0]
 
 Initial release.
@@ -19,5 +26,6 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/cedrivard/embassy-supervisor/releases/tag/v0.1.1
 [0.1.0]: https://github.com/cedrivard/embassy-supervisor/releases/tag/v0.1.0

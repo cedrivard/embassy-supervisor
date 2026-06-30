@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.1.0"
+version = "0.1.1"
 description = "A generic, HAL-agnostic task-lifecycle supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, and runtime start/stop/pause/resume control."
 edition.workspace = true
 authors.workspace = true

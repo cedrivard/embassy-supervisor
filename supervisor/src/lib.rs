@@ -532,6 +532,19 @@ macro_rules! task_graph {
             $($rest)*
         );
     };
+    // Last element with a cfg attribute and no trailing comma.
+    (@munch units=[$($u:tt)*] nodes=[$($n:tt)*]; #[cfg($c:meta)] $node:expr) => {
+        $crate::task_graph!(@munch
+            units=[$($u)* #[cfg($c)] (),]
+            nodes=[$($n)* #[cfg($c)] $node,];
+        );
+    };
+    // Last element, unconditional, with no trailing comma. Without this arm a
+    // missing trailing comma would fall through to the entry rule below and
+    // re-wrap forever (recursion-limit error), so accept both styles explicitly.
+    (@munch units=[$($u:tt)*] nodes=[$($n:tt)*]; $node:expr) => {
+        $crate::task_graph!(@munch units=[$($u)* (),] nodes=[$($n)* $node,];);
+    };
     // Entry: seed the accumulators with the caller's list.
     ($($items:tt)*) => {
         $crate::task_graph!(@munch units=[] nodes=[]; $($items)*);
