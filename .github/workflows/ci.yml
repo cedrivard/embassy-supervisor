@@ -59,8 +59,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt -p embassy-supervisor -- --check
+      - run: cargo fmt -p embassy-supervisor -p embassy-supervisor-macros -- --check
       - run: cargo clippy -p embassy-supervisor --target $HOST --all-features -- -D warnings
+      # The `supervisor_graph!` proc-macro crate (host-only build).
+      - run: cargo clippy -p embassy-supervisor-macros -- -D warnings
 
   docs:
     name: doc

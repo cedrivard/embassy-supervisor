@@ -1,0 +1,17 @@
+[package]
+name = "embassy-supervisor-macros"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Proc-macro for embassy-supervisor: declares a task graph and computes its topological order at compile time."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

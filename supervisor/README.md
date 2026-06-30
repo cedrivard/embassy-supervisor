@@ -6,13 +6,14 @@
 A generic, **HAL-agnostic** task-lifecycle supervisor for the [embassy](https://embassy.dev)
 async embedded framework. `no_std`, no allocator, no board crates — it compiles for any embassy
 target. The only third-party deps are pure-embassy crates (`embassy-executor`/`-sync`/`-time`/
-`-futures`), `heapless`, and `portable-atomic`.
+`-futures`) and `portable-atomic`.
 
 ## What it does
 
-- **Dependency-ordered lifecycle** — declare each task as a `TaskNode` with its `deps`; the
-  supervisor topologically sorts the graph, brings tasks up in dependency order, and tears
-  dependents down before the things they depend on.
+- **Dependency-ordered lifecycle** — declare the graph with the `supervisor_graph!` macro; it
+  computes the topological order **at compile time** (a dependency cycle is a *compile error*), and
+  the supervisor brings tasks up in dependency order and tears dependents down before the things
+  they depend on.
 - **Lifecycle modes** — `Terminate` (started at boot, restartable), `Pause` (park/resume while
   keeping a held resource), `OnDemand` (started on demand to scale a pool).
 - **Elastic pools** *(feature `pool`)* — `ElasticPool` scales a set of single-instance worker
@@ -28,23 +29,20 @@ tasks do — it orchestrates their *lifecycle* and leaves the rest to you.
 
 ```rust,ignore
 use embassy_executor::Spawner;
-use embassy_supervisor::{task_graph, Mode, Supervisor, TaskNode, wait_control};
+use embassy_supervisor::{supervisor_graph, Supervisor, wait_control};
 
-// Each subsystem is a `TaskNode` wrapping a spawn fn; `app` depends on `net`.
-static NET: TaskNode = TaskNode::new("net", Mode::Terminate, &[], |s| {
-    s.spawn(net_task())?;
-    Ok(())
-});
-static APP: TaskNode = TaskNode::new("app", Mode::Terminate, &[&NET], |s| {
-    s.spawn(app_task())?;
-    Ok(())
-});
-
-task_graph! { &NET, &APP }   // emits `ALL_NODES` + `NODE_COUNT`
+// Declare the graph once: `supervisor_graph!` generates the node `static`s and the
+// compile-time `ALL_NODES` / `DEPS` / `ORDER`. Each `spawn:` names a task fn that is
+// `s.spawn`ed with the node; `app` depends on `net`.
+supervisor_graph! {
+    node NET = Terminate, deps: [], spawn: net_task;
+    node APP = Terminate, deps: [NET], spawn: app_task;
+}
 
 #[embassy_executor::task]
 async fn supervisor_task(spawner: Spawner) {
-    let sup = Supervisor::new(&ALL_NODES).expect("no dependency cycle");
+    // Infallible: the order is precomputed, so a dependency cycle is a compile error.
+    let sup = Supervisor::new(&ALL_NODES, &DEPS, ORDER);
     sup.start(spawner).expect("initial spawn");   // brings up `net`, then `app`
     loop {
         let cmd = wait_control().await;           // runtime control requests
@@ -59,6 +57,7 @@ async fn supervisor_task(spawner: Spawner) {
 |-----------|:-------:|--------------|
 | `control` |    ✓    | runtime control plane (`ControlOp`, `request_control`, `apply_control`) |
 | `pool`    |    ✓    | elastic worker pools (`ElasticPool`, `with_pools`, `run_pools`) |
+| `macros`  |    ✓    | the `supervisor_graph!` graph-declaration macro |
 | `defmt`   |         | route the supervisor's logs through `defmt` (otherwise the log macros are no-ops) |
 
 `default-features = false` gives a minimal core that only does dependency-ordered

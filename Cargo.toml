@@ -7,7 +7,7 @@
 # - `bootloader` : the embassy-boot-rp A/B bootloader.
 [workspace]
 resolver = "2"
-members = ["supervisor", "firmware", "bootloader"]
+members = ["supervisor", "supervisor-macros", "firmware", "bootloader"]
 
 [workspace.package]
 edition = "2024"

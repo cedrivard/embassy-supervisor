@@ -653,10 +653,19 @@ dependencies = [
  "defmt 1.1.0",
  "embassy-executor",
  "embassy-futures",
+ "embassy-supervisor-macros",
  "embassy-sync",
  "embassy-time",
- "heapless 0.8.0",
  "portable-atomic",
+]
+
+[[package]]
+name = "embassy-supervisor-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

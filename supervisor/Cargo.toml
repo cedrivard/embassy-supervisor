@@ -22,20 +22,23 @@ embassy-executor = { version = "0.10" }     # Spawner / SpawnError types only
 embassy-sync = { version = "0.8" }
 embassy-time = { version = "0.5" }
 embassy-futures = { version = "0.1" }
-heapless = "0.8"
 portable-atomic = { version = "1", features = ["critical-section"] }
 defmt = { version = "1", optional = true }
+# The `supervisor_graph!` proc-macro (single-source, compile-time graph).
+embassy-supervisor-macros = { path = "../supervisor-macros", optional = true }
 
 [features]
 # Full-featured out of the box; a footprint-constrained consumer trims with
 # `default-features = false` and opts back into what it needs.
-default = ["control", "pool"]
+default = ["control", "pool", "macros"]
 # Runtime control plane: ControlOp, request_control/apply_control, activate/deactivate.
 control = []
 # Elastic worker pools: the `pool` module, with_pools, run_pools, load scaling.
 pool = []
 # Logging via defmt (otherwise the log macros are no-ops).
 defmt = ["dep:defmt"]
+# Re-export the `supervisor_graph!` proc-macro.
+macros = ["dep:embassy-supervisor-macros"]
 
 [package.metadata.docs.rs]
 # Document every feature (control/pool/defmt) on docs.rs.

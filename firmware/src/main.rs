@@ -20,16 +20,19 @@ mod http;
 mod net;
 mod ota;
 
-use heartbeat::HEARTBEAT;
-use http::HTTP;
-use net::NET;
-
-// Supervisor task graph -> `ALL_NODES` + `NODE_COUNT`. `heartbeat` is standalone;
-// `http` and `ota` depend on `net`. `ota` is pre-disabled in `main`, control-started.
-supervisor::task_graph! {
-    &NET, &HEARTBEAT,
-    &HTTP[0], &HTTP[1], &HTTP[2], &HTTP[3],
-    &ota::OTA,
+// The supervised task graph — the single source of nodes, deps, pool, and order.
+// `supervisor_graph!` generates the `static` nodes, the `HTTP` pool + `HTTP_POOL`,
+// `ALL_NODES`/`DEPS`, the `POOLS` registry, and the compile-time `ORDER` (a
+// dependency cycle is a *compile* error). `heartbeat` is standalone; `http` and
+// `ota` depend on `net`; `ota` is disabled-at-boot (control-started).
+embassy_supervisor::supervisor_graph! {
+    node NET = Terminate, deps: [], spawn: crate::net::net_task;
+    node HEARTBEAT = Pause, deps: [], spawn: crate::heartbeat::heartbeat_task;
+    pool HTTP = [Terminate, OnDemand, OnDemand, OnDemand], deps: [NET],
+        worker: crate::http::http_task,
+        policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(4)),
+        min: 1, max: 4;
+    node OTA = Terminate, deps: [NET], spawn: crate::ota::ota_task, disabled;
 }
 
 #[embassy_executor::main]
@@ -53,18 +56,18 @@ async fn main(spawner: Spawner) {
 /// order, then drive elastic-pool scaling and runtime control forever.
 #[embassy_executor::task]
 async fn app_supervisor(spawner: Spawner) {
-    let sup = supervisor::Supervisor::new(&ALL_NODES)
-        .expect("supervisor: dependency cycle")
-        .with_pools(http::POOLS);
-    // `ota` is stopped-at-boot: pre-disable so `start()` skips it; control `Activate`
-    // (POST /api/ota or the dashboard start button) starts it.
-    ota::OTA.set_disabled(true);
-    sup.start(spawner).expect("supervisor: initial spawn failed");
+    // Construction is infallible: the topological `ORDER` is computed at compile
+    // time, so a dependency cycle would have been a compile error.
+    let sup = embassy_supervisor::Supervisor::new(&ALL_NODES, &DEPS, ORDER).with_pools(POOLS);
+    // `ota` is declared `disabled` (disabled-at-boot), so `start()` skips it; a
+    // control `Activate` (POST /api/ota or the dashboard start button) starts it.
+    sup.start(spawner)
+        .expect("supervisor: initial spawn failed");
 
     loop {
         // Race pool scaling against runtime control requests. `run_pools` never
         // returns; only a control command wakes the other arm.
-        match select(sup.run_pools(spawner), supervisor::wait_control()).await {
+        match select(sup.run_pools(spawner), embassy_supervisor::wait_control()).await {
             Either::First(()) => {}
             Either::Second(cmd) => sup.apply_control(cmd, spawner).await,
         }
@@ -76,9 +79,8 @@ async fn app_supervisor(spawner: Spawner) {
 /// bootloader rolls back an unconfirmed update.
 #[embassy_executor::task]
 async fn watchdog_feed() {
-    let mut wd = embassy_rp::watchdog::Watchdog::new(unsafe {
-        embassy_rp::peripherals::WATCHDOG::steal()
-    });
+    let mut wd =
+        embassy_rp::watchdog::Watchdog::new(unsafe { embassy_rp::peripherals::WATCHDOG::steal() });
     loop {
         wd.feed(embassy_time::Duration::from_secs(8)); // `feed` also sets the timeout
         embassy_time::Timer::after(embassy_time::Duration::from_secs(2)).await;

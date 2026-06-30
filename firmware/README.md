@@ -56,7 +56,7 @@ for the firmware download + decode (see [OTA update](#ota-update)).
 | Lifecycle: Pause/Resume  | `heartbeat` keeps its LED `Output` across a pause         |
 | Lifecycle: control-started| `ota` is a `Terminate` node pre-disabled at boot, started by control |
 | Detached teardown        | `ota` outlives the `net` it tears down (`set_detached`)  |
-| Runtime control          | `POST /api/control` → `supervisor::request_control`      |
+| Runtime control          | `POST /api/control` → `embassy_supervisor::request_control` |
 | Observability            | `GET /api/tasks` (and the page at `/`)                    |
 
 Networking is **USB-CDC-NCM** (TCP/IP over the USB cable). This is a deliberate
