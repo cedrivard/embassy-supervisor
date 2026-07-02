@@ -152,7 +152,7 @@ pub async fn wait_scale() {
 /// mechanism (respawn vs resume vs leave-to-pool) is then chosen per node `Mode`
 /// by the supervisor when it applies the command ([`Supervisor::apply_control`]).
 #[cfg(feature = "control")]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ControlOp {
     /// Bring the node up (start a stopped `Terminate` node, resume a `Pause` node).
     Activate,
@@ -163,7 +163,7 @@ pub enum ControlOp {
 /// A runtime control request: drive `node` (and, per the dependency graph and
 /// pool membership, the nodes it implies) in the `op` direction.
 #[cfg(feature = "control")]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ControlCommand {
     /// The node to drive.
     pub node: &'static TaskNode,
@@ -201,7 +201,7 @@ const SHUTDOWN_ACK_TIMEOUT_MS: u64 = 2_000;
 
 /// Lifecycle policy for a managed task: what the task does on shutdown and what
 /// the supervisor does to bring it back.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     /// Task exits its loop on shutdown. The supervisor respawns it via the
     /// node's `spawn` fn from `respawn_terminate`.
@@ -499,6 +499,22 @@ impl TaskNode {
     }
 }
 
+/// Manual impl: the private `TaskHandle` (Signals + atomics) has no `Debug`, and a
+/// snapshot of the *live* flags is more useful than raw handle internals anyway.
+/// `finish_non_exhaustive` marks the elided fields (`spawn`, the handle).
+impl core::fmt::Debug for TaskNode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TaskNode")
+            .field("name", &self.name)
+            .field("mode", &self.mode)
+            .field("running", &self.is_running())
+            .field("busy", &self.is_busy())
+            .field("disabled", &self.is_disabled())
+            .field("detached", &self.is_detached())
+            .finish_non_exhaustive()
+    }
+}
+
 // ─── Graph ───────────────────────────────────────────────────────────────
 
 /// The compile-time task graph produced by [`supervisor_graph!`]: the node slots,
@@ -506,6 +522,9 @@ impl TaskNode {
 /// single value [`Supervisor::new`] consumes. The macro emits one `pub static GRAPH`
 /// of this type. The fields are public so the application can read them directly
 /// (e.g. a status endpoint iterating `GRAPH.nodes` / `GRAPH.deps`).
+///
+/// `N` is capped at 256 (graph indices are `u8`); the macro enforces this at
+/// expansion time.
 pub struct Graph<const N: usize> {
     /// Node slots, one per declared node. `None` marks a `#[cfg]`-ed-out node.
     pub nodes: &'static [Option<&'static TaskNode>; N],
@@ -869,8 +888,17 @@ impl<const N: usize> Supervisor<N> {
 /// Evaluated at compile time by the code `supervisor_graph!` generates — a
 /// dependency **cycle is a compile error** (the `panic!` fires during const
 /// evaluation). `#[doc(hidden)]`: an engine for the macro, not a user-facing API.
+///
+/// Supports at most 256 nodes: indices are `u8`, so a larger `N` would truncate.
+/// The macro rejects bigger graphs at expansion; the assert below is defense in
+/// depth for a manual caller (a const-eval panic, i.e. a compile error).
 #[doc(hidden)]
+#[must_use]
 pub const fn topo_sort_const<const N: usize>(deps: &[&'static [u8]; N]) -> [u8; N] {
+    assert!(
+        N <= 256,
+        "supervisor graph exceeds 256 node slots (indices are u8)"
+    );
     // in_degree[i] = number of deps of node i not yet resolved.
     let mut in_degree = [0u8; N];
     let mut i = 0;

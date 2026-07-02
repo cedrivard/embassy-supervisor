@@ -23,6 +23,9 @@
 //! injected first, via a generated `spawn_<pool>::<j>` glue fn; a pool has no closure
 //! form (members are instantiated per index).
 //!
+//! A graph holds at most **256 node slots** (including pool members): all graph
+//! indices are `u8`, and the macro rejects a larger declaration at expansion.
+//!
 //! Nodes, pools, and individual deps may carry `#[cfg(...)]` attributes. A
 //! proc-macro can't evaluate `cfg`, so the node array is a fixed-length
 //! `[Option<&TaskNode>; M]` over all declared slots (each entry `Some`/`None` via a
@@ -401,6 +404,28 @@ fn emit_pool(
     let pool_static = format_ident!("{}_POOL", ident);
     let k = p.modes.len();
 
+    // Validate the scaling bounds at expansion time. `base10_parse::<u8>` also
+    // rejects values > 255 with a span-attached error (the `ElasticPool` fields are
+    // `u8`). `min > max` makes the policy contradict itself; `max > k` is a ceiling
+    // the pool can never reach (there are only `k` member slots) — both are
+    // declaration bugs, caught here rather than surfacing as odd runtime scaling.
+    // `max < k` is allowed (spare declared members below the ceiling), as is
+    // `min: 0` (the policy may scale the pool all the way down when idle).
+    let min_v: u8 = p.min.base10_parse()?;
+    let max_v: u8 = p.max.base10_parse()?;
+    if min_v > max_v {
+        return Err(syn::Error::new_spanned(
+            &p.min,
+            format!("pool `min:` ({min_v}) must not exceed `max:` ({max_v})"),
+        ));
+    }
+    if usize::from(max_v) > k {
+        return Err(syn::Error::new_spanned(
+            &p.max,
+            format!("pool `max:` ({max_v}) exceeds the declared member count ({k})"),
+        ));
+    }
+
     // Build member `I`'s spawn call from the `spawn:` expr, injecting
     // `&POOL[I]` as the first argument (see `inject_node_call`).
     let call = inject_node_call(&p.spawn, &quote!(&#ident[I]))?;
@@ -564,6 +589,18 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
     }
 
     let m = slots.len();
+    // Every graph index (dep entries, `topo_sort_const`'s queue/order) is a `u8`, so
+    // more than 256 slots would silently truncate (`i as u8`) and corrupt the order.
+    // 256 slots means max index 255 and max per-node dep count 255 — both fit exactly.
+    if m > 256 {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "supervisor_graph!: {m} node slots declared, but at most 256 are supported \
+                 (including pool members) — graph indices are `u8`"
+            ),
+        ));
+    }
     let (all_entries, deps_entries) = slot_tables(&slots, &names)?;
 
     // `Graph.pools` is `#[cfg(feature = "pool")]`; emit that field iff this macro was

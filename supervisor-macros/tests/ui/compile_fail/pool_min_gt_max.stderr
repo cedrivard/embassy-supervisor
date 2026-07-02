@@ -1,0 +1,5 @@
+error: pool `min:` (3) must not exceed `max:` (2)
+  --> tests/ui/compile_fail/pool_min_gt_max.rs:11:14
+   |
+11 |         min: 3, max: 2;
+   |              ^

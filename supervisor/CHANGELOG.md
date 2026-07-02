@@ -6,11 +6,23 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-01
+
+The graph moved to compile time, and the `supervisor_graph!` proc-macro shipped in the
+new companion crate `embassy-supervisor-macros` (versioned independently and pinned by
+exact version; pulled in by the default `macros` feature). **Breaking release** — see
+the migration notes in the README.
+
 ### Added
 - Pool `policy:` accepts an optional explicit type: `policy: <Type> = <expr>`. When the
   type is omitted it is still derived from a `Type::new(..)` value (unchanged); the
   explicit form allows any value of that type (a `const`, a `const fn` factory, a builder
   chain, a qualified path).
+- `Debug` impls on `Mode`, `ControlOp`, `ControlCommand`, and `TaskNode` (the latter a
+  manual impl printing the name, mode, and live state flags).
+- Macro-time validation: graphs are capped at 256 node slots (all graph indices are `u8`;
+  a larger graph previously truncated silently), and pool bounds must satisfy
+  `min <= max <= member count`.
 
 ### Changed
 - The graph-declaration macro was renamed from `task_graph!` to `supervisor_graph!`.
@@ -53,6 +65,7 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/cedrivard/embassy-supervisor/releases/tag/v0.1.1
 [0.1.0]: https://github.com/cedrivard/embassy-supervisor/releases/tag/v0.1.0

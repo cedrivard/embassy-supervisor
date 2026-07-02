@@ -1,15 +1,26 @@
 [package]
 name = "embassy-supervisor-macros"
+# Versioned independently of `embassy-supervisor`, which pins this crate by EXACT
+# version (`=x.y.z`): the generated code references doc(hidden) supervisor internals,
+# so only the tested pair is guaranteed compatible. Bump only when the macro changes;
+# the supervisor updates its pin to match.
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+rust-version.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/embassy-supervisor-macros"
 description = "Proc-macro for embassy-supervisor: declares a task graph and computes its topological order at compile time."
+keywords = ["embassy", "async", "embedded", "supervisor", "no-std"]
+categories = ["embedded", "asynchronous", "no-std"]
 
 [lib]
 proc-macro = true
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 # Read at expansion time via `cfg!(feature = "pool")` to decide whether the
