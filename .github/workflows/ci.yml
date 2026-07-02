@@ -27,6 +27,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # rust-src changes how rustc renders const-eval panics whose frames land in
+          # core (with the source it prints the annotated snippet; without it, a bare
+          # `= note:` fallback). The trybuild `.stderr` snapshots for the dependency-
+          # cycle cases are blessed with the source available, so CI must match.
+          components: rust-src
       - uses: Swatinem/rust-cache@v2
       # `defmt` is an embedded-logging feature: it needs a `#[global_logger]` to
       # link a binary, so it cannot run in a host test. Its compilation is covered
