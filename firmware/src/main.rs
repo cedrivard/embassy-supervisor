@@ -22,14 +22,15 @@ mod ota;
 
 // The supervised task graph — the single source of nodes, deps, pool, and order.
 // `supervisor_graph!` generates the `static` nodes, the `HTTP` pool + `HTTP_POOL`,
-// `ALL_NODES`/`DEPS`, the `POOLS` registry, and the compile-time `ORDER` (a
-// dependency cycle is a *compile* error). `heartbeat` is standalone; `http` and
-// `ota` depend on `net`; `ota` is disabled-at-boot (control-started).
+// and the `GRAPH` bundle (node slots, dep table, elastic pools, and the compile-time
+// topological order — a dependency cycle is a *compile* error) that `Supervisor::new`
+// takes. `heartbeat` is standalone; `http` and `ota` depend on `net`; `ota` is
+// disabled-at-boot (control-started).
 embassy_supervisor::supervisor_graph! {
     node NET = Terminate, deps: [], spawn: crate::net::net_task;
     node HEARTBEAT = Pause, deps: [], spawn: crate::heartbeat::heartbeat_task;
     pool HTTP = [Terminate, OnDemand, OnDemand, OnDemand], deps: [NET],
-        worker: crate::http::http_task,
+        spawn: crate::http::http_task,
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(4)),
         min: 1, max: 4;
     node OTA = Terminate, deps: [NET], spawn: crate::ota::ota_task, disabled;
@@ -56,9 +57,10 @@ async fn main(spawner: Spawner) {
 /// order, then drive elastic-pool scaling and runtime control forever.
 #[embassy_executor::task]
 async fn app_supervisor(spawner: Spawner) {
-    // Construction is infallible: the topological `ORDER` is computed at compile
-    // time, so a dependency cycle would have been a compile error.
-    let sup = embassy_supervisor::Supervisor::new(&ALL_NODES, &DEPS, ORDER).with_pools(POOLS);
+    // Construction is infallible: the graph's topological order is computed at
+    // compile time, so a dependency cycle would have been a compile error. `GRAPH`
+    // carries the nodes, dep table, order, and the elastic pools.
+    let sup = embassy_supervisor::Supervisor::new(&GRAPH);
     // `ota` is declared `disabled` (disabled-at-boot), so `start()` skips it; a
     // control `Activate` (POST /api/ota or the dashboard start button) starts it.
     sup.start(spawner)

@@ -31,9 +31,9 @@ tasks do — it orchestrates their *lifecycle* and leaves the rest to you.
 use embassy_executor::Spawner;
 use embassy_supervisor::{supervisor_graph, Supervisor, wait_control};
 
-// Declare the graph once: `supervisor_graph!` generates the node `static`s and the
-// compile-time `ALL_NODES` / `DEPS` / `ORDER`. Each `spawn:` names a task fn that is
-// `s.spawn`ed with the node; `app` depends on `net`.
+// Declare the graph once: `supervisor_graph!` generates the node `static`s and a
+// single `GRAPH` bundling the node slots, dep table, compile-time order, and pools.
+// Each `spawn:` names a task fn that is `s.spawn`ed with the node; `app` depends on `net`.
 supervisor_graph! {
     node NET = Terminate, deps: [], spawn: net_task;
     node APP = Terminate, deps: [NET], spawn: app_task;
@@ -42,7 +42,7 @@ supervisor_graph! {
 #[embassy_executor::task]
 async fn supervisor_task(spawner: Spawner) {
     // Infallible: the order is precomputed, so a dependency cycle is a compile error.
-    let sup = Supervisor::new(&ALL_NODES, &DEPS, ORDER);
+    let sup = Supervisor::new(&GRAPH);
     sup.start(spawner).expect("initial spawn");   // brings up `net`, then `app`
     loop {
         let cmd = wait_control().await;           // runtime control requests
@@ -56,7 +56,7 @@ async fn supervisor_task(spawner: Spawner) {
 | feature   | default | what it adds |
 |-----------|:-------:|--------------|
 | `control` |    ✓    | runtime control plane (`ControlOp`, `request_control`, `apply_control`) |
-| `pool`    |    ✓    | elastic worker pools (`ElasticPool`, `with_pools`, `run_pools`) |
+| `pool`    |    ✓    | elastic worker pools (`ElasticPool`, `run_pools`, `GRAPH.pools`) |
 | `macros`  |    ✓    | the `supervisor_graph!` graph-declaration macro |
 | `defmt`   |         | route the supervisor's logs through `defmt` (otherwise the log macros are no-ops) |
 

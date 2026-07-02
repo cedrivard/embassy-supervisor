@@ -106,15 +106,15 @@ once with the `supervisor_graph!` macro; the supervisor does the rest:
 ```rust
 use embassy_supervisor::{supervisor_graph, Supervisor};
 
-// One declaration generates the node `static`s and the compile-time
-// ALL_NODES / DEPS / ORDER. `app` depends on `net`, so it starts after it.
+// One declaration generates the node `static`s and a single `GRAPH` bundling the
+// node slots, deps, and compile-time order. `app` depends on `net`, so it starts after it.
 supervisor_graph! {
     node NET = Terminate, deps: [],    spawn: net_task;
     node APP = Terminate, deps: [NET], spawn: app_task;
 }
 
 // in your supervisor task:
-let sup = Supervisor::new(&ALL_NODES, &DEPS, ORDER);  // infallible — a cycle is a compile error
+let sup = Supervisor::new(&GRAPH);                    // infallible — a cycle is a compile error
 sup.start(spawner).expect("spawn");                   // brings up net, then app
 ```
 

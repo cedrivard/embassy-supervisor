@@ -62,7 +62,8 @@ embedded-alloc = { version = "0.7", default-features = false, features = ["llff"
 
 embedded-io-async = "0.7"
 
-# OTA: A/B firmware update + zstd decompression (windowLog<=13, ~16 KB window).
+# OTA: A/B firmware update + zstd decompression (windowLog=11, ~2 KB window; capped
+# at 11 to bound ruzstd's heap — see src/ota.rs / src/heap.rs).
 embassy-boot-rp = "0.10"
 embedded-storage = "0.3"
 ruzstd = { version = "0.8", default-features = false }

@@ -11,7 +11,31 @@ description = "Proc-macro for embassy-supervisor: declares a task graph and comp
 [lib]
 proc-macro = true
 
+[features]
+# Read at expansion time via `cfg!(feature = "pool")` to decide whether the
+# generated `GRAPH` carries a `pools` field + the pool statics. The parent
+# `embassy-supervisor` crate forwards its own `pool` feature here (see its
+# Cargo.toml), so this tracks the supervisor's pool feature — the macro emits
+# pools iff the supervisor was built with pools.
+pool = []
+
 [dependencies]
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
+
+# `trybuild` UI tests: compile-fail cases lock the macro's error contracts (cycle,
+# unknown dep, etc.); compile-pass cases exercise the codegen end-to-end. The graph
+# the macro generates references `embassy-supervisor` + `embassy-executor`, and
+# linking a pass binary needs a critical-section impl + an embassy-time driver (same
+# shims the supervisor's own host tests use). All dev-only — proc-macro crates build
+# for the host, and dev-deps never reach a consumer, so this is host/test-only.
+# (embassy-supervisor depends back on this crate; a dev-dependency cycle is allowed.)
+[dev-dependencies]
+trybuild = "1"
+embassy-supervisor = { path = "../supervisor" }
+# `platform-std` + `executor-thread` give embassy-executor a host Pender/executor so a
+# compile-pass case that uses real `#[embassy_executor::task]`s can link on the host.
+embassy-executor = { version = "0.10", features = ["platform-std", "executor-thread"] }
+critical-section = { version = "1", features = ["std"] }
+embassy-time = { version = "0.5", features = ["mock-driver"] }

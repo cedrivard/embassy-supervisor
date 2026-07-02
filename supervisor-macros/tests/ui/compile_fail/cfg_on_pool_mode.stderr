@@ -1,0 +1,5 @@
+error: expected identifier
+ --> tests/ui/compile_fail/cfg_on_pool_mode.rs:9:26
+  |
+9 |     pool P = [Terminate, #[cfg(all())] OnDemand], deps: [A],
+  |                          ^

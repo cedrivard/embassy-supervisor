@@ -246,7 +246,7 @@ async fn deadline_timer(deadline: Option<Instant>) {
 }
 
 impl<const N: usize> Supervisor<N> {
-    /// Drive the registered elastic pools (from `with_pools`) forever: run their
+    /// Drive the registered elastic pools (from `GRAPH.pools`) forever: run their
     /// policies, then park until the next status signal (`SCALE_REQ`) or a pool's
     /// deferred deadline. Never completes — meant to be `select`ed against the
     /// application's control / teardown futures in the supervisor task. When
@@ -357,9 +357,9 @@ mod tests {
 
     #[test]
     fn pool_grows_a_down_member_when_saturated() {
-        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, noop, false);
-        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, noop, false);
-        static N2: TaskNode = TaskNode::new("p2", Mode::OnDemand, noop, false);
+        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, Some(noop), false);
+        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, Some(noop), false);
+        static N2: TaskNode = TaskNode::new("p2", Mode::OnDemand, Some(noop), false);
         static POOL: ElasticPool<DeferredShrink> = ElasticPool {
             nodes: &[&N0, &N1, &N2],
             min: 1,
@@ -378,9 +378,9 @@ mod tests {
 
     #[test]
     fn pool_shrinks_an_idle_member_after_cooldown() {
-        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, noop, false);
-        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, noop, false);
-        static N2: TaskNode = TaskNode::new("p2", Mode::OnDemand, noop, false);
+        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, Some(noop), false);
+        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, Some(noop), false);
+        static N2: TaskNode = TaskNode::new("p2", Mode::OnDemand, Some(noop), false);
         static POOL: ElasticPool<DeferredShrink> = ElasticPool {
             nodes: &[&N0, &N1, &N2],
             min: 1,
@@ -411,8 +411,8 @@ mod tests {
 
     #[test]
     fn pool_does_not_grow_a_disabled_member() {
-        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, noop, false);
-        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, noop, false);
+        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, Some(noop), false);
+        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, Some(noop), false);
         static POOL: ElasticPool<DeferredShrink> = ElasticPool {
             nodes: &[&N0, &N1],
             min: 1,

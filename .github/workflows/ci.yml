@@ -34,6 +34,10 @@ jobs:
       # check-only) jobs; here we run the functional matrix (control + pool) without it.
       - run: cargo test -p embassy-supervisor --target $HOST
       - run: cargo test -p embassy-supervisor --target $HOST --no-default-features
+      # `supervisor_graph!` UI tests (trybuild): compile-fail cases lock the macro's
+      # error contracts (cycle, unknown dep, ...); compile-pass cases run the generated
+      # graph. Host-only — trybuild compiles real graphs — so `--target $HOST`.
+      - run: cargo test -p embassy-supervisor-macros --target $HOST
 
   # `no_std` guard: the crate must still cross-compile for the MCU target (the
   # pinned default) across the feature matrix.

@@ -14,12 +14,12 @@
 //! ## The model
 //!
 //!   * The graph is declared once with the [`supervisor_graph!`] macro: each
-//!     managed task becomes a [`TaskNode`] `static`, and the macro computes the
-//!     topological `ORDER` **at compile time** (a dependency cycle is a compile
-//!     error) alongside the `ALL_NODES` node array and `DEPS` index table.
-//!   * [`Supervisor::new`] consumes those (no work, no failure) and uses the
-//!     order to bring tasks up in dependency order ([`Supervisor::start`]) and
-//!     tear them down in reverse ([`Supervisor::teardown`]).
+//!     managed task becomes a [`TaskNode`] `static`, and the macro bundles the node
+//!     slots, dependency table, and a topological order computed **at compile time**
+//!     (a dependency cycle is a compile error) into a single [`Graph`] (`GRAPH`).
+//!   * [`Supervisor::new`] takes `&GRAPH` (no work, no failure) and uses the order
+//!     to bring tasks up in dependency order ([`Supervisor::start`]) and tear them
+//!     down in reverse ([`Supervisor::teardown`]).
 //!   * Each node carries a `TaskHandle` of per-node atomic flags and
 //!     single-consumer `Signal`s. Every node is single-instance — no counts, no
 //!     fan-out. See [`TaskHandle`].
@@ -50,7 +50,7 @@
 //!   * `control` *(default)* — the runtime control plane: [`ControlOp`],
 //!     [`request_control`], [`Supervisor::apply_control`].
 //!   * `pool` *(default)* — elastic worker pools: [`ElasticPool`],
-//!     [`Supervisor::with_pools`], [`Supervisor::run_pools`].
+//!     [`Supervisor::run_pools`], and the `pools` field of [`Graph`].
 //!   * `defmt` — route the supervisor's logs through `defmt`; without it the log
 //!     macros are no-ops.
 //!
@@ -61,8 +61,9 @@
 //! ## Example
 //!
 //! [`supervisor_graph!`] declares the whole graph once — it generates the node
-//! `static`s and the compile-time `ALL_NODES` / `DEPS` / `ORDER` (a dependency
-//! cycle is a compile error), which [`Supervisor::new`] consumes.
+//! `static`s and a single [`Graph`] value `GRAPH` bundling the node slots, dep
+//! table, and compile-time topological order (a dependency cycle is a compile
+//! error), which [`Supervisor::new`] consumes.
 //!
 //! ```ignore
 //! use embassy_executor::Spawner;
@@ -76,7 +77,7 @@
 //!
 //! #[embassy_executor::task]
 //! async fn supervisor_task(spawner: Spawner) {
-//!     let sup = Supervisor::new(&ALL_NODES, &DEPS, ORDER);
+//!     let sup = Supervisor::new(&GRAPH);
 //!     sup.start(spawner).expect("initial spawn"); // brings up `net`, then `app`
 //!     loop {
 //!         // Apply runtime start/stop/pause/resume requests in dependency order.
@@ -315,8 +316,7 @@ impl TaskHandle {
 ///
 /// Designed to live in `static` memory: every field is `Sync`, all constructors
 /// are `const`. Declared by [`supervisor_graph!`], which emits one per managed
-/// task along with the `ALL_NODES` / `DEPS` / `ORDER` that [`Supervisor::new`]
-/// consumes.
+/// task along with the [`Graph`] (`GRAPH`) that [`Supervisor::new`] consumes.
 pub struct TaskNode {
     /// Human-readable name. Used in defmt logs and panic messages.
     pub name: &'static str,
@@ -325,8 +325,10 @@ pub struct TaskNode {
     /// App-provided spawn function (typically an inline closure at the node's
     /// declaration). Called once at boot from `Supervisor::start`, again from
     /// `respawn_terminate` for Terminate nodes, and at runtime from `start_node`
-    /// for `OnDemand` nodes.
-    pub spawn: fn(Spawner) -> Result<(), SpawnError>,
+    /// for `OnDemand` nodes. `None` for a **parked** node the application spawns
+    /// itself (e.g. a `Pause` sensor holding a peripheral handle): the supervisor
+    /// tracks its lifecycle but never spawns it.
+    pub spawn: Option<fn(Spawner) -> Result<(), SpawnError>>,
     handle: TaskHandle,
 }
 
@@ -340,10 +342,11 @@ impl TaskNode {
     /// [`supervisor_graph!`] emits and [`Supervisor::new`] consumes.
     /// `disabled_at_boot` seeds the node's disabled flag so a control-started node
     /// (e.g. an OTA task) can be declared down and started later via a control op.
+    /// `spawn` is `None` for a parked node the application spawns itself.
     pub const fn new(
         name: &'static str,
         mode: Mode,
-        spawn: fn(Spawner) -> Result<(), SpawnError>,
+        spawn: Option<fn(Spawner) -> Result<(), SpawnError>>,
         disabled_at_boot: bool,
     ) -> Self {
         Self {
@@ -377,10 +380,14 @@ impl TaskNode {
         self.handle.shutdown_wake.wait().await;
     }
 
-    /// Mark this instance as having shut down. Every instance must call this
-    /// exactly once on exit (Terminate/OnDemand mode) or on each pause (Pause
-    /// mode) so the supervisor's `wait_dropped` can complete.
+    /// Mark this instance as having shut down: clears the running flag and acks
+    /// the teardown handshake (so the supervisor's `wait_dropped` completes).
+    /// Every instance must call this exactly once on exit (Terminate/OnDemand
+    /// mode) or on each pause (Pause mode). It also covers an **autonomous** exit
+    /// the supervisor didn't request — e.g. a pool worker backing off — so the
+    /// pool sees the instance as down and can re-grow it under later demand.
     pub fn ack_dropped(&self) {
+        self.handle.running.store(false, Ordering::Release);
         self.handle.dropped.store(true, Ordering::Release);
         self.handle.dropped_wake.signal(());
     }
@@ -492,6 +499,26 @@ impl TaskNode {
     }
 }
 
+// ─── Graph ───────────────────────────────────────────────────────────────
+
+/// The compile-time task graph produced by [`supervisor_graph!`]: the node slots,
+/// the dependency-index table, the topological order, and the elastic pools — the
+/// single value [`Supervisor::new`] consumes. The macro emits one `pub static GRAPH`
+/// of this type. The fields are public so the application can read them directly
+/// (e.g. a status endpoint iterating `GRAPH.nodes` / `GRAPH.deps`).
+pub struct Graph<const N: usize> {
+    /// Node slots, one per declared node. `None` marks a `#[cfg]`-ed-out node.
+    pub nodes: &'static [Option<&'static TaskNode>; N],
+    /// Per-node dependency indices into `nodes` (`deps[i]` lists node `i`'s deps).
+    pub deps: &'static [&'static [u8]; N],
+    /// Topologically sorted indices into `nodes` (dependencies before dependents;
+    /// reverse iteration is the teardown order). A dependency cycle is a compile error.
+    pub order: [u8; N],
+    /// Elastic worker pools to register with the supervisor (empty when unused).
+    #[cfg(feature = "pool")]
+    pub pools: &'static [&'static dyn Pool],
+}
+
 // ─── Supervisor ──────────────────────────────────────────────────────────
 
 /// Orchestrates a set of managed tasks across spawn / teardown / bring-up.
@@ -499,7 +526,9 @@ impl TaskNode {
 /// Owned by a single supervisor task. Concurrent access from other tasks goes
 /// through each [`TaskNode`]'s own atomic state, not the `Supervisor` struct.
 pub struct Supervisor<const N: usize> {
-    nodes: &'static [&'static TaskNode],
+    /// Node slots, one per declared node. `None` marks a slot whose node was
+    /// `#[cfg]`-ed out of the build (feature-gated); every method skips those.
+    nodes: &'static [Option<&'static TaskNode>],
     /// Per-node dependency indices into `nodes` (`deps[i]` lists the indices of
     /// the nodes that node `i` depends on). The single runtime source of graph
     /// topology, generated alongside `order` by the `supervisor_graph!` macro.
@@ -510,56 +539,45 @@ pub struct Supervisor<const N: usize> {
     order: [u8; N],
     /// Elastic pools, so the control interface can co-control a whole pool from
     /// any one member (`apply_control` expands the target through
-    /// [`Pool::members`]) — the same registry `run_pools` drives. Defaults
-    /// empty; set via [`Supervisor::with_pools`].
+    /// [`Pool::members`]) — the same registry `run_pools` drives. Taken from
+    /// `GRAPH.pools` at construction (empty when no pool is declared).
     #[cfg(feature = "pool")]
     pools: &'static [&'static dyn Pool],
 }
 
 impl<const N: usize> Supervisor<N> {
-    /// Build a supervisor from a precomputed graph. `nodes`, `deps`, and `order`
-    /// are all generated by the `supervisor_graph!` macro: `deps` is the per-node
-    /// dependency-index table and `order` the compile-time topological sort. A
-    /// dependency cycle is a *compile* error, so construction is infallible and
-    /// does no work — `start` / `teardown` / `respawn_terminate` just iterate.
-    pub const fn new(
-        nodes: &'static [&'static TaskNode; N],
-        deps: &'static [&'static [u8]; N],
-        order: [u8; N],
-    ) -> Self {
+    /// Build a supervisor from a precomputed [`Graph`] — the `GRAPH` that
+    /// `supervisor_graph!` emits (node slots, dependency-index table, compile-time
+    /// topological `order`, and the elastic pools). A dependency cycle is a
+    /// *compile* error, so construction is infallible and does no work —
+    /// `start` / `teardown` / `respawn_terminate` just iterate.
+    pub const fn new(graph: &'static Graph<N>) -> Self {
         Self {
-            nodes,
-            deps,
-            order,
+            nodes: graph.nodes,
+            deps: graph.deps,
+            order: graph.order,
             #[cfg(feature = "pool")]
-            pools: &[],
+            pools: graph.pools,
         }
-    }
-
-    /// Register the elastic pools so runtime control co-controls each pool as a
-    /// unit (stopping/starting any member affects the whole pool). The same
-    /// `&[&dyn Pool]` registry passed to `run_pools`. Builder-style so the call
-    /// site reads `Supervisor::new(..)?.with_pools(POOLS)`.
-    #[cfg(feature = "pool")]
-    pub fn with_pools(mut self, pools: &'static [&'static dyn Pool]) -> Self {
-        self.pools = pools;
-        self
     }
 
     /// Spawn every boot node in dependency order. Called once at boot.
     /// `Mode::OnDemand` nodes are skipped — they're brought up at runtime by
-    /// `start_node`. Pause-mode nodes often use a `|_| Ok(())` spawner and are
-    /// spawned externally by `main()` (with hardware handles main owns); the
-    /// no-op call here is harmless and still marks them `running`. Disabled nodes
-    /// are skipped.
+    /// `start_node`. A **parked** node (no `spawn` fn) is spawned externally by
+    /// `main()` (with hardware handles main owns); it's still marked `running`
+    /// here. Disabled nodes, and `#[cfg]`-ed-out slots, are skipped.
     pub fn start(&self, spawner: Spawner) -> Result<(), SpawnError> {
         for i in self.order.iter() {
-            let node = self.nodes[*i as usize];
+            let Some(node) = self.nodes[*i as usize] else {
+                continue;
+            };
             if matches!(node.mode, Mode::OnDemand) || node.is_disabled() {
                 continue;
             }
             info!("supervisor: spawning {} ({})", node.name, node.mode);
-            (node.spawn)(spawner)?;
+            if let Some(spawn) = node.spawn {
+                spawn(spawner)?;
+            }
             node.set_running(true);
         }
         Ok(())
@@ -572,7 +590,9 @@ impl<const N: usize> Supervisor<N> {
     /// treats as "can't grow".
     pub fn start_node(&self, node: &'static TaskNode, spawner: Spawner) -> Result<(), SpawnError> {
         node.reset();
-        (node.spawn)(spawner)?;
+        if let Some(spawn) = node.spawn {
+            spawn(spawner)?;
+        }
         node.set_running(true);
         info!("supervisor: started {}", node.name);
         Ok(())
@@ -615,7 +635,9 @@ impl<const N: usize> Supervisor<N> {
     /// running node fails to ack within `SHUTDOWN_ACK_TIMEOUT_MS`.
     pub async fn teardown(&self) {
         for i in self.order.iter().rev() {
-            let node = self.nodes[*i as usize];
+            let Some(node) = self.nodes[*i as usize] else {
+                continue;
+            };
             if !node.is_running() {
                 continue;
             }
@@ -631,7 +653,9 @@ impl<const N: usize> Supervisor<N> {
     /// manual pause sticks; there is intentionally no dependency gate here.
     pub fn resume_pausable(&self) {
         for i in self.order.iter() {
-            let node = self.nodes[*i as usize];
+            let Some(node) = self.nodes[*i as usize] else {
+                continue;
+            };
             if matches!(node.mode, Mode::Pause) && !node.is_disabled() {
                 node.reset();
                 info!("supervisor: resuming {}", node.name);
@@ -648,11 +672,15 @@ impl<const N: usize> Supervisor<N> {
     /// before the spawn so newly-running tasks see a clean handle.
     pub fn respawn_terminate(&self, spawner: Spawner) -> Result<(), SpawnError> {
         for i in self.order.iter() {
-            let node = self.nodes[*i as usize];
+            let Some(node) = self.nodes[*i as usize] else {
+                continue;
+            };
             if matches!(node.mode, Mode::Terminate) && !node.is_disabled() {
                 node.reset();
                 info!("supervisor: respawning {}", node.name);
-                (node.spawn)(spawner)?;
+                if let Some(spawn) = node.spawn {
+                    spawn(spawner)?;
+                }
                 node.set_running(true);
             }
         }
@@ -675,9 +703,11 @@ impl<const N: usize> Supervisor<N> {
 impl<const N: usize> Supervisor<N> {
     /// Position of `node` in `self.nodes` (pointer identity — every node is a
     /// `&'static`). `None` only if the node isn't in this graph (impossible for
-    /// targets sourced from `ALL_NODES`; treated as a no-op by callers).
+    /// targets sourced from `GRAPH.nodes`; treated as a no-op by callers).
     fn index_of(&self, node: &'static TaskNode) -> Option<usize> {
-        self.nodes.iter().position(|n| core::ptr::eq(*n, node))
+        self.nodes
+            .iter()
+            .position(|n| n.is_some_and(|x| core::ptr::eq(x, node)))
     }
 
     /// Whether every dependency of `node` is currently running, resolved through
@@ -689,16 +719,15 @@ impl<const N: usize> Supervisor<N> {
         match self.index_of(node) {
             Some(i) => self.deps[i]
                 .iter()
-                .all(|&di| self.nodes[di as usize].is_running()),
+                .all(|&di| self.nodes[di as usize].is_some_and(|n| n.is_running())),
             None => false,
         }
     }
 
     /// Seed a membership set with `target` plus — if `target` belongs to an
     /// elastic pool — every member of that pool, so control is applied to the
-    /// whole pool atomically. Pool membership is read from the registry passed to
-    /// `with_pools`; with no pools (the `pool` feature off, or none registered)
-    /// this is just `{target}`.
+    /// whole pool atomically. Pool membership is read from `GRAPH.pools`; with no
+    /// pools (the `pool` feature off, or none declared) this is just `{target}`.
     fn seed(&self, target: &'static TaskNode, set: &mut [bool; N]) {
         if let Some(i) = self.index_of(target) {
             set[i] = true;
@@ -742,9 +771,12 @@ impl<const N: usize> Supervisor<N> {
             if set[j] {
                 continue;
             }
+            let Some(node) = self.nodes[j] else {
+                continue;
+            };
             // A detached node declares its dep only for start ordering and intends
             // to outlive it, so it's never pulled into the cascade.
-            if self.nodes[j].is_detached() {
+            if node.is_detached() {
                 continue;
             }
             if self.deps[j].iter().any(|&di| set[di as usize]) {
@@ -758,7 +790,9 @@ impl<const N: usize> Supervisor<N> {
             if !set[j] {
                 continue;
             }
-            let node = self.nodes[j];
+            let Some(node) = self.nodes[j] else {
+                continue;
+            };
             node.set_disabled(true);
             if node.is_running() {
                 info!("supervisor: control-stop {}", node.name);
@@ -793,7 +827,9 @@ impl<const N: usize> Supervisor<N> {
             if !set[j] {
                 continue;
             }
-            let node = self.nodes[j];
+            let Some(node) = self.nodes[j] else {
+                continue;
+            };
             node.set_disabled(false);
             if node.is_running() {
                 continue;

@@ -33,8 +33,10 @@ embassy-supervisor-macros = { path = "../supervisor-macros", optional = true }
 default = ["control", "pool", "macros"]
 # Runtime control plane: ControlOp, request_control/apply_control, activate/deactivate.
 control = []
-# Elastic worker pools: the `pool` module, with_pools, run_pools, load scaling.
-pool = []
+# Elastic worker pools: the `pool` module, run_pools, load scaling. Forwarded to
+# the proc-macro (weak `?`, so only when the optional `macros` dep is enabled) so
+# `supervisor_graph!` emits the `GRAPH.pools` field iff this feature is on.
+pool = ["embassy-supervisor-macros?/pool"]
 # Logging via defmt (otherwise the log macros are no-ops).
 defmt = ["dep:defmt"]
 # Re-export the `supervisor_graph!` proc-macro.

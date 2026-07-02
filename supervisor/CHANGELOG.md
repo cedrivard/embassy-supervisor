@@ -6,6 +6,27 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 
 ## [Unreleased]
 
+### Added
+- Pool `policy:` accepts an optional explicit type: `policy: <Type> = <expr>`. When the
+  type is omitted it is still derived from a `Type::new(..)` value (unchanged); the
+  explicit form allows any value of that type (a `const`, a `const fn` factory, a builder
+  chain, a qualified path).
+
+### Changed
+- The graph-declaration macro was renamed from `task_graph!` to `supervisor_graph!`.
+- `supervisor_graph!` now emits a single `pub static GRAPH: Graph<M>` bundling the node
+  slots, dependency table, topological order, and (with the `pool` feature) the pools,
+  replacing the former loose `ALL_NODES` / `DEPS` / `ORDER` / `POOLS` symbols. Read them as
+  `GRAPH.nodes` / `GRAPH.deps` / `GRAPH.order` / `GRAPH.pools`.
+- `Supervisor::new` takes the bundled graph: `Supervisor::new(&GRAPH)`, replacing the
+  previous three-argument `new(&ALL_NODES, &DEPS, ORDER)` form.
+- `Supervisor::run_pools` no longer takes a pool-registry argument; it reads the pools from
+  the graph (`GRAPH.pools`).
+
+### Removed
+- `Supervisor::with_pools` — pools are now part of `GRAPH` and passed via `Supervisor::new`.
+- The generated `NODE_COUNT` constant; use `GRAPH.nodes.len()` instead.
+
 ### Internal
 - Host-runnable unit + integration tests for the dependency-ordered topo sort, cycle
   detection, and the `DeferredShrink`/`ElasticPool` scaling logic, plus a GitHub Actions CI

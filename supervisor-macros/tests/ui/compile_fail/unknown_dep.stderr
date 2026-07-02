@@ -1,0 +1,5 @@
+error: unknown dependency `MISSING` — not a declared node
+ --> tests/ui/compile_fail/unknown_dep.rs:6:32
+  |
+6 |     node A = Terminate, deps: [MISSING];
+  |                                ^^^^^^^

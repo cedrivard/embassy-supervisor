@@ -17,11 +17,11 @@
 //! One `static` bridges the gap between the task-owned objects and the rest of
 //! the firmware, guarded by a documented single-core invariant:
 //!
-//! - `STACK` — the `Copy` stack handle, published for the `http` pool. The handle
-//!   is lifetime-extended to `'static`, valid only while the task's backing
-//!   buffers live. Sound because every stack user (`http`) depends on `net`, so
-//!   the supervisor tears them all down *before* `net` clears `STACK` and frees
-//!   the backing (dependency-ordered teardown).
+//! - `STACK` — the `Copy` stack handle, published for the `http` pool and the `ota`
+//!   node. The handle is lifetime-extended to `'static`, valid only while the task's
+//!   backing buffers live. Sound because every stack user (`http`, `ota`) depends on
+//!   `net`, so the supervisor tears them all down *before* `net` clears `STACK` and
+//!   frees the backing (dependency-ordered teardown).
 //!
 //! Static IPv4 so no host DHCP server is needed: set your host's `usb0` to
 //! `10.42.0.1/24` and reach the device at `10.42.0.61`.
