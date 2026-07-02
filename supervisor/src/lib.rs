@@ -13,13 +13,13 @@
 //!
 //! ## The model
 //!
-//!   * Each managed task is described by a [`TaskNode`] stored in a `static`.
-//!   * Nodes declare their dependencies (`deps: &'static [&'static TaskNode]`)
-//!     and a `spawn` fn the supervisor calls to launch them.
-//!   * [`Supervisor`] topologically sorts the graph once at construction
-//!     (Kahn's algorithm) and uses that ordering to bring tasks up in dependency
-//!     order ([`Supervisor::start`]) and tear them down in reverse
-//!     ([`Supervisor::teardown`]).
+//!   * The graph is declared once with the [`supervisor_graph!`] macro: each
+//!     managed task becomes a [`TaskNode`] `static`, and the macro bundles the node
+//!     slots, dependency table, and a topological order computed **at compile time**
+//!     (a dependency cycle is a compile error) into a single [`Graph`] (`GRAPH`).
+//!   * [`Supervisor::new`] takes `&GRAPH` (no work, no failure) and uses the order
+//!     to bring tasks up in dependency order ([`Supervisor::start`]) and tear them
+//!     down in reverse ([`Supervisor::teardown`]).
 //!   * Each node carries a `TaskHandle` of per-node atomic flags and
 //!     single-consumer `Signal`s. Every node is single-instance — no counts, no
 //!     fan-out. See [`TaskHandle`].
@@ -39,7 +39,8 @@
 //!
 //!   * It does not model any power-state transition (sleep/wake): it reacts to
 //!     "teardown" and "bring-up" requests; the application drives them.
-//!   * It does not allocate. Topo-sort scratch lives in a `heapless::Vec`.
+//!   * It does not allocate, and does no work at construction: the topological
+//!     sort runs at compile time (see the `supervisor_graph!` macro).
 //!   * It does not observe task internals. Tasks self-report their drop state via
 //!     `ack_dropped()`; a task that fails to ack within a timeout panics the
 //!     supervisor with the offending node's name.
@@ -49,7 +50,7 @@
 //!   * `control` *(default)* — the runtime control plane: [`ControlOp`],
 //!     [`request_control`], [`Supervisor::apply_control`].
 //!   * `pool` *(default)* — elastic worker pools: [`ElasticPool`],
-//!     [`Supervisor::with_pools`], [`Supervisor::run_pools`].
+//!     [`Supervisor::run_pools`], and the `pools` field of [`Graph`].
 //!   * `defmt` — route the supervisor's logs through `defmt`; without it the log
 //!     macros are no-ops.
 //!
@@ -59,25 +60,24 @@
 //!
 //! ## Example
 //!
+//! [`supervisor_graph!`] declares the whole graph once — it generates the node
+//! `static`s and a single [`Graph`] value `GRAPH` bundling the node slots, dep
+//! table, and compile-time topological order (a dependency cycle is a compile
+//! error), which [`Supervisor::new`] consumes.
+//!
 //! ```ignore
 //! use embassy_executor::Spawner;
-//! use embassy_supervisor::{task_graph, Mode, Supervisor, TaskNode, wait_control};
+//! use embassy_supervisor::{supervisor_graph, Supervisor, wait_control};
 //!
-//! // Each subsystem is a `TaskNode` wrapping a spawn fn; `app` depends on `net`.
-//! static NET: TaskNode = TaskNode::new("net", Mode::Terminate, &[], |s| {
-//!     s.spawn(net_task())?;
-//!     Ok(())
-//! });
-//! static APP: TaskNode = TaskNode::new("app", Mode::Terminate, &[&NET], |s| {
-//!     s.spawn(app_task())?;
-//!     Ok(())
-//! });
-//!
-//! task_graph! { &NET, &APP }   // emits `ALL_NODES` + `NODE_COUNT`
+//! // `app` depends on `net`; each `spawn:` names a task fn spawned with the node.
+//! supervisor_graph! {
+//!     node NET = Terminate, deps: [], spawn: net_task;
+//!     node APP = Terminate, deps: [NET], spawn: app_task;
+//! }
 //!
 //! #[embassy_executor::task]
 //! async fn supervisor_task(spawner: Spawner) {
-//!     let sup = Supervisor::new(&ALL_NODES).expect("no dependency cycle");
+//!     let sup = Supervisor::new(&GRAPH);
 //!     sup.start(spawner).expect("initial spawn"); // brings up `net`, then `app`
 //!     loop {
 //!         // Apply runtime start/stop/pause/resume requests in dependency order.
@@ -94,7 +94,6 @@
 //! and OTA).
 //!
 //! Docs:
-//!   - `heapless::Vec` (no-alloc stack vector): <https://docs.rs/heapless>
 //!   - `embassy_sync::signal::Signal`: <https://docs.embassy.dev/embassy-sync>
 //!   - Kahn's algorithm (topological sort):
 //!     <https://en.wikipedia.org/wiki/Topological_sorting#Kahn's_algorithm>
@@ -111,7 +110,6 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::Timer;
-use heapless::Vec;
 use portable_atomic::AtomicBool;
 
 // ─── Scale-request signal (task → supervisor) ──────────────────────────────
@@ -154,7 +152,7 @@ pub async fn wait_scale() {
 /// mechanism (respawn vs resume vs leave-to-pool) is then chosen per node `Mode`
 /// by the supervisor when it applies the command ([`Supervisor::apply_control`]).
 #[cfg(feature = "control")]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ControlOp {
     /// Bring the node up (start a stopped `Terminate` node, resume a `Pause` node).
     Activate,
@@ -165,7 +163,7 @@ pub enum ControlOp {
 /// A runtime control request: drive `node` (and, per the dependency graph and
 /// pool membership, the nodes it implies) in the `op` direction.
 #[cfg(feature = "control")]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ControlCommand {
     /// The node to drive.
     pub node: &'static TaskNode,
@@ -203,7 +201,7 @@ const SHUTDOWN_ACK_TIMEOUT_MS: u64 = 2_000;
 
 /// Lifecycle policy for a managed task: what the task does on shutdown and what
 /// the supervisor does to bring it back.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     /// Task exits its loop on shutdown. The supervisor respawns it via the
     /// node's `spawn` fn from `respawn_terminate`.
@@ -297,7 +295,7 @@ pub struct TaskHandle {
 }
 
 impl TaskHandle {
-    const fn new() -> Self {
+    const fn new(disabled_at_boot: bool) -> Self {
         Self {
             shutdown: AtomicBool::new(false),
             shutdown_wake: Signal::new(),
@@ -306,7 +304,7 @@ impl TaskHandle {
             running: AtomicBool::new(false),
             busy: AtomicBool::new(false),
             resume_wake: Signal::new(),
-            disabled: AtomicBool::new(false),
+            disabled: AtomicBool::new(disabled_at_boot),
             detached: AtomicBool::new(false),
         }
     }
@@ -317,23 +315,20 @@ impl TaskHandle {
 /// A node in the supervisor's task graph.
 ///
 /// Designed to live in `static` memory: every field is `Sync`, all constructors
-/// are `const`. The application declares one per managed task and passes an
-/// array of `&'static TaskNode` (typically via [`task_graph!`]) to
-/// [`Supervisor::new`].
+/// are `const`. Declared by [`supervisor_graph!`], which emits one per managed
+/// task along with the [`Graph`] (`GRAPH`) that [`Supervisor::new`] consumes.
 pub struct TaskNode {
     /// Human-readable name. Used in defmt logs and panic messages.
     pub name: &'static str,
     /// Lifecycle policy. See [`Mode`].
     pub mode: Mode,
-    /// Nodes that must come up *before* this one (and tear down *after*).
-    /// Pointer-equality is used during topological sort; references must point
-    /// to other `static` `TaskNode`s in the same graph.
-    pub deps: &'static [&'static TaskNode],
     /// App-provided spawn function (typically an inline closure at the node's
     /// declaration). Called once at boot from `Supervisor::start`, again from
     /// `respawn_terminate` for Terminate nodes, and at runtime from `start_node`
-    /// for `OnDemand` nodes.
-    pub spawn: fn(Spawner) -> Result<(), SpawnError>,
+    /// for `OnDemand` nodes. `None` for a **parked** node the application spawns
+    /// itself (e.g. a `Pause` sensor holding a peripheral handle): the supervisor
+    /// tracks its lifecycle but never spawns it.
+    pub spawn: Option<fn(Spawner) -> Result<(), SpawnError>>,
     handle: TaskHandle,
 }
 
@@ -341,18 +336,24 @@ impl TaskNode {
     /// A single-instance node started at boot (`Terminate`/`Pause`) or on demand
     /// (`Mode::OnDemand`). Every node is single-instance; an elastic service is
     /// modelled as several `OnDemand` nodes of the same pooled task fn.
+    ///
+    /// A `TaskNode` carries only its own identity and behaviour; the graph's
+    /// dependency edges live in the compile-time index table that
+    /// [`supervisor_graph!`] emits and [`Supervisor::new`] consumes.
+    /// `disabled_at_boot` seeds the node's disabled flag so a control-started node
+    /// (e.g. an OTA task) can be declared down and started later via a control op.
+    /// `spawn` is `None` for a parked node the application spawns itself.
     pub const fn new(
         name: &'static str,
         mode: Mode,
-        deps: &'static [&'static TaskNode],
-        spawn: fn(Spawner) -> Result<(), SpawnError>,
+        spawn: Option<fn(Spawner) -> Result<(), SpawnError>>,
+        disabled_at_boot: bool,
     ) -> Self {
         Self {
             name,
             mode,
-            deps,
             spawn,
-            handle: TaskHandle::new(),
+            handle: TaskHandle::new(disabled_at_boot),
         }
     }
 
@@ -379,10 +380,14 @@ impl TaskNode {
         self.handle.shutdown_wake.wait().await;
     }
 
-    /// Mark this instance as having shut down. Every instance must call this
-    /// exactly once on exit (Terminate/OnDemand mode) or on each pause (Pause
-    /// mode) so the supervisor's `wait_dropped` can complete.
+    /// Mark this instance as having shut down: clears the running flag and acks
+    /// the teardown handshake (so the supervisor's `wait_dropped` completes).
+    /// Every instance must call this exactly once on exit (Terminate/OnDemand
+    /// mode) or on each pause (Pause mode). It also covers an **autonomous** exit
+    /// the supervisor didn't request — e.g. a pool worker backing off — so the
+    /// pool sees the instance as down and can re-grow it under later demand.
     pub fn ack_dropped(&self) {
+        self.handle.running.store(false, Ordering::Release);
         self.handle.dropped.store(true, Ordering::Release);
         self.handle.dropped_wake.signal(());
     }
@@ -494,149 +499,104 @@ impl TaskNode {
     }
 }
 
-// ─── Task-graph declaration macro ─────────────────────────────────────────
+/// Manual impl: the private `TaskHandle` (Signals + atomics) has no `Debug`, and a
+/// snapshot of the *live* flags is more useful than raw handle internals anyway.
+/// `finish_non_exhaustive` marks the elided fields (`spawn`, the handle).
+impl core::fmt::Debug for TaskNode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TaskNode")
+            .field("name", &self.name)
+            .field("mode", &self.mode)
+            .field("running", &self.is_running())
+            .field("busy", &self.is_busy())
+            .field("disabled", &self.is_disabled())
+            .field("detached", &self.is_detached())
+            .finish_non_exhaustive()
+    }
+}
 
-/// Declares a supervisor task graph from one `cfg`-gated list, emitting both an
-/// `ALL_NODES` array (what [`Supervisor::new`] sorts) and a `NODE_COUNT` const
-/// (its length, which feeds the `const N` generic). Both expand from the same
-/// tokens, so the count can't drift from the list. Invoke once in the
-/// application, where the node `static`s are in scope:
+// ─── Graph ───────────────────────────────────────────────────────────────
+
+/// The compile-time task graph produced by [`supervisor_graph!`]: the node slots,
+/// the dependency-index table, the topological order, and the elastic pools — the
+/// single value [`Supervisor::new`] consumes. The macro emits one `pub static GRAPH`
+/// of this type. The fields are public so the application can read them directly
+/// (e.g. a status endpoint iterating `GRAPH.nodes` / `GRAPH.deps`).
 ///
-/// ```ignore
-/// supervisor::task_graph! {
-///     &NET,
-///     #[cfg(feature = "http")] &HTTP,
-///     // …
-/// }
-/// // → pub const NODE_COUNT; pub static ALL_NODES: [&TaskNode; NODE_COUNT];
-/// ```
-///
-/// Counting goes through cfg-gated `()` units (`[(); …].len()` is const; the
-/// node refs aren't const-countable — a `const` can't refer to a `static`,
-/// E0013). The cfg / no-cfg cases are split into separate `@munch` rules, with
-/// the attribute matched as literal `#[cfg(...)]` tokens, to dodge the
-/// `#[cfg] expr` ambiguity a single `$(#[$m:meta])*` rule hits (a cfg attribute
-/// can legally prefix the `expr`, so the two can't be one fragment).
-#[macro_export]
-macro_rules! task_graph {
-    // Done: emit the count + array from the two accumulated lists.
-    (@munch units=[$($u:tt)*] nodes=[$($n:tt)*];) => {
-        pub const NODE_COUNT: usize = [$($u)*].len();
-        pub static ALL_NODES: [&$crate::TaskNode; NODE_COUNT] = [$($n)*];
-    };
-    // Next element carries a cfg attribute: push it to both lists.
-    (@munch units=[$($u:tt)*] nodes=[$($n:tt)*]; #[cfg($c:meta)] $node:expr, $($rest:tt)*) => {
-        $crate::task_graph!(@munch
-            units=[$($u)* #[cfg($c)] (),]
-            nodes=[$($n)* #[cfg($c)] $node,];
-            $($rest)*
-        );
-    };
-    // Next element is unconditional.
-    (@munch units=[$($u:tt)*] nodes=[$($n:tt)*]; $node:expr, $($rest:tt)*) => {
-        $crate::task_graph!(@munch
-            units=[$($u)* (),]
-            nodes=[$($n)* $node,];
-            $($rest)*
-        );
-    };
-    // Last element with a cfg attribute and no trailing comma.
-    (@munch units=[$($u:tt)*] nodes=[$($n:tt)*]; #[cfg($c:meta)] $node:expr) => {
-        $crate::task_graph!(@munch
-            units=[$($u)* #[cfg($c)] (),]
-            nodes=[$($n)* #[cfg($c)] $node,];
-        );
-    };
-    // Last element, unconditional, with no trailing comma. Without this arm a
-    // missing trailing comma would fall through to the entry rule below and
-    // re-wrap forever (recursion-limit error), so accept both styles explicitly.
-    (@munch units=[$($u:tt)*] nodes=[$($n:tt)*]; $node:expr) => {
-        $crate::task_graph!(@munch units=[$($u)* (),] nodes=[$($n)* $node,];);
-    };
-    // Entry: seed the accumulators with the caller's list.
-    ($($items:tt)*) => {
-        $crate::task_graph!(@munch units=[] nodes=[]; $($items)*);
-    };
+/// `N` is capped at 256 (graph indices are `u8`); the macro enforces this at
+/// expansion time.
+pub struct Graph<const N: usize> {
+    /// Node slots, one per declared node. `None` marks a `#[cfg]`-ed-out node.
+    pub nodes: &'static [Option<&'static TaskNode>; N],
+    /// Per-node dependency indices into `nodes` (`deps[i]` lists node `i`'s deps).
+    pub deps: &'static [&'static [u8]; N],
+    /// Topologically sorted indices into `nodes` (dependencies before dependents;
+    /// reverse iteration is the teardown order). A dependency cycle is a compile error.
+    pub order: [u8; N],
+    /// Elastic worker pools to register with the supervisor (empty when unused).
+    #[cfg(feature = "pool")]
+    pub pools: &'static [&'static dyn Pool],
 }
 
 // ─── Supervisor ──────────────────────────────────────────────────────────
-
-/// Reasons [`Supervisor::new`] may fail. The node count `N` is derived from the
-/// graph array, so the scratch buffers always fit — the only remaining failure
-/// is a declared dependency `Cycle`.
-#[derive(Debug)]
-pub enum BuildError {
-    /// The declared dependency graph contains a cycle.
-    Cycle,
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for BuildError {
-    fn format(&self, f: defmt::Formatter) {
-        match self {
-            BuildError::Cycle => defmt::write!(f, "Cycle"),
-        }
-    }
-}
 
 /// Orchestrates a set of managed tasks across spawn / teardown / bring-up.
 ///
 /// Owned by a single supervisor task. Concurrent access from other tasks goes
 /// through each [`TaskNode`]'s own atomic state, not the `Supervisor` struct.
 pub struct Supervisor<const N: usize> {
-    nodes: &'static [&'static TaskNode],
-    /// Topologically sorted indices into `nodes`. Dependencies appear before
-    /// their dependents. The reverse iteration is the teardown order. `N` is the
-    /// node count (from `ALL_NODES`), so this is sized exactly to the graph.
-    order: Vec<u8, N>,
+    /// Node slots, one per declared node. `None` marks a slot whose node was
+    /// `#[cfg]`-ed out of the build (feature-gated); every method skips those.
+    nodes: &'static [Option<&'static TaskNode>],
+    /// Per-node dependency indices into `nodes` (`deps[i]` lists the indices of
+    /// the nodes that node `i` depends on). The single runtime source of graph
+    /// topology, generated alongside `order` by the `supervisor_graph!` macro.
+    deps: &'static [&'static [u8]],
+    /// Topologically sorted indices into `nodes`: dependencies before their
+    /// dependents; reverse iteration is the teardown order. Precomputed at
+    /// compile time (a cycle is a compile error), so construction does no work.
+    order: [u8; N],
     /// Elastic pools, so the control interface can co-control a whole pool from
     /// any one member (`apply_control` expands the target through
-    /// [`Pool::members`]) — the same registry `run_pools` drives. Defaults
-    /// empty; set via [`Supervisor::with_pools`].
+    /// [`Pool::members`]) — the same registry `run_pools` drives. Taken from
+    /// `GRAPH.pools` at construction (empty when no pool is declared).
     #[cfg(feature = "pool")]
     pools: &'static [&'static dyn Pool],
 }
 
 impl<const N: usize> Supervisor<N> {
-    /// Build a supervisor over `nodes`. `N` (the node count) is inferred from the
-    /// array length, so the topo-sort scratch is sized exactly to the graph and
-    /// the build can only fail on a dependency `Cycle`. Performs the topo sort
-    /// eagerly so `start` / `teardown` / `respawn_terminate` are cheap.
-    pub fn new(nodes: &'static [&'static TaskNode; N]) -> Result<Self, BuildError> {
-        let order = topo_sort::<N>(nodes)?;
-        let nodes: &'static [&'static TaskNode] = nodes;
-        Ok(Self {
-            nodes,
-            order,
+    /// Build a supervisor from a precomputed [`Graph`] — the `GRAPH` that
+    /// `supervisor_graph!` emits (node slots, dependency-index table, compile-time
+    /// topological `order`, and the elastic pools). A dependency cycle is a
+    /// *compile* error, so construction is infallible and does no work —
+    /// `start` / `teardown` / `respawn_terminate` just iterate.
+    pub const fn new(graph: &'static Graph<N>) -> Self {
+        Self {
+            nodes: graph.nodes,
+            deps: graph.deps,
+            order: graph.order,
             #[cfg(feature = "pool")]
-            pools: &[],
-        })
-    }
-
-    /// Register the elastic pools so runtime control co-controls each pool as a
-    /// unit (stopping/starting any member affects the whole pool). The same
-    /// `&[&dyn Pool]` registry passed to `run_pools`. Builder-style so the call
-    /// site reads `Supervisor::new(..)?.with_pools(POOLS)`.
-    #[cfg(feature = "pool")]
-    pub fn with_pools(mut self, pools: &'static [&'static dyn Pool]) -> Self {
-        self.pools = pools;
-        self
+            pools: graph.pools,
+        }
     }
 
     /// Spawn every boot node in dependency order. Called once at boot.
     /// `Mode::OnDemand` nodes are skipped — they're brought up at runtime by
-    /// `start_node`. Pause-mode nodes often use a `|_| Ok(())` spawner and are
-    /// spawned externally by `main()` (with hardware handles main owns); the
-    /// no-op call here is harmless and still marks them `running`. Disabled nodes
-    /// are skipped.
+    /// `start_node`. A **parked** node (no `spawn` fn) is spawned externally by
+    /// `main()` (with hardware handles main owns); it's still marked `running`
+    /// here. Disabled nodes, and `#[cfg]`-ed-out slots, are skipped.
     pub fn start(&self, spawner: Spawner) -> Result<(), SpawnError> {
         for i in self.order.iter() {
-            let node = self.nodes[*i as usize];
+            let Some(node) = self.nodes[*i as usize] else {
+                continue;
+            };
             if matches!(node.mode, Mode::OnDemand) || node.is_disabled() {
                 continue;
             }
             info!("supervisor: spawning {} ({})", node.name, node.mode);
-            (node.spawn)(spawner)?;
+            if let Some(spawn) = node.spawn {
+                spawn(spawner)?;
+            }
             node.set_running(true);
         }
         Ok(())
@@ -649,7 +609,9 @@ impl<const N: usize> Supervisor<N> {
     /// treats as "can't grow".
     pub fn start_node(&self, node: &'static TaskNode, spawner: Spawner) -> Result<(), SpawnError> {
         node.reset();
-        (node.spawn)(spawner)?;
+        if let Some(spawn) = node.spawn {
+            spawn(spawner)?;
+        }
         node.set_running(true);
         info!("supervisor: started {}", node.name);
         Ok(())
@@ -692,7 +654,9 @@ impl<const N: usize> Supervisor<N> {
     /// running node fails to ack within `SHUTDOWN_ACK_TIMEOUT_MS`.
     pub async fn teardown(&self) {
         for i in self.order.iter().rev() {
-            let node = self.nodes[*i as usize];
+            let Some(node) = self.nodes[*i as usize] else {
+                continue;
+            };
             if !node.is_running() {
                 continue;
             }
@@ -708,7 +672,9 @@ impl<const N: usize> Supervisor<N> {
     /// manual pause sticks; there is intentionally no dependency gate here.
     pub fn resume_pausable(&self) {
         for i in self.order.iter() {
-            let node = self.nodes[*i as usize];
+            let Some(node) = self.nodes[*i as usize] else {
+                continue;
+            };
             if matches!(node.mode, Mode::Pause) && !node.is_disabled() {
                 node.reset();
                 info!("supervisor: resuming {}", node.name);
@@ -725,11 +691,15 @@ impl<const N: usize> Supervisor<N> {
     /// before the spawn so newly-running tasks see a clean handle.
     pub fn respawn_terminate(&self, spawner: Spawner) -> Result<(), SpawnError> {
         for i in self.order.iter() {
-            let node = self.nodes[*i as usize];
+            let Some(node) = self.nodes[*i as usize] else {
+                continue;
+            };
             if matches!(node.mode, Mode::Terminate) && !node.is_disabled() {
                 node.reset();
                 info!("supervisor: respawning {}", node.name);
-                (node.spawn)(spawner)?;
+                if let Some(spawn) = node.spawn {
+                    spawn(spawner)?;
+                }
                 node.set_running(true);
             }
         }
@@ -752,16 +722,31 @@ impl<const N: usize> Supervisor<N> {
 impl<const N: usize> Supervisor<N> {
     /// Position of `node` in `self.nodes` (pointer identity — every node is a
     /// `&'static`). `None` only if the node isn't in this graph (impossible for
-    /// targets sourced from `ALL_NODES`; treated as a no-op by callers).
+    /// targets sourced from `GRAPH.nodes`; treated as a no-op by callers).
     fn index_of(&self, node: &'static TaskNode) -> Option<usize> {
-        self.nodes.iter().position(|n| core::ptr::eq(*n, node))
+        self.nodes
+            .iter()
+            .position(|n| n.is_some_and(|x| core::ptr::eq(x, node)))
+    }
+
+    /// Whether every dependency of `node` is currently running, resolved through
+    /// the graph's index table. The pool driver checks this before growing a
+    /// worker, so a pool member is never spawned while one of its dependencies is
+    /// down.
+    #[cfg(feature = "pool")]
+    pub(crate) fn deps_running(&self, node: &'static TaskNode) -> bool {
+        match self.index_of(node) {
+            Some(i) => self.deps[i]
+                .iter()
+                .all(|&di| self.nodes[di as usize].is_some_and(|n| n.is_running())),
+            None => false,
+        }
     }
 
     /// Seed a membership set with `target` plus — if `target` belongs to an
     /// elastic pool — every member of that pool, so control is applied to the
-    /// whole pool atomically. Pool membership is read from the registry passed to
-    /// `with_pools`; with no pools (the `pool` feature off, or none registered)
-    /// this is just `{target}`.
+    /// whole pool atomically. Pool membership is read from `GRAPH.pools`; with no
+    /// pools (the `pool` feature off, or none declared) this is just `{target}`.
     fn seed(&self, target: &'static TaskNode, set: &mut [bool; N]) {
         if let Some(i) = self.index_of(target) {
             set[i] = true;
@@ -805,16 +790,15 @@ impl<const N: usize> Supervisor<N> {
             if set[j] {
                 continue;
             }
+            let Some(node) = self.nodes[j] else {
+                continue;
+            };
             // A detached node declares its dep only for start ordering and intends
             // to outlive it, so it's never pulled into the cascade.
-            if self.nodes[j].is_detached() {
+            if node.is_detached() {
                 continue;
             }
-            if self.nodes[j]
-                .deps
-                .iter()
-                .any(|d| self.index_of(d).is_some_and(|di| set[di]))
-            {
+            if self.deps[j].iter().any(|&di| set[di as usize]) {
                 set[j] = true;
             }
         }
@@ -825,7 +809,9 @@ impl<const N: usize> Supervisor<N> {
             if !set[j] {
                 continue;
             }
-            let node = self.nodes[j];
+            let Some(node) = self.nodes[j] else {
+                continue;
+            };
             node.set_disabled(true);
             if node.is_running() {
                 info!("supervisor: control-stop {}", node.name);
@@ -848,10 +834,8 @@ impl<const N: usize> Supervisor<N> {
         for i in self.order.iter().rev() {
             let j = *i as usize;
             if set[j] {
-                for d in self.nodes[j].deps {
-                    if let Some(di) = self.index_of(d) {
-                        set[di] = true;
-                    }
+                for &di in self.deps[j] {
+                    set[di as usize] = true;
                 }
             }
         }
@@ -862,7 +846,9 @@ impl<const N: usize> Supervisor<N> {
             if !set[j] {
                 continue;
             }
-            let node = self.nodes[j];
+            let Some(node) = self.nodes[j] else {
+                continue;
+            };
             node.set_disabled(false);
             if node.is_running() {
                 continue;
@@ -887,62 +873,92 @@ impl<const N: usize> Supervisor<N> {
     }
 }
 
-// ─── Topological sort (Kahn's algorithm) ──────────────────────────────────
+// ─── Topological sort (Kahn's algorithm, const) ───────────────────────────
 //
-// Returns the node indices in dependency-first order: if A depends on B, then B
-// appears before A in the result. The supervisor iterates this forward for
-// `start` / `respawn_terminate` and in reverse for `teardown`.
+// Computes the topological order at *compile time* over a per-node
+// dependency-index table; a dependency cycle is a compile error.
 
-fn topo_sort<const N: usize>(
-    nodes: &'static [&'static TaskNode],
-) -> Result<Vec<u8, N>, BuildError> {
-    let n = nodes.len();
-
-    // in_degree[i] = number of dependencies of nodes[i] not yet resolved.
-    // Every scratch Vec has capacity N == nodes.len(), and each index is pushed
-    // at most once, so no push can overflow; an impossible overflow would only
-    // leave `order` short and surface harmlessly as `Cycle` via the check below.
-    let mut in_degree: Vec<u8, N> = Vec::new();
-    for node in nodes {
-        let _ = in_degree.push(node.deps.len() as u8);
+/// Topologically sort a graph given as a per-node dependency-index table.
+///
+/// `deps[i]` lists the indices of the nodes that node `i` depends on; the result
+/// lists node indices in dependency-first order (a dependency appears before its
+/// dependents). The supervisor iterates it forward for `start` /
+/// `respawn_terminate` and in reverse for `teardown`.
+///
+/// Evaluated at compile time by the code `supervisor_graph!` generates — a
+/// dependency **cycle is a compile error** (the `panic!` fires during const
+/// evaluation). `#[doc(hidden)]`: an engine for the macro, not a user-facing API.
+///
+/// Supports at most 256 nodes: indices are `u8`, so a larger `N` would truncate.
+/// The macro rejects bigger graphs at expansion; the assert below is defense in
+/// depth for a manual caller (a const-eval panic, i.e. a compile error).
+#[doc(hidden)]
+#[must_use]
+pub const fn topo_sort_const<const N: usize>(deps: &[&'static [u8]; N]) -> [u8; N] {
+    assert!(
+        N <= 256,
+        "supervisor graph exceeds 256 node slots (indices are u8)"
+    );
+    // in_degree[i] = number of deps of node i not yet resolved.
+    let mut in_degree = [0u8; N];
+    let mut i = 0;
+    while i < N {
+        in_degree[i] = deps[i].len() as u8;
+        i += 1;
     }
 
-    // Seed the queue with nodes that have no dependencies.
-    let mut queue: Vec<u8, N> = Vec::new();
-    for i in 0..n {
+    // Queue (fixed array, head/tail indices) seeded with the dependency-free nodes.
+    let mut queue = [0u8; N];
+    let mut tail = 0;
+    i = 0;
+    while i < N {
         if in_degree[i] == 0 {
-            let _ = queue.push(i as u8);
+            queue[tail] = i as u8;
+            tail += 1;
         }
+        i += 1;
     }
 
-    let mut order: Vec<u8, N> = Vec::new();
+    let mut order = [0u8; N];
+    let mut produced = 0;
     let mut head = 0;
-    while head < queue.len() {
-        let i = queue[head] as usize;
+    while head < tail {
+        let node = queue[head] as usize;
         head += 1;
-        let _ = order.push(i as u8);
+        order[produced] = node as u8;
+        produced += 1;
 
-        // Decrement the in-degree of every node that depends on nodes[i].
-        // Pointer-equality works because `TaskNode`s live in `static` memory;
-        // each reference to nodes[i] is the same address.
-        for j in 0..n {
-            if in_degree[j] == 0 {
-                continue;
-            }
-            let depends_on_i = nodes[j].deps.iter().any(|d| core::ptr::eq(*d, nodes[i]));
-            if depends_on_i {
-                in_degree[j] -= 1;
-                if in_degree[j] == 0 {
-                    let _ = queue.push(j as u8);
+        // Decrement the in-degree of every node that depends on `node`.
+        let mut j = 0;
+        while j < N {
+            if in_degree[j] != 0 {
+                let mut depends = false;
+                let mut k = 0;
+                while k < deps[j].len() {
+                    if deps[j][k] as usize == node {
+                        depends = true;
+                    }
+                    k += 1;
+                }
+                if depends {
+                    in_degree[j] -= 1;
+                    if in_degree[j] == 0 {
+                        queue[tail] = j as u8;
+                        tail += 1;
+                    }
                 }
             }
+            j += 1;
         }
     }
 
-    if order.len() != n {
-        return Err(BuildError::Cycle);
+    // A cycle leaves some nodes unproduced. During const eval this panic is a
+    // compile error, so cyclic graphs are rejected at build time. `core::panic!`
+    // (not the crate's defmt-shimmed `panic!`) keeps this const-evaluable.
+    if produced != N {
+        core::panic!("supervisor_graph!: dependency cycle");
     }
-    Ok(order)
+    order
 }
 
 #[cfg(feature = "pool")]
@@ -950,111 +966,74 @@ mod pool;
 #[cfg(feature = "pool")]
 pub use pool::*;
 
+/// Declare a supervised task graph and compute its topological order at compile
+/// time (single source of nodes, deps, pool, and order). See the
+/// `embassy-supervisor-macros` crate for the surface syntax.
+#[cfg(feature = "macros")]
+pub use embassy_supervisor_macros::supervisor_graph;
+
 // ─── Tests (host-only) ─────────────────────────────────────────────────────
 //
 // Run on the host: `cargo test -p embassy-supervisor --target x86_64-unknown-linux-gnu`
 // (the workspace `.cargo/config.toml` pins the embedded target, so `--target` is
-// required to override it). These cover the pure topo-sort / cycle logic — no
-// embassy executor or `Spawner` is constructed; the node `spawn` fns are never
-// invoked. The dev-dependency host shims (critical-section + embassy-time driver)
-// satisfy the crate's link-time requirements for the test binary.
+// required to override it). These exercise the compile-time `topo_sort_const`
+// over index adjacency tables — exactly what `supervisor_graph!` generates.
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::topo_sort_const;
 
-    /// A spawn fn that is never actually called by these tests (no executor runs).
-    fn noop(_: Spawner) -> Result<(), SpawnError> {
-        Ok(())
-    }
-
-    /// Position of node index `idx` within a sorted `order`.
-    fn pos<const N: usize>(order: &Vec<u8, N>, idx: u8) -> usize {
-        order
-            .iter()
-            .position(|&x| x == idx)
-            .expect("index present in order")
+    /// Position of index `x` within `order`.
+    fn pos<const N: usize>(order: &[u8; N], x: u8) -> usize {
+        order.iter().position(|&y| y == x).expect("index present")
     }
 
     #[test]
     fn linear_chain_orders_deps_before_dependents() {
-        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[], noop);
-        static B: TaskNode = TaskNode::new("b", Mode::Terminate, &[&A], noop);
-        static C: TaskNode = TaskNode::new("c", Mode::Terminate, &[&B], noop);
-        // Deliberately unsorted input order: C=0, B=1, A=2.
-        static NODES: [&TaskNode; 3] = [&C, &B, &A];
-
-        let order = topo_sort::<3>(&NODES).expect("acyclic");
-        assert_eq!(order.len(), 3);
-        assert!(pos(&order, 2) < pos(&order, 1), "A before B");
-        assert!(pos(&order, 1) < pos(&order, 0), "B before C");
+        // A=0, B=1 dep A, C=2 dep B.
+        const DEPS: [&[u8]; 3] = [&[], &[0], &[1]];
+        const ORDER: [u8; 3] = topo_sort_const(&DEPS);
+        assert_eq!(ORDER, [0, 1, 2]);
     }
 
     #[test]
     fn diamond_puts_root_first_and_join_last() {
-        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[], noop);
-        static B: TaskNode = TaskNode::new("b", Mode::Terminate, &[&A], noop);
-        static C: TaskNode = TaskNode::new("c", Mode::Terminate, &[&A], noop);
-        static D: TaskNode = TaskNode::new("d", Mode::Terminate, &[&B, &C], noop);
-        // A=0, B=1, C=2, D=3.
-        static NODES: [&TaskNode; 4] = [&A, &B, &C, &D];
-
-        let order = topo_sort::<4>(&NODES).expect("acyclic");
-        assert_eq!(order.len(), 4);
-        assert_eq!(order[0], 0, "A (no deps) sorts first");
-        assert_eq!(*order.last().unwrap(), 3, "D (depends on all) sorts last");
-        assert!(pos(&order, 0) < pos(&order, 1), "A before B");
-        assert!(pos(&order, 0) < pos(&order, 2), "A before C");
-        assert!(pos(&order, 1) < pos(&order, 3), "B before D");
-        assert!(pos(&order, 2) < pos(&order, 3), "C before D");
+        // A=0; B=1 dep A; C=2 dep A; D=3 dep B,C.
+        const DEPS: [&[u8]; 4] = [&[], &[0], &[0], &[1, 2]];
+        const ORDER: [u8; 4] = topo_sort_const(&DEPS);
+        assert_eq!(ORDER[0], 0, "root first");
+        assert_eq!(ORDER[3], 3, "join last");
+        assert!(pos(&ORDER, 1) < pos(&ORDER, 3), "B before D");
+        assert!(pos(&ORDER, 2) < pos(&ORDER, 3), "C before D");
     }
 
     #[test]
     fn independent_nodes_all_present() {
-        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[], noop);
-        static B: TaskNode = TaskNode::new("b", Mode::Pause, &[], noop);
-        static NODES: [&TaskNode; 2] = [&A, &B];
-
-        let order = topo_sort::<2>(&NODES).expect("acyclic");
-        assert_eq!(order.len(), 2);
+        const DEPS: [&[u8]; 2] = [&[], &[]];
+        const ORDER: [u8; 2] = topo_sort_const(&DEPS);
+        assert!(ORDER.contains(&0) && ORDER.contains(&1));
     }
 
     #[test]
-    fn two_node_cycle_is_rejected() {
-        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[&B], noop);
-        static B: TaskNode = TaskNode::new("b", Mode::Terminate, &[&A], noop);
-        static NODES: [&TaskNode; 2] = [&A, &B];
-
-        assert!(matches!(topo_sort::<2>(&NODES), Err(BuildError::Cycle)));
+    fn unsorted_input_is_sorted() {
+        // Declared out of dependency order: node 0 depends on 1 and 2, node 2 on 1.
+        const DEPS: [&[u8]; 3] = [&[1, 2], &[], &[1]];
+        const ORDER: [u8; 3] = topo_sort_const(&DEPS);
+        assert!(pos(&ORDER, 1) < pos(&ORDER, 2), "1 before 2");
+        assert!(pos(&ORDER, 2) < pos(&ORDER, 0), "2 before 0");
     }
 
     #[test]
-    fn three_node_cycle_is_rejected() {
-        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[&C], noop);
-        static B: TaskNode = TaskNode::new("b", Mode::Terminate, &[&A], noop);
-        static C: TaskNode = TaskNode::new("c", Mode::Terminate, &[&B], noop);
-        static NODES: [&TaskNode; 3] = [&A, &B, &C];
-
-        assert!(matches!(topo_sort::<3>(&NODES), Err(BuildError::Cycle)));
+    fn evaluates_at_compile_time() {
+        // The sort runs in a `const` context, proving it is const-evaluable.
+        // (A cyclic table here would be a *compile* error, not a test failure.)
+        const DEPS: [&[u8]; 3] = [&[], &[0], &[1]];
+        const _: () = {
+            let order = topo_sort_const(&DEPS);
+            assert!(order[0] == 0 && order[1] == 1 && order[2] == 2);
+        };
     }
 
-    #[test]
-    fn supervisor_new_ok_on_acyclic_graph() {
-        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[], noop);
-        static B: TaskNode = TaskNode::new("b", Mode::Terminate, &[&A], noop);
-        static NODES: [&TaskNode; 2] = [&A, &B];
-
-        assert!(Supervisor::<2>::new(&NODES).is_ok());
-    }
-
-    #[test]
-    fn supervisor_new_errs_on_cyclic_graph() {
-        static A: TaskNode = TaskNode::new("a", Mode::Terminate, &[&B], noop);
-        static B: TaskNode = TaskNode::new("b", Mode::Terminate, &[&A], noop);
-        static NODES: [&TaskNode; 2] = [&A, &B];
-
-        assert!(matches!(
-            Supervisor::<2>::new(&NODES),
-            Err(BuildError::Cycle)
-        ));
-    }
+    // Uncommenting this must fail to compile ("dependency cycle"):
+    //   const CYCLE: [&[u8]; 2] = [&[1], &[0]];
+    //   const _BAD: [u8; 2] = topo_sort_const(&CYCLE);
 }

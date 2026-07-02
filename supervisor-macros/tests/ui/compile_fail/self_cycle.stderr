@@ -1,0 +1,18 @@
+error[E0080]: evaluation panicked: supervisor_graph!: dependency cycle
+ --> tests/ui/compile_fail/self_cycle.rs:6:1
+  |
+6 | / supervisor_graph! {
+7 | |     node A = Terminate, deps: [A];
+8 | | }
+  | |_^ evaluation of `GRAPH` failed inside this call
+  |
+note: inside `embassy_supervisor::topo_sort_const::<1>`
+ --> $RUST/core/src/panic.rs
+  |
+  |         $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: $WORKSPACE/supervisor/src/lib.rs
+  |
+  |         core::panic!("supervisor_graph!: dependency cycle");
+  |         --------------------------------------------------- in this macro invocation

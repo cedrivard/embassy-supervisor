@@ -1,0 +1,5 @@
+error: expected a task-fn path or a partial call like `f(extra_args)`
+ --> tests/ui/compile_fail/pool_closure.rs:8:16
+  |
+8 |         spawn: |_s| {},
+  |                ^^^^^^^

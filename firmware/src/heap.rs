@@ -18,8 +18,8 @@ static HEAP: LlffHeap = LlffHeap::empty();
 /// Two peaks bound this, balanced by design at ~28 KB:
 /// - **Serving:** net (~15 KB; `SOCKET_BUDGET = POOL_MAX + 1 = 5` — 4 worker sockets
 ///   + 1 DNS) + 4 http workers × 3.07 KB + one in-flight response `String` ≈ ~28 KB.
-///   (Only one `String` is ever live — small bodies fit the tx buffer so the write
-///   never yields.)
+///     (Only one `String` is ever live — small bodies fit the tx buffer so the write
+///     never yields.)
 /// - **OTA decode:** the OTA task drains the http pool *and* `net` (it decodes the
 ///   staged image from flash, not the network), so `ruzstd` decodes alone — ~28 KB
 ///   on-device for a `windowLog=11` image (measured 27.6 KB host peak; see the

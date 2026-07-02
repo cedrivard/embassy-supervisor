@@ -1,0 +1,5 @@
+error: expected `policy`
+  --> tests/ui/compile_fail/pool_missing_field.rs:10:9
+   |
+10 |         min: 1, max: 1;
+   |         ^^^

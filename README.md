@@ -92,11 +92,11 @@ flowchart TB
 
 ## What the supervisor adds
 
-`embassy-supervisor` is a small, `no_std`, `#![forbid(unsafe_code)]` library. You declare each task as
-a node with its dependencies and a spawn function; the supervisor does the rest:
+`embassy-supervisor` is a small, `no_std`, `#![forbid(unsafe_code)]` library. You declare the graph
+once with the `supervisor_graph!` macro; the supervisor does the rest:
 
-- **Dependency-ordered bring-up and reverse teardown** — a topological sort starts things in the
-  right order and tears dependents down before what they depend on.
+- **Dependency-ordered bring-up and reverse teardown** — the topological order is computed **at
+  compile time** (a dependency cycle is a *compile error*); bring-up follows it and teardown reverses it.
 - **Lifecycle modes** — `Terminate` (exit and respawn), `Pause` (park and resume while keeping a held
   resource like an open bus or socket), `OnDemand` (started on demand to scale a pool).
 - **Elastic pools** — grow workers under load, shrink them after a cooldown, within a fixed budget.
@@ -104,22 +104,18 @@ a node with its dependencies and a spawn function; the supervisor does the rest:
   pool) from anywhere; a stop cascades through dependents, a start through dependencies.
 
 ```rust
-use embassy_supervisor::{task_graph, Mode, Supervisor, TaskNode};
+use embassy_supervisor::{supervisor_graph, Supervisor};
 
-static NET: TaskNode = TaskNode::new("net", Mode::Terminate, &[], |s| {
-    s.spawn(net_task())?;
-    Ok(())
-});
-static APP: TaskNode = TaskNode::new("app", Mode::Terminate, &[&NET], |s| {
-    s.spawn(app_task())?;            // started only after `net` is up
-    Ok(())
-});
-
-task_graph! { &NET, &APP }           // -> ALL_NODES
+// One declaration generates the node `static`s and a single `GRAPH` bundling the
+// node slots, deps, and compile-time order. `app` depends on `net`, so it starts after it.
+supervisor_graph! {
+    node NET = Terminate, deps: [],    spawn: net_task;
+    node APP = Terminate, deps: [NET], spawn: app_task;
+}
 
 // in your supervisor task:
-let sup = Supervisor::new(&ALL_NODES).expect("no dependency cycle");
-sup.start(spawner).expect("spawn");  // brings up net, then app
+let sup = Supervisor::new(&GRAPH);                    // infallible — a cycle is a compile error
+sup.start(spawner).expect("spawn");                   // brings up net, then app
 ```
 
 The library is feature-gated — the control plane and pools are optional, so a minimal build is just

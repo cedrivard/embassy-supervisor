@@ -1,0 +1,13 @@
+error: supervisor_graph!: 257 node slots declared, but at most 256 are supported (including pool members) — graph indices are `u8`
+   --> tests/ui/compile_fail/too_many_nodes.rs:8:1
+    |
+  8 | / supervisor_graph! {
+  9 | |     node N000 = Terminate, deps: [];
+ 10 | |     node N001 = Terminate, deps: [];
+ 11 | |     node N002 = Terminate, deps: [];
+...   |
+265 | |     node N256 = Terminate, deps: [];
+266 | | }
+    | |_^
+    |
+    = note: this error originates in the macro `supervisor_graph` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -179,21 +179,14 @@ pub trait Pool: Sync {
 impl<P: ScalingPolicy + Sync> Pool for ElasticPool<P> {
     fn evaluate(&self, now: Instant) -> PoolAction {
         match self.policy.decide(self.stats(), now) {
-            // Grow only a candidate that is OnDemand, down, **not manually
-            // disabled**, and whose deps are all running. The disabled check is
-            // what keeps a manually-stopped pool from being re-grown by the
-            // policy; the deps check keeps the pool from spawning a worker while
-            // one of its dependencies is down (e.g. after a manual stop of a
-            // dependency cascaded the pool down).
+            // Grow a candidate that is OnDemand, down, and **not manually
+            // disabled** (the disabled check keeps a manually-stopped pool from
+            // being re-grown by the policy). Dependency-readiness is checked in
+            // `drive_pools` via `Supervisor::deps_running`.
             ScaleAction::Grow => self
                 .nodes
                 .iter()
-                .find(|n| {
-                    matches!(n.mode, Mode::OnDemand)
-                        && !n.is_running()
-                        && !n.is_disabled()
-                        && n.deps.iter().all(|d| d.is_running())
-                })
+                .find(|n| matches!(n.mode, Mode::OnDemand) && !n.is_running() && !n.is_disabled())
                 .map_or(PoolAction::None, |n| PoolAction::Start(n)),
             ScaleAction::Shrink => self
                 .nodes
@@ -226,8 +219,11 @@ async fn drive_pools<const N: usize>(
     for pool in pools {
         match pool.evaluate(now) {
             PoolAction::Start(n) => {
+                // Only grow when the candidate's dependencies are up.
                 // SpawnError::Busy at the pool ceiling → can't grow, no-op.
-                let _ = sup.start_node(n, spawner);
+                if sup.deps_running(n) {
+                    let _ = sup.start_node(n, spawner);
+                }
             }
             PoolAction::Stop(n) => sup.stop_node(n).await,
             PoolAction::None => {}
@@ -250,7 +246,7 @@ async fn deadline_timer(deadline: Option<Instant>) {
 }
 
 impl<const N: usize> Supervisor<N> {
-    /// Drive the registered elastic pools (from `with_pools`) forever: run their
+    /// Drive the registered elastic pools (from `GRAPH.pools`) forever: run their
     /// policies, then park until the next status signal (`SCALE_REQ`) or a pool's
     /// deferred deadline. Never completes — meant to be `select`ed against the
     /// application's control / teardown futures in the supervisor task. When
@@ -361,9 +357,9 @@ mod tests {
 
     #[test]
     fn pool_grows_a_down_member_when_saturated() {
-        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, &[], noop);
-        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, &[], noop);
-        static N2: TaskNode = TaskNode::new("p2", Mode::OnDemand, &[], noop);
+        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, Some(noop), false);
+        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, Some(noop), false);
+        static N2: TaskNode = TaskNode::new("p2", Mode::OnDemand, Some(noop), false);
         static POOL: ElasticPool<DeferredShrink> = ElasticPool {
             nodes: &[&N0, &N1, &N2],
             min: 1,
@@ -382,9 +378,9 @@ mod tests {
 
     #[test]
     fn pool_shrinks_an_idle_member_after_cooldown() {
-        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, &[], noop);
-        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, &[], noop);
-        static N2: TaskNode = TaskNode::new("p2", Mode::OnDemand, &[], noop);
+        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, Some(noop), false);
+        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, Some(noop), false);
+        static N2: TaskNode = TaskNode::new("p2", Mode::OnDemand, Some(noop), false);
         static POOL: ElasticPool<DeferredShrink> = ElasticPool {
             nodes: &[&N0, &N1, &N2],
             min: 1,
@@ -415,8 +411,8 @@ mod tests {
 
     #[test]
     fn pool_does_not_grow_a_disabled_member() {
-        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, &[], noop);
-        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, &[], noop);
+        static N0: TaskNode = TaskNode::new("p0", Mode::Terminate, Some(noop), false);
+        static N1: TaskNode = TaskNode::new("p1", Mode::OnDemand, Some(noop), false);
         static POOL: ElasticPool<DeferredShrink> = ElasticPool {
             nodes: &[&N0, &N1],
             min: 1,

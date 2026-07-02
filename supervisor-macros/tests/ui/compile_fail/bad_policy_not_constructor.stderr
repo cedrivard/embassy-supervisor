@@ -1,0 +1,5 @@
+error: pool `policy:` must be a `Type::new(..)` constructor (e.g. `DeferredShrink::new(..)`), or give the type explicitly: `policy: <Type> = <expr>`
+  --> tests/ui/compile_fail/bad_policy_not_constructor.rs:11:17
+   |
+11 |         policy: make_policy(dur),
+   |                 ^^^^^^^^^^^^^^^^

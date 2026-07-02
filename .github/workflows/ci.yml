@@ -27,6 +27,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # rust-src changes how rustc renders const-eval panics whose frames land in
+          # core (with the source it prints the annotated snippet; without it, a bare
+          # `= note:` fallback). The trybuild `.stderr` snapshots for the dependency-
+          # cycle cases are blessed with the source available, so CI must match.
+          components: rust-src
       - uses: Swatinem/rust-cache@v2
       # `defmt` is an embedded-logging feature: it needs a `#[global_logger]` to
       # link a binary, so it cannot run in a host test. Its compilation is covered
@@ -34,6 +40,10 @@ jobs:
       # check-only) jobs; here we run the functional matrix (control + pool) without it.
       - run: cargo test -p embassy-supervisor --target $HOST
       - run: cargo test -p embassy-supervisor --target $HOST --no-default-features
+      # `supervisor_graph!` UI tests (trybuild): compile-fail cases lock the macro's
+      # error contracts (cycle, unknown dep, ...); compile-pass cases run the generated
+      # graph. Host-only — trybuild compiles real graphs — so `--target $HOST`.
+      - run: cargo test -p embassy-supervisor-macros --target $HOST
 
   # `no_std` guard: the crate must still cross-compile for the MCU target (the
   # pinned default) across the feature matrix.
@@ -59,8 +69,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt -p embassy-supervisor -- --check
+      - run: cargo fmt -p embassy-supervisor -p embassy-supervisor-macros -- --check
       - run: cargo clippy -p embassy-supervisor --target $HOST --all-features -- -D warnings
+      # The `supervisor_graph!` proc-macro crate (host-only build).
+      - run: cargo clippy -p embassy-supervisor-macros -- -D warnings
 
   docs:
     name: doc
