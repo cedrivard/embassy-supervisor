@@ -40,6 +40,7 @@ jobs:
       # check-only) jobs; here we run the functional matrix (control + pool) without it.
       - run: cargo test -p embassy-supervisor --target $HOST
       - run: cargo test -p embassy-supervisor --target $HOST --no-default-features
+      - run: cargo test -p embassy-supervisor --target $HOST --features trace-hooks
       # `supervisor_graph!` UI tests (trybuild): compile-fail cases lock the macro's
       # error contracts (cycle, unknown dep, ...); compile-pass cases run the generated
       # graph. Host-only — trybuild compiles real graphs — so `--target $HOST`.
@@ -58,7 +59,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p embassy-supervisor
       - run: cargo build -p embassy-supervisor --no-default-features
+      - run: cargo build -p embassy-supervisor --features trace
       - run: cargo build -p embassy-supervisor --all-features
+
+  # Canary against embassy's main branch (allow-failure): the executor's trace-hook
+  # API is documented as unstable, so this job builds the trace feature with
+  # embassy-executor patched to git.
+  trace-canary:
+    name: trace vs embassy git (canary)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Patch embassy-executor to git main
+        run: |
+          printf '\n[patch.crates-io]\nembassy-executor = { git = "https://github.com/embassy-rs/embassy" }\n' >> Cargo.toml
+          cargo update -p embassy-executor
+      - run: cargo build -p embassy-supervisor --target $HOST --features trace-hooks,trace-names
 
   lint:
     name: fmt + clippy

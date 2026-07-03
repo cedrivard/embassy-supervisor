@@ -6,6 +6,15 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [Unreleased]
+
+### Added
+- Forwarded trace features: under `trace` the generated spawn glue captures each
+  `SpawnToken`'s task id into its node (`set_task_id`); under `trace-names` it also stamps
+  the node name into the task Metadata; under `trace-hooks` the macro defines the seven
+  `_embassy_trace_*` hook symbols at the graph declaration site (the supervisor crate is
+  `forbid(unsafe_code)` and cannot; requires an edition-2024 consumer).
+
 ## [0.1.0] - 2026-07-01
 
 First published version (previously an unpublished workspace member).

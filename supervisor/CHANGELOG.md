@@ -6,6 +6,18 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 
 ## [Unreleased]
 
+### Added
+- Trace-hook observability (opt-in features): `trace` — the supervisor consumes
+  embassy-executor's `_embassy_trace_*` instrumentation, mapping task ids to nodes via the
+  generated spawn glue and accounting per-node poll time / poll count / max-poll watermark,
+  per-executor idle time, and live stall detection (`trace::current_task` /
+  `trace::stalled_task`), and a per-executor time decomposition (`trace::executor_stats`:
+  idle / in-poll / overhead / unsupervised-task share, poll and pass counters);
+  `trace-hooks` — `supervisor_graph!` also defines the hook symbols
+  at the declaration site; `trace-names` — node names are stamped into task Metadata for
+  external consumers. Counters are wrapping u32 ticks (sample-and-diff); accounting is
+  preemption-naive and capped at 4 executors (documented).
+
 ## [0.2.0] - 2026-07-01
 
 The graph moved to compile time, and the `supervisor_graph!` proc-macro shipped in the

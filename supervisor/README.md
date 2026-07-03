@@ -185,9 +185,41 @@ battery-powered sensor node):
 | `pool`    |    ✓    | elastic worker pools (`ElasticPool`, `run_pools`, `GRAPH.pools`) |
 | `macros`  |    ✓    | the `supervisor_graph!` graph-declaration macro |
 | `defmt`   |         | route the supervisor's logs through `defmt` (otherwise the log macros are no-ops) |
+| `trace`   |         | trace-hook observability: per-node CPU time / poll counts / max-poll watermark, executor idle time, stall detection (see below) |
+| `trace-hooks` |     | batteries-included: the graph declaration also defines the `_embassy_trace_*` hook symbols |
+| `trace-names` |     | stamp node names into task Metadata for external tooling (SystemView, debuggers) |
 
 `default-features = false` gives a minimal core that only does dependency-ordered
 bring-up/teardown — dropping the control plane and pools trims flash and a couple of statics.
+
+## Observability (feature `trace`)
+
+embassy-executor ships raw `_embassy_trace_*` instrumentation hooks that identify tasks only
+by an opaque `u32`. The `trace` feature makes the supervisor their batteries-included
+consumer: the generated spawn glue captures each `SpawnToken`'s id into its node, so every
+executor poll is attributed to a *named* node — correctly across respawns.
+
+- **Per node**: accumulated poll time (`exec_ticks`), poll count, and the longest single
+  poll ever (`max_poll_ticks`) — the "never yields" watermark that names a task that hogged
+  its executor, even after the fact.
+- **Per executor**: a full time decomposition via `trace::executor_stats` — idle, in-poll
+  (every task poll, supervised or not), and by subtraction the **executor overhead**
+  (scheduler bookkeeping + hook cost + ISRs between polls) and the unsupervised-task
+  share — plus poll/pass counters and the in-flight poll (`trace::current_task` /
+  `trace::stalled_task(executor, threshold)` for live blocked-task detection from a
+  context that can still run).
+- Counters are wrapping `u32` ticks: sample twice, `wrapping_sub`, divide — the in-repo
+  firmware's dashboard renders live per-node CPU% and executor busy% exactly this way.
+
+`trace-hooks` additionally emits the seven hook symbol definitions at the graph declaration
+site (exactly one set may exist per binary; define your own and forward to the
+`trace::on_*` recorders instead if you need custom hooks). Limitations: accounting is
+preemption-naive (an interrupt executor's or hardware ISR's time lands in the poll it
+preempts), executor busy% exceeds the per-node sum by a per-poll accounting gap (executor
+bookkeeping + the hooks' own cost, ~10 µs/poll — it grows with poll rate), at most 4
+executors are tracked, and parked / closure-spawned nodes register via
+`TaskNode::set_task_id`. The hook API is an executor implementation detail — this feature
+tracks the executor minor version the crate already pins.
 
 ## `no_std` / MSRV
 

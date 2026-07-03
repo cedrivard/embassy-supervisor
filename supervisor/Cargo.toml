@@ -41,6 +41,21 @@ pool = ["embassy-supervisor-macros?/pool"]
 defmt = ["dep:defmt"]
 # Re-export the `supervisor_graph!` proc-macro.
 macros = ["dep:embassy-supervisor-macros"]
+# Trace-hook observability: the `trace` module (task-id -> node registry,
+# per-node exec-tick/poll/max-poll accounting, per-executor idle accounting,
+# stall detection). Recorders only — the `_embassy_trace_*` hook SYMBOLS are
+# gated separately (see `trace-hooks`) so an application with its own hooks can
+# forward to the recorders manually, and so the recorders stay host-testable.
+trace = ["embassy-executor/trace", "embassy-supervisor-macros?/trace"]
+# Batteries-included: `supervisor_graph!` defines the seven `no_mangle`
+# `_embassy_trace_*` symbols at the graph declaration site. Exactly ONE
+# definition may exist per binary: enable this OR define your own hooks and
+# forward to the `trace` recorders.
+trace-hooks = ["trace", "embassy-supervisor-macros?/trace-hooks"]
+# Stamp each node's name into its task Metadata at spawn, so external consumers
+# (rtos-trace/SystemView, debuggers) see node names instead of opaque ids. Separate
+# from `trace` because `metadata-name` grows every TaskStorage in the binary.
+trace-names = ["trace", "embassy-executor/metadata-name", "embassy-supervisor-macros?/trace-names"]
 
 [package.metadata.docs.rs]
 # Document every feature (control/pool/defmt) on docs.rs.
@@ -58,3 +73,8 @@ all-features = true
 [target.'cfg(not(target_os = "none"))'.dev-dependencies]
 critical-section = { version = "1", features = ["std"] }
 embassy-time = { version = "0.5", features = ["mock-driver"] }
+
+# Host tests for the `trace` recorders.
+[[test]]
+name = "trace"
+required-features = ["trace-hooks", "macros"]

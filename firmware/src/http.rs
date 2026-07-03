@@ -65,25 +65,44 @@ button{cursor:pointer}</style>\
 async function ctl(n,o){await fetch('/api/control?node='+n+'&op='+o,{method:'POST'});\
 load();setTimeout(load,400);}\
 async function hb(ms){await fetch('/api/heartbeat?ms='+ms,{method:'POST'});}\
+/* trace counters are raw wrapping u32 ticks: keep the previous sample and diff \
+(>>>0 = wrap-safe) to turn them into rates; max_poll converts via tick_hz. */\
+let prev=null;const sub=(a,b)=>(a-b)>>>0;\
 async function load(){let d=await (await fetch('/api/tasks')).json();\
 let f=d.heap_free,tot=d.heap_total,u=tot-f;\
-document.getElementById('heap').textContent=\
-'heap: '+u+' used / '+f+' free / '+tot+' total B ('+Math.round(100*u/tot)+'% used)';\
-let h='<tr><th>task<th>mode<th>state<th>deps<th>';\
+let hd='heap: '+u+' used / '+f+' free / '+tot+' total B ('+Math.round(100*u/tot)+'% used)';\
+if(prev&&prev.x)for(let e of d.executors||[]){let p=prev.x[e.id];\
+if(p!=null){let dt=sub(d.now_ticks,prev.now);\
+let busy=Math.max(0,100*(1-sub(e.idle_ticks,p.i)/dt));\
+let poll=100*sub(e.exec_ticks,p.e)/dt;\
+hd+=' | executor '+(e.id>>>0).toString(16)+': '+busy.toFixed(1)+'% busy ('+\
+poll.toFixed(1)+'% in-poll, '+Math.max(0,busy-poll).toFixed(1)+'% overhead, '+\
+Math.round(sub(e.polls,p.p)/(dt/d.tick_hz))+' polls/s)';}}\
+document.getElementById('heap').textContent=hd;\
+const cpu=(n,tk)=>(!prev||prev.m[n]==null)?'-':\
+(100*sub(tk,prev.m[n])/sub(d.now_ticks,prev.now)).toFixed(1)+'%';\
+const us=t=>Math.round(t*1e6/d.tick_hz)+'us';\
+let h='<tr><th>task<th>mode<th>state<th>cpu<th>max poll<th>deps<th>';\
 let pool=null;\
 for(let t of d.tasks){\
 if(/^http[0-9]+$/.test(t.name)){\
-pool=pool||{n:0,r:0,b:0,dis:true,deps:t.deps};\
-pool.n++;if(t.running)pool.r++;if(t.busy)pool.b++;if(!t.disabled)pool.dis=false;continue;}\
+pool=pool||{n:0,r:0,b:0,dis:true,deps:t.deps,e:0,mp:0};\
+pool.n++;if(t.running)pool.r++;if(t.busy)pool.b++;if(!t.disabled)pool.dis=false;\
+pool.e=(pool.e+t.exec_ticks)>>>0;pool.mp=Math.max(pool.mp,t.max_poll_ticks);continue;}\
 let st=t.disabled?'disabled':t.running?(t.busy?'busy':'running'):'stopped';\
 let pause=t.mode=='pause';let act=t.disabled||!t.running;\
 let op=act?(pause?'resume':'start'):(pause?'pause':'stop');\
-h+='<tr><td>'+t.name+'<td>'+t.mode+'<td>'+st+'<td>'+t.deps.join(',')+\
+h+='<tr><td>'+t.name+'<td>'+t.mode+'<td>'+st+'<td>'+cpu(t.name,t.exec_ticks)+\
+'<td>'+us(t.max_poll_ticks)+'<td>'+t.deps.join(',')+\
 '<td><button onclick=\"ctl(\\''+t.name+'\\',\\''+op+'\\')\">'+op+'</button>';}\
 if(pool){let op=pool.dis?'start':'stop';\
-h+='<tr><td>http (pool)<td>elastic<td>'+pool.r+'/'+pool.n+' up, '+pool.b+' busy<td>'+pool.deps.join(',')+\
+h+='<tr><td>http (pool)<td>elastic<td>'+pool.r+'/'+pool.n+' up, '+pool.b+' busy<td>'+\
+cpu('_pool',pool.e)+'<td>'+us(pool.mp)+'<td>'+pool.deps.join(',')+\
 '<td><button onclick=\"ctl(\\'http0\\',\\''+op+'\\')\">'+op+'</button>';}\
-document.getElementById('t').innerHTML=h;}\
+document.getElementById('t').innerHTML=h;\
+let m={};for(let t of d.tasks)m[t.name]=t.exec_ticks;if(pool)m['_pool']=pool.e;\
+let x={};for(let e of d.executors||[])x[e.id]={i:e.idle_ticks,e:e.exec_ticks,p:e.polls};\
+prev={now:d.now_ticks,m:m,x:x};}\
 load();setInterval(load,2000);\
 </script>";
 
@@ -96,7 +115,7 @@ pub(crate) async fn http_task(node: &'static TaskNode) {
     // exits (pool shrink or teardown). So the heap budget tracks the live pool
     // size: every grow consumes a buffer set, every shrink returns one.
     let mut rx = alloc::vec![0u8; 1024];
-    let mut tx = alloc::vec![0u8; 1024];
+    let mut tx = alloc::vec![0u8; 1440];
     let mut req = alloc::vec![0u8; 1024];
 
     loop {
@@ -159,7 +178,7 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &Tas
             ("GET", "/api/tasks") => {
                 // Built on the heap (freed at the end of this match) so the worker
                 // future stays small — the JSON body is never inline in the future.
-                let mut body = String::with_capacity(512);
+                let mut body = String::with_capacity(1408);
                 build_tasks_json(&mut body);
                 send(socket, "application/json", &body, keep).await;
             }
@@ -252,13 +271,41 @@ fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
 }
 
 /// Build the task-state JSON straight from the static graph + each node's atomics.
+///
+/// The trace counters are emitted RAW (wrapping tick counts + `tick_hz` +
+/// `now_ticks`): the dashboard keeps its previous sample and computes CPU% /
+/// idle% from the deltas, so the firmware holds no windowing state.
 fn build_tasks_json(json: &mut String) {
     let _ = write!(
         json,
-        "{{\"heap_free\":{},\"heap_total\":{},\"tasks\":[",
+        "{{\"heap_free\":{},\"heap_total\":{},\"tick_hz\":{},\"now_ticks\":{},\"executors\":[",
         crate::heap::free_bytes(),
-        crate::heap::HEAP_SIZE
+        crate::heap::HEAP_SIZE,
+        embassy_time::TICK_HZ,
+        embassy_time::Instant::now().as_ticks() as u32,
     );
+    let mut first = true;
+    for id in embassy_supervisor::trace::executors() {
+        if id == 0 {
+            continue; // free slot
+        }
+        let Some(st) = embassy_supervisor::trace::executor_stats(id) else {
+            continue;
+        };
+        if !first {
+            json.push(',');
+        }
+        first = false;
+        // idle/exec split the executor's time three ways for the dashboard:
+        // idle, in-poll (exec), and overhead = busy - exec (scheduler + hooks
+        // + ISRs between polls). polls/passes give the poll rate.
+        let _ = write!(
+            json,
+            "{{\"id\":{},\"idle_ticks\":{},\"exec_ticks\":{},\"polls\":{},\"passes\":{}}}",
+            id, st.idle_ticks, st.exec_ticks, st.polls, st.passes
+        );
+    }
+    json.push_str("],\"tasks\":[");
     let mut first = true;
     for (i, slot) in crate::GRAPH.nodes.iter().enumerate() {
         // Skip a `#[cfg]`-ed-out node slot (`None`).
@@ -269,14 +316,20 @@ fn build_tasks_json(json: &mut String) {
             json.push(',');
         }
         first = false;
+        // Raw wrapping trace counters (see the fn doc): the dashboard diffs
+        // consecutive samples for CPU%, and converts max_poll to µs via tick_hz.
         let _ = write!(
             json,
-            "{{\"name\":\"{}\",\"mode\":\"{}\",\"running\":{},\"busy\":{},\"disabled\":{},\"deps\":[",
+            "{{\"name\":\"{}\",\"mode\":\"{}\",\"running\":{},\"busy\":{},\"disabled\":{},\
+             \"exec_ticks\":{},\"polls\":{},\"max_poll_ticks\":{},\"deps\":[",
             node.name,
             node.mode.as_str(),
             node.is_running(),
             node.is_busy(),
-            node.is_disabled()
+            node.is_disabled(),
+            node.exec_ticks(),
+            node.poll_count(),
+            node.max_poll_ticks()
         );
         // `GRAPH.deps[i]` lists the indices of node `i`'s dependencies (the graph's
         // edges, from `supervisor_graph!`); cfg-aware, so each resolves to a present node.

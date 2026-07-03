@@ -39,6 +39,14 @@
 //! `Supervisor::new`. The backing tables are private; read them through `GRAPH.nodes`
 //! / `GRAPH.deps` / `GRAPH.order` / `GRAPH.pools` (node count is `GRAPH.nodes.len()`).
 //!
+//! With the supervisor's `trace` feature (forwarded here) the generated spawn glue
+//! also captures each `SpawnToken`'s task id into its node (`set_task_id`), and
+//! `trace-names` stamps the node name into the task Metadata. With `trace-hooks`
+//! the macro additionally defines the seven `_embassy_trace_*` hook symbols at the
+//! declaration site (the supervisor crate is `forbid(unsafe_code)` and cannot),
+//! forwarding to the supervisor's `trace` recorders — requires an edition-2024
+//! consumer, and exactly one graph declaration (or hook set) per binary.
+//!
 //! Types are referenced absolutely (`::embassy_supervisor::…`), so the consuming
 //! crate must depend on `embassy-supervisor` under its real name (not aliased).
 
@@ -351,16 +359,45 @@ fn node_spawn(
         // given args); generate `|s| { s.spawn(<task>(&NODE, ..)?); Ok(()) }`.
         Some(e @ (Expr::Path(_) | Expr::Call(_))) => {
             let call = inject_node_call(e, &quote!(&#ident))?;
+            let stmts = spawn_stmts(&call, &quote!(&#ident));
             quote!(::core::option::Option::Some(
                 (|s| {
-                    s.spawn(#call?);
+                    #stmts
                     ::core::result::Result::Ok(())
                 }) as #spawn_fn
             ))
         }
         // Anything else (a closure, or a ready spawn fn) is emitted verbatim.
+        // NOTE: with the `trace` feature such a node is not auto-mapped — the
+        // closure owns the SpawnToken; call `set_task_id` in it yourself.
         Some(e) => quote!(::core::option::Option::Some((#e) as #spawn_fn)),
     })
+}
+
+/// The spawn statement(s) for the generated glue. Plain `s.spawn(<call>?)`
+/// normally; with the `trace` feature the `SpawnToken` is bound first so its task
+/// id can be captured into the node (`set_task_id`) — the id→node mapping the
+/// supervisor's `trace` recorders resolve against (in embassy-executor 0.10 the
+/// task-fn call returns `Result<SpawnToken, SpawnError>` and `Spawner::spawn`
+/// itself is infallible, so the token is available between the two). Under
+/// `trace-names` the node's name is also stamped into the task Metadata so
+/// external consumers (rtos-trace/SystemView) see names instead of raw ids.
+fn spawn_stmts(call: &TokenStream2, node_ref: &TokenStream2) -> TokenStream2 {
+    if cfg!(feature = "trace") {
+        let set_name = if cfg!(feature = "trace-names") {
+            quote!(__token.metadata().set_name((#node_ref).name);)
+        } else {
+            quote!()
+        };
+        quote! {
+            let __token = #call?;
+            (#node_ref).set_task_id(__token.id());
+            #set_name
+            s.spawn(__token);
+        }
+    } else {
+        quote!(s.spawn(#call?);)
+    }
 }
 
 /// Emit a `node`: its `pub static #ident: TaskNode` definition and its `Slot`. The
@@ -429,7 +466,9 @@ fn emit_pool(
     // Build member `I`'s spawn call from the `spawn:` expr, injecting
     // `&POOL[I]` as the first argument (see `inject_node_call`).
     let call = inject_node_call(&p.spawn, &quote!(&#ident[I]))?;
-    // Per-member spawn fn: a generated `spawn_<pool>::<I>` wrapper.
+    // Per-member spawn fn: a generated `spawn_<pool>::<I>` wrapper. Same optional
+    // trace capture as a node's closure, against member `I`'s slot.
+    let pool_spawn_stmts = spawn_stmts(&call, &quote!(&#ident[I]));
     let wrapper = format_ident!("spawn_{}", lname);
     let mut defs: Vec<TokenStream2> = Vec::new();
     defs.push(quote! {
@@ -437,7 +476,7 @@ fn emit_pool(
         fn #wrapper<const I: usize>(
             s: ::embassy_executor::Spawner,
         ) -> ::core::result::Result<(), ::embassy_executor::SpawnError> {
-            s.spawn(#call?);
+            #pool_spawn_stmts
             ::core::result::Result::Ok(())
         }
     });
@@ -611,6 +650,45 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
         quote!()
     };
 
+    // embassy-executor's trace hooks (declared `unsafe extern "Rust"` in the
+    // executor), defined once here at the graph declaration site — the supervisor
+    // crate is `forbid(unsafe_code)` and cannot carry `#[unsafe(no_mangle)]` items.
+    // They forward to the supervisor's `trace` recorders. `task_new` and
+    // `task_ready_begin` carry nothing the recorders need (the id→node mapping
+    // comes from the spawn glue above), so they are no-ops. Exactly one definition
+    // of each may exist per binary: enable `trace-hooks` OR write your own set.
+    // Requires an edition-2024 consumer (`#[unsafe(no_mangle)]` syntax).
+    let trace_hooks = if cfg!(feature = "trace-hooks") {
+        quote! {
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_poll_start(executor_id: u32) {
+                #cr::trace::on_poll_start(executor_id);
+            }
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_task_new(_executor_id: u32, _task_id: u32) {}
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_task_end(executor_id: u32, task_id: u32) {
+                #cr::trace::on_task_end(executor_id, task_id);
+            }
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_task_exec_begin(executor_id: u32, task_id: u32) {
+                #cr::trace::on_task_exec_begin(executor_id, task_id);
+            }
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_task_exec_end(executor_id: u32, task_id: u32) {
+                #cr::trace::on_task_exec_end(executor_id, task_id);
+            }
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_task_ready_begin(_executor_id: u32, _task_id: u32) {}
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_executor_idle(executor_id: u32) {
+                #cr::trace::on_executor_idle(executor_id);
+            }
+        }
+    } else {
+        quote!()
+    };
+
     Ok(quote! {
         #(#defs)*
 
@@ -628,6 +706,8 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
             order: #cr::topo_sort_const(&DEPS),
             #pools_field
         };
+
+        #trace_hooks
     })
 }
 

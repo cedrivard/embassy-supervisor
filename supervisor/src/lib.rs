@@ -111,6 +111,8 @@ use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::Timer;
 use portable_atomic::AtomicBool;
+#[cfg(feature = "trace")]
+use portable_atomic::AtomicU32;
 
 // ─── Scale-request signal (task → supervisor) ──────────────────────────────
 //
@@ -292,6 +294,26 @@ pub struct TaskHandle {
     /// set, `deactivate` will not pull the node into a transitive-dependent teardown.
     /// Self-managed, so `reset()` leaves it (the node clears it itself when done).
     detached: AtomicBool,
+    /// The executor task id currently running this node (`TaskRef::id()`, captured
+    /// from the `SpawnToken` by the macro's spawn glue). `0` = unknown (not yet
+    /// spawned, or a parked/closure-spawned node that never registered). Overwritten
+    /// on every (re)spawn, so — unlike an external tracker — it stays correct across
+    /// respawns without any unlinking.
+    #[cfg(feature = "trace")]
+    task_id: AtomicU32,
+    /// Accumulated executor-poll time for this node, in embassy-time ticks,
+    /// wrapping. Consumers sample twice and `wrapping_sub` to get a rate; the
+    /// crate does no windowing.
+    #[cfg(feature = "trace")]
+    exec_ticks: AtomicU32,
+    /// Number of executor polls of this node, wrapping.
+    #[cfg(feature = "trace")]
+    polls: AtomicU32,
+    /// Longest single poll ever observed, in ticks — the "never yields" watermark.
+    /// A large value names the node that hogged the executor even after the fact,
+    /// which a live check cannot do from the blocked executor itself.
+    #[cfg(feature = "trace")]
+    max_poll_ticks: AtomicU32,
 }
 
 impl TaskHandle {
@@ -306,6 +328,14 @@ impl TaskHandle {
             resume_wake: Signal::new(),
             disabled: AtomicBool::new(disabled_at_boot),
             detached: AtomicBool::new(false),
+            #[cfg(feature = "trace")]
+            task_id: AtomicU32::new(0),
+            #[cfg(feature = "trace")]
+            exec_ticks: AtomicU32::new(0),
+            #[cfg(feature = "trace")]
+            polls: AtomicU32::new(0),
+            #[cfg(feature = "trace")]
+            max_poll_ticks: AtomicU32::new(0),
         }
     }
 }
@@ -444,6 +474,44 @@ impl TaskNode {
     /// True while this node is detached from dependency-cascade teardown.
     pub fn is_detached(&self) -> bool {
         self.handle.detached.load(Ordering::Acquire)
+    }
+
+    /// Record the executor task id (`SpawnToken::id()` / `TaskRef::id()`) currently
+    /// backing this node, so the [`trace`] recorders can attribute executor polls to
+    /// it. Called automatically by the spawn glue `supervisor_graph!` generates;
+    /// call it manually only for a **parked** node (no `spawn:`) or a verbatim-closure
+    /// `spawn:`, where the macro cannot see the token. Overwrites on every (re)spawn.
+    #[cfg(feature = "trace")]
+    pub fn set_task_id(&self, id: u32) {
+        self.handle.task_id.store(id, Ordering::Release);
+    }
+
+    /// The executor task id last recorded by [`set_task_id`](Self::set_task_id)
+    /// (`0` = never spawned / not registered).
+    #[cfg(feature = "trace")]
+    pub fn task_id(&self) -> u32 {
+        self.handle.task_id.load(Ordering::Acquire)
+    }
+
+    /// Accumulated executor-poll time of this node, in embassy-time ticks. Wrapping:
+    /// sample twice and `wrapping_sub` the readings to get a rate over a window.
+    #[cfg(feature = "trace")]
+    pub fn exec_ticks(&self) -> u32 {
+        self.handle.exec_ticks.load(Ordering::Relaxed)
+    }
+
+    /// Number of executor polls of this node (wrapping counter).
+    #[cfg(feature = "trace")]
+    pub fn poll_count(&self) -> u32 {
+        self.handle.polls.load(Ordering::Relaxed)
+    }
+
+    /// Longest single executor poll of this node ever observed, in ticks — the
+    /// "never yields" watermark. A poll is expected to be microseconds; a large
+    /// value names the node that hogged its executor, even after the fact.
+    #[cfg(feature = "trace")]
+    pub fn max_poll_ticks(&self) -> u32 {
+        self.handle.max_poll_ticks.load(Ordering::Relaxed)
     }
 
     // ── Supervisor-side API ──────────────────────────────────────────────
@@ -586,6 +654,10 @@ impl<const N: usize> Supervisor<N> {
     /// `main()` (with hardware handles main owns); it's still marked `running`
     /// here. Disabled nodes, and `#[cfg]`-ed-out slots, are skipped.
     pub fn start(&self, spawner: Spawner) -> Result<(), SpawnError> {
+        // Register the node slots with the trace recorders.
+        #[cfg(feature = "trace")]
+        trace::register_graph(self.nodes);
+
         for i in self.order.iter() {
             let Some(node) = self.nodes[*i as usize] else {
                 continue;
@@ -965,6 +1037,9 @@ pub const fn topo_sort_const<const N: usize>(deps: &[&'static [u8]; N]) -> [u8; 
 mod pool;
 #[cfg(feature = "pool")]
 pub use pool::*;
+
+#[cfg(feature = "trace")]
+pub mod trace;
 
 /// Declare a supervised task graph and compute its topological order at compile
 /// time (single source of nodes, deps, pool, and order). See the

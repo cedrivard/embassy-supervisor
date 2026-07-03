@@ -83,8 +83,32 @@ async fn app_supervisor(spawner: Spawner) {
 async fn watchdog_feed() {
     let mut wd =
         embassy_rp::watchdog::Watchdog::new(unsafe { embassy_rp::peripherals::WATCHDOG::steal() });
+    // Blocked-task detector (feature `trace`). Two complementary checks:
+    // - `stalled_task`: an in-flight poll > 100 ms. On this single-executor
+    //   firmware it can rarely fire (a blocked executor also blocks this task;
+    //   it is here as the pattern for an ISR-priority observer), so additionally:
+    // - `max_poll_ticks` watermark: post-hoc, names any node whose longest single
+    //   poll exceeded the threshold — works even when observed after the fact.
+    //   Warn only on increase to avoid log spam (16 slots cover this graph).
+    const STALL_TICKS: u32 = (embassy_time::TICK_HZ / 10) as u32; // 100 ms
+    let mut warned = [0u32; 16];
     loop {
         wd.feed(embassy_time::Duration::from_secs(8)); // `feed` also sets the timeout
+        for id in embassy_supervisor::trace::executors() {
+            if id == 0 {
+                continue;
+            }
+            if let Some((node, ticks)) = embassy_supervisor::trace::stalled_task(id, STALL_TICKS) {
+                defmt::warn!("trace: {} has been polling for {} ticks", node.name, ticks);
+            }
+        }
+        for (node, w) in GRAPH.nodes.iter().flatten().zip(warned.iter_mut()) {
+            let max = node.max_poll_ticks();
+            if max > STALL_TICKS && max > *w {
+                *w = max;
+                defmt::warn!("trace: {} once held the executor {} ticks", node.name, max);
+            }
+        }
         embassy_time::Timer::after(embassy_time::Duration::from_secs(2)).await;
     }
 }

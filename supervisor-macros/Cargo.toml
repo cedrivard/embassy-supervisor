@@ -29,6 +29,15 @@ all-features = true
 # Cargo.toml), so this tracks the supervisor's pool feature — the macro emits
 # pools iff the supervisor was built with pools.
 pool = []
+# Forwarded from the supervisor's `trace` feature: the generated spawn glue captures
+# each SpawnToken's task id into the node (`set_task_id`) before spawning it.
+trace = []
+# Forwarded from `trace-names`: additionally stamp the node name into task Metadata.
+trace-names = ["trace"]
+# Forwarded from the supervisor's `trace-hooks`: emit the seven `no_mangle`
+# `_embassy_trace_*` hook definitions at the graph declaration site (the supervisor
+# crate itself is `forbid(unsafe_code)` and cannot define them).
+trace-hooks = ["trace"]
 
 [dependencies]
 syn = { version = "2", features = ["full"] }
