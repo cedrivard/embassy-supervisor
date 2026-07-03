@@ -247,6 +247,26 @@ xdg-open http://10.42.0.61/             # task view + stop/start buttons
   curl -XPOST 'http://10.42.0.61/api/heartbeat?ms=-1'    # on
   ```
 
+### Observability (trace feature)
+
+The firmware enables `embassy-supervisor`'s `trace-hooks`, so `GET /api/tasks` (and the
+dashboard) report per-node CPU% / max-poll and per-executor busy / in-poll / idle,
+computed from the executor's trace hooks.
+
+⚠️ **On RP2350, the executor "idle %" is NOT sleep.** RP2350 has a silicon quirk where any
+exclusive-access atomic (`ldaex`/`strex`) raises a global-monitor event — an effective
+`SEV` — so every atomic in the executor's idle loop (the critical-section spinlock, task
+flags) makes the following `WFE` return immediately. The thread executor therefore
+free-runs at ~1 MHz (`polls/pass` in the wrk report is far below 1) and never actually
+sleeps, regardless of how little work there is. Read `idle %` as "WFE-spin", not power
+saving. This is not specific to this firmware or the supervisor — it affects any
+WFE-idle embassy/pico-SDK program on RP2350. For genuine low power use the `powman`
+peripheral (deep sleep), not WFE.
+
+- raspberrypi/pico-feedback [#482](https://github.com/raspberrypi/pico-feedback/issues/482)
+- embassy-rs/embassy [#4818](https://github.com/embassy-rs/embassy/issues/4818)
+- pico-sdk [#1812](https://github.com/raspberrypi/pico-sdk/issues/1812)
+
 ## Portability
 
 The `embassy-supervisor` crate is HAL-agnostic and reused verbatim on any embassy
