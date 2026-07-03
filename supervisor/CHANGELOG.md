@@ -7,6 +7,17 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 ## [Unreleased]
 
 ### Added
+- Multi-executor graphs: the `executor NAME;` item declares a runtime-filled
+  `SpawnerSlot` (a `SendSpawner` — `InterruptExecutor` tiers, the second core, or a
+  foreign thread executor via `make_send()`), and `executor: NAME` on a node routes its
+  generated spawn through the slot. An unfilled slot fails the spawn with
+  `SpawnError::Busy`; annotated nodes' futures must be `Send`.
+- `TaskNode::adopt(&SpawnToken)`: one-call registration (task id + `trace-names` name
+  stamp) for spawns the macro cannot see (parked nodes, verbatim spawn closures).
+- `trace-nested` (opt-in, single-core): preemption-exact accounting. A nested
+  higher-tier poll credits its wall time back to the window it interrupted, so a
+  preempted node's `exec_ticks`/`max_poll_ticks` are no longer inflated and
+  `stalled_task`/watermarks name the real culprit.
 - Trace-hook observability (opt-in features): `trace` — the supervisor consumes
   embassy-executor's `_embassy_trace_*` instrumentation, mapping task ids to nodes via the
   generated spawn glue and accounting per-node poll time / poll count / max-poll watermark,

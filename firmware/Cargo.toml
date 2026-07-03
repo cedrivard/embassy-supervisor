@@ -9,8 +9,14 @@ license.workspace = true
 # come from the crate's defaults.
 # `trace-hooks` turns on the executor's trace instrumentation and generates the
 # hook symbols at the graph declaration; the dashboard renders per-node CPU% and
-# max-poll from the counters (see http.rs).
-embassy-supervisor = { path = "../supervisor", features = ["defmt", "trace-hooks"] }
+# max-poll from the counters (see http.rs). `trace-nested` makes the accounting
+# preemption-exact (single core here): heartbeat's HIGH-tier polls are credited
+# back to whatever thread-executor window they preempt.
+embassy-supervisor = { path = "../supervisor", features = [
+    "defmt",
+    "trace-hooks",
+    "trace-nested",
+] }
 
 # embassy core. These versions are the latest crates.io releases that resolve
 # together with embassy-rp 0.10 (executor 0.10 / time 0.5 / sync 0.8); the
@@ -18,6 +24,7 @@ embassy-supervisor = { path = "../supervisor", features = ["defmt", "trace-hooks
 embassy-executor = { version = "0.10", features = [
     "platform-cortex-m",
     "executor-thread",
+    "executor-interrupt", # the HIGH tier (InterruptExecutor on SWI_IRQ_0)
     "defmt",
 ] }
 embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }

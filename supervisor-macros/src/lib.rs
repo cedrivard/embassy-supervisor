@@ -5,12 +5,18 @@
 //! the topological order at **compile time**. A dependency cycle is a compile
 //! error; an unknown dependency name is a compile error.
 //!
-//! Surface (each `node`/`pool` may be `#[cfg(...)]`-prefixed):
+//! Surface (each item may be `#[cfg(...)]`-prefixed):
 //! ```text
-//! node NAME = Mode, deps: [A, B], spawn: <spawn>[, disabled];
+//! node NAME = Mode, deps: [A, B], spawn: <spawn>[, executor: EXEC][, disabled];
 //! node NAME = Mode, deps: [A];                 // no `spawn:` => a parked node the app spawns
+//! executor EXEC;                               // runtime-filled SendSpawner slot
 //! pool NAME = [Mode, ..], deps: [A], spawn: <fn>, policy: [<Ty> =] <expr>, min: N, max: M;
 //! ```
+//! `executor EXEC;` emits a `pub static EXEC: SpawnerSlot`; the app fills it with a
+//! `SendSpawner` (`InterruptExecutor::start`, `Spawner::make_send`) before
+//! `Supervisor::start`, and nodes carrying `executor: EXEC` spawn through it instead
+//! of the supervisor's own executor (their futures must be `Send`; an unfilled slot
+//! fails the spawn with `SpawnError::Busy`).
 //! A pool is emitted as `ElasticPool<P>`, so the macro needs the policy type `P`. By
 //! default it derives `P` from a `Ty::new(..)`-shaped `policy:` value (e.g.
 //! `DeferredShrink::new(..)` => `P = DeferredShrink`). Give `policy: <Ty> = <expr>` to
@@ -69,6 +75,7 @@ mod kw {
     syn::custom_keyword!(min);
     syn::custom_keyword!(max);
     syn::custom_keyword!(disabled);
+    syn::custom_keyword!(executor);
 }
 
 /// A dependency reference: a node ident, optionally `#[cfg(...)]`-gated.
@@ -110,6 +117,18 @@ struct NodeItem {
     /// `None` = a parked node the app spawns itself (no `spawn:` given).
     spawn: Option<Expr>,
     disabled: bool,
+    /// `executor: NAME` — spawn through the named [`SpawnerSlot`] (a
+    /// `SendSpawner` the app registers at runtime) instead of the supervisor's
+    /// own `Spawner`. `None` = the default executor.
+    executor: Option<Ident>,
+}
+
+/// `executor NAME;` — declares a `pub static NAME: SpawnerSlot` the application
+/// fills with a `SendSpawner` before `Supervisor::start` (an InterruptExecutor
+/// tier, core1, ...). Nodes reference it with `executor: NAME`.
+struct ExecutorItem {
+    cfg: Vec<Attribute>,
+    ident: Ident,
 }
 
 struct PoolItem {
@@ -145,6 +164,7 @@ struct PoolItem {
 enum Item {
     Node(NodeItem),
     Pool(PoolItem),
+    Executor(ExecutorItem),
 }
 
 /// The parsed macro input: the list of `node`/`pool` declarations, in source order.
@@ -163,10 +183,16 @@ impl Parse for GraphSpec {
                 items.push(Item::Node(parse_node(input, cfg)?));
             } else if input.peek(kw::pool) {
                 items.push(Item::Pool(parse_pool(input, cfg)?));
+            } else if input.peek(kw::executor) {
+                // `executor NAME;` — a runtime-filled SendSpawner slot.
+                input.parse::<kw::executor>()?;
+                let ident: Ident = input.parse()?;
+                input.parse::<Token![;]>()?;
+                items.push(Item::Executor(ExecutorItem { cfg, ident }));
             } else {
-                return Err(
-                    input.error("expected `node` or `pool` (optionally `#[cfg(...)]`-prefixed)")
-                );
+                return Err(input.error(
+                    "expected `node`, `pool`, or `executor` (optionally `#[cfg(...)]`-prefixed)",
+                ));
             }
         }
         Ok(GraphSpec { items })
@@ -186,6 +212,7 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
 
     let mut spawn = None;
     let mut disabled = false;
+    let mut executor = None;
     while input.peek(Token![,]) {
         input.parse::<Token![,]>()?;
         if input.peek(kw::spawn) {
@@ -195,8 +222,12 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
         } else if input.peek(kw::disabled) {
             input.parse::<kw::disabled>()?;
             disabled = true;
+        } else if input.peek(kw::executor) {
+            input.parse::<kw::executor>()?;
+            input.parse::<Token![:]>()?;
+            executor = Some(input.parse::<Ident>()?);
         } else {
-            return Err(input.error("expected `spawn:` or `disabled`"));
+            return Err(input.error("expected `spawn:`, `executor:`, or `disabled`"));
         }
     }
     input.parse::<Token![;]>()?;
@@ -207,6 +238,7 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
         deps,
         spawn,
         disabled,
+        executor,
     })
 }
 
@@ -351,26 +383,64 @@ struct Slot {
 fn node_spawn(
     ident: &Ident,
     spawn: &Option<Expr>,
+    executor: &Option<Ident>,
     spawn_fn: &TokenStream2,
 ) -> SynResult<TokenStream2> {
-    Ok(match spawn {
-        None => quote!(::core::option::Option::None),
+    Ok(match (spawn, executor) {
+        (None, None) => quote!(::core::option::Option::None),
+        // `executor:` needs the macro to perform the spawn, so it composes only
+        // with the path / partial-call `spawn:` forms below.
+        (None, Some(ex)) => {
+            return Err(syn::Error::new_spanned(
+                ex,
+                "`executor:` requires a `spawn:` (a parked node is spawned by the \
+                 application, which picks its own spawner)",
+            ));
+        }
         // A path or a partial call: a task fn taking `&NODE` first (plus any
         // given args); generate `|s| { s.spawn(<task>(&NODE, ..)?); Ok(()) }`.
-        Some(e @ (Expr::Path(_) | Expr::Call(_))) => {
+        // With `executor: NAME` the glue ignores the supervisor's `Spawner` and
+        // spawns through the named `SpawnerSlot` (a `SendSpawner` the app
+        // registers at runtime): an unfilled slot fails the spawn with
+        // `SpawnError::Busy` — loud misconfiguration, not a missing task. The
+        // task future must then be `Send` (enforced by `SendSpawner::spawn`).
+        (Some(e @ (Expr::Path(_) | Expr::Call(_))), executor) => {
             let call = inject_node_call(e, &quote!(&#ident))?;
-            let stmts = spawn_stmts(&call, &quote!(&#ident));
-            quote!(::core::option::Option::Some(
-                (|s| {
-                    #stmts
-                    ::core::result::Result::Ok(())
-                }) as #spawn_fn
-            ))
+            match executor {
+                None => {
+                    let stmts = spawn_stmts(&call, &quote!(&#ident), &quote!(s));
+                    quote!(::core::option::Option::Some(
+                        (|s| {
+                            #stmts
+                            ::core::result::Result::Ok(())
+                        }) as #spawn_fn
+                    ))
+                }
+                Some(ex) => {
+                    let stmts = spawn_stmts(&call, &quote!(&#ident), &quote!(__sp));
+                    quote!(::core::option::Option::Some(
+                        (|_s| {
+                            let __sp = #ex
+                                .get()
+                                .ok_or(::embassy_executor::SpawnError::Busy)?;
+                            #stmts
+                            ::core::result::Result::Ok(())
+                        }) as #spawn_fn
+                    ))
+                }
+            }
+        }
+        (Some(_), Some(ex)) => {
+            return Err(syn::Error::new_spanned(
+                ex,
+                "`executor:` cannot be combined with a verbatim spawn closure (the \
+                 closure owns the spawn; use the named SpawnerSlot inside it instead)",
+            ));
         }
         // Anything else (a closure, or a ready spawn fn) is emitted verbatim.
         // NOTE: with the `trace` feature such a node is not auto-mapped — the
-        // closure owns the SpawnToken; call `set_task_id` in it yourself.
-        Some(e) => quote!(::core::option::Option::Some((#e) as #spawn_fn)),
+        // closure owns the SpawnToken; call `adopt`/`set_task_id` in it yourself.
+        (Some(e), None) => quote!(::core::option::Option::Some((#e) as #spawn_fn)),
     })
 }
 
@@ -382,21 +452,16 @@ fn node_spawn(
 /// itself is infallible, so the token is available between the two). Under
 /// `trace-names` the node's name is also stamped into the task Metadata so
 /// external consumers (rtos-trace/SystemView) see names instead of raw ids.
-fn spawn_stmts(call: &TokenStream2, node_ref: &TokenStream2) -> TokenStream2 {
+fn spawn_stmts(call: &TokenStream2, node_ref: &TokenStream2, sp: &TokenStream2) -> TokenStream2 {
     if cfg!(feature = "trace") {
-        let set_name = if cfg!(feature = "trace-names") {
-            quote!(__token.metadata().set_name((#node_ref).name);)
-        } else {
-            quote!()
-        };
+        // `adopt` = set_task_id + (under trace-names) Metadata name stamp.
         quote! {
             let __token = #call?;
-            (#node_ref).set_task_id(__token.id());
-            #set_name
-            s.spawn(__token);
+            (#node_ref).adopt(&__token);
+            #sp.spawn(__token);
         }
     } else {
-        quote!(s.spawn(#call?);)
+        quote!(#sp.spawn(#call?);)
     }
 }
 
@@ -412,7 +477,7 @@ fn emit_node(
     let mode = &n.mode;
     let name = name_string(&n.ident);
     let disabled = n.disabled;
-    let spawn = node_spawn(ident, &n.spawn, spawn_fn)?;
+    let spawn = node_spawn(ident, &n.spawn, &n.executor, spawn_fn)?;
     let def = quote! {
         #(#cfg)*
         pub static #ident: #cr::TaskNode =
@@ -468,7 +533,7 @@ fn emit_pool(
     let call = inject_node_call(&p.spawn, &quote!(&#ident[I]))?;
     // Per-member spawn fn: a generated `spawn_<pool>::<I>` wrapper. Same optional
     // trace capture as a node's closure, against member `I`'s slot.
-    let pool_spawn_stmts = spawn_stmts(&call, &quote!(&#ident[I]));
+    let pool_spawn_stmts = spawn_stmts(&call, &quote!(&#ident[I]), &quote!(s));
     let wrapper = format_ident!("spawn_{}", lname);
     let mut defs: Vec<TokenStream2> = Vec::new();
     defs.push(quote! {
@@ -598,14 +663,50 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
     let mut slots: Vec<Slot> = Vec::new();
     let mut names: HashMap<String, usize> = HashMap::new();
 
+    // Pre-pass: collect the declared `executor NAME;` slots so a node's
+    // `executor:` reference can be validated regardless of declaration order.
+    let executor_names: Vec<String> = graph
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Executor(x) => Some(x.ident.to_string()),
+            _ => None,
+        })
+        .collect();
+
     for item in &graph.items {
         match item {
             Item::Node(n) => {
+                if let Some(ex) = &n.executor
+                    && !executor_names.contains(&ex.to_string())
+                {
+                    return Err(syn::Error::new_spanned(
+                        ex,
+                        format!(
+                            "unknown executor `{ex}`; declare it in the graph with \
+                             `executor {ex};` (declared: [{}])",
+                            executor_names.join(", ")
+                        ),
+                    ));
+                }
                 // The index is the slot's position, taken *before* the push.
                 names.insert(n.ident.to_string(), slots.len());
                 let (def, slot) = emit_node(n, &cr, &spawn_fn)?;
                 defs.push(def);
                 slots.push(slot);
+            }
+            Item::Executor(x) => {
+                let (cfg, ident) = (&x.cfg, &x.ident);
+                // A runtime-filled SendSpawner slot: the app registers the
+                // executor's spawner before `Supervisor::start`; nodes declared
+                // `executor: NAME` spawn through it. Occupies no graph slot.
+                defs.push(quote! {
+                    #(#cfg)*
+                    /// Spawner slot for the graph's `executor:`-annotated nodes
+                    /// (generated by `supervisor_graph!`). Fill with
+                    /// `SpawnerSlot::set` before `Supervisor::start`.
+                    pub static #ident: #cr::SpawnerSlot = #cr::SpawnerSlot::new();
+                });
             }
             Item::Pool(p) => {
                 // Pools are only meaningful with the supervisor's `pool` feature (which

@@ -101,10 +101,12 @@
 #[macro_use]
 mod fmt;
 
+use core::cell::Cell;
 use core::sync::atomic::Ordering;
 
-use embassy_executor::{SpawnError, Spawner};
+use embassy_executor::{SendSpawner, SpawnError, Spawner};
 use embassy_futures::select::{Either, select};
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 #[cfg(feature = "control")]
 use embassy_sync::channel::Channel;
@@ -340,6 +342,53 @@ impl TaskHandle {
     }
 }
 
+// ─── Executor spawner slots ──────────────────────────────────────────────
+
+/// A runtime-filled slot holding the [`SendSpawner`] of an executor other than
+/// the one the supervisor runs on — an `InterruptExecutor` tier, the second
+/// core's executor, any foreign thread executor (via `Spawner::make_send()`).
+///
+/// Declared by the `executor NAME;` item of [`supervisor_graph!`]; nodes carrying
+/// `executor: NAME` are spawned through the slot instead of the supervisor's own
+/// `Spawner`. The application fills it once at startup, before
+/// [`Supervisor::start`]:
+///
+/// ```ignore
+/// static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
+/// HIGH.set(EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0));
+/// sup.start(spawner)?;   // nodes declared `executor: HIGH` spawn on that tier
+/// ```
+///
+/// A node whose slot is still empty at spawn time fails with
+/// [`SpawnError::Busy`] (the one portable error variant) — a loud
+/// misconfiguration instead of a silently missing task. Futures spawned through
+/// a `SendSpawner` must be `Send`; a non-`Send` task on an `executor:` node is a
+/// compile error at the generated glue.
+pub struct SpawnerSlot(BlockingMutex<CriticalSectionRawMutex, Cell<Option<SendSpawner>>>);
+
+impl SpawnerSlot {
+    /// An empty slot (`const` — it lives in a `static` the macro emits).
+    pub const fn new() -> Self {
+        Self(BlockingMutex::new(Cell::new(None)))
+    }
+
+    /// Fill the slot (last set wins). Call before [`Supervisor::start`].
+    pub fn set(&self, spawner: SendSpawner) {
+        self.0.lock(|c| c.set(Some(spawner)));
+    }
+
+    /// The registered spawner, or `None` while unfilled.
+    pub fn get(&self) -> Option<SendSpawner> {
+        self.0.lock(Cell::get)
+    }
+}
+
+impl Default for SpawnerSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ─── TaskNode ────────────────────────────────────────────────────────────
 
 /// A node in the supervisor's task graph.
@@ -484,6 +533,24 @@ impl TaskNode {
     #[cfg(feature = "trace")]
     pub fn set_task_id(&self, id: u32) {
         self.handle.task_id.store(id, Ordering::Release);
+    }
+
+    /// Register an externally-spawned token as this node's live task: records
+    /// the task id for the [`trace`] recorders and (feature `trace-names`)
+    /// stamps the node name into the task Metadata. One call replaces the
+    /// manual [`set_task_id`](Self::set_task_id) dance wherever the macro can't
+    /// see the token — parked nodes and verbatim-closure `spawn:` forms:
+    ///
+    /// ```ignore
+    /// let t = environment_task(i2c_dev)?;
+    /// BME280.adopt(&t);
+    /// high_spawner.spawn(t);
+    /// ```
+    #[cfg(feature = "trace")]
+    pub fn adopt<S>(&self, token: &embassy_executor::SpawnToken<S>) {
+        self.set_task_id(token.id());
+        #[cfg(feature = "trace-names")]
+        token.metadata().set_name(self.name);
     }
 
     /// The executor task id last recorded by [`set_task_id`](Self::set_task_id)

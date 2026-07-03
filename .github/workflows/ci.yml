@@ -41,6 +41,9 @@ jobs:
       - run: cargo test -p embassy-supervisor --target $HOST
       - run: cargo test -p embassy-supervisor --target $HOST --no-default-features
       - run: cargo test -p embassy-supervisor --target $HOST --features trace-hooks
+      # Charge-splitting (preemption-exact) accounting + the base trace tests again
+      # under the extra feature.
+      - run: cargo test -p embassy-supervisor --target $HOST --features trace-nested,trace-hooks
       # `supervisor_graph!` UI tests (trybuild): compile-fail cases lock the macro's
       # error contracts (cycle, unknown dep, ...); compile-pass cases run the generated
       # graph. Host-only — trybuild compiles real graphs — so `--target $HOST`.

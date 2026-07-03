@@ -12,6 +12,8 @@ extern crate alloc;
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
+use embassy_rp::interrupt;
+use embassy_rp::interrupt::{InterruptExt, Priority};
 use {defmt_rtt as _, panic_probe as _};
 
 mod heap;
@@ -27,13 +29,27 @@ mod ota;
 // takes. `heartbeat` is standalone; `http` and `ota` depend on `net`; `ota` is
 // disabled-at-boot (control-started).
 embassy_supervisor::supervisor_graph! {
+    executor HIGH; // Interrupt-priority tier (SWI_IRQ_0)
     node NET = Terminate, deps: [], spawn: crate::net::net_task;
-    node HEARTBEAT = Pause, deps: [], spawn: crate::heartbeat::heartbeat_task;
+    node HEARTBEAT = Pause, deps: [], executor: HIGH, spawn: crate::heartbeat::heartbeat_task;
     pool HTTP = [Terminate, OnDemand, OnDemand, OnDemand], deps: [NET],
         spawn: crate::http::http_task,
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(4)),
         min: 1, max: 4;
     node OTA = Terminate, deps: [NET], spawn: crate::ota::ota_task, disabled;
+}
+
+// The interrupt-priority executor backing the graph's `HIGH` slot. Its poll loop
+// runs in the SWI_IRQ_0 handler at P2, preempting the thread executor.
+// https://docs.rs/embassy-executor/latest/embassy_executor/struct.InterruptExecutor.html
+static EXECUTOR_HIGH: embassy_executor::InterruptExecutor =
+    embassy_executor::InterruptExecutor::new();
+
+#[interrupt]
+unsafe fn SWI_IRQ_0() {
+    // SAFETY: called only from this vector, which EXECUTOR_HIGH owns after
+    // `start()` — the contract `on_interrupt()` requires.
+    unsafe { EXECUTOR_HIGH.on_interrupt() }
 }
 
 #[embassy_executor::main]
@@ -42,6 +58,11 @@ async fn main(spawner: Spawner) {
     // needs (USB in net, PIN_25 in heartbeat, FLASH/WATCHDOG here), so `main` holds none.
     let _ = embassy_rp::init(Default::default());
     heap::init();
+
+    // Bring up the HIGH tier and fill the graph's spawner slot BEFORE the
+    // supervisor starts (an unfilled slot would fail heartbeat's spawn loudly).
+    interrupt::SWI_IRQ_0.set_priority(Priority::P2);
+    HIGH.set(EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0));
     defmt::info!(
         "boot: heap {}/{} B free",
         heap::free_bytes(),

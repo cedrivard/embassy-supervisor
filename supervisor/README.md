@@ -118,6 +118,12 @@ pool NAME = [Mode, ..], deps: [A],
   `Pause` sensor holding a peripheral handle) — the supervisor tracks it but never spawns it.
 - **`disabled`** — declared but not started at boot; a control `Activate` starts it later
   (e.g. an OTA task).
+- **`executor EXEC;` / `executor: EXEC`** — run a node on a different executor. The
+  declaration emits a `SpawnerSlot` static; the app fills it with a `SendSpawner`
+  (`InterruptExecutor::start()`, `Spawner::make_send()`) before `start()`, and annotated
+  nodes spawn through it — interrupt-priority tiers and the second core become graph
+  citizens instead of hand-spawned parked nodes. Their futures must be `Send`; an
+  unfilled slot fails the spawn with `SpawnError::Busy` (loud, not silent).
 - **`#[cfg(...)]`** — on any `node`/`pool` *and on individual deps*. Absent nodes keep their
   slot as `None` and are skipped everywhere at runtime.
 - **`pool`** — the mode list declares the members (floor first: typically
@@ -188,6 +194,7 @@ battery-powered sensor node):
 | `trace`   |         | trace-hook observability: per-node CPU time / poll counts / max-poll watermark, executor idle time, stall detection (see below) |
 | `trace-hooks` |     | batteries-included: the graph declaration also defines the `_embassy_trace_*` hook symbols |
 | `trace-names` |     | stamp node names into task Metadata for external tooling (SystemView, debuggers) |
+| `trace-nested` |    | preemption-exact accounting: nested higher-tier polls are credited back to the window they interrupt (single-core) |
 
 `default-features = false` gives a minimal core that only does dependency-ordered
 bring-up/teardown — dropping the control plane and pools trims flash and a couple of statics.
@@ -214,12 +221,14 @@ executor poll is attributed to a *named* node — correctly across respawns.
 `trace-hooks` additionally emits the seven hook symbol definitions at the graph declaration
 site (exactly one set may exist per binary; define your own and forward to the
 `trace::on_*` recorders instead if you need custom hooks). Limitations: accounting is
-preemption-naive (an interrupt executor's or hardware ISR's time lands in the poll it
-preempts), executor busy% exceeds the per-node sum by a per-poll accounting gap (executor
-bookkeeping + the hooks' own cost, ~10 µs/poll — it grows with poll rate), at most 4
-executors are tracked, and parked / closure-spawned nodes register via
-`TaskNode::set_task_id`. The hook API is an executor implementation detail — this feature
-tracks the executor minor version the crate already pins.
+preemption-naive by default — an interrupt executor's poll lands in whichever window it
+preempts; enable `trace-nested` (single-core) for exact charge-splitting; hardware-ISR
+time remains invisible either way. Executor busy% exceeds the per-node sum by a per-poll
+accounting gap (executor bookkeeping + the hooks' own cost — it grows with poll rate;
+`ExecutorStats` measures it as `busy − in-poll`), at most 4 executors are tracked, and
+parked / closure-spawned nodes register with one call: `TaskNode::adopt(&token)`. The
+hook API is an executor implementation detail — this feature tracks the executor minor
+version the crate already pins.
 
 ## `no_std` / MSRV
 

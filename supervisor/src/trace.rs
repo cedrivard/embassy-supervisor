@@ -132,6 +132,11 @@ struct ExecutorSlot {
     /// Scheduler passes (`poll_start` events, wrapping). `polls / passes` is the
     /// mean number of task polls per pass.
     passes: AtomicU32,
+    /// Wall ticks stolen from the currently-open poll by nested higher-tier
+    /// polls (`trace-nested`): the victim's `exec_end` subtracts this before
+    /// attributing, making its numbers preemption-exact.
+    #[cfg(feature = "trace-nested")]
+    stolen_ticks: AtomicU32,
 }
 
 #[allow(clippy::declare_interior_mutable_const)] // const used only as array initializer
@@ -145,6 +150,32 @@ const FREE_SLOT: ExecutorSlot = ExecutorSlot {
     exec_ticks: AtomicU32::new(0),
     polls: AtomicU32::new(0),
     passes: AtomicU32::new(0),
+    #[cfg(feature = "trace-nested")]
+    stolen_ticks: AtomicU32::new(0),
+};
+
+// ─── Preemption stack (feature `trace-nested`) ───────────────────────────
+//
+// On ONE core, executor hooks nest strictly LIFO: a higher tier's whole
+// begin..end pair lands inside the preempted window. A tiny global stack of
+// slot indices tracks who is open, so a nested `exec_end` can credit its wall
+// time back to the window it interrupted (`stolen_ticks`). A preemption landing
+// in the `exec_end` epilogue (after the timestamp or after the `stolen` swap,
+// but before the pop) deposits into a window whose measured `raw` never
+// contained it; the leftover is then subtracted from the slot's NEXT poll — a
+// few ticks of edge noise. `saturating_sub` bounds that noise at zero: without
+// it, a stale deposit larger than a short next poll would underflow the u32 and
+// poison `exec_ticks`/`max_poll_ticks` with a ~4e9-tick garbage value. SMP
+// would interleave pushes from two cores and corrupt the LIFO order, hence the
+// feature's single-core contract.
+
+#[cfg(feature = "trace-nested")]
+static NEST_DEPTH: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "trace-nested")]
+static NEST_STACK: [AtomicUsize; MAX_EXECUTORS] = {
+    #[allow(clippy::declare_interior_mutable_const)] // array initializer
+    const ZERO: AtomicUsize = AtomicUsize::new(0);
+    [ZERO; MAX_EXECUTORS]
 };
 
 static EXECUTORS: [ExecutorSlot; MAX_EXECUTORS] = [FREE_SLOT; MAX_EXECUTORS];
@@ -159,20 +190,20 @@ static LAST_SLOT: AtomicUsize = AtomicUsize::new(0);
 /// `compare_exchange` on the `id` field; a loser retries the scan once via the
 /// outer loop shape below (two passes are enough: either it finds the winner's
 /// slot or claims another).
-fn slot_for(executor_id: u32) -> Option<&'static ExecutorSlot> {
+fn slot_for(executor_id: u32) -> Option<(usize, &'static ExecutorSlot)> {
     // Fast path: the slot that matched last time (hooks fire thousands of times
     // per second from at most a handful of executors).
     let last = LAST_SLOT.load(Ordering::Relaxed);
     if let Some(s) = EXECUTORS.get(last)
         && s.id.load(Ordering::Acquire) == executor_id
     {
-        return Some(s);
+        return Some((last, s));
     }
     // Pass 1: existing slot.
     for (i, s) in EXECUTORS.iter().enumerate() {
         if s.id.load(Ordering::Acquire) == executor_id {
             LAST_SLOT.store(i, Ordering::Relaxed);
-            return Some(s);
+            return Some((i, s));
         }
     }
     // Pass 2: claim a free one (or discover a racing claimer of the same id).
@@ -183,11 +214,11 @@ fn slot_for(executor_id: u32) -> Option<&'static ExecutorSlot> {
         {
             Ok(_) => {
                 LAST_SLOT.store(i, Ordering::Relaxed);
-                return Some(s);
+                return Some((i, s));
             }
             Err(existing) if existing == executor_id => {
                 LAST_SLOT.store(i, Ordering::Relaxed);
-                return Some(s);
+                return Some((i, s));
             }
             Err(_) => {}
         }
@@ -215,7 +246,7 @@ fn now_ticks() -> u32 {
 /// merges into the surrounding idle window instead of inflating "overhead" with
 /// the instrument's own cost.
 pub fn on_poll_start(executor_id: u32) {
-    let Some(slot) = slot_for(executor_id) else {
+    let Some((_, slot)) = slot_for(executor_id) else {
         return;
     };
     slot.passes.fetch_add(1, Ordering::Relaxed);
@@ -225,7 +256,7 @@ pub fn on_poll_start(executor_id: u32) {
 /// window (see [`on_poll_start`]) with the same timestamp — a real poll pays for
 /// exactly one timer read here.
 pub fn on_task_exec_begin(executor_id: u32, task_id: u32) {
-    let Some(slot) = slot_for(executor_id) else {
+    let Some((idx, slot)) = slot_for(executor_id) else {
         return;
     };
     let now = now_ticks();
@@ -235,17 +266,51 @@ pub fn on_task_exec_begin(executor_id: u32, task_id: u32) {
     }
     slot.current_begin.store(now, Ordering::Relaxed);
     slot.current_task.store(task_id, Ordering::Release);
+    // Open a frame on the preemption stack so a poll we preempted can be
+    // relieved of our wall time at our exec_end.
+    #[cfg(feature = "trace-nested")]
+    {
+        let depth = NEST_DEPTH.fetch_add(1, Ordering::Relaxed);
+        if let Some(frame) = NEST_STACK.get(depth) {
+            frame.store(idx, Ordering::Relaxed);
+        }
+    }
+    #[cfg(not(feature = "trace-nested"))]
+    let _ = idx;
 }
 
 /// Record a task poll ending (`task_exec_end`): attributes the elapsed ticks to
 /// the node mapped to `task_id` (unknown ids are counted nowhere and ignored).
 pub fn on_task_exec_end(executor_id: u32, task_id: u32) {
-    let Some(slot) = slot_for(executor_id) else {
+    let Some((_, slot)) = slot_for(executor_id) else {
         return;
     };
     let begin = slot.current_begin.load(Ordering::Relaxed);
     slot.current_task.store(0, Ordering::Release);
-    let elapsed = now_ticks().wrapping_sub(begin);
+    // Raw wall time of this window; with `trace-nested` the time stolen by
+    // nested higher-tier polls is subtracted before attribution, and the full
+    // wall time is credited back to the window WE preempted (if any).
+    let raw = now_ticks().wrapping_sub(begin);
+    #[cfg(feature = "trace-nested")]
+    let elapsed = {
+        let stolen = slot.stolen_ticks.swap(0, Ordering::Relaxed);
+        // Pop our frame; the new top (if any) is the poll we preempted.
+        let depth = NEST_DEPTH.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+        if depth > 0
+            && let Some(frame) = NEST_STACK.get(depth - 1)
+        {
+            let parent = frame.load(Ordering::Relaxed);
+            if let Some(p) = EXECUTORS.get(parent) {
+                p.stolen_ticks.fetch_add(raw, Ordering::Relaxed);
+            }
+        }
+        // Saturating, not wrapping: `raw` and `stolen` are plain magnitudes
+        // (already-diffed), and a stale epilogue-race deposit must clamp to a
+        // zero-length poll instead of underflowing (see the module comment).
+        raw.saturating_sub(stolen)
+    };
+    #[cfg(not(feature = "trace-nested"))]
+    let elapsed = raw;
     // Executor-level accounting counts EVERY poll, resolvable or not, so that
     // `busy - exec` isolates pure executor overhead and `exec - sum(nodes)` the
     // unsupervised-task share (see `ExecutorStats`).
@@ -267,7 +332,7 @@ pub fn on_task_exec_end(executor_id: u32, task_id: u32) {
 /// own context), so the load-then-store is not a lost-update hazard; the
 /// `idle_since`-before-`idle` order keeps readers ([`executor_stats`]) safe.
 pub fn on_executor_idle(executor_id: u32) {
-    let Some(slot) = slot_for(executor_id) else {
+    let Some((_, slot)) = slot_for(executor_id) else {
         return;
     };
     if !slot.idle.load(Ordering::Acquire) {

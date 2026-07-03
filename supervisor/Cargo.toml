@@ -56,6 +56,12 @@ trace-hooks = ["trace", "embassy-supervisor-macros?/trace-hooks"]
 # (rtos-trace/SystemView, debuggers) see node names instead of opaque ids. Separate
 # from `trace` because `metadata-name` grows every TaskStorage in the binary.
 trace-names = ["trace", "embassy-executor/metadata-name", "embassy-supervisor-macros?/trace-names"]
+# Preemption-accurate (charge-splitting) accounting: a nested poll (an
+# InterruptExecutor preempting a lower tier mid-poll) credits its wall time back
+# to the interrupted window, so the victim's exec/max-poll numbers stay exact.
+# SINGLE-CORE ONLY (or: all traced executors on one core) — the preemption stack
+# relies on strict LIFO hook nesting, which SMP interleaving breaks.
+trace-nested = ["trace"]
 
 [package.metadata.docs.rs]
 # Document every feature (control/pool/defmt) on docs.rs.
@@ -78,3 +84,8 @@ embassy-time = { version = "0.5", features = ["mock-driver"] }
 [[test]]
 name = "trace"
 required-features = ["trace-hooks", "macros"]
+
+# Host tests for the `trace-nested` charge-splitting (preemption accounting).
+[[test]]
+name = "trace_nested"
+required-features = ["trace-nested", "trace-hooks", "macros"]

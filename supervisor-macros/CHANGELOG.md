@@ -9,6 +9,10 @@ supervisor's CHANGELOG for the surrounding API history.
 ## [Unreleased]
 
 ### Added
+- The `executor NAME;` item (emits a `pub static NAME: SpawnerSlot`) and the
+  `executor: NAME` node clause: the generated glue spawns through the named slot's
+  `SendSpawner` instead of the supervisor's `Spawner`. Unknown names, `executor:`
+  without `spawn:`, and `executor:` with a verbatim closure are expansion errors.
 - Forwarded trace features: under `trace` the generated spawn glue captures each
   `SpawnToken`'s task id into its node (`set_task_id`); under `trace-names` it also stamps
   the node name into the task Metadata; under `trace-hooks` the macro defines the seven
