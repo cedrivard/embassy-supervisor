@@ -10,7 +10,8 @@
 //! node NAME = Mode, deps: [A, B], spawn: <spawn>[, executor: EXEC][, disabled];
 //! node NAME = Mode, deps: [A];                 // no `spawn:` => a parked node the app spawns
 //! executor EXEC;                               // runtime-filled SendSpawner slot
-//! pool NAME = [Mode, ..], deps: [A], spawn: <fn>, policy: [<Ty> =] <expr>, min: N, max: M;
+//! pool NAME = [Mode, ..], deps: [A][, executor: EXEC], spawn: <fn>,
+//!     policy: [<Ty> =] <expr>, min: N, max: M;
 //! ```
 //! `executor EXEC;` emits a `pub static EXEC: SpawnerSlot`; the app fills it with a
 //! `SendSpawner` (`InterruptExecutor::start`, `Spawner::make_send`) before
@@ -151,6 +152,9 @@ struct PoolItem {
     /// bypasses `policy_type` derivation, allowing a value the deriver can't handle
     /// (a free fn, a const, a builder chain, a qualified path).
     policy_ty: Option<Type>,
+    /// `executor: NAME` — spawn every member through the named [`SpawnerSlot`]
+    /// (e.g. a worker pool on the second core, scaled by this core's supervisor).
+    executor: Option<Ident>,
     min: LitInt,
     max: LitInt,
 }
@@ -242,7 +246,7 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
     })
 }
 
-// pool IDENT = [MODES], deps: [..], spawn: <fn>, policy: EXPR, min: N, max: M;
+// pool IDENT = [MODES], deps: [..][, executor: EXEC], spawn: <fn>, policy: EXPR, min: N, max: M;
 fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
     input.parse::<kw::pool>()?;
     let ident: Ident = input.parse()?;
@@ -253,6 +257,17 @@ fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
     input.parse::<Token![:]>()?;
     let deps = parse_dep_list(input)?;
     input.parse::<Token![,]>()?;
+    // Optional `executor: NAME,` — run the whole pool on the named SpawnerSlot's
+    // executor (e.g. a worker pool on the second core, scaled from this one).
+    let executor = if input.peek(kw::executor) {
+        input.parse::<kw::executor>()?;
+        input.parse::<Token![:]>()?;
+        let ex: Ident = input.parse()?;
+        input.parse::<Token![,]>()?;
+        Some(ex)
+    } else {
+        None
+    };
     // The member task: a path, or a partial call supplying extra args (the macro
     // injects `&POOL[j]` as the first argument in either case).
     input.parse::<kw::spawn>()?;
@@ -295,6 +310,7 @@ fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
         spawn,
         policy,
         policy_ty,
+        executor,
         min,
         max,
     })
@@ -532,15 +548,30 @@ fn emit_pool(
     // `&POOL[I]` as the first argument (see `inject_node_call`).
     let call = inject_node_call(&p.spawn, &quote!(&#ident[I]))?;
     // Per-member spawn fn: a generated `spawn_<pool>::<I>` wrapper. Same optional
-    // trace capture as a node's closure, against member `I`'s slot.
-    let pool_spawn_stmts = spawn_stmts(&call, &quote!(&#ident[I]), &quote!(s));
+    // trace capture as a node's closure, against member `I`'s slot. With
+    // `executor: NAME` the wrapper ignores the supervisor's `Spawner` and spawns
+    // through the named SpawnerSlot (unfilled slot = SpawnError::Busy; member
+    // futures must then be `Send`), so a whole worker pool can live on another
+    // executor — e.g. the second core — while this core's supervisor scales it.
+    let (param, prelude, sp_tokens) = match &p.executor {
+        None => (quote!(s), quote!(), quote!(s)),
+        Some(ex) => (
+            quote!(_s),
+            quote! {
+                let __sp = #ex.get().ok_or(::embassy_executor::SpawnError::Busy)?;
+            },
+            quote!(__sp),
+        ),
+    };
+    let pool_spawn_stmts = spawn_stmts(&call, &quote!(&#ident[I]), &sp_tokens);
     let wrapper = format_ident!("spawn_{}", lname);
     let mut defs: Vec<TokenStream2> = Vec::new();
     defs.push(quote! {
         #(#cfg)*
         fn #wrapper<const I: usize>(
-            s: ::embassy_executor::Spawner,
+            #param: ::embassy_executor::Spawner,
         ) -> ::core::result::Result<(), ::embassy_executor::SpawnError> {
+            #prelude
             #pool_spawn_stmts
             ::core::result::Result::Ok(())
         }
@@ -714,6 +745,18 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                 // `ElasticPool` doesn't exist — so refuse a `pool` with a clear message
                 // rather than emitting dangling references.
                 if cfg!(feature = "pool") {
+                    if let Some(ex) = &p.executor
+                        && !executor_names.contains(&ex.to_string())
+                    {
+                        return Err(syn::Error::new_spanned(
+                            ex,
+                            format!(
+                                "unknown executor `{ex}`; declare it in the graph with \
+                                 `executor {ex};` (declared: [{}])",
+                                executor_names.join(", ")
+                            ),
+                        ));
+                    }
                     let (pool_defs, pool_entry, pool_slots) = emit_pool(p, &cr, &spawn_fn)?;
                     defs.extend(pool_defs);
                     pool_entries.push(pool_entry);

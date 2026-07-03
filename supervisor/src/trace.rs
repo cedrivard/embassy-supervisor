@@ -165,17 +165,57 @@ const FREE_SLOT: ExecutorSlot = ExecutorSlot {
 // contained it; the leftover is then subtracted from the slot's NEXT poll — a
 // few ticks of edge noise. `saturating_sub` bounds that noise at zero: without
 // it, a stale deposit larger than a short next poll would underflow the u32 and
-// poison `exec_ticks`/`max_poll_ticks` with a ~4e9-tick garbage value. SMP
-// would interleave pushes from two cores and corrupt the LIFO order, hence the
-// feature's single-core contract.
+// poison `exec_ticks`/`max_poll_ticks` with a ~4e9-tick garbage value.
+//
+// Multi-core: LIFO nesting only holds PER CORE — two cores' hooks interleave
+// arbitrarily. Registering a core-id fn ([`set_core_id_fn`]) switches to one
+// stack per core (nesting across cores does not exist: concurrent cores steal
+// nothing from each other, so no cross-core charge is needed). Without a
+// registered fn everything maps to core 0 — the single-core behavior.
+
+/// Number of per-core preemption stacks compiled in when `trace-nested` is
+/// enabled. Core indices from the registered fn are clamped to this.
+#[cfg(feature = "trace-nested")]
+pub const MAX_CORES: usize = 2;
+
+/// The app-registered core-id reader (see [`set_core_id_fn`]).
+#[cfg(feature = "trace-nested")]
+type CoreIdFn = fn() -> usize;
+#[cfg(feature = "trace-nested")]
+static CORE_ID_FN: Mutex<CriticalSectionRawMutex, Cell<Option<CoreIdFn>>> =
+    Mutex::new(Cell::new(None));
+
+/// Register how to read the current core's index (`trace-nested` on multi-core
+/// systems). The crate is HAL-agnostic, so the one-liner lives in the app — on
+/// RP2350: `trace::set_core_id_fn(|| embassy_rp::pac::SIO.cpuid().read() as usize)`.
+/// Must be registered before the second core's executor starts polling;
+/// unregistered, all hooks share core 0's stack (correct on single core).
+#[cfg(feature = "trace-nested")]
+pub fn set_core_id_fn(f: fn() -> usize) {
+    CORE_ID_FN.lock(|c| c.set(Some(f)));
+}
+
+/// The current core's stack index (0 when no fn is registered; clamped).
+#[cfg(feature = "trace-nested")]
+fn core_id() -> usize {
+    CORE_ID_FN
+        .lock(Cell::get)
+        .map_or(0, |f| f().min(MAX_CORES - 1))
+}
 
 #[cfg(feature = "trace-nested")]
-static NEST_DEPTH: AtomicUsize = AtomicUsize::new(0);
-#[cfg(feature = "trace-nested")]
-static NEST_STACK: [AtomicUsize; MAX_EXECUTORS] = {
+static NEST_DEPTH: [AtomicUsize; MAX_CORES] = {
     #[allow(clippy::declare_interior_mutable_const)] // array initializer
     const ZERO: AtomicUsize = AtomicUsize::new(0);
-    [ZERO; MAX_EXECUTORS]
+    [ZERO; MAX_CORES]
+};
+#[cfg(feature = "trace-nested")]
+static NEST_STACK: [[AtomicUsize; MAX_EXECUTORS]; MAX_CORES] = {
+    #[allow(clippy::declare_interior_mutable_const)] // array initializer
+    const ZERO: AtomicUsize = AtomicUsize::new(0);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ROW: [AtomicUsize; MAX_EXECUTORS] = [ZERO; MAX_EXECUTORS];
+    [ROW; MAX_CORES]
 };
 
 static EXECUTORS: [ExecutorSlot; MAX_EXECUTORS] = [FREE_SLOT; MAX_EXECUTORS];
@@ -266,12 +306,13 @@ pub fn on_task_exec_begin(executor_id: u32, task_id: u32) {
     }
     slot.current_begin.store(now, Ordering::Relaxed);
     slot.current_task.store(task_id, Ordering::Release);
-    // Open a frame on the preemption stack so a poll we preempted can be
-    // relieved of our wall time at our exec_end.
+    // Open a frame on this core's preemption stack so a poll we preempted can
+    // be relieved of our wall time at our exec_end.
     #[cfg(feature = "trace-nested")]
     {
-        let depth = NEST_DEPTH.fetch_add(1, Ordering::Relaxed);
-        if let Some(frame) = NEST_STACK.get(depth) {
+        let core = core_id();
+        let depth = NEST_DEPTH[core].fetch_add(1, Ordering::Relaxed);
+        if let Some(frame) = NEST_STACK[core].get(depth) {
             frame.store(idx, Ordering::Relaxed);
         }
     }
@@ -294,10 +335,14 @@ pub fn on_task_exec_end(executor_id: u32, task_id: u32) {
     #[cfg(feature = "trace-nested")]
     let elapsed = {
         let stolen = slot.stolen_ticks.swap(0, Ordering::Relaxed);
-        // Pop our frame; the new top (if any) is the poll we preempted.
-        let depth = NEST_DEPTH.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+        // Pop our frame from this core's stack; the new top (if any) is the
+        // poll we preempted on this core.
+        let core = core_id();
+        let depth = NEST_DEPTH[core]
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
         if depth > 0
-            && let Some(frame) = NEST_STACK.get(depth - 1)
+            && let Some(frame) = NEST_STACK[core].get(depth - 1)
         {
             let parent = frame.load(Ordering::Relaxed);
             if let Some(p) = EXECUTORS.get(parent) {

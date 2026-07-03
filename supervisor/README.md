@@ -163,6 +163,36 @@ The built-in `DeferredShrink` policy grows immediately when saturated (no idle m
 responsive up, lazy down. Swap in your own policy by implementing `ScalingPolicy` (a sync,
 allocation-free decision fn).
 
+## Multi-core
+
+The `executor` mechanism extends to a second core: each core runs its **own** executor,
+tasks never migrate, and the graph is the single source of *placement*.
+
+```rust,ignore
+supervisor_graph! {
+    executor CORE1;
+    node BENCH = Terminate, deps: [], executor: CORE1, spawn: bench_task, disabled;
+}
+
+// core 1 publishes its spawner as it boots (embassy-rp shown; any HAL works):
+spawn_core1(p.CORE1, &mut CORE1_STACK, || {
+    EXECUTOR1.run(|sp| CORE1.set(sp.make_send()))
+});
+
+// the supervisor rendezvouses with that asynchronous bring-up:
+CORE1.ready().await;
+sup.start(spawner)?;
+```
+
+Everything the supervisor does is already cross-core sound (atomics + critical-section
+primitives): teardown awaits acks from the other core, `apply_control` starts/stops
+remote nodes, and a whole `pool` can carry `executor: CORE1` — an elastic worker pool
+on core 1, scaled by core 0's supervisor. With `trace`, the other core's executor shows
+up as its own line in the stats; register `trace::set_core_id_fn` (one line, e.g. read
+`SIO.CPUID` on RP2350) to keep `trace-nested` exact per core. Explicit non-goals: task
+migration and work stealing (futures aren't `Send` across most HALs — each node lives
+where the graph puts it).
+
 ## Patterns
 
 Recipes from the two real applications built on this crate (the in-repo `firmware`, and a
@@ -194,7 +224,7 @@ battery-powered sensor node):
 | `trace`   |         | trace-hook observability: per-node CPU time / poll counts / max-poll watermark, executor idle time, stall detection (see below) |
 | `trace-hooks` |     | batteries-included: the graph declaration also defines the `_embassy_trace_*` hook symbols |
 | `trace-names` |     | stamp node names into task Metadata for external tooling (SystemView, debuggers) |
-| `trace-nested` |    | preemption-exact accounting: nested higher-tier polls are credited back to the window they interrupt (single-core) |
+| `trace-nested` |    | preemption-exact accounting: nested higher-tier polls are credited back to the window they interrupt (per-core stacks via `trace::set_core_id_fn` on multi-core) |
 
 `default-features = false` gives a minimal core that only does dependency-ordered
 bring-up/teardown — dropping the control plane and pools trims flash and a couple of statics.
@@ -222,8 +252,8 @@ executor poll is attributed to a *named* node — correctly across respawns.
 site (exactly one set may exist per binary; define your own and forward to the
 `trace::on_*` recorders instead if you need custom hooks). Limitations: accounting is
 preemption-naive by default — an interrupt executor's poll lands in whichever window it
-preempts; enable `trace-nested` (single-core) for exact charge-splitting; hardware-ISR
-time remains invisible either way. Executor busy% exceeds the per-node sum by a per-poll
+preempts; enable `trace-nested` for exact charge-splitting (register
+`trace::set_core_id_fn` on multi-core); hardware-ISR time remains invisible either way. Executor busy% exceeds the per-node sum by a per-poll
 accounting gap (executor bookkeeping + the hooks' own cost — it grows with poll rate;
 `ExecutorStats` measures it as `busy − in-poll`), at most 4 executors are tracked, and
 parked / closure-spawned nodes register with one call: `TaskNode::adopt(&token)`. The

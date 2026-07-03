@@ -364,22 +364,58 @@ impl TaskHandle {
 /// misconfiguration instead of a silently missing task. Futures spawned through
 /// a `SendSpawner` must be `Send`; a non-`Send` task on an `executor:` node is a
 /// compile error at the generated glue.
-pub struct SpawnerSlot(BlockingMutex<CriticalSectionRawMutex, Cell<Option<SendSpawner>>>);
+///
+/// When the executor lives on another core, its boot is asynchronous relative
+/// to the supervisor's: await [`ready`](Self::ready) before
+/// [`Supervisor::start`] instead of racing the fill.
+pub struct SpawnerSlot {
+    slot: BlockingMutex<CriticalSectionRawMutex, Cell<Option<SendSpawner>>>,
+    /// Wakes a `ready()` waiter when `set` fills the slot (cross-core safe:
+    /// `Signal` is critical-section based and latches).
+    filled: Signal<CriticalSectionRawMutex, ()>,
+}
 
 impl SpawnerSlot {
     /// An empty slot (`const` — it lives in a `static` the macro emits).
     pub const fn new() -> Self {
-        Self(BlockingMutex::new(Cell::new(None)))
+        Self {
+            slot: BlockingMutex::new(Cell::new(None)),
+            filled: Signal::new(),
+        }
     }
 
-    /// Fill the slot (last set wins). Call before [`Supervisor::start`].
+    /// Fill the slot (last set wins) and wake a [`ready`](Self::ready) waiter.
+    /// Call before [`Supervisor::start`] — or from the other core's bring-up,
+    /// with the supervisor awaiting `ready()`.
     pub fn set(&self, spawner: SendSpawner) {
-        self.0.lock(|c| c.set(Some(spawner)));
+        self.slot.lock(|c| c.set(Some(spawner)));
+        self.filled.signal(());
     }
 
     /// The registered spawner, or `None` while unfilled.
     pub fn get(&self) -> Option<SendSpawner> {
-        self.0.lock(Cell::get)
+        self.slot.lock(Cell::get)
+    }
+
+    /// Wait until the slot is filled and return the spawner. Intended for the
+    /// supervisor task to rendezvous with another core's executor bring-up:
+    ///
+    /// ```ignore
+    /// CORE1.ready().await;          // core1 fills the slot when its executor runs
+    /// sup.start(spawner)?;          // now `executor: CORE1` nodes can spawn
+    /// ```
+    ///
+    /// Single-waiter: the underlying `Signal` wakes one task (by design — the
+    /// one supervisor task). Returns immediately if already filled.
+    pub async fn ready(&self) -> SendSpawner {
+        loop {
+            if let Some(sp) = self.get() {
+                return sp;
+            }
+            // `Signal` latches: a `set()` racing between the check above and
+            // this wait still wakes us.
+            self.filled.wait().await;
+        }
     }
 }
 

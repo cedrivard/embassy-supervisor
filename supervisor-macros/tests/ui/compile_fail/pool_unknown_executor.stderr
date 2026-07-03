@@ -1,0 +1,5 @@
+error: unknown executor `TYPO`; declare it in the graph with `executor TYPO;` (declared: [HIGH])
+ --> tests/ui/compile_fail/pool_unknown_executor.rs:8:47
+  |
+8 |     pool P = [Terminate], deps: [], executor: TYPO,
+  |                                               ^^^^

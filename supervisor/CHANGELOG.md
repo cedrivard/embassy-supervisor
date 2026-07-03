@@ -14,10 +14,17 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
   `SpawnError::Busy`; annotated nodes' futures must be `Send`.
 - `TaskNode::adopt(&SpawnToken)`: one-call registration (task id + `trace-names` name
   stamp) for spawns the macro cannot see (parked nodes, verbatim spawn closures).
-- `trace-nested` (opt-in, single-core): preemption-exact accounting. A nested
-  higher-tier poll credits its wall time back to the window it interrupted, so a
-  preempted node's `exec_ticks`/`max_poll_ticks` are no longer inflated and
-  `stalled_task`/watermarks name the real culprit.
+- `trace-nested` (opt-in): preemption-exact accounting. A nested higher-tier poll
+  credits its wall time back to the window it interrupted, so a preempted node's
+  `exec_ticks`/`max_poll_ticks` are no longer inflated and `stalled_task`/watermarks
+  name the real culprit. On multi-core systems register `trace::set_core_id_fn`
+  (e.g. read `SIO.CPUID` on RP2350) for one preemption stack per core; unregistered,
+  everything maps to core 0 (single-core behavior).
+- Multi-core (AMP) support: `SpawnerSlot::ready()` lets the supervisor rendezvous
+  with another core's asynchronous executor bring-up before `start()`; pools accept
+  `executor: NAME` too (an elastic worker pool on the second core, scaled by this
+  core's supervisor). Cross-core lifecycle (slot-routed spawn, shutdown/ack,
+  control) is covered by cross-thread host tests running two real executors.
 - Trace-hook observability (opt-in features): `trace` — the supervisor consumes
   embassy-executor's `_embassy_trace_*` instrumentation, mapping task ids to nodes via the
   generated spawn glue and accounting per-node poll time / poll count / max-poll watermark,

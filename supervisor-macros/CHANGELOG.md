@@ -13,6 +13,8 @@ supervisor's CHANGELOG for the surrounding API history.
   `executor: NAME` node clause: the generated glue spawns through the named slot's
   `SendSpawner` instead of the supervisor's `Spawner`. Unknown names, `executor:`
   without `spawn:`, and `executor:` with a verbatim closure are expansion errors.
+- Pools accept `executor: NAME` too (between `deps:` and `spawn:`): every member
+  spawns through the slot — a worker pool on another executor or core.
 - Forwarded trace features: under `trace` the generated spawn glue captures each
   `SpawnToken`'s task id into its node (`set_task_id`); under `trace-names` it also stamps
   the node name into the task Metadata; under `trace-hooks` the macro defines the seven

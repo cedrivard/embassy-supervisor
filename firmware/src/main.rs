@@ -16,6 +16,7 @@ use embassy_rp::interrupt;
 use embassy_rp::interrupt::{InterruptExt, Priority};
 use {defmt_rtt as _, panic_probe as _};
 
+mod bench;
 mod heap;
 mod heartbeat;
 mod http;
@@ -29,7 +30,8 @@ mod ota;
 // takes. `heartbeat` is standalone; `http` and `ota` depend on `net`; `ota` is
 // disabled-at-boot (control-started).
 embassy_supervisor::supervisor_graph! {
-    executor HIGH; // Interrupt-priority tier (SWI_IRQ_0)
+    executor HIGH;  // Interrupt-priority tier (SWI_IRQ_0)
+    executor CORE1; // Core 1's thread executor (filled by core1_entry via spawn_core1)
     node NET = Terminate, deps: [], spawn: crate::net::net_task;
     node HEARTBEAT = Pause, deps: [], executor: HIGH, spawn: crate::heartbeat::heartbeat_task;
     pool HTTP = [Terminate, OnDemand, OnDemand, OnDemand], deps: [NET],
@@ -37,6 +39,7 @@ embassy_supervisor::supervisor_graph! {
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(4)),
         min: 1, max: 4;
     node OTA = Terminate, deps: [NET], spawn: crate::ota::ota_task, disabled;
+    node BENCH = Terminate, deps: [], executor: CORE1, spawn: crate::bench::bench_task, disabled;
 }
 
 // The interrupt-priority executor backing the graph's `HIGH` slot. Its poll loop
@@ -52,17 +55,38 @@ unsafe fn SWI_IRQ_0() {
     unsafe { EXECUTOR_HIGH.on_interrupt() }
 }
 
+// Core 1's boot stack (the executor's tasks have their own statics; this is the
+// entry/idle stack). `static mut` accessed exactly once, before core 1 starts.
+static mut CORE1_STACK: embassy_rp::multicore::Stack<4096> = embassy_rp::multicore::Stack::new();
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // Init the HAL, then drop `Peripherals`: each subsystem steals the hardware it
-    // needs (USB in net, PIN_25 in heartbeat, FLASH/WATCHDOG here), so `main` holds none.
-    let _ = embassy_rp::init(Default::default());
+    // Init the HAL; each subsystem steals the hardware it needs (USB in net,
+    // PIN_25 in heartbeat, FLASH/WATCHDOG below) — `main` keeps only CORE1.
+    let p = embassy_rp::init(Default::default());
     heap::init();
 
     // Bring up the HIGH tier and fill the graph's spawner slot BEFORE the
     // supervisor starts (an unfilled slot would fail heartbeat's spawn loudly).
     interrupt::SWI_IRQ_0.set_priority(Priority::P2);
     HIGH.set(EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0));
+
+    // Per-core preemption stacks for trace-nested: the crate is HAL-agnostic,
+    // so the one-line core-id reader lives here (SIO.CPUID = current core).
+    embassy_supervisor::trace::set_core_id_fn(|| embassy_rp::pac::SIO.cpuid().read() as usize);
+
+    // Boot core 1: its executor publishes a SendSpawner into the graph's CORE1
+    // slot, and `app_supervisor` awaits `CORE1.ready()` before starting — the
+    // supervisor-side rendezvous with this asynchronous bring-up. The executor
+    // is Box::leak'd (core 1 allocating is fine: the heap's critical-section is
+    // a cross-core spinlock on RP2350).
+    // SAFETY: CORE1_STACK is borrowed exactly once, here, before core 1 runs.
+    let core1_stack = unsafe { &mut *&raw mut CORE1_STACK };
+    embassy_rp::multicore::spawn_core1(p.CORE1, core1_stack, || {
+        let executor =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(embassy_executor::Executor::new()));
+        executor.run(|sp| CORE1.set(sp.make_send()))
+    });
     defmt::info!(
         "boot: heap {}/{} B free",
         heap::free_bytes(),
@@ -78,6 +102,11 @@ async fn main(spawner: Spawner) {
 /// order, then drive elastic-pool scaling and runtime control forever.
 #[embassy_executor::task]
 async fn app_supervisor(spawner: Spawner) {
+    // Rendezvous with core 1's asynchronous bring-up: `executor: CORE1` nodes
+    // (bench) can only spawn once its executor has published a SendSpawner.
+    // (HIGH is filled synchronously in `main` before this task is spawned.)
+    let _ = CORE1.ready().await;
+
     // Construction is infallible: the graph's topological order is computed at
     // compile time, so a dependency cycle would have been a compile error. `GRAPH`
     // carries the nodes, dep table, order, and the elastic pools.
