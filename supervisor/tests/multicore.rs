@@ -7,7 +7,13 @@
 //!   1. per-core `trace-nested` stacks: concurrently-open polls on two "cores"
 //!      (simulated by a switchable core-id fn) must not cross-charge — the bug
 //!      a single LIFO stack would produce;
-//!   2. `SpawnerSlot::ready()` woken by a `set()` from another thread;
+//!   2. the cross-core spawn rendezvous: `Supervisor::start` awaiting a node's
+//!      `executor:` `SpawnerSlot` (`ready()`) that thread B fills ~50 ms late — the
+//!      WAITING branch, standing in for core 1 publishing its `SendSpawner` after
+//!      core 0 has already reached bring-up. Because the wait is now a real async
+//!      `.await` (not the old `block_on` busy-spin, which starved the std CS mutex),
+//!      it resolves cross-thread in-process, so this path is exercised here rather
+//!      than being hardware-only;
 //!   3. the full graph path across threads: `Supervisor::start` on executor A
 //!      spawning an `executor: CORE1` node onto executor B through the slot,
 //!      then `stop_node` driving the shutdown/ack handshake cross-thread.
@@ -47,13 +53,16 @@ async fn remote_task(node: &'static TaskNode) {
 /// spawns REMOTE onto B through the CORE1 slot), then stop it cross-thread.
 #[embassy_executor::task]
 async fn driver_task(spawner: Spawner) {
-    // (2) ready() must be woken by thread B's set() — B fills the slot ~50 ms
-    // after this task first checks, so the wait path is genuinely exercised.
-    let _ = CORE1.ready().await;
-
+    // (2) + (3) Start the graph WITHOUT pre-filling the slot: thread B publishes
+    // CORE1's SendSpawner ~50 ms late (below), so `Supervisor::start` takes the
+    // WAITING branch — it awaits `CORE1.ready()` internally (a real executor await,
+    // not a busy-spin), yielding until B's `set()` wakes it, then spawns REMOTE onto
+    // executor B through the slot. This is the cross-core rendezvous the firmware
+    // relies on, now handled by the supervisor instead of an explicit app-side await.
     let sup = Supervisor::new(&GRAPH);
     sup.start(spawner)
-        .expect("start spawns REMOTE via the slot");
+        .await
+        .expect("start spawns REMOTE via the slot once B fills it");
     // REMOTE runs on executor B (another thread): wait for its first poll.
     while !REMOTE_STARTED.load(Ordering::Acquire) {
         embassy_futures::yield_now().await;
@@ -121,7 +130,7 @@ fn multicore() {
     });
     // Thread B: "core 1" — its executor's only supervisor-visible artifact is
     // the SendSpawner it publishes into the graph's CORE1 slot, deliberately
-    // late so driver_task's ready() takes the waiting path.
+    // late so `Supervisor::start`'s internal slot wait takes the WAITING path.
     std::thread::spawn(|| {
         std::thread::sleep(StdDuration::from_millis(50));
         let executor: &'static mut embassy_executor::Executor =

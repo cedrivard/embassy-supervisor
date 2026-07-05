@@ -222,7 +222,7 @@ async fn drive_pools<const N: usize>(
                 // Only grow when the candidate's dependencies are up.
                 // SpawnError::Busy at the pool ceiling → can't grow, no-op.
                 if sup.deps_running(n) {
-                    let _ = sup.start_node(n, spawner);
+                    let _ = sup.start_node(n, spawner).await;
                 }
             }
             PoolAction::Stop(n) => sup.stop_node(n).await,

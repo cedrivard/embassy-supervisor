@@ -125,8 +125,10 @@ struct NodeItem {
 }
 
 /// `executor NAME;` — declares a `pub static NAME: SpawnerSlot` the application
-/// fills with a `SendSpawner` before `Supervisor::start` (an InterruptExecutor
-/// tier, core1, ...). Nodes reference it with `executor: NAME`.
+/// fills with a `SendSpawner` before (or concurrently with) `Supervisor::start` (an
+/// InterruptExecutor tier, core1, ...). Nodes reference it with `executor: NAME`; the
+/// supervisor awaits the slot before spawning such a node (bounded by
+/// `SLOT_READY_TIMEOUT`, then `SpawnError::Busy`).
 struct ExecutorItem {
     cfg: Vec<Attribute>,
     ident: Ident,
@@ -188,7 +190,9 @@ impl Parse for GraphSpec {
             } else if input.peek(kw::pool) {
                 items.push(Item::Pool(parse_pool(input, cfg)?));
             } else if input.peek(kw::executor) {
-                // `executor NAME;` — a runtime-filled SendSpawner slot.
+                // `executor NAME;` — a runtime-filled SendSpawner slot; nodes
+                // carrying `executor: NAME` spawn through it (the supervisor awaits
+                // the slot before spawning them).
                 input.parse::<kw::executor>()?;
                 let ident: Ident = input.parse()?;
                 input.parse::<Token![;]>()?;
@@ -436,6 +440,10 @@ fn node_spawn(
                     let stmts = spawn_stmts(&call, &quote!(&#ident), &quote!(__sp));
                     quote!(::core::option::Option::Some(
                         (|_s| {
+                            // The supervisor awaits this slot's `ready()` before
+                            // invoking the glue (the node carries `.with_executor(&EX)`
+                            // and the bring-up bounds the wait), so `get()` is already
+                            // filled; `ok_or` is the belt-and-braces unfilled guard.
                             let __sp = #ex
                                 .get()
                                 .ok_or(::embassy_executor::SpawnError::Busy)?;
@@ -494,10 +502,16 @@ fn emit_node(
     let name = name_string(&n.ident);
     let disabled = n.disabled;
     let spawn = node_spawn(ident, &n.spawn, &n.executor, spawn_fn)?;
+    // `executor: NAME` routes the node through that SpawnerSlot; the supervisor
+    // awaits the slot before spawning (see `TaskNode::with_executor`).
+    let with_exec = match &n.executor {
+        Some(ex) => quote!( .with_executor(&#ex) ),
+        None => quote!(),
+    };
     let def = quote! {
         #(#cfg)*
         pub static #ident: #cr::TaskNode =
-            #cr::TaskNode::new(#name, #cr::Mode::#mode, #spawn, #disabled);
+            #cr::TaskNode::new(#name, #cr::Mode::#mode, #spawn, #disabled) #with_exec;
     };
     let slot = Slot {
         cfg_pred: cfg_predicate(cfg),
@@ -550,15 +564,19 @@ fn emit_pool(
     // Per-member spawn fn: a generated `spawn_<pool>::<I>` wrapper. Same optional
     // trace capture as a node's closure, against member `I`'s slot. With
     // `executor: NAME` the wrapper ignores the supervisor's `Spawner` and spawns
-    // through the named SpawnerSlot (unfilled slot = SpawnError::Busy; member
-    // futures must then be `Send`), so a whole worker pool can live on another
-    // executor — e.g. the second core — while this core's supervisor scales it.
+    // through the named SpawnerSlot; each member node carries `.with_executor(&EX)`,
+    // so the supervisor awaits the slot (bounded) before invoking the wrapper and
+    // the wrapper's `get()` is already filled (`SpawnError::Busy` guards a never-
+    // filled slot; member futures must be `Send`). A whole worker pool can thus live
+    // on another executor — e.g. the second core — while this core scales it.
     let (param, prelude, sp_tokens) = match &p.executor {
         None => (quote!(s), quote!(), quote!(s)),
         Some(ex) => (
             quote!(_s),
             quote! {
-                let __sp = #ex.get().ok_or(::embassy_executor::SpawnError::Busy)?;
+                let __sp = #ex
+                    .get()
+                    .ok_or(::embassy_executor::SpawnError::Busy)?;
             },
             quote!(__sp),
         ),
@@ -578,6 +596,12 @@ fn emit_pool(
     });
     let member_spawn: Vec<TokenStream2> = (0..k).map(|j| quote!(#wrapper::<#j>)).collect();
 
+    // `executor: NAME` on the pool routes every member through that SpawnerSlot; the
+    // supervisor awaits it before spawning each member (see `TaskNode::with_executor`).
+    let member_with_exec = match &p.executor {
+        Some(ex) => quote!( .with_executor(&#ex) ),
+        None => quote!(),
+    };
     let members = p
         .modes
         .iter()
@@ -589,7 +613,7 @@ fn emit_pool(
                 #cr::TaskNode::new(
                     #nm, #cr::Mode::#mode,
                     ::core::option::Option::Some((#sp) as #spawn_fn), false,
-                )
+                ) #member_with_exec
             }
         });
     defs.push(quote! {

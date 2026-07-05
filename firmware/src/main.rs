@@ -76,10 +76,7 @@ async fn main(spawner: Spawner) {
     embassy_supervisor::trace::set_core_id_fn(|| embassy_rp::pac::SIO.cpuid().read() as usize);
 
     // Boot core 1: its executor publishes a SendSpawner into the graph's CORE1
-    // slot, and `app_supervisor` awaits `CORE1.ready()` before starting — the
-    // supervisor-side rendezvous with this asynchronous bring-up. The executor
-    // is Box::leak'd (core 1 allocating is fine: the heap's critical-section is
-    // a cross-core spinlock on RP2350).
+    // slot.
     // SAFETY: CORE1_STACK is borrowed exactly once, here, before core 1 runs.
     let core1_stack = unsafe { &mut *&raw mut CORE1_STACK };
     embassy_rp::multicore::spawn_core1(p.CORE1, core1_stack, || {
@@ -102,11 +99,6 @@ async fn main(spawner: Spawner) {
 /// order, then drive elastic-pool scaling and runtime control forever.
 #[embassy_executor::task]
 async fn app_supervisor(spawner: Spawner) {
-    // Rendezvous with core 1's asynchronous bring-up: `executor: CORE1` nodes
-    // (bench) can only spawn once its executor has published a SendSpawner.
-    // (HIGH is filled synchronously in `main` before this task is spawned.)
-    let _ = CORE1.ready().await;
-
     // Construction is infallible: the graph's topological order is computed at
     // compile time, so a dependency cycle would have been a compile error. `GRAPH`
     // carries the nodes, dep table, order, and the elastic pools.
@@ -114,6 +106,7 @@ async fn app_supervisor(spawner: Spawner) {
     // `ota` is declared `disabled` (disabled-at-boot), so `start()` skips it; a
     // control `Activate` (POST /api/ota or the dashboard start button) starts it.
     sup.start(spawner)
+        .await
         .expect("supervisor: initial spawn failed");
 
     loop {

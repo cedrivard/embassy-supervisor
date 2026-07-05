@@ -78,7 +78,7 @@
 //! #[embassy_executor::task]
 //! async fn supervisor_task(spawner: Spawner) {
 //!     let sup = Supervisor::new(&GRAPH);
-//!     sup.start(spawner).expect("initial spawn"); // brings up `net`, then `app`
+//!     sup.start(spawner).await.expect("initial spawn"); // brings up `net`, then `app`
 //!     loop {
 //!         // Apply runtime start/stop/pause/resume requests in dependency order.
 //!         let cmd = wait_control().await;
@@ -111,7 +111,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 #[cfg(feature = "control")]
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
-use embassy_time::Timer;
+use embassy_time::{Timer, with_timeout};
 use portable_atomic::AtomicBool;
 #[cfg(feature = "trace")]
 use portable_atomic::AtomicU32;
@@ -200,6 +200,14 @@ pub async fn wait_control() -> ControlCommand {
 /// supervisor with the offending node's name. 2 s comfortably exceeds a typical
 /// task's poll period and peripheral settle time.
 const SHUTDOWN_ACK_TIMEOUT_MS: u64 = 2_000;
+
+/// How long the supervisor's bring-up waits for a node's `executor:`
+/// [`SpawnerSlot`] to be filled before failing the spawn with
+/// [`SpawnError::Busy`]. A genuine cross-core rendezvous resolves in microseconds;
+/// a slot empty this long is a misconfiguration (the app never registered that
+/// executor's spawner). Bounded, so a misconfigured graph fails loudly instead of
+/// hanging bring-up forever.
+const SLOT_READY_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(100);
 
 // ─── Mode ────────────────────────────────────────────────────────────────
 
@@ -350,24 +358,21 @@ impl TaskHandle {
 ///
 /// Declared by the `executor NAME;` item of [`supervisor_graph!`]; nodes carrying
 /// `executor: NAME` are spawned through the slot instead of the supervisor's own
-/// `Spawner`. The application fills it once at startup, before
-/// [`Supervisor::start`]:
+/// `Spawner`. The application fills it once at startup — before, or concurrently
+/// with, [`Supervisor::start`] (e.g. from the second core's bring-up):
 ///
 /// ```ignore
 /// static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
 /// HIGH.set(EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0));
-/// sup.start(spawner)?;   // nodes declared `executor: HIGH` spawn on that tier
+/// sup.start(spawner).await?;   // nodes declared `executor: HIGH` spawn on that tier
 /// ```
 ///
-/// A node whose slot is still empty at spawn time fails with
-/// [`SpawnError::Busy`] (the one portable error variant) — a loud
-/// misconfiguration instead of a silently missing task. Futures spawned through
-/// a `SendSpawner` must be `Send`; a non-`Send` task on an `executor:` node is a
-/// compile error at the generated glue.
-///
-/// When the executor lives on another core, its boot is asynchronous relative
-/// to the supervisor's: await [`ready`](Self::ready) before
-/// [`Supervisor::start`] instead of racing the fill.
+/// The supervisor's bring-up (`start` / `start_node` / `respawn_terminate`) awaits
+/// [`ready`](Self::ready) for a node's slot before spawning it, so a tier filled
+/// late — or from another core — is handled without a race; a slot still empty after
+/// the supervisor's bounded wait fails the spawn with [`SpawnError::Busy`] rather
+/// than silently dropping the task. Spawned futures must be `Send` (a non-`Send`
+/// `executor:` task is a compile error at the glue).
 pub struct SpawnerSlot {
     slot: BlockingMutex<CriticalSectionRawMutex, Cell<Option<SendSpawner>>>,
     /// Wakes a `ready()` waiter when `set` fills the slot (cross-core safe:
@@ -397,16 +402,12 @@ impl SpawnerSlot {
         self.slot.lock(Cell::get)
     }
 
-    /// Wait until the slot is filled and return the spawner. Intended for the
-    /// supervisor task to rendezvous with another core's executor bring-up:
-    ///
-    /// ```ignore
-    /// CORE1.ready().await;          // core1 fills the slot when its executor runs
-    /// sup.start(spawner)?;          // now `executor: CORE1` nodes can spawn
-    /// ```
-    ///
-    /// Single-waiter: the underlying `Signal` wakes one task (by design — the
-    /// one supervisor task). Returns immediately if already filled.
+    /// Await the slot and return the spawner. The rendezvous primitive: the
+    /// supervisor's bring-up awaits this for a node's `executor:` slot before
+    /// spawning it (bounded, see [`Supervisor::start`]), so a tier filled late — or
+    /// from another core — is handled without a race. An application may also await
+    /// it directly to gate other work on the executor being up. Single-waiter (the
+    /// one supervisor task); returns immediately if the slot is already filled.
     pub async fn ready(&self) -> SendSpawner {
         loop {
             if let Some(sp) = self.get() {
@@ -444,6 +445,13 @@ pub struct TaskNode {
     /// itself (e.g. a `Pause` sensor holding a peripheral handle): the supervisor
     /// tracks its lifecycle but never spawns it.
     pub spawn: Option<fn(Spawner) -> Result<(), SpawnError>>,
+    /// The executor [`SpawnerSlot`] this node spawns through (`executor: NAME` in
+    /// the graph), or `None` to spawn on the supervisor's own `Spawner`. When
+    /// `Some`, the supervisor awaits the slot's [`ready`](SpawnerSlot::ready)
+    /// (bounded by [`SLOT_READY_TIMEOUT`]) *before* invoking `spawn`, so the
+    /// generated glue's own non-blocking `SpawnerSlot::get` is already filled. Set
+    /// by the macro via [`with_executor`](Self::with_executor); `const`, zero-cost.
+    spawn_slot: Option<&'static SpawnerSlot>,
     handle: TaskHandle,
 }
 
@@ -468,8 +476,19 @@ impl TaskNode {
             name,
             mode,
             spawn,
+            spawn_slot: None,
             handle: TaskHandle::new(disabled_at_boot),
         }
+    }
+
+    /// Route this node's spawn through the given executor [`SpawnerSlot`] (the
+    /// `executor: NAME` graph annotation). The supervisor awaits the slot before
+    /// spawning the node, so a tier filled late — or from another core — is handled
+    /// without a race, and the generated glue's non-blocking `get` is already filled.
+    /// `const` and chainable in a `static` initializer; emitted by [`supervisor_graph!`].
+    pub const fn with_executor(mut self, slot: &'static SpawnerSlot) -> Self {
+        self.spawn_slot = Some(slot);
+        self
     }
 
     // ── Task-side API ────────────────────────────────────────────────────
@@ -735,6 +754,19 @@ pub struct Supervisor<const N: usize> {
     pools: &'static [&'static dyn Pool],
 }
 
+/// Await a node's `executor:` [`SpawnerSlot`] (if it has one), bounded by
+/// [`SLOT_READY_TIMEOUT`]. A slot still empty after the wait yields
+/// [`SpawnError::Busy`] — a loud misconfiguration, not a silent hang. A node with no
+/// slot returns immediately, so a same-executor bring-up never touches the timer.
+async fn await_spawn_slot(node: &'static TaskNode) -> Result<(), SpawnError> {
+    if let Some(slot) = node.spawn_slot {
+        with_timeout(SLOT_READY_TIMEOUT, slot.ready())
+            .await
+            .map_err(|_| SpawnError::Busy)?;
+    }
+    Ok(())
+}
+
 impl<const N: usize> Supervisor<N> {
     /// Build a supervisor from a precomputed [`Graph`] — the `GRAPH` that
     /// `supervisor_graph!` emits (node slots, dependency-index table, compile-time
@@ -756,7 +788,7 @@ impl<const N: usize> Supervisor<N> {
     /// `start_node`. A **parked** node (no `spawn` fn) is spawned externally by
     /// `main()` (with hardware handles main owns); it's still marked `running`
     /// here. Disabled nodes, and `#[cfg]`-ed-out slots, are skipped.
-    pub fn start(&self, spawner: Spawner) -> Result<(), SpawnError> {
+    pub async fn start(&self, spawner: Spawner) -> Result<(), SpawnError> {
         // Register the node slots with the trace recorders.
         #[cfg(feature = "trace")]
         trace::register_graph(self.nodes);
@@ -770,6 +802,10 @@ impl<const N: usize> Supervisor<N> {
             }
             info!("supervisor: spawning {} ({})", node.name, node.mode);
             if let Some(spawn) = node.spawn {
+                // For an `executor:` node, wait (bounded) for its slot to be filled
+                // before spawning; a same-executor node has no slot, so this is an
+                // immediate no-op and the bring-up loop stays tight.
+                await_spawn_slot(node).await?;
                 spawn(spawner)?;
             }
             node.set_running(true);
@@ -782,9 +818,14 @@ impl<const N: usize> Supervisor<N> {
     /// exactly one), and marks it `running`. Returns `SpawnError::Busy` if the
     /// underlying embassy task pool is exhausted (the ceiling), which the caller
     /// treats as "can't grow".
-    pub fn start_node(&self, node: &'static TaskNode, spawner: Spawner) -> Result<(), SpawnError> {
+    pub async fn start_node(
+        &self,
+        node: &'static TaskNode,
+        spawner: Spawner,
+    ) -> Result<(), SpawnError> {
         node.reset();
         if let Some(spawn) = node.spawn {
+            await_spawn_slot(node).await?;
             spawn(spawner)?;
         }
         node.set_running(true);
@@ -864,7 +905,7 @@ impl<const N: usize> Supervisor<N> {
     /// are left down — they re-grow under load via `start_node`. Disabled nodes
     /// are skipped so a manual stop sticks across the bring-up. The reset happens
     /// before the spawn so newly-running tasks see a clean handle.
-    pub fn respawn_terminate(&self, spawner: Spawner) -> Result<(), SpawnError> {
+    pub async fn respawn_terminate(&self, spawner: Spawner) -> Result<(), SpawnError> {
         for i in self.order.iter() {
             let Some(node) = self.nodes[*i as usize] else {
                 continue;
@@ -873,6 +914,7 @@ impl<const N: usize> Supervisor<N> {
                 node.reset();
                 info!("supervisor: respawning {}", node.name);
                 if let Some(spawn) = node.spawn {
+                    await_spawn_slot(node).await?;
                     spawn(spawner)?;
                 }
                 node.set_running(true);
@@ -1032,7 +1074,7 @@ impl<const N: usize> Supervisor<N> {
                 Mode::Terminate => {
                     info!("supervisor: control-start {}", node.name);
                     // SpawnError::Busy (pool exhausted) → can't start, skip.
-                    let _ = self.start_node(node, spawner);
+                    let _ = self.start_node(node, spawner).await;
                 }
                 Mode::Pause => {
                     info!("supervisor: control-resume {}", node.name);
