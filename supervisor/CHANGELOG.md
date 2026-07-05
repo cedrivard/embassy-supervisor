@@ -4,7 +4,10 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-07-05
+
+**Breaking release** — bring-up is now `async` (see *Changed*). Adds multi-executor
+graphs, AMP (multi-core) support, and trace-hook observability.
 
 ### Added
 - Multi-executor graphs: the `executor NAME;` item declares a runtime-filled
@@ -20,11 +23,14 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
   name the real culprit. On multi-core systems register `trace::set_core_id_fn`
   (e.g. read `SIO.CPUID` on RP2350) for one preemption stack per core; unregistered,
   everything maps to core 0 (single-core behavior).
-- Multi-core (AMP) support: `SpawnerSlot::ready()` lets the supervisor rendezvous
-  with another core's asynchronous executor bring-up before `start()`; pools accept
-  `executor: NAME` too (an elastic worker pool on the second core, scaled by this
-  core's supervisor). Cross-core lifecycle (slot-routed spawn, shutdown/ack,
-  control) is covered by cross-thread host tests running two real executors.
+- Multi-core support: bring-up awaits a node's `SpawnerSlot` (`ready()`) so the
+  supervisor rendezvouses with another core's asynchronous executor bring-up *as part
+  of* `start()` (bounded, then `SpawnError::Busy`); pools accept `executor: NAME` too
+  (an elastic worker pool on the second core, scaled by this core's supervisor).
+  Cross-core lifecycle (slot-routed spawn, shutdown/ack, control) is covered by
+  cross-thread host tests running two real executors.
+- `TaskNode::with_executor(&SpawnerSlot)`: routes a node's spawn through an executor
+  slot (emitted by `supervisor_graph!` for `executor: NAME`).
 - Trace-hook observability (opt-in features): `trace` — the supervisor consumes
   embassy-executor's `_embassy_trace_*` instrumentation, mapping task ids to nodes via the
   generated spawn glue and accounting per-node poll time / poll count / max-poll watermark,
@@ -35,6 +41,16 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
   at the declaration site; `trace-names` — node names are stamped into task Metadata for
   external consumers. Counters are wrapping u32 ticks (sample-and-diff); accounting is
   preemption-naive and capped at 4 executors (documented).
+
+### Changed
+- **Breaking:** `Supervisor::start`, `Supervisor::start_node`, and
+  `Supervisor::respawn_terminate` are now `async fn` and must be `.await`ed (they were
+  synchronous). Bringing up an `executor: NAME` node now awaits its `SpawnerSlot`
+  (bounded by an internal default, then `SpawnError::Busy`) before spawning it, so a
+  tier filled late — or from another core — is handled without a race and without the
+  hazards of the old synchronous slot wait (no busy-spin; no integrated-timer-queue
+  panic on hardware). A node with no `executor:` slot skips the wait. Callers on the
+  supervisor task simply add `.await`.
 
 ## [0.2.0] - 2026-07-01
 
@@ -95,7 +111,7 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/v0.2.0...HEAD
+[0.3.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/cedrivard/embassy-supervisor/releases/tag/v0.1.1
 [0.1.0]: https://github.com/cedrivard/embassy-supervisor/releases/tag/v0.1.0

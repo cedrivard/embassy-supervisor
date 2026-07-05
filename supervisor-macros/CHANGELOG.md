@@ -6,7 +6,10 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
-## [Unreleased]
+## [0.2.0] - 2026-07-05
+
+Requires `embassy-supervisor` >= 0.3.0 (the generated `executor:` glue uses that
+release's async slot rendezvous); pinned by exact version from the supervisor crate.
 
 ### Added
 - The `executor NAME;` item (emits a `pub static NAME: SpawnerSlot`) and the
@@ -15,6 +18,9 @@ supervisor's CHANGELOG for the surrounding API history.
   without `spawn:`, and `executor:` with a verbatim closure are expansion errors.
 - Pools accept `executor: NAME` too (between `deps:` and `spawn:`): every member
   spawns through the slot — a worker pool on another executor or core.
+- An `executor:` node/pool now emits `TaskNode::with_executor(&NAME)`; its spawn glue
+  does a non-blocking `SpawnerSlot::get()` because the supervisor awaits the slot
+  before invoking it (see the supervisor's 0.3.0 async bring-up).
 - Forwarded trace features: under `trace` the generated spawn glue captures each
   `SpawnToken`'s task id into its node (`set_task_id`); under `trace-names` it also stamps
   the node name into the task Metadata; under `trace-hooks` the macro defines the seven
@@ -36,4 +42,5 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
+[0.2.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.1.0...embassy-supervisor-macros-v0.2.0
 [0.1.0]: https://github.com/cedrivard/embassy-supervisor/releases/tag/embassy-supervisor-macros-v0.1.0

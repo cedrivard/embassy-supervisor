@@ -296,13 +296,14 @@ pub struct TaskHandle {
     /// Because it lives in a `static`, it also survives a power-state transition
     /// that retains RAM (e.g. a warm-resume from deep sleep).
     disabled: AtomicBool,
-    /// The node manages its own lifecycle and must NOT be torn down by a
-    /// dependency cascade. A dependency normally means "stop me when my dep stops",
-    /// but a node can declare a dep purely for *start* ordering and then intend to
-    /// outlive it — e.g. a node that needs a dependency up to initialize, then stops
-    /// that dependency to reclaim its resources, must survive that teardown. While
-    /// set, `deactivate` will not pull the node into a transitive-dependent teardown.
-    /// Self-managed, so `reset()` leaves it (the node clears it itself when done).
+    /// The node manages its own lifecycle and must NOT be stopped by the supervisor.
+    /// A dependency normally means "stop me when my dep stops", but a node can declare
+    /// a dep purely for *start* ordering and then intend to outlive it — e.g. a
+    /// sleep/power coordinator that needs the graph up to initialize, then tears it
+    /// down, sleeps, and wakes it, all while itself staying alive. While set, the node
+    /// is skipped by `deactivate` (transitive-dependent teardown), by full `teardown`,
+    /// and by `respawn_terminate` — so it runs continuously across a teardown/wake
+    /// cycle. Self-managed, so `reset()` leaves it (the node clears it itself when done).
     detached: AtomicBool,
     /// The executor task id currently running this node (`TaskRef::id()`, captured
     /// from the `SpawnToken` by the macro's spawn glue). `0` = unknown (not yet
@@ -568,14 +569,21 @@ impl TaskNode {
         self.handle.disabled.load(Ordering::Acquire)
     }
 
-    /// Mark/clear this node as **detached**: a node that manages its own lifecycle
-    /// and must not be torn down by a dependency cascade (see the field doc). Set it
-    /// before stopping a dependency the node has declared but intends to outlive.
+    /// Mark/clear this node as **detached**: a self-managing node the supervisor
+    /// brings up once (via [`start`](Supervisor::start)) and then leaves alone. A
+    /// detached node is skipped by dependency-cascade teardown, by full
+    /// [`teardown`](Supervisor::teardown), and by
+    /// [`respawn_terminate`](Supervisor::respawn_terminate) — so it keeps running
+    /// across a teardown/wake cycle instead of being stopped and re-spawned. Use it
+    /// for a task that must outlive the teardown it participates in — e.g. a
+    /// sleep/power coordinator that tears the graph down, sleeps, then wakes it. The
+    /// node owns its own shutdown; the supervisor will not drive it.
     pub fn set_detached(&self, detached: bool) {
         self.handle.detached.store(detached, Ordering::Release);
     }
 
-    /// True while this node is detached from dependency-cascade teardown.
+    /// True while this node is [detached](Self::set_detached) (self-managed;
+    /// skipped by cascade teardown, full teardown, and respawn).
     pub fn is_detached(&self) -> bool {
         self.handle.detached.load(Ordering::Acquire)
     }
@@ -876,6 +884,12 @@ impl<const N: usize> Supervisor<N> {
             if !node.is_running() {
                 continue;
             }
+            // A detached node manages its own lifecycle (e.g. a sleep/power
+            // coordinator that must outlive the teardown it drives), so the
+            // supervisor never tears it down. See [`TaskNode::set_detached`].
+            if node.is_detached() {
+                continue;
+            }
             info!("supervisor: tearing down {}", node.name);
             self.shutdown_and_wait(node).await;
         }
@@ -903,14 +917,16 @@ impl<const N: usize> Supervisor<N> {
     /// Reset and re-spawn every Terminate-mode node in dependency order.
     /// Pause-mode nodes are untouched (use `resume_pausable`); `OnDemand` nodes
     /// are left down — they re-grow under load via `start_node`. Disabled nodes
-    /// are skipped so a manual stop sticks across the bring-up. The reset happens
-    /// before the spawn so newly-running tasks see a clean handle.
+    /// are skipped so a manual stop sticks across the bring-up. Detached nodes are
+    /// skipped too: `teardown` never brought them down, so they are still running
+    /// and re-spawning would double-spawn them (see [`TaskNode::set_detached`]). The
+    /// reset happens before the spawn so newly-running tasks see a clean handle.
     pub async fn respawn_terminate(&self, spawner: Spawner) -> Result<(), SpawnError> {
         for i in self.order.iter() {
             let Some(node) = self.nodes[*i as usize] else {
                 continue;
             };
-            if matches!(node.mode, Mode::Terminate) && !node.is_disabled() {
+            if matches!(node.mode, Mode::Terminate) && !node.is_disabled() && !node.is_detached() {
                 node.reset();
                 info!("supervisor: respawning {}", node.name);
                 if let Some(spawn) = node.spawn {
