@@ -13,6 +13,8 @@
 //! pool NAME = [Mode, ..], deps: [A][, executor: EXEC], spawn: <fn>,
 //!     policy: [<Ty> =] <expr>, min: N, max: M;
 //! ```
+//! `deps:` entries name a `node` or a `pool`; a `pool` dep resolves to that pool's floor
+//! member (member 0, the `min`-kept one), i.e. "start after the pool is up".
 //! `executor EXEC;` emits a `pub static EXEC: SpawnerSlot`; the app fills it with a
 //! `SendSpawner` (`InterruptExecutor::start`, `Spawner::make_send`) before
 //! `Supervisor::start`, and nodes carrying `executor: EXEC` spawn through it instead
@@ -709,10 +711,11 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
     );
 
     // First pass: emit the statics/glue in declaration order, assign stable slot
-    // indices, and record each slot + its raw deps. `names` maps a node ident to its
-    // slot index for dep resolution — keyed on the *raw* ident (not the runtime
-    // `name_string`), and populated for `node`s only (pool members occupy slots but
-    // aren't name-addressable, so a dep on a pool name stays an "unknown dependency").
+    // indices, and record each slot + its raw deps. `names` maps a dep-addressable ident
+    // to its slot index for dep resolution — keyed on the *raw* ident (not the runtime
+    // `name_string`). A `node` maps to its own slot; a `pool` maps to its floor member's
+    // slot (so `deps: [POOL]` = "after the pool is up"). Individual pool members are not
+    // separately name-addressable.
     let mut defs: Vec<TokenStream2> = Vec::new();
     let mut pool_entries: Vec<TokenStream2> = Vec::new();
     let mut slots: Vec<Slot> = Vec::new();
@@ -782,6 +785,11 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                         ));
                     }
                     let (pool_defs, pool_entry, pool_slots) = emit_pool(p, &cr, &spawn_fn)?;
+                    // A dep on the pool NAME resolves to the pool's floor member (member 0
+                    // — the `min`-kept, always-started member): `deps: [POOL]` means "after
+                    // the pool is up". `slots.len()` here is that member's slot index, taken
+                    // *before* the extend below (pool_slots[0] lands at exactly this index).
+                    names.insert(p.ident.to_string(), slots.len());
                     defs.extend(pool_defs);
                     pool_entries.push(pool_entry);
                     slots.extend(pool_slots);

@@ -18,6 +18,9 @@ release's async slot rendezvous); pinned by exact version from the supervisor cr
   without `spawn:`, and `executor:` with a verbatim closure are expansion errors.
 - Pools accept `executor: NAME` too (between `deps:` and `spawn:`): every member
   spawns through the slot — a worker pool on another executor or core.
+- `deps:` may name a `pool` (not just a `node`); the dep resolves to the pool's floor
+  member (member 0, the `min`-kept one), i.e. "start after the pool is up". Previously a
+  dep on a pool name was an "unknown dependency" error.
 - An `executor:` node/pool now emits `TaskNode::with_executor(&NAME)`; its spawn glue
   does a non-blocking `SpawnerSlot::get()` because the supervisor awaits the slot
   before invoking it (see the supervisor's 0.3.0 async bring-up).

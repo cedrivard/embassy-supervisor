@@ -31,6 +31,8 @@ graphs, AMP (multi-core) support, and trace-hook observability.
   cross-thread host tests running two real executors.
 - `TaskNode::with_executor(&SpawnerSlot)`: routes a node's spawn through an executor
   slot (emitted by `supervisor_graph!` for `executor: NAME`).
+- `supervisor_graph!` `deps:` may name a `pool` (not only a `node`); it resolves to the
+  pool's floor member — "start after the pool is up".
 - Trace-hook observability (opt-in features): `trace` — the supervisor consumes
   embassy-executor's `_embassy_trace_*` instrumentation, mapping task ids to nodes via the
   generated spawn glue and accounting per-node poll time / poll count / max-poll watermark,
