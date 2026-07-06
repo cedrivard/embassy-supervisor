@@ -104,4 +104,4 @@ required-features = ["trace-nested", "trace-hooks", "macros"]
 # a real executor on a std thread drives start -> teardown -> respawn.
 [[test]]
 name = "teardown"
-required-features = ["macros"]
+required-features = ["macros", "control"]

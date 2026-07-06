@@ -570,20 +570,23 @@ impl TaskNode {
     }
 
     /// Mark/clear this node as **detached**: a self-managing node the supervisor
-    /// brings up once (via [`start`](Supervisor::start)) and then leaves alone. A
-    /// detached node is skipped by dependency-cascade teardown, by full
-    /// [`teardown`](Supervisor::teardown), and by
-    /// [`respawn_terminate`](Supervisor::respawn_terminate) — so it keeps running
-    /// across a teardown/wake cycle instead of being stopped and re-spawned. Use it
-    /// for a task that must outlive the teardown it participates in — e.g. a
-    /// sleep/power coordinator that tears the graph down, sleeps, then wakes it. The
-    /// node owns its own shutdown; the supervisor will not drive it.
+    /// brings up once (via [`start`](Supervisor::start)) and then stops managing
+    /// **entirely**. Every runtime lifecycle operation skips a detached node: full
+    /// [`teardown`](Supervisor::teardown), the control deactivate/activate cascades,
+    /// [`stop_node`](Supervisor::stop_node), [`respawn_terminate`](Supervisor::respawn_terminate),
+    /// and pause-resume. It keeps running (or, for a one-shot, stays exited) across a
+    /// teardown/wake cycle instead of being stopped, re-enabled, or re-spawned. Use it
+    /// for a task that must outlive the teardown it participates in — e.g. a sleep/power
+    /// coordinator that tears the graph down, sleeps, then wakes it — or a self-managed
+    /// one-shot whose `deps:` exist only for start-ordering. The node owns its own
+    /// shutdown; the supervisor will not drive it.
     pub fn set_detached(&self, detached: bool) {
         self.handle.detached.store(detached, Ordering::Release);
     }
 
-    /// True while this node is [detached](Self::set_detached) (self-managed;
-    /// skipped by cascade teardown, full teardown, and respawn).
+    /// True while this node is [detached](Self::set_detached): self-managed, skipped by
+    /// every runtime lifecycle operation (teardown, deactivate/activate, `stop_node`,
+    /// respawn, pause-resume). Only the initial `start` brings it up.
     pub fn is_detached(&self) -> bool {
         self.handle.detached.load(Ordering::Acquire)
     }
@@ -862,9 +865,10 @@ impl<const N: usize> Supervisor<N> {
 
     /// Stop a single running node at runtime — e.g. shrinking an elastic pool.
     /// Signals shutdown, waits for the ack, clears `running`. No-op if the node
-    /// isn't running. Panics if it doesn't ack within the timeout.
+    /// isn't running, or is [detached](TaskNode::set_detached) (self-managed — the
+    /// supervisor never stops it). Panics if it doesn't ack within the timeout.
     pub async fn stop_node(&self, node: &'static TaskNode) {
-        if !node.is_running() {
+        if !node.is_running() || node.is_detached() {
             return;
         }
         self.shutdown_and_wait(node).await;
@@ -905,7 +909,7 @@ impl<const N: usize> Supervisor<N> {
             let Some(node) = self.nodes[*i as usize] else {
                 continue;
             };
-            if matches!(node.mode, Mode::Pause) && !node.is_disabled() {
+            if matches!(node.mode, Mode::Pause) && !node.is_disabled() && !node.is_detached() {
                 node.reset();
                 info!("supervisor: resuming {}", node.name);
                 node.signal_resume();
@@ -1045,6 +1049,14 @@ impl<const N: usize> Supervisor<N> {
             let Some(node) = self.nodes[j] else {
                 continue;
             };
+            // A detached node is self-managed — never control-stop it. The growth loop
+            // keeps detached *dependents* out of the set; this also covers a detached
+            // node that was seeded directly (or a detached pool member). Without it a
+            // detached one-shot that already exited (stale `is_running`, no ack path)
+            // would be signalled a shutdown it can never acknowledge, panicking here.
+            if node.is_detached() {
+                continue;
+            }
             node.set_disabled(true);
             if node.is_running() {
                 info!("supervisor: control-stop {}", node.name);
@@ -1082,6 +1094,11 @@ impl<const N: usize> Supervisor<N> {
             let Some(node) = self.nodes[j] else {
                 continue;
             };
+            // A detached node is self-managed — the supervisor never re-enables or
+            // re-starts it, even when it is a dependency of an activated target.
+            if node.is_detached() {
+                continue;
+            }
             node.set_disabled(false);
             if node.is_running() {
                 continue;

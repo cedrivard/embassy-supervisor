@@ -127,7 +127,8 @@ async fn app_supervisor(spawner: Spawner) {
 /// An update broken enough not to reach here never calls `mark_booted`, so the
 /// bootloader rolls back on next reset. Runs once and exits.
 #[embassy_executor::task]
-async fn ota_confirm(_node: &'static embassy_supervisor::TaskNode) {
+async fn ota_confirm(node: &'static embassy_supervisor::TaskNode) {
+    node.set_detached(true);
     let stack = net::stack_ready().await;
     stack.wait_config_up().await;
     match ota::mark_booted() {

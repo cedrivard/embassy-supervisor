@@ -1,8 +1,16 @@
-//! Behavioral tests for the async `teardown` / `respawn_terminate` paths, focused on
-//! **detached** nodes (self-managed: brought up once by `start`, then skipped by
-//! teardown *and* respawn). A single real embassy executor on a std thread drives a
-//! driver task through `start -> teardown -> respawn_terminate`, asserting the node
-//! lifecycle transitions at each step.
+//! Behavioral tests for the async `teardown` / `respawn_terminate` / control-stop
+//! paths and the **detached** flag — the supervisor starts a detached node once, then
+//! stops managing it entirely. Two flavours: a long-lived daemon that parks on
+//! `wait_shutdown`, and a self-managed **one-shot** (`deps: [NORMAL]`) that detaches,
+//! runs once, and *exits*. Both must be skipped by teardown, respawn, *and* the
+//! deactivate cascade. A single real embassy executor on a std thread drives a driver
+//! task through `start -> teardown -> resume -> respawn -> deactivate`, asserting the
+//! lifecycle at each step.
+//!
+//! The detached one-shot is the regression guard for the on-device panic: a Terminate
+//! node that returns leaves a stale `is_running == true` (no ack), so if the deactivate
+//! cascade pulled it in it would wait forever on an ack that never comes. Detaching (for
+//! a node whose `deps:` are only start-ordering) opts it out of the cascade entirely.
 //!
 //! As in `multicore.rs`, the std critical-section impl plus a real executor make this
 //! a faithful in-process model of the on-device scheduler (same atomics, `Signal`s,
@@ -12,13 +20,16 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
-use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
+use embassy_supervisor::{
+    ControlOp, Supervisor, TaskNode, request_control, supervisor_graph, wait_control,
+};
 use embassy_time::MockDriver;
 
 supervisor_graph! {
     node NORMAL = Terminate, deps: [], spawn: normal_task;
     node PAUSED = Pause, deps: [], spawn: paused_task;
     node DAEMON = Terminate, deps: [], spawn: daemon_task;
+    node ONESHOT = Terminate, deps: [NORMAL], spawn: oneshot_task;
 }
 
 static NORMAL_SPAWNS: AtomicU32 = AtomicU32::new(0);
@@ -27,6 +38,8 @@ static PAUSED_RESUMES: AtomicU32 = AtomicU32::new(0);
 static DAEMON_SPAWNS: AtomicU32 = AtomicU32::new(0);
 /// Set only if the supervisor wrongly signals the detached daemon to shut down.
 static DAEMON_SHUTDOWN_SEEN: AtomicBool = AtomicBool::new(false);
+/// The self-managed one-shot's run count — must stay 1 (never respawned / re-run).
+static ONESHOT_SPAWNS: AtomicU32 = AtomicU32::new(0);
 static PHASE: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
 
@@ -66,6 +79,19 @@ async fn daemon_task(node: &'static TaskNode) {
     DAEMON_SHUTDOWN_SEEN.store(true, Ordering::SeqCst);
 }
 
+/// A self-managed one-shot: marks itself `detached`, records its single run, and
+/// *exits*. Because it returns without ever acking, its `is_running` stays a stale
+/// `true` — so the supervisor must leave it alone. Detaching does that: teardown,
+/// respawn, and the deactivate cascade all skip a detached node. If any stop path
+/// signalled it, the ack would never come and, with the clock frozen, the driver would
+/// hang forever, failing the test's deadline.
+#[embassy_executor::task]
+async fn oneshot_task(node: &'static TaskNode) {
+    node.set_detached(true);
+    ONESHOT_SPAWNS.fetch_add(1, Ordering::SeqCst);
+    // Returns immediately — no wait_shutdown / ack_dropped.
+}
+
 /// Yield until `f()` holds (freshly-spawned tasks need to be polled before their
 /// bodies have run) or a generous turn budget elapses.
 async fn settle(mut f: impl FnMut() -> bool) {
@@ -81,12 +107,14 @@ async fn settle(mut f: impl FnMut() -> bool) {
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
 
-    // ── start(): all three nodes come up; the daemon detaches itself ─────────
+    // ── start(): all nodes come up; the daemon detaches itself, the one-shot
+    //    disables itself and exits ──────────────────────────────────────────────
     sup.start(spawner).await.expect("start");
     settle(|| {
         NORMAL_SPAWNS.load(Ordering::SeqCst) == 1
             && PAUSED_SPAWNS.load(Ordering::SeqCst) == 1
             && DAEMON_SPAWNS.load(Ordering::SeqCst) == 1
+            && ONESHOT_SPAWNS.load(Ordering::SeqCst) == 1
     })
     .await;
     assert!(NORMAL.is_running(), "normal running after start");
@@ -94,6 +122,7 @@ async fn driver(spawner: Spawner) {
     assert!(DAEMON.is_running(), "daemon running after start");
     assert!(DAEMON.is_detached(), "daemon marked itself detached");
     assert!(!NORMAL.is_detached(), "normal is not detached");
+    assert!(ONESHOT.is_detached(), "one-shot marked itself detached and exited");
     PHASE.store(1, Ordering::SeqCst);
 
     // ── teardown(): tears down NORMAL + PAUSED, skips the detached DAEMON ─────
@@ -105,6 +134,9 @@ async fn driver(spawner: Spawner) {
         !DAEMON_SHUTDOWN_SEEN.load(Ordering::SeqCst),
         "detached daemon was never signaled to shut down"
     );
+    // The detached one-shot already exited (stale is_running); teardown must skip it.
+    // Reaching this line at all proves it did — else the frozen-clock ack wait hangs.
+    assert!(ONESHOT.is_detached(), "detached one-shot skipped by teardown");
     PHASE.store(2, Ordering::SeqCst);
 
     // ── resume_pausable(): resumes PAUSED in place (not respawned) ───────────
@@ -142,6 +174,44 @@ async fn driver(spawner: Spawner) {
         "daemon is still the same running, detached instance"
     );
     assert!(!DAEMON_SHUTDOWN_SEEN.load(Ordering::SeqCst));
+    assert_eq!(
+        ONESHOT_SPAWNS.load(Ordering::SeqCst),
+        1,
+        "detached one-shot NOT respawned by respawn_terminate"
+    );
+    PHASE.store(4, Ordering::SeqCst);
+
+    // ── control deactivate cascade (the exact on-device panic path): stop NORMAL;
+    //    its dependent ONESHOT is `detached` — a one-shot that already exited — so the
+    //    cascade's growth loop skips it, never awaiting an ack it can't give ──────────
+    request_control(&NORMAL, ControlOp::Deactivate);
+    let cmd = wait_control().await;
+    sup.apply_control(cmd, spawner).await;
+    assert!(!NORMAL.is_running(), "normal control-stopped");
+    assert!(NORMAL.is_disabled(), "normal marked disabled by deactivate");
+    assert!(
+        ONESHOT.is_detached(),
+        "detached one-shot skipped by the deactivate cascade (did not hang on its ack)"
+    );
+    assert_eq!(
+        ONESHOT_SPAWNS.load(Ordering::SeqCst),
+        1,
+        "one-shot ran exactly once across the whole lifecycle"
+    );
+
+    // ── deactivate the detached one-shot *directly*: it is seeded into the set,
+    //    bypassing the growth-loop skip, so only the teardown loop's own detached guard
+    //    prevents signalling a shutdown to the already-exited task. A no-op: it stays
+    //    detached, is not even marked disabled, and the driver does not hang on an ack.
+    request_control(&ONESHOT, ControlOp::Deactivate);
+    let cmd = wait_control().await;
+    sup.apply_control(cmd, spawner).await;
+    assert!(ONESHOT.is_detached(), "detached one-shot still detached after direct deactivate");
+    assert!(
+        !ONESHOT.is_disabled(),
+        "detached one-shot left untouched by deactivate (not even disabled)"
+    );
+    assert_eq!(ONESHOT_SPAWNS.load(Ordering::SeqCst), 1, "one-shot still ran exactly once");
 
     DONE.store(true, Ordering::SeqCst);
 }
