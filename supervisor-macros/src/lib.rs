@@ -14,7 +14,13 @@
 //!     policy: [<Ty> =] <expr>, min: N, max: M;
 //! ```
 //! `deps:` entries name a `node` or a `pool`; a `pool` dep resolves to that pool's floor
-//! member (member 0, the `min`-kept one), i.e. "start after the pool is up".
+//! member (member 0, the `min`-kept one), i.e. "start after the pool is up". A repeated
+//! dep or a redeclared node/pool name is a compile error.
+//!
+//! An `executor NAME;` slot may carry `#[cfg(...)]`, but validation does not model cfg
+//! predicates: a node referencing a slot that is cfg'd *out* while the node is cfg'd
+//! *in* surfaces as rustc's `cannot find value NAME`, not a macro error — don't gate an
+//! executor slot more restrictively than the nodes that reference it.
 //! `executor EXEC;` emits a `pub static EXEC: SpawnerSlot`; the app fills it with a
 //! `SendSpawner` (`InterruptExecutor::start`, `Spawner::make_send`) before
 //! `Supervisor::start`, and nodes carrying `executor: EXEC` spawn through it instead
@@ -634,13 +640,15 @@ fn emit_pool(
             quote!(#path)
         }
     };
-    let (min, max) = (&p.min, &p.max);
+    // Emit the *validated* u8 values (`min_v`/`max_v`), not the raw literals: a
+    // suffixed literal like `min: 3usize` parses as u8 above but would emit a
+    // mismatched-type rustc error into the u8 field.
     defs.push(quote! {
         #(#cfg)*
         pub static #pool_static: #cr::ElasticPool<#policy_ty> = #cr::ElasticPool {
             nodes: &[ #(#member_refs),* ],
-            min: #min,
-            max: #max,
+            min: #min_v,
+            max: #max_v,
             policy: #policy,
         };
     });
@@ -682,17 +690,34 @@ fn slot_tables(
         });
 
         let mut dep_toks: Vec<TokenStream2> = Vec::new();
+        // Duplicate deps are a compile error: `deps: [A, A]` would emit a doubled
+        // index, which `topo_sort_const` counts twice in the in-degree but decrements
+        // once — misreported as a dependency cycle. Compared by *resolved* slot index
+        // (so a repeated pool name trips it too); two cfg-gated variants of the same
+        // dep are allowed only when their cfg predicates differ.
+        let mut seen: Vec<(u8, String)> = Vec::new();
         for d in &slot.deps {
             let idx = match names.get(&d.ident.to_string()) {
                 Some(&i) => i as u8,
                 None => {
                     return Err(syn::Error::new_spanned(
                         &d.ident,
-                        format!("unknown dependency `{}` — not a declared node", d.ident),
+                        format!(
+                            "unknown dependency `{}` — not a declared node or pool",
+                            d.ident
+                        ),
                     ));
                 }
             };
             let cfg = &d.cfg;
+            let cfg_key = quote!( #(#cfg)* ).to_string();
+            if seen.iter().any(|(i, k)| *i == idx && *k == cfg_key) {
+                return Err(syn::Error::new_spanned(
+                    &d.ident,
+                    format!("duplicate dependency `{}`", d.ident),
+                ));
+            }
+            seen.push((idx, cfg_key));
             dep_toks.push(quote!( #(#cfg)* #idx ));
         }
         deps_entries.push(quote!( &[ #(#dep_toks),* ] ));
@@ -748,7 +773,15 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                     ));
                 }
                 // The index is the slot's position, taken *before* the push.
-                names.insert(n.ident.to_string(), slots.len());
+                // A redeclared name is a hard error here (not just the downstream
+                // `duplicate definition of static`): deps resolve through this map,
+                // so a silent overwrite would silently rewire earlier `deps:` edges.
+                if names.insert(n.ident.to_string(), slots.len()).is_some() {
+                    return Err(syn::Error::new_spanned(
+                        &n.ident,
+                        format!("duplicate node/pool name `{}`", n.ident),
+                    ));
+                }
                 let (def, slot) = emit_node(n, &cr, &spawn_fn)?;
                 defs.push(def);
                 slots.push(slot);
@@ -789,7 +822,13 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                     // — the `min`-kept, always-started member): `deps: [POOL]` means "after
                     // the pool is up". `slots.len()` here is that member's slot index, taken
                     // *before* the extend below (pool_slots[0] lands at exactly this index).
-                    names.insert(p.ident.to_string(), slots.len());
+                    // A redeclared name errors, same as the node arm.
+                    if names.insert(p.ident.to_string(), slots.len()).is_some() {
+                        return Err(syn::Error::new_spanned(
+                            &p.ident,
+                            format!("duplicate node/pool name `{}`", p.ident),
+                        ));
+                    }
                     defs.extend(pool_defs);
                     pool_entries.push(pool_entry);
                     slots.extend(pool_slots);

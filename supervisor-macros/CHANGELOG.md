@@ -21,6 +21,13 @@ release's async slot rendezvous); pinned by exact version from the supervisor cr
 - `deps:` may name a `pool` (not just a `node`); the dep resolves to the pool's floor
   member (member 0, the `min`-kept one), i.e. "start after the pool is up". Previously a
   dep on a pool name was an "unknown dependency" error.
+- A repeated dependency (`deps: [A, A]`; compared by resolved slot, so a repeated pool
+  name counts too) and a redeclared node/pool name are now spanned compile errors.
+  Previously a duplicate dep surfaced as a bogus "dependency cycle" and a duplicate
+  name silently rewired earlier `deps:` edges before failing downstream.
+- Pool `min:`/`max:` emit the validated `u8` values instead of the raw literals, so a
+  suffixed literal (`min: 3usize`) no longer produces a mismatched-type rustc error.
+- The unknown-dependency error now says "not a declared node or pool".
 - An `executor:` node/pool now emits `TaskNode::with_executor(&NAME)`; its spawn glue
   does a non-blocking `SpawnerSlot::get()` because the supervisor awaits the slot
   before invoking it (see the supervisor's 0.3.0 async bring-up).
