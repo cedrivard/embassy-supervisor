@@ -159,7 +159,7 @@ async fn run() -> Result<(), &'static str> {
         .unwrap_or_else(default_target);
 
     // Drain the http pool and wait for it to fully stop before opening the download
-    // socket — else 4 workers + DNS + download = 6 would exceed the 5-socket budget.
+    // socket — else 2 workers + DNS + download = 4 would exceed the 3-socket budget.
     // Poll `is_running` (false only once teardown completes and the sockets are
     // freed), NOT `is_disabled` (set when the stop is merely *requested*, before the
     // workers actually exit). Deactivating the floor seeds the whole pool.

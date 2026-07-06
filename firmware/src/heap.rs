@@ -15,10 +15,14 @@ static HEAP: LlffHeap = LlffHeap::empty();
 /// Heap arena size. Sized to hold the subsystem budgets at once; the
 /// supervisor's start/stop is what keeps usage under it.
 ///
-/// Two peaks bound this, balanced by design at **~28 KB each**: serving (net +
-/// full http pool + one in-flight response; breakdown in `net.rs`/`http.rs`) and
-/// the OTA decode (net + pool drained, `ruzstd` alone; window sizing in `ota.rs`).
-/// They never coexist, so 32 KB leaves ~4 KB margin.
+/// Two peaks bound this: serving (**~30 KB** — net + full 2-worker http pool at
+/// ~4.6 KB/worker + one in-flight response; breakdown in `net.rs`/`http.rs`) and
+/// the OTA decode (**~28 KB** — net + pool drained, `ruzstd` alone; window sizing
+/// in `ota.rs`). They never coexist; serving is the high-water mark (each worker's
+/// `tx` buffer holds a whole /api/tasks response so only one body String is ever
+/// live — see `http.rs`), so 32 KB leaves ~2 KB margin at peak. The pool ceiling
+/// (`POOL_MAX = 2`) is what keeps serving inside the arena: a third worker's
+/// ~4.6 KB would blow it.
 pub const HEAP_SIZE: usize = 32 * 1024;
 
 /// Initialize the global allocator. Call once, early in `main`, before anything

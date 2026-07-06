@@ -36,10 +36,10 @@ embassy_supervisor::supervisor_graph! {
     node WATCHDOG = Terminate, deps: [], spawn: crate::watchdog::watchdog_task;
     node NET = Terminate, deps: [], spawn: crate::net::net_task;
     node HEARTBEAT = Pause, deps: [], executor: HIGH, spawn: crate::heartbeat::heartbeat_task;
-    pool HTTP = [Terminate, OnDemand, OnDemand, OnDemand], deps: [NET],
+    pool HTTP = [Terminate, OnDemand], deps: [NET],
         spawn: crate::http::http_task,
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(4)),
-        min: 1, max: 4;
+        min: 1, max: 2;
     node OTA = Terminate, deps: [NET], spawn: crate::ota::ota_task, disabled;
     node BENCH = Terminate, deps: [], executor: CORE1, spawn: crate::bench::bench_task, disabled;
     node OTA_CONFIRM = Terminate, deps: [HTTP], spawn: crate::ota_confirm;

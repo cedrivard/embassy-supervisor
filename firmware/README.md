@@ -18,7 +18,6 @@ stays in view.
 5. [Exercise the supervisor](#exercise-the-supervisor)
 6. [Stress-testing the HTTP service](#stress-testing-the-http-service)
 7. [Interpreting the observability data](#interpreting-the-observability-data)
-   - [SEV wake storm: status](#sev-wake-storm-status)
 8. [OTA update](#ota-update)
 9. [Portability](#portability)
 10. [Implementation notes](#implementation-notes)
@@ -68,7 +67,7 @@ is a *compile* error):
 watchdog  (Terminate, detached daemon)              heartbeat (Pause, executor HIGH)
 bench     (Terminate, executor CORE1, disabled)
 
-net (Terminate) ──┬── http pool (1 Terminate floor + 3 OnDemand) ── ota-confirm (Terminate,
+net (Terminate) ──┬── http pool (1 Terminate floor + 1 OnDemand) ── ota-confirm (Terminate,
                   │                                                  detached, runs last)
                   └── ota (Terminate, disabled at boot; control-started)
 ```
@@ -83,7 +82,7 @@ one-line `executor:` field in the graph:
 
 | Graph slot | Executor | Runs | Nodes |
 |---|---|---|---|
-| *(default)* | core-0 thread executor (`#[embassy_executor::main]`) | thread mode, core 0 | `watchdog`, `net`, `http0..3`, `ota`, `ota-confirm`, the supervisor task |
+| *(default)* | core-0 thread executor (`#[embassy_executor::main]`) | thread mode, core 0 | `watchdog`, `net`, `http0..1`, `ota`, `ota-confirm`, the supervisor task |
 | `HIGH` | `InterruptExecutor` on `SWI_IRQ_0` at priority P2 | preempts the thread executor | `heartbeat` |
 | `CORE1` | thread executor on core 1 (`spawn_core1`; publishes a `SendSpawner` into the slot) | core 1 | `bench` |
 
@@ -95,7 +94,7 @@ one-line `executor:` field in the graph:
 | `net` | Terminate | — | thread | started | Root of the data plane: torn down last among its subtree, dependents (`http`, `ota`) cascaded down first. Stopping it returns its whole ~16 KB heap budget. |
 | `heartbeat` | Pause | — | `HIGH` | started | Pause parks the task (it acks and keeps its LED `Output`); resume continues the same future. Never respawned. |
 | `http0` | Terminate | `net` | thread | started | The pool floor: always on while `net` is up; a manual stop of the floor seeds a whole-pool deactivate. |
-| `http1..3` | OnDemand | `net` | thread | stopped | Elastic burst workers: `ElasticPool<DeferredShrink>` (4 s cooldown, `min: 1, max: 4`) grows one when every running worker is busy, shrinks one spare after the cooldown. |
+| `http1` | OnDemand | `net` | thread | stopped | Elastic burst worker: `ElasticPool<DeferredShrink>` (4 s cooldown, `min: 1, max: 2`) grows it when every running worker is busy, shrinks it back after the cooldown. |
 | `ota` | Terminate | `net` | thread | **disabled** | Control-started (`Activate` via `POST /api/ota` or the dashboard). Detaches itself at start, so once running it is uninterruptible; it then drains `http` and `net` itself and exits only via reset. |
 | `bench` | Terminate | — | `CORE1` | **disabled** | Control-started compute load on core 1: the core-0 supervisor spawns/stops it cross-core through the `CORE1` spawner slot. Honors shutdown (`ack_dropped`) like any Terminate node. |
 | `ota-confirm` | Terminate | `http` (= pool floor) | thread | started | Depending on the pool name resolves to its floor member, so this node is spawned **last** in topological order. It detaches, waits for the network to come up, calls `mark_booted` to confirm the running image, and exits — a run-once job. |
@@ -208,7 +207,7 @@ xdg-open http://10.42.0.61/             # task view + stop/start buttons
 ## Exercise the supervisor
 
 - **Dynamic pool:** hold several concurrent connections open to the HTTP port so
-  every worker is busy, and watch the pool grow `1 → 4` in the task view (free
+  every worker is busy, and watch the pool grow `1 → 2` in the task view (free
   heap drops as workers spawn), then shrink ~4 s after they close (heap returns):
   ```sh
   for i in $(seq 6); do (sleep 12) | nc 10.42.0.61 80 & done   # 6 clients -> pool caps at 4
@@ -257,14 +256,14 @@ sudo pacman -S wrk        # Arch (or the AUR)
 From the repo root, pointing at the device:
 
 ```sh
-wrk -t1 -c4 -d10s --latency -s firmware/tools/wrk-tasks.lua http://10.42.0.61/api/tasks
+wrk -t1 -c2 -d10s --latency -s firmware/tools/wrk-tasks.lua http://10.42.0.61/api/tasks
 ```
 
 Why these flags:
 
-- **`-c4` matches `POOL_MAX`.** The HTTP pool tops out at four workers
-  (`POOL_MAX = 4` in `firmware/src/http.rs`), one embassy-net socket per worker,
-  and that ceiling is also the socket budget. Four keep-alive connections give
+- **`-c2` matches `POOL_MAX`.** The HTTP pool tops out at two workers
+  (`POOL_MAX = 2` in `firmware/src/http.rs`), one embassy-net socket per worker,
+  and that ceiling is also the socket budget. Two keep-alive connections give
   every worker exactly one connection to serve, driving the `ElasticPool` to its
   fully-grown steady state without piling extra connections onto the `accept`
   backlog. Go higher and you stop measuring per-worker behaviour and start
@@ -272,7 +271,7 @@ Why these flags:
 - **`-t1` gives the cleanest report.** Each wrk thread runs an isolated Lua
   state, and `done()` runs in yet another; nested tables can't be copied across
   states reliably. With a single thread there is exactly one rendered report to
-  print, and one thread easily saturates four keep-alive connections against an
+  print, and one thread easily saturates two keep-alive connections against an
   embedded target.
 - **`--latency`** adds wrk's own latency percentile table to the summary,
   alongside the script's device-side analysis.
@@ -311,23 +310,31 @@ Why these flags:
 
 ```
 ==== /api/tasks analysis (wrk thread 1) ====
-samples 4120 | non-200 0 | malformed/truncated 0 | counter regressions 0
-body bytes  min 690 / max 742 (worker tx buffer must hold max + headers)
-heap_free   min 21536 / max 22072 B (min = headroom at peak load)
-window      10.0 s of device time (tick_hz 1000000)
-executor 20001abc: 41.2% busy = 33.8% in-poll + 7.4% overhead (scheduler + hooks + inter-poll ISRs)
-executor 20001abc: 8140 polls/s, 5330 passes/s, 1.53 polls/pass, unsupervised tasks 0.42%
-task              cpu%      polls  avg poll us  max poll us
-http0            9.14%      41200         22.1        410.0
-http1            8.97%      40850         21.7        398.0
-net              2.31%      12030          8.4        150.0
-...
+samples 424 | non-200 0 | malformed/truncated 0 | counter regressions 0
+body bytes  min 1655 / max 1656 (worker tx buffer must hold max + headers)
+heap_free   min 5284 / max 5284 B (min = headroom at peak load)
+window      9.9 s of device time (tick_hz 1000000)
+executor 200093b0: 0.0% busy = 0.0% in-poll + 0.0% overhead (scheduler + hooks + inter-poll ISRs)
+executor 200093b0: 2 polls/s, 2 passes/s, 1.00 polls/pass
+executor 2007ffe8: 23.6% busy = 21.6% in-poll + 2.0% overhead (scheduler + hooks + inter-poll ISRs)
+executor 2007ffe8: 1832 polls/s, 850993 passes/s, 0.00 polls/pass
+executor 20000360: 0.0% busy = 0.0% in-poll + 0.0% overhead (scheduler + hooks + inter-poll ISRs)
+executor 20000360: 0 polls/s, 869433 passes/s, 0.00 polls/pass
+task            cpu%      polls  avg poll us  max poll us
+bench          0.00%          0          0.0          0.0
+heartbeat      0.01%         20         38.1         68.0
+http0          1.51%        213        705.8        748.0
+http1          1.53%        212        715.8        795.0
+net           18.57%      17783        103.8        696.0
+ota            0.00%          0          0.0          0.0
+ota-confirm    0.00%          0          0.0         21.0
+watchdog       0.00%          5         36.2         62.0
 ```
 
 **Good looks like:** `non-200 0`, `malformed/truncated 0`, `counter regressions 0`;
-`body max` comfortably below the worker's 1440-byte TX buffer minus header bytes;
+`body max` comfortably below the worker's 2560-byte TX buffer minus header bytes;
 `heap_free min` steady and well clear of zero; task CPU% roughly balanced across
-`http0..http3`; max poll µs bounded.
+`http0..http1`; max poll µs bounded.
 
 **Bad looks like:**
 
@@ -381,7 +388,7 @@ busy%        = in-poll% + overhead%
   nothing runnable) are booked as **idle**, not overhead.
 - **The single most diagnostic comparison is `passes/s` vs `polls/s`:** near-equal
   (ratio ≈ 1) is healthy — the executor wakes only for work. `passes/s` far above
-  `polls/s` is a **wake storm** (see [below](#sev-wake-storm-status)). Tick-based
+  `polls/s` is a **wake storm** (see [below](#note-on-rp2350)). Tick-based
   idle% alone hides a storm completely, because empty passes count as idle.
 - **Overhead as a share of busy** grows with poll rate (~13% of a 150 MHz core
   measured at ~8k polls/s under HTTP load); it ballooning means the hooks and
@@ -408,7 +415,7 @@ polls, max_poll_ticks, deps`.
   this firmware uses live in two places: `heartbeat` (on the `HIGH` tier, so it
   can name a task wedging the thread executor *while it happens*) and `watchdog`
   (post-hoc watermark warnings every feed cycle).
-- **Healthy:** `max_poll_ticks` in the tens-to-low-hundreds of µs; CPU% small and
+- **Healthy:** `max_poll_ticks` in the hundreds of µs; CPU% small and
   proportional to the task's job; on-demand pool members sitting idle at 0 until
   pulled in. **Concerning:** `max_poll_ticks` ≫ ms (busy-looping without
   yielding); one task's CPU% approaching its executor's whole busy% (it dominates

@@ -40,7 +40,7 @@ use crate::net;
 const HTTP_PORT: u16 = 80;
 /// Pool ceiling, and also the socket budget (`net::SOCKET_BUDGET` derives from it):
 /// each worker owns one socket. Mirrors the `max:` in the `supervisor_graph!` pool.
-pub const POOL_MAX: usize = 4;
+pub const POOL_MAX: usize = 2;
 /// Close a keep-alive connection after this long with no request, freeing the
 /// worker (and its socket) back to the pool.
 const KEEPALIVE_IDLE_SECS: u64 = 10;
@@ -115,7 +115,7 @@ pub(crate) async fn http_task(node: &'static TaskNode) {
     // exits (pool shrink or teardown). So the heap budget tracks the live pool
     // size: every grow consumes a buffer set, every shrink returns one.
     let mut rx = alloc::vec![0u8; 1024];
-    let mut tx = alloc::vec![0u8; 1440];
+    let mut tx = alloc::vec![0u8; 2560];
     let mut req = alloc::vec![0u8; 1024];
 
     loop {
@@ -178,10 +178,11 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &Tas
             ("GET", "/api/tasks") => {
                 // Built on the heap (freed at the end of this match) so the worker
                 // future stays small — the JSON body is never inline in the future.
-                // Capacity: 9 nodes x ~200 B/row (keys + name + 4 bools + three u32
-                // counters + deps) + ~450 B heap/executors prefix + slack. Growth
-                // still works (String reallocs) but a realloc at the ~28 KB serving
-                // peak transiently doubles the body's footprint, so reserve enough.
+                // Capacity: 8 node slots x ~200 B/row (keys + name + 4 bools + three u32
+                // counters + deps) + ~450 B heap/executors prefix + slack (measured
+                // 1783 B max on hardware with 9 slots). MUST exceed the real body: an
+                // undersized reserve doesn't just realloc (transient 2x footprint) — it
+                // grew 1408->2816 mid-serving and OOM-panicked the arena.
                 let mut body = String::with_capacity(2560);
                 build_tasks_json(&mut body);
                 send(socket, "application/json", &body, keep).await;

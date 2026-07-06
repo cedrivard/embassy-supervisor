@@ -1,9 +1,9 @@
 -- wrk script: load /api/tasks and analyze the trace counters it returns.
 --
--- Usage (single wrk thread gives the cleanest report; -c4 matches POOL_MAX so
+-- Usage (single wrk thread gives the cleanest report; -c2 matches POOL_MAX so
 -- every keep-alive connection gets a worker, more stresses accept):
 --
---   wrk -t1 -c4 -d10s --latency -s firmware/tools/wrk-tasks.lua http://10.42.0.61/api/tasks
+--   wrk -t1 -c2 -d10s --latency -s firmware/tools/wrk-tasks.lua http://10.42.0.61/api/tasks
 --
 -- What it checks, per response:
 --   * well-formedness (complete JSON with all expected fields — a truncated body
