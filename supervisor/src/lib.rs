@@ -98,11 +98,6 @@
 //! The `firmware` crate in the [repository](https://github.com/cedrivard/embassy-supervisor)
 //! is a complete working example (USB-net, an HTTP control plane, an elastic pool,
 //! and OTA).
-//!
-//! Docs:
-//!   - `embassy_sync::signal::Signal`: <https://docs.embassy.dev/embassy-sync>
-//!   - Kahn's algorithm (topological sort):
-//!     <https://en.wikipedia.org/wiki/Topological_sorting#Kahn's_algorithm>
 
 #[macro_use]
 mod fmt;
