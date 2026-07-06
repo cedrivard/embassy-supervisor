@@ -6,172 +6,149 @@ real [embassy](https://embassy.dev) firmware. The supervisor is the star; this
 firmware keeps each task thin (wrapping third-party crates) so the orchestration
 stays in view.
 
+## Table of Contents
+
+1. [Overview — what this demo shows](#overview--what-this-demo-shows)
+2. [The supervised task graph](#the-supervised-task-graph)
+   - [Executors](#executors)
+   - [Node-by-node breakdown](#node-by-node-breakdown)
+   - [Supervisor features exercised](#supervisor-features-exercised)
+3. [Build & run (RP2350)](#build--run-rp2350)
+4. [Host network setup (USB-net)](#host-network-setup-usb-net)
+5. [Exercise the supervisor](#exercise-the-supervisor)
+6. [Stress-testing the HTTP service](#stress-testing-the-http-service)
+7. [Interpreting the observability data](#interpreting-the-observability-data)
+   - [SEV wake storm: status](#sev-wake-storm-status)
+8. [OTA update](#ota-update)
+9. [Portability](#portability)
+10. [Implementation notes](#implementation-notes)
+    - [Heap budget (canonical breakdown)](#heap-budget-canonical-breakdown)
+
+## Overview — what this demo shows
+
 `embassy-supervisor` provides, at runtime:
 
-- **Dependency-ordered bring-up / teardown** (topological sort of a task graph).
+- **Dependency-ordered bring-up / teardown** (topological sort of a task graph,
+  computed at compile time by `supervisor_graph!`).
 - **Lifecycle modes** — `Terminate` (exit + respawn), `Pause` (park + resume,
-  keeping a held resource), `OnDemand` (pool workers brought up/down with load).
+  keeping a held resource), `OnDemand` (pool workers brought up/down with load) —
+  see the [lifecycle reference](../supervisor/README.md#lifecycle-reference).
 - **Elastic task pools** — grow immediately under load, shrink after a cooldown.
+- **Multi-executor, multi-core placement** — `executor:` slots route nodes onto
+  an interrupt-priority tier or the second core, all driven by one supervisor.
 - **Dependency- and pool-honoring control** — start/stop/pause/resume a task (or
   a whole pool) at runtime; a stop cascades through dependents, a start through
   dependencies, and a manual stop "sticks" against autoscaling.
+- **Trace observability** — per-node CPU% / poll counters and per-executor
+  busy/idle/pass accounting, surfaced over HTTP.
 
-This firmware exercises all of the above on an RP2350 — USB networking, an HTTP
+This firmware exercises all of the above on an RP2350: USB networking, an HTTP
 control/observability plane, an elastic pool of keep-alive HTTP workers, a
-Pause-mode heartbeat LED, and an OTA update path — each mapped to a supervisor
-capability in the table below. It depends on the crate via a path dependency
-aliased to `supervisor`, with the optional `defmt` feature enabled.
+Pause-mode heartbeat LED, a detached watchdog daemon, a second-core benchmark
+load, and an A/B OTA update path with a run-last confirm node. It depends on
+`embassy-supervisor` via a path dependency with the `defmt`, `trace-hooks`, and
+`trace-nested` features enabled (`control`/`pool`/`macros` come from the crate's
+defaults — see the [features table](../supervisor/README.md#cargo-features)).
 
-## Repository
+Repository layout:
 
 - [`embassy-supervisor`](../supervisor) — the generalized, HAL-agnostic supervisor
-  crate this firmware demonstrates. It has **zero board or application specifics**:
-  it depends only on `embassy-executor`/`-sync`/`-time`/`-futures` +
-  `heapless`/`portable-atomic` (and optional `defmt`), so it compiles for any
-  embassy target.
+  crate this firmware demonstrates. Zero board or application specifics; it
+  compiles for any embassy target.
 - `firmware/` (this crate) — the RP2350 demo application; the only RP-specific code.
 - `bootloader/` — the embassy-boot-rp A/B bootloader (the ROM boots it; it swaps
   DFU↔ACTIVE on a pending update).
 
 ## The supervised task graph
 
-The firmware builds this graph (see `firmware/src/main.rs`):
+The graph is declared once, in `firmware/src/main.rs`, by `supervisor_graph!` —
+the single source of nodes, deps, executors, pool, and order (a dependency cycle
+is a *compile* error):
 
 ```
-net (Terminate) ─┬─ http pool (1 Terminate floor + 3 OnDemand)   heartbeat (Pause, standalone)
-                 └─ ota (Terminate, disabled at boot; started via control)
+watchdog  (Terminate, detached daemon)              heartbeat (Pause, executor HIGH)
+bench     (Terminate, executor CORE1, disabled)
+
+net (Terminate) ──┬── http pool (1 Terminate floor + 3 OnDemand) ── ota-confirm (Terminate,
+                  │                                                  detached, runs last)
+                  └── ota (Terminate, disabled at boot; control-started)
 ```
 
 The `http` pool is both the worker pool and the control/observability plane: each
 worker is an HTTP/1.1 keep-alive server, and the pool grows under concurrent load.
-`ota` is a stopped-at-boot node that, when started, drains the others to free heap
-for the firmware download + decode (see [OTA update](#ota-update)).
 
-| Supervisor feature      | Where                                                    |
-|-------------------------|----------------------------------------------------------|
-| Task dependencies        | `http`/`ota` depend on `net`; ordered start/teardown     |
-| Dynamic task pools       | `http` `ElasticPool<DeferredShrink>` (`http.rs`)         |
-| Resource: sockets        | the pool scales within the fixed `StackResources` budget |
-| Resource: heap (budgeted)| `ota` drains `http` + `net` to free the arena for the decode |
-| Lifecycle: Pause/Resume  | `heartbeat` keeps its LED `Output` across a pause         |
-| Lifecycle: control-started| `ota` is a `Terminate` node pre-disabled at boot, started by control |
-| Detached teardown        | `ota` outlives the `net` it tears down (`set_detached`)  |
-| Runtime control          | `POST /api/control` → `embassy_supervisor::request_control` |
-| Observability            | `GET /api/tasks` (and the page at `/`)                    |
+### Executors
 
-Networking is **USB-CDC-NCM** (TCP/IP over the USB cable). This is a deliberate
-demo choice for **ease of reuse and testing** — it needs no extra hardware or
-wireless setup and works on any embassy MCU with USB, so the supervisor stays the
-focus. A real-world application would swap it for a wireless chip (Wi-Fi/BLE/
-Thread); only the `net` task changes — the rest of the task graph is unaffected.
+Three executors, all fed by the same core-0 supervisor — a node's placement is a
+one-line `executor:` field in the graph:
 
-### Heap as a budgeted resource
+| Graph slot | Executor | Runs | Nodes |
+|---|---|---|---|
+| *(default)* | core-0 thread executor (`#[embassy_executor::main]`) | thread mode, core 0 | `watchdog`, `net`, `http0..3`, `ota`, `ota-confirm`, the supervisor task |
+| `HIGH` | `InterruptExecutor` on `SWI_IRQ_0` at priority P2 | preempts the thread executor | `heartbeat` |
+| `CORE1` | thread executor on core 1 (`spawn_core1`; publishes a `SendSpawner` into the slot) | core 1 | `bench` |
 
-`embedded-alloc` is the global allocator, and the networked subsystems' working
-memory lives on it — so free heap (shown in the task view) **moves as the
-supervisor starts and stops tasks**:
+### Node-by-node breakdown
 
-- **`net`** owns its *entire* USB + stack bring-up inside its own task: on start it
-  heap-allocates all buffers (USB descriptors, the ~12 KB CDC-NCM packet pool, the
-  socket storage); on stop it drops them, **returning net's whole budget** (see
-  `net.rs`). So `net` is a genuinely reclaimable subsystem, not a fixed reservation.
-- **`http`** — each worker allocates its I/O buffers on start and frees them on
-  exit, so the pool's heap footprint tracks the live worker count (grow consumes,
-  shrink returns).
-- **`heartbeat`** allocates nothing on the heap; it only owns its LED `Output`.
-- **`ota`** is the payoff: when started it drains the `http` pool **and** `net`
-  to reclaim their budget, giving the zstd decoder nearly the whole arena, then
-  resets. This is the supervisor's signature move — coordinated drain-to-free-budget
-  for a disruptive operation (see [OTA update](#ota-update)).
+| Node | Mode | Deps | Executor | Boot state | How the supervisor manages it |
+|---|---|---|---|---|---|
+| `watchdog` | Terminate | — | thread | started | Detaches itself as its first act (`set_detached(true)`): the supervisor starts it once and then never tears it down, respawns it, or includes it in cascades — a self-managed daemon. |
+| `net` | Terminate | — | thread | started | Root of the data plane: torn down last among its subtree, dependents (`http`, `ota`) cascaded down first. Stopping it returns its whole ~16 KB heap budget. |
+| `heartbeat` | Pause | — | `HIGH` | started | Pause parks the task (it acks and keeps its LED `Output`); resume continues the same future. Never respawned. |
+| `http0` | Terminate | `net` | thread | started | The pool floor: always on while `net` is up; a manual stop of the floor seeds a whole-pool deactivate. |
+| `http1..3` | OnDemand | `net` | thread | stopped | Elastic burst workers: `ElasticPool<DeferredShrink>` (4 s cooldown, `min: 1, max: 4`) grows one when every running worker is busy, shrinks one spare after the cooldown. |
+| `ota` | Terminate | `net` | thread | **disabled** | Control-started (`Activate` via `POST /api/ota` or the dashboard). Detaches itself at start, so once running it is uninterruptible; it then drains `http` and `net` itself and exits only via reset. |
+| `bench` | Terminate | — | `CORE1` | **disabled** | Control-started compute load on core 1: the core-0 supervisor spawns/stops it cross-core through the `CORE1` spawner slot. Honors shutdown (`ack_dropped`) like any Terminate node. |
+| `ota-confirm` | Terminate | `http` (= pool floor) | thread | started | Depending on the pool name resolves to its floor member, so this node is spawned **last** in topological order. It detaches, waits for the network to come up, calls `mark_booted` to confirm the running image, and exits — a run-once job. |
 
-Allocation is infallible-but-safe: the supervisor's start/stop is admission
-control that keeps total usage within the arena, rather than per-allocation
-fallibility. The arena is sized so the two big consumers — the serving pool and
-the OTA decoder — peak at the same ~28 KB and never coexist.
+What each node demonstrates:
 
-## Memory footprint
+- **`watchdog`** (`watchdog.rs`) — the *detached daemon* pattern. It feeds the
+  bootloader's 8 s rollback watchdog every 2 s, so it must survive every
+  teardown/respawn cycle — exactly what `set_detached` guarantees. It doubles as
+  a post-hoc stall detector, warning when any node's `max_poll_ticks` watermark
+  crosses 100 ms.
+- **`net`** (`net.rs`) — a *reclaimable subsystem*, not a fixed reservation. The
+  task owns the entire USB-CDC-NCM + embassy-net bring-up: on start it
+  heap-allocates all buffers (descriptors, the ~12 KB packet pool, socket
+  storage); on stop it drops them, returning the whole budget.
+- **`heartbeat`** (`heartbeat.rs`) — *Pause/Resume with a retained resource*: the
+  LED `Output` is owned across pause→resume, never re-acquired. Its blink period
+  is a runtime parameter (`POST /api/heartbeat?ms=`). Running on the `HIGH`
+  interrupt tier, it also observes thread-executor stalls live (it still gets CPU
+  when the thread executor is wedged) and can name the culprit *before* the
+  watchdog resets.
+- **`http` pool** (`http.rs`) — *elastic pool + socket & heap budgeting*. Each
+  worker owns one embassy-net socket and heap I/O buffers, so the pool scales
+  within the fixed `StackResources` budget and its heap footprint tracks the live
+  worker count. `mark_busy`/`mark_idle` drive the scaling.
+- **`ota`** (`ota.rs`) — the supervisor's signature *drain-to-free-budget* move:
+  a disabled-at-boot node that, once control-started, orchestrates its own
+  resource draining (see [OTA update](#ota-update)).
+- **`bench`** (`bench.rs`) — *multi-core placement*: yield-chunked xorshift
+  busywork that pins core 1's executor near 100% in-poll while core 0's numbers
+  are untouched. Each task lives on one core; nothing migrates.
+- **`ota-confirm`** (`main.rs`) — *deps-on-pool ordering + run-once*: by
+  depending on `http` it starts after the whole graph is up; an update broken
+  enough not to reach it never confirms, and the bootloader rolls back.
 
-Measured from the release binary (`thumbv8m.main-none-eabihf`, `opt-level="s"`,
-fat LTO) plus exact `size_of` of the heap types. Reproduce with
-`rust-size -A target/thumbv8m.main-none-eabihf/release/firmware` and
-`rust-nm --print-size --size-sort`.
+### Supervisor features exercised
 
-| Region | Used | Capacity | % |
-|---|---:|---:|---:|
-| **Flash** (`.text`+`.rodata`+`.data`) | ~159 KB | 892 KB (ACTIVE partition) | 17.8% |
-| **Static RAM** (`.data`+`.bss`+`.uninit`) | ~41 KB | 512 KB | 8.0% |
-| ↳ heap arena | 32 KB | — | — |
-| ↳ everything else static | ~8.8 KB | — | — |
-| **Max stack** (RAM left over) | ~471 KB | — | — |
-
-Flash grew from ~87 KB (pre-OTA) to ~159 KB once OTA pulled in `reqwless`,
-`ruzstd`, and `embassy-boot-rp`; it's bounded by the 892 KB ACTIVE partition, not
-the full 2 MB. The compressed update image must also fit the 128 KB scratch region
-and decode into the 896 KB DFU partition.
-
-### Static RAM (compile-time, independent of runtime task state)
-
-| Symbol | Bytes | What |
-|---|---:|---|
-| `heap::HEAP_MEM` | 32,768 | the heap arena (see below) |
-| `net::net_task::POOL` | 3,728 | net worker future (mostly irreducible runner state) |
-| `http::http_task::POOL` | 1,280 | `TaskStorage` for 4 http worker futures (~320 B each) |
-| `defmt_rtt::BUFFER` | 1,024 | RTT log ring |
-| `ota::ota_task::POOL` | 984 | OTA worker future (reqwless buffers are heap, not here) |
-| wakers / nodes / channels / supervisor | ~1,200 | gpio+usb wakers, the `TaskNode`s, control mailbox, `HTTP_POOL`, … |
-
-Non-heap static (~8.8 KB) is dominated by the task futures, which are **always
-reserved** — net/http/ota futures exist even when those tasks are stopped; only the
-*buffers* the tasks own are dynamic. The OTA future stays ~1 KB because reqwless's
-socket/header/chunk buffers are heap-allocated rather than inlined; each http future
-is ~320 B because response bodies are built on the heap, not in inline
-`heapless::String`s across the write `.await`. `net`'s ~3.7 KB future is mostly
-embassy/smoltcp runner state with no large app-owned local to box away.
-
-### Heap (the 32 KB `embedded-alloc` arena)
-
-| Subsystem | Allocation | Bytes | Freed when |
-|---|---|---:|---|
-| **net** | `NetState<1514,4,4>` packet pool | 12,264 | `net` stops |
-| | `StackResources<5>` + dns socket | ~2,900 | `net` stops |
-| | USB descriptors + control buf | 640 | `net` stops |
-| | CDC-NCM `State` | 28 | `net` stops |
-| | *net subtotal* | **~15,800** | |
-| **http** (per worker) | `rx`+`tx`+`req` (3×1 KB `Vec`) | 3,072 | worker shrinks/stops |
-| **http** (per request) | response body/header `String` | ~0.6–1 KB | request completes |
-| **ota** (download) | reqwless `TcpClientState` + header/chunk buffers | ~4,600 | download finishes |
-| **ota** (decode) | `ruzstd` window + literals/block + Huffman/FSE tables (`wlog=11`) | **27,615** | decode finishes |
-
-| Scenario | Heap used | % of 32 KB | Free |
-|---|---:|---:|---:|
-| Steady (net + 1 http floor) | ~18.5 KB | 58% | ~13.5 KB |
-| **Serving peak** (net + 4 http workers + 1 response) | **~27.4 KB** | 86% | ~4.6 KB |
-| **OTA decode** (ruzstd alone — net + http both drained) | **~28 KB** | ~88% | ~4 KB |
-
-The two peaks are **balanced by design at ~28 KB**, which is why 32 KB fits with
-~4 KB margin:
-
-- **Serving** is net + the 4-worker pool. The pool ceiling (`POOL_MAX`) is chosen so
-  this matches the OTA peak — raising it raises both. Only one response `String` is
-  ever live (small bodies fit the tx buffer, so the write never yields), as the
-  Phase-1 build confirmed by measuring exactly 28,292 B at 4 workers.
-- **OTA decode** is `ruzstd` alone: the `ota` task drains the http pool **and** `net`
-  before decoding (it reads the staged image from flash, not the network). `ruzstd`'s
-  footprint is the window + per-block literals/content buffers + ~18 KB of fixed
-  Huffman/FSE decode tables; it ~doubles per `windowLog` (wlog 11→13 = 28→71 KB) while
-  the compressed image barely shrinks, so the window is capped at **11**. The
-  27,615 B figure is **measured** by the `zstd-heapcheck` tool decoding the real
-  image, not estimated.
-
-`GET /api/tasks` reports the true runtime `free_bytes()` (LlffHeap rounds each alloc
-to an 8-byte block, so live usage is marginally above these requested bytes).
-
-Two implementation notes. **Task futures are static, their buffers are heap** — so
-stopping `net` frees ~16 KB of heap but not its 3.7 KB future slot. And
-`Box::new(NetState::new())` has no *guaranteed* placement-new (the value is built as
-a temporary, then moved into the heap), so a debug build copies the 12 KB `NetState`
-through the bring-up poll's stack frame; the release build elides it (largest
-task-poll frame is ~2.9 KB) — harmless either way against the ~471 KB stack.
+| Supervisor feature | Where |
+|---|---|
+| Task dependencies | `http`/`ota` depend on `net`; ordered start/teardown |
+| Dynamic task pools | `http` `ElasticPool<DeferredShrink>` (`http.rs`) |
+| Deps on a pool name | `ota-confirm` depends on `http` → its floor member, so it runs last |
+| Detached daemon | `watchdog` — started once, excluded from every cascade |
+| Detached teardown | `ota` outlives the `net` it tears down (`set_detached`) |
+| Lifecycle: Pause/Resume | `heartbeat` keeps its LED `Output` across a pause |
+| Lifecycle: control-started | `ota` and `bench` are pre-disabled, started by control |
+| Multi-executor tier | `heartbeat` on the `HIGH` `InterruptExecutor` (SWI_IRQ_0 @ P2) |
+| Multi-core placement | `bench` on `CORE1` via the graph's spawner slot |
+| Resource: sockets | the pool scales within the fixed `StackResources` budget |
+| Resource: heap (budgeted) | `ota` drains `http` + `net` to free the arena for the decode |
+| Runtime control | `POST /api/control` → `embassy_supervisor::request_control` |
+| Trace observability | `GET /api/tasks` (and the dashboard at `/`) — CPU%, max-poll, executor stats |
 
 ## Build & run (RP2350)
 
@@ -181,8 +158,8 @@ the probe; the USB port is the network link).
 The firmware always runs from the **ACTIVE partition under the bootloader** (it is
 linked at `0x10021000` and cannot boot standalone), so a first flash installs the
 **bootloader + firmware pair**. The bootloader arms an 8 s watchdog as its OTA
-rollback safety; the firmware feeds it, so a healthy image stays up and a hung one
-resets and rolls back.
+rollback safety; the firmware's `watchdog` node feeds it, so a healthy image stays
+up and a hung one resets and rolls back.
 
 ```sh
 # Board variant: firmware/Cargo.toml uses embassy-rp `rp235xb` (SparkFun IoT
@@ -213,7 +190,12 @@ cargo build --workspace          # thumbv8m.main-none-eabihf
 cargo build -p embassy-supervisor --target x86_64-unknown-linux-gnu   # crate is host-buildable
 ```
 
-### Host network setup (USB-net)
+## Host network setup (USB-net)
+
+Networking is **USB-CDC-NCM** (TCP/IP over the USB cable) — a deliberate demo
+choice for ease of reuse and testing: no extra hardware or wireless setup, and it
+works on any embassy MCU with USB. A real application would swap in a wireless
+chip; only the `net` task changes — the rest of the graph is unaffected.
 
 The device uses a static IP `10.42.0.61/24`. Point the host's USB ethernet
 interface at the same subnet, then browse to the device:
@@ -224,7 +206,7 @@ ip link set usb0 up
 xdg-open http://10.42.0.61/             # task view + stop/start buttons
 ```
 
-### Exercise the supervisor
+## Exercise the supervisor
 
 - **Dynamic pool:** hold several concurrent connections open to the HTTP port so
   every worker is busy, and watch the pool grow `1 → 4` in the task view (free
@@ -239,6 +221,10 @@ xdg-open http://10.42.0.61/             # task view + stop/start buttons
   the dashboard; it illustrates the root drain, not a recoverable-over-HTTP stop.)
 - **Pause/Resume:** pause `heartbeat` (LED stops; the GPIO handle is retained),
   then resume it.
+- **Multi-core load:** start `bench`
+  (`curl -XPOST 'http://10.42.0.61/api/control?node=bench&op=start'`) and watch
+  core 1's executor line jump from idle to ~100% busy (in-poll) while core 0's
+  numbers are untouched; stop it and core 1 goes quiet again.
 - **Runtime parameter:** change the heartbeat without a rebuild —
   `?ms=` is `>0` blink half-period, `0` LED off, `<0` LED on, applied immediately:
   ```sh
@@ -247,60 +233,255 @@ xdg-open http://10.42.0.61/             # task view + stop/start buttons
   curl -XPOST 'http://10.42.0.61/api/heartbeat?ms=-1'    # on
   ```
 
-### Observability (trace feature)
+## Stress-testing the HTTP service
 
-The firmware enables `embassy-supervisor`'s `trace-hooks`, so `GET /api/tasks` (and the
-dashboard) report per-node CPU% / max-poll and per-executor busy / in-poll / idle,
-computed from the executor's trace hooks.
+The `/api/tasks` endpoint doubles as a load target and a self-report: every
+response carries the full trace snapshot (heap, per-executor and per-task
+counters), so hammering it with [`wrk`](https://github.com/wg/wrk) both exercises
+the elastic worker pool *and* streams back the numbers to judge how it held up.
+The companion Lua script (`firmware/tools/wrk-tasks.lua`) parses those snapshots
+and prints an analysis when the run ends.
 
-⚠️ **On RP2350, the executor "idle %" is NOT sleep.** RP2350 has a silicon quirk where any
-exclusive-access atomic (`ldaex`/`strex`) raises a global-monitor event — an effective
-`SEV` — so every atomic in the executor's idle loop (the critical-section spinlock, task
-flags) makes the following `WFE` return immediately. The thread executor therefore
-free-runs at ~1 MHz (`polls/pass` in the wrk report is far below 1) and never actually
-sleeps, regardless of how little work there is. Read `idle %` as "WFE-spin", not power
-saving. This is not specific to this firmware or the supervisor — it affects any
-WFE-idle embassy/pico-SDK program on RP2350. For genuine low power use the `powman`
-peripheral (deep sleep), not WFE.
+### Prerequisites
+
+Install `wrk` (a scriptable HTTP benchmarking tool with a Lua/LuaJIT engine):
+
+```sh
+sudo apt install wrk      # Debian/Ubuntu
+sudo dnf install wrk      # Fedora
+brew install wrk          # macOS
+sudo pacman -S wrk        # Arch (or the AUR)
+```
+
+### The command
+
+From the repo root, pointing at the device:
+
+```sh
+wrk -t1 -c4 -d10s --latency -s firmware/tools/wrk-tasks.lua http://10.42.0.61/api/tasks
+```
+
+Why these flags:
+
+- **`-c4` matches `POOL_MAX`.** The HTTP pool tops out at four workers
+  (`POOL_MAX = 4` in `firmware/src/http.rs`), one embassy-net socket per worker,
+  and that ceiling is also the socket budget. Four keep-alive connections give
+  every worker exactly one connection to serve, driving the `ElasticPool` to its
+  fully-grown steady state without piling extra connections onto the `accept`
+  backlog. Go higher and you stop measuring per-worker behaviour and start
+  measuring accept contention / connection churn instead.
+- **`-t1` gives the cleanest report.** Each wrk thread runs an isolated Lua
+  state, and `done()` runs in yet another; nested tables can't be copied across
+  states reliably. With a single thread there is exactly one rendered report to
+  print, and one thread easily saturates four keep-alive connections against an
+  embedded target.
+- **`--latency`** adds wrk's own latency percentile table to the summary,
+  alongside the script's device-side analysis.
+- **`-d10s` is plenty:** the device counters are wrapping `u32` ticks that only
+  wrap after ~71 min of uptime at 1 MHz, so any short run is wrap-safe. The only
+  thing that breaks the first-vs-last comparison is a run that straddles a device
+  reboot.
+
+### What the script measures
+
+**Per response** (validated on every sample):
+
+- **Well-formedness / truncation.** `heap_free`, `tick_hz`, and `now_ticks` must
+  be present and the body must end in `]}`. Anything else means the device
+  truncated the JSON — the body outgrew the worker's TX buffer — and increments
+  `malformed/truncated`.
+- **Heap headroom.** Tracks `heap_free` min/max across the run; the *min* is the
+  free heap at peak pool load.
+- **Counter monotonicity.** `now_ticks` must advance and each task's `exec_ticks`
+  must only accumulate. A wrap-safe backward step is counted as a **regression**
+  — a trace-attribution bug, not normal wrap.
+
+**Over the whole run** (first-vs-last wrap-safe diffs):
+
+- **Per task:** CPU% (`exec_ticks` delta / window), poll count, average poll
+  duration and **max poll duration** in µs (via `tick_hz`).
+- **Per executor:** `busy% = in-poll% + overhead%` (in-poll is time inside task
+  polls; overhead is scheduler bookkeeping, trace hooks, and ISRs landing between
+  polls), plus polls/s, passes/s, and polls/pass.
+- **Unsupervised share.** With exactly one executor the script attributes
+  `in-poll minus the sum of supervised tasks` to unsupervised work (tasks the
+  graph doesn't track); with multiple executors this can't be pinned to one, so
+  it's omitted.
+
+### Reading a sample report
+
+```
+==== /api/tasks analysis (wrk thread 1) ====
+samples 4120 | non-200 0 | malformed/truncated 0 | counter regressions 0
+body bytes  min 690 / max 742 (worker tx buffer must hold max + headers)
+heap_free   min 21536 / max 22072 B (min = headroom at peak load)
+window      10.0 s of device time (tick_hz 1000000)
+executor 20001abc: 41.2% busy = 33.8% in-poll + 7.4% overhead (scheduler + hooks + inter-poll ISRs)
+executor 20001abc: 8140 polls/s, 5330 passes/s, 1.53 polls/pass, unsupervised tasks 0.42%
+task              cpu%      polls  avg poll us  max poll us
+http0            9.14%      41200         22.1        410.0
+http1            8.97%      40850         21.7        398.0
+net              2.31%      12030          8.4        150.0
+...
+```
+
+**Good looks like:** `non-200 0`, `malformed/truncated 0`, `counter regressions 0`;
+`body max` comfortably below the worker's 1440-byte TX buffer minus header bytes;
+`heap_free min` steady and well clear of zero; task CPU% roughly balanced across
+`http0..http3`; max poll µs bounded.
+
+**Bad looks like:**
+
+- **`malformed/truncated > 0`** — the JSON body no longer fits the worker's TX
+  buffer (1440 B, `tx` in `http_task`). Shrink the body or grow the buffer.
+- **`heap_free min` approaching 0** — the pool grew but the heap can't sustain a
+  fully-grown pool under load; an allocation is about to fail. This is the exact
+  failure mode the TX/body sizing was chosen to avoid.
+- **`counter regressions > 0`** — a counter stepped backward beyond wrap
+  tolerance: a trace attribution bug, not load-related — worth investigating
+  regardless of throughput.
+- **`non-200 > 0`** — connections dropped or errored under load.
+- **`busy%` pinned near 100% with high `overhead%`** — the executor is saturated
+  and spending a large share outside polls; a runaway max-poll on one task points
+  at a specific culprit.
+
+## Interpreting the observability data
+
+The firmware enables `embassy-supervisor`'s `trace-hooks` + `trace-nested`
+(see the [supervisor features](../supervisor/README.md#cargo-features)), so
+`GET /api/tasks` — and the dashboard rendering it — reports per-node and
+per-executor counters. All counters are **wrapping u32 ticks**: to get a rate,
+sample twice and `wrapping_sub` (the dashboard and the wrk script both do this),
+or divide a cumulative counter by uptime when nothing has wrapped. `tick_hz`
+converts ticks to time (here 1 MHz → 1 tick = 1 µs).
+
+### System / heap
+
+- `heap_total` / `heap_free` — arena size (32768) and bytes currently free.
+  **Healthy:** free oscillates around a steady baseline across load.
+  **Concerning:** a monotonic downward trend between idle points (a leak), or
+  dips near 0 under peak load (allocation-failure risk).
+- `tick_hz` / `now_ticks` — tick unit and device uptime; use `now_ticks` as the
+  denominator for whole-uptime rates.
+
+### Per-executor
+
+Each executor reports `id, idle_ticks, exec_ticks, polls, passes`. Over a window
+of `dt` ticks:
+
+```
+busy         = dt - Δidle_ticks            (executor not sleeping)
+in-poll      = Δexec_ticks                 (inside task polls, supervised or not)
+overhead     = busy - Δexec_ticks          (bookkeeping + trace hooks + ISRs between polls)
+unsupervised = Δexec_ticks - Σ Δnode.exec_ticks   (polls that map to no node)
+busy%        = in-poll% + overhead%
+```
+
+- `passes` counts scheduler passes; `polls` counts completed task polls, so
+  **`polls / passes` is the mean useful polls per pass**. Empty passes (woken but
+  nothing runnable) are booked as **idle**, not overhead.
+- **The single most diagnostic comparison is `passes/s` vs `polls/s`:** near-equal
+  (ratio ≈ 1) is healthy — the executor wakes only for work. `passes/s` far above
+  `polls/s` is a **wake storm** (see [below](#sev-wake-storm-status)). Tick-based
+  idle% alone hides a storm completely, because empty passes count as idle.
+- **Overhead as a share of busy** grows with poll rate (~13% of a 150 MHz core
+  measured at ~8k polls/s under HTTP load); it ballooning means the hooks and
+  bookkeeping are eating the core — expected only at very high poll rates.
+- **Unsupervised share** should be near zero (nearly all poll time maps to named
+  nodes); a large share means significant work in tasks outside the graph.
+
+Caveats: the accounting is preemption-naive by default — a preempted
+thread-executor poll absorbs the preemptor's CPU, idle is per-executor not
+per-core, and hardware-ISR time is invisible (it inflates whichever node was
+mid-poll, else lands in overhead). This firmware enables `trace-nested`, which
+makes nested/preempted attribution preemption-exact.
+
+### Per-task
+
+Each task reports `name, mode, running, busy, disabled, detached, exec_ticks,
+polls, max_poll_ticks, deps`.
+
+- **CPU% = Δ`exec_ticks` / Δ`now_ticks`; mean poll = `exec_ticks` / `polls`.**
+- **`max_poll_ticks` is the key health signal** — the longest single poll ever
+  seen, the "never yields" watermark. A poll should be microseconds; a value in
+  the many-ms range means the task ran without hitting an `.await` and starved
+  its executor for that long. It is the post-hoc twin of `stalled_task()`, which
+  this firmware uses live in two places: `heartbeat` (on the `HIGH` tier, so it
+  can name a task wedging the thread executor *while it happens*) and `watchdog`
+  (post-hoc watermark warnings every feed cycle).
+- **Healthy:** `max_poll_ticks` in the tens-to-low-hundreds of µs; CPU% small and
+  proportional to the task's job; on-demand pool members sitting idle at 0 until
+  pulled in. **Concerning:** `max_poll_ticks` ≫ ms (busy-looping without
+  yielding); one task's CPU% approaching its executor's whole busy% (it dominates
+  the core); `running=true` but `polls` frozen across samples (wedged task).
+
+Quick recipe: (1) convert with `tick_hz`; (2) per executor, compare `passes/s`
+to `polls/s` — a big gap is a wake storm; (3) split `busy%` into in-poll and
+overhead, and check the unsupervised share; (4) per task, compute CPU% and mean
+poll, and treat a large `max_poll_ticks` as the flag for a task that doesn't
+yield.
+
+### SEV wake storm: status
+
+**Still visible as of 2026-07-06, under investigation.** On a live device
+(46 min uptime, whole-uptime rates from the cumulative counters):
+
+| Executor | passes/s | polls/s | passes per useful poll | idle% (ticks) |
+|---|---:|---:|---:|---:|
+| core-0 thread | **≈1.12 M** | 20.4 | ~54,700 | 99.81% |
+| core-1 thread (`bench` never started) | **≈1.01 M** | **0** | ∞ | ~100% |
+| `HIGH` interrupt (`heartbeat` only) | 1.18 | 1.18 | **1.00** | 99.997% |
+
+Both thread-mode executors wake ~a million times per second and find nothing
+runnable — the core-1 executor is the purest illustration, spinning at ~1.01 M
+passes/s while polling literally nothing. Because empty passes are (correctly)
+booked as idle, the storm costs almost no CPU by tick accounting and is invisible
+in `busy%` — **the `passes/s` vs `polls/s` gap is the instrument that exposes
+it**. Read the thread executors' `idle%` as WFE-spin, not sleep or power saving.
+The interrupt executor is the clean control case: exactly 1 poll per pass, waking
+only for real work.
+
+The prime suspect — a suspicion, not a conclusion — is the attached **debug
+probe keeping `C_DEBUGEN` set, which turns `WFE` into a NOP**, so the idle loop
+never actually blocks; a probe-free retest is still pending. A second hypothesis
+is the RP2350 behavior where exclusive-access atomics (`ldaex`/`strex`) raise a
+global-monitor event (an effective `SEV`) that makes the next `WFE` return
+immediately. Related public threads:
 
 - raspberrypi/pico-feedback [#482](https://github.com/raspberrypi/pico-feedback/issues/482)
 - embassy-rs/embassy [#4818](https://github.com/embassy-rs/embassy/issues/4818)
 - pico-sdk [#1812](https://github.com/raspberrypi/pico-sdk/issues/1812)
 
-## Portability
-
-The `embassy-supervisor` crate is HAL-agnostic and reused verbatim on any embassy
-target. Porting this firmware to another MCU means swapping `embassy-rp` for the
-target HAL, the USB init, and `embassy-boot-<mcu>` — the supervisor, USB-net,
-HTTP plane, OTA flow, and the whole task graph stay.
+Either way, for genuine low power use the `powman` peripheral (deep sleep), not
+WFE idle.
 
 ## OTA update
 
 A/B firmware update over USB-net with `embassy-boot-rp` rollback. `ota` is a
 `Terminate` node pre-disabled at boot, so it sits stopped until control starts it.
-Once started, **the node orchestrates its own resource draining** — the supervisor's
-signature move:
+Once started, **the node orchestrates its own resource draining** — the
+supervisor's signature move:
 
 1. `POST /api/ota[?ip=&port=&path=]` records a download target (each part defaults:
    gateway `10.42.0.1`, port `8000`, path `/fw.zst`) and issues `Activate(ota)`.
    Starting the node straight from the dashboard (or `/api/control?node=ota&op=start`)
    works too — with no target set, the task falls back to the same defaults.
-2. The `ota` task **drains the http pool** (and waits via `is_running` for the
-   workers' sockets to free), pulls the **zstd** image with `reqwless` over a
-   socket it opens by IP, and streams it into a 128 KB **scratch** flash region.
+2. The `ota` task **detaches itself as its first act** — from here on it is
+   uninterruptible (no control op can stop it mid-update; its only exits are the
+   reset in step 4). It then **drains the http pool** (waiting via `is_running`
+   for the workers' sockets to free), pulls the **zstd** image with `reqwless`
+   over a socket it opens by IP, and streams it into a 128 KB **scratch** flash
+   region.
 3. It then **drains `net`** — it decodes from flash, not the network, so net's
-   ~16 KB is reclaimed for the decoder. It `set_detached`es first so net's teardown
-   doesn't cascade back into the still-running `ota` task.
+   ~16 KB is reclaimed for the decoder. Being detached, net's teardown doesn't
+   cascade back into the still-running `ota` task.
 4. `ruzstd` (`windowLog=11`) decodes the scratch image into the DFU partition with
-   nearly the whole arena free, arms the swap (`mark_updated`), and resets.
-5. The bootloader swaps DFU→ACTIVE; on the next boot the firmware feeds the
-   watchdog and, once the network is up, calls `mark_booted` to confirm — otherwise
-   the bootloader rolls back.
-
-The window is capped at `wlog=11` because ruzstd's heap ~doubles per `windowLog`
-while the compressed image barely shrinks; `tools`-style measurement of the real
-image (`~/DEV/zstd-heapcheck`) put the decode peak at 27,615 B, which sizes the
-32 KB arena.
+   nearly the whole arena free, arms the swap (`mark_updated`), and resets. On
+   failure it resets *without* arming the swap — a clean recovery into the
+   current image.
+5. The bootloader swaps DFU→ACTIVE; on the next boot the `watchdog` node feeds
+   the rollback watchdog and, once the network is up, the run-last `ota-confirm`
+   node calls `mark_booted` to confirm — otherwise the bootloader rolls back.
 
 Build the update image (a flat binary of the ACTIVE-located firmware, zstd'd):
 
@@ -327,7 +508,53 @@ the new image. **Rollback:** an image that crashes or hangs before `mark_booted`
 stops feeding the watchdog → reset → the bootloader reverts to the previous image.
 `probe-rs erase --chip RP235x` + a fresh flash is the recovery path if needed.
 
-## Notes
+## Portability
+
+The `embassy-supervisor` crate is HAL-agnostic and reused verbatim on any embassy
+target. Porting this firmware to another MCU means swapping `embassy-rp` for the
+target HAL, the USB init, and `embassy-boot-<mcu>` — the supervisor, USB-net,
+HTTP plane, OTA flow, and the whole task graph stay.
+
+## Implementation notes
+
+### Heap budget (canonical breakdown)
+
+`embedded-alloc` is the global allocator, and the networked subsystems' working
+memory lives on it, so free heap (shown in the task view) moves as the supervisor
+starts and stops tasks. This table is the canonical breakdown that the comments
+in `heap.rs`, `net.rs`, and `ota.rs` refer to:
+
+| Consumer | Bytes | Freed when |
+|---|---:|---|
+| `net` subsystem (USB descriptors + ~12 KB CDC-NCM packet pool + socket storage) | ~16 KB | `net` stops |
+| `http` worker I/O buffers (`rx` 1024 + `tx` 1440 + `req` 1024) | ~3.4 KB / worker | worker exits (shrink or teardown) |
+| `http` in-flight response body/header `String`s | ~0.6–1 KB | request completes |
+| `ota` download (reqwless `TcpClientState` + header/chunk buffers) | ~4.6 KB | download finishes |
+| `ota` decode (`ruzstd`, `windowLog=11` — **measured** by `zstd-heapcheck` on the real image) | 27,615 B | decode finishes |
+
+The arena is sized so the two big consumers peak at the same level and never
+coexist:
+
+| Scenario | Heap used |
+|---|---:|
+| **Serving peak** — `net` + 4 http workers + 1 in-flight response (measured 28,292 B) | **~28 KB** |
+| **OTA decode peak** — `ruzstd` alone; `http` and `net` both drained | **~28 KB** |
+| Arena | 32 KB |
+| Margin at either peak | **~4 KB** |
+
+The two peaks are balanced by design: the pool ceiling (`POOL_MAX = 4`) is chosen
+so serving matches the decode — raising it raises the arena requirement. The zstd
+window is capped at `wlog=11` because ruzstd's footprint ~doubles per `windowLog`
+while the compressed image barely shrinks. Allocation is infallible-but-safe: the
+supervisor's start/stop is admission control that keeps total usage within the
+arena, rather than per-allocation fallibility. `GET /api/tasks` reports the true
+runtime `free_bytes()`.
+
+Note that **task futures are static, their buffers are heap**: net/http/ota
+futures are always reserved even when those tasks are stopped, so stopping `net`
+frees its ~16 KB of heap but not its future slot.
+
+### Other notes
 
 - `embassy-supervisor`'s logging is an optional `defmt` feature (no-op otherwise),
   which this firmware enables so the supervisor's lifecycle events show up over RTT.
@@ -338,3 +565,6 @@ stops feeding the watchdog → reset → the bootloader reverts to the previous 
 - Each worker reads a request in a single `socket.read`, which assumes it arrives
   in one segment — true for these short requests over USB-net, but a general
   server would loop until the header terminator.
+- The socket budget is `POOL_MAX + 1` (`net::SOCKET_BUDGET`): one socket per http
+  worker plus embassy-net's internal DNS slot. The OTA download needs no extra
+  slot — the pool is drained before it opens its socket.
