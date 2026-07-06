@@ -8,30 +8,26 @@ async embedded framework. `no_std`, no allocator, no board crates — it compile
 target. The only third-party deps are pure-embassy crates (`embassy-executor`/`-sync`/`-time`/
 `-futures`) and `portable-atomic`.
 
-## New in 0.2.0
+## Table of contents
 
-- **Compile-time topology.** The graph is declared once with the new `supervisor_graph!`
-  proc-macro (crate `embassy-supervisor-macros`, pulled in by the default `macros` feature).
-  The topological order is computed at **compile time**: a dependency cycle or an unknown
-  dependency is a *compile error*, and `Supervisor::new` is infallible and `const`.
-- **One `GRAPH` bundle.** The macro emits a single `pub static GRAPH: Graph<N>` (node slots,
-  dependency table, order, and pools) consumed by `Supervisor::new(&GRAPH)`.
-- **Explicit pool policy type.** `policy: <Type> = <expr>` lets a pool's scaling policy be
-  built by anything (a `const fn` factory, a builder chain); the shorthand
-  `policy: Type::new(..)` still derives the type.
-- **Stricter declarations.** Graphs are capped at 256 node slots (indices are `u8`), and pool
-  bounds must satisfy `min <= max <= member count` — both checked at macro expansion.
+- [What it is](#what-it-is)
+- [Highlights in 0.3.0](#highlights-in-030)
+- [Quickstart](#quickstart)
+- [The model](#the-model)
+- [Lifecycle reference](#lifecycle-reference)
+- [The `supervisor_graph!` DSL](#the-supervisor_graph-dsl)
+- [Recipes by use case](#recipes-by-use-case)
+- [Elastic pools](#elastic-pools)
+- [Multi-executor tiers and multi-core](#multi-executor-tiers-and-multi-core)
+- [Observability](#observability)
+- [Cargo features](#cargo-features)
+- [Supported feature combinations](#supported-feature-combinations)
+- [no_std / MSRV](#no_std--msrv)
+- [Full example](#full-example)
+- [Migration](#migration)
+- [License](#license)
 
-Migrating from 0.1.x:
-
-| 0.1.x | 0.2.0 |
-|---|---|
-| `task_graph! { &A, &B }` | `supervisor_graph! { node A = ...; node B = ...; }` |
-| `Supervisor::new(&ALL_NODES, &DEPS, ORDER)` | `Supervisor::new(&GRAPH)` |
-| `.with_pools(POOLS)` | gone — pools ride in `GRAPH` |
-| `NODE_COUNT` | `GRAPH.nodes.len()` |
-
-## What it does
+## What it is
 
 - **Dependency-ordered lifecycle** — the supervisor brings tasks up in dependency order and
   tears dependents down before the things they depend on.
@@ -42,9 +38,38 @@ Migrating from 0.1.x:
 - **Runtime control** *(feature `control`)* — drive start/stop/pause/resume from anywhere (an HTTP
   endpoint, a button, …) through a decoupled mailbox (`request_control` / `apply_control`) that
   honors dependencies and pool membership.
+- **Multi-executor placement** — `executor:` annotations route nodes onto interrupt-priority
+  tiers or the second core; the graph is the single source of *where each task runs*.
+- **Observability** *(feature family `trace`)* — per-node CPU time, poll counts and stall
+  detection by consuming embassy-executor's trace hooks, with node *names* attached.
 
 The supervisor deliberately does **not** allocate, own a HAL, manage power states, or know what your
 tasks do — it orchestrates their *lifecycle* and leaves the rest to you.
+
+## Highlights in 0.3.0
+
+**Breaking release** — bring-up is now `async` (see [Migration](#migration)).
+
+- **Async bring-up.** `Supervisor::start`, `start_node`, and `respawn_terminate` are `async fn`
+  and must be `.await`ed. Bringing up an `executor:` node awaits its `SpawnerSlot` (bounded,
+  then `SpawnError::Busy`), so a tier filled late — or from another core — is handled without a
+  race, a busy-spin, or a hardware timer-queue hazard. Same-executor nodes never touch the timer.
+- **Multi-executor graphs.** `executor NAME;` declares a runtime-filled `SendSpawner` slot;
+  `executor: NAME` on a node (or a whole pool) routes its spawn through it — interrupt-priority
+  tiers become graph citizens.
+- **Multi-core placement.** The same mechanism spans the second core: `start()` rendezvouses
+  with the other core's asynchronous executor bring-up as part of the bring-up loop, and a whole
+  elastic pool can live on core 1, scaled by core 0's supervisor. Covered by cross-thread host
+  tests running two real executors.
+- **Pool-name deps.** `deps:` may name a `pool`; it resolves to the pool's floor member —
+  "start after the pool is up".
+- **Detached is fully hands-off.** After `set_detached(true)`, *nothing* the supervisor does
+  touches the node: `teardown`, `deactivate`/`activate` cascades, `stop_node`,
+  `respawn_terminate`, and `resume_pausable` all skip it (see the
+  [Lifecycle reference](#lifecycle-reference)).
+- **Trace observability.** The opt-in `trace` / `trace-hooks` / `trace-names` / `trace-nested`
+  features turn embassy-executor's raw trace hooks into named per-node accounting (see
+  [Observability](#observability)), plus `TaskNode::adopt(&token)` for spawns the macro can't see.
 
 ## Quickstart
 
@@ -64,19 +89,22 @@ supervisor_graph! {
 async fn supervisor_task(spawner: Spawner) {
     // Infallible: the order is precomputed, so a dependency cycle is a compile error.
     let sup = Supervisor::new(&GRAPH);
-    sup.start(spawner).expect("initial spawn");   // brings up `net`, then `app`
+    sup.start(spawner).await.expect("initial spawn"); // brings up `net`, then `app`
     loop {
-        let cmd = wait_control().await;           // runtime control requests
-        sup.apply_control(cmd, spawner).await;    // applied in dependency order
+        let cmd = wait_control().await;               // runtime control requests
+        sup.apply_control(cmd, spawner).await;        // applied in dependency order
     }
 }
 ```
+
+`start` is `async` because an `executor:` node first awaits its slot; a plain single-executor
+graph resolves immediately — the `.await` costs nothing.
 
 ## The model
 
 Three pieces, all `static`:
 
-- **`TaskNode`** — one per managed task: a name, a [`Mode`], an optional spawn fn, and a
+- **`TaskNode`** — one per managed task: a name, a `Mode`, an optional spawn fn, and a
   private handle of atomic flags + signals. The *task side* of the protocol is a handful of
   node methods: a task selects its work against `wait_shutdown()`, calls `ack_dropped()` when
   it exits (or before parking), and — for `Pause` nodes — parks on `wait_resume()`. Pool
@@ -101,54 +129,277 @@ Three pieces, all `static`:
 A task that never acks a shutdown within the timeout panics the supervisor with the node's
 name — a loud bug report, not a hang.
 
+## Lifecycle reference
+
+The canonical per-operation matrix — what each supervisor operation does to a node, by mode
+and by the two lifecycle-spanning flags (`disabled`, `detached`). Other docs link here.
+
+| operation | `Terminate` | `Pause` | `OnDemand` | disabled | detached |
+|---|---|---|---|---|---|
+| `start` *(boot, async)* | spawned in dep order | spawned; a parked (no-`spawn:`) node is only marked running | skipped | skipped | spawned like any node — tasks detach *themselves* after their first spawn |
+| `teardown` | shutdown + ack, exits | shutdown + ack, parks on `wait_resume()` | stopped if running, else skipped | already down — nothing to do | **skipped** (self-managed) |
+| `deactivate` *(control)* | disabled + stopped; cascades to transitive dependents, dependents first | disabled + stopped, parks; stays parked | disabled + stopped — the whole pool, atomically | re-disabled (idempotent) | **skipped** — never pulled into the cascade, even when targeted directly |
+| `activate` *(control)* | enabled + started, after its transitive deps | enabled + resumed in place | enabled only — the pool policy regrows it under load | this is the flag it clears | **skipped** — not re-enabled, not restarted; its `deps:` are start-ordering only and are not expanded |
+| `stop_node` | shutdown + ack | shutdown + ack, parks | shutdown + ack (the pool-shrink path) | not running → no-op | **no-op** |
+| `respawn_terminate` *(async)* | reset + respawned in dep order | untouched (use `resume_pausable`) | left down — the policy regrows it | skipped — a manual stop sticks | **skipped** — it never went down, respawning would double-spawn |
+| `resume_pausable` | untouched | reset + resumed in place, keeps held resources | untouched | skipped — a manual pause sticks | **left parked** |
+
+Two flags cut across the modes:
+
+- **`disabled`** is the "a human said stop" latch: `deactivate` sets it, `activate` clears it,
+  and every bring-up path honors it so a manual stop/pause survives a wake respawn or an
+  elastic regrow.
+- **`detached`** (`TaskNode::set_detached(true)`) is full hands-off: the node manages its own
+  lifecycle and the supervisor never drives it again. Its `deps:` still order its *first*
+  spawn — after that, the graph only remembers where it was declared.
+
 ## The `supervisor_graph!` DSL
 
 ```text
-node NAME = Mode, deps: [A, B], spawn: <spawn>[, disabled];
-node NAME = Mode, deps: [A];      // no `spawn:` => parked node the app spawns itself
-pool NAME = [Mode, ..], deps: [A],
+executor NAME;                        // runtime-filled SendSpawner slot (tier / second core)
+node NAME = Mode, deps: [A, B][, executor: EXEC], spawn: <spawn>[, disabled];
+node NAME = Mode, deps: [A];          // no `spawn:` => parked node the app spawns itself
+pool NAME = [Mode, ..], deps: [A][, executor: EXEC],
     spawn: <fn>,
     policy: [<Type> =] <expr>,
     min: N, max: M;
 ```
 
-- **`spawn:` forms** — a bare path `f` spawns `f(&NAME)`; a partial call `f(a, b)` spawns
-  `f(&NAME, a, b)` (the node is always injected first); a closure is emitted verbatim (nodes
-  only). Omit `spawn:` for a **parked** node whose task the application spawns itself (e.g. a
-  `Pause` sensor holding a peripheral handle) — the supervisor tracks it but never spawns it.
-- **`disabled`** — declared but not started at boot; a control `Activate` starts it later
-  (e.g. an OTA task).
-- **`executor EXEC;` / `executor: EXEC`** — run a node on a different executor. The
-  declaration emits a `SpawnerSlot` static; the app fills it with a `SendSpawner`
-  (`InterruptExecutor::start()`, `Spawner::make_send()`) before `start()`, and annotated
-  nodes spawn through it — interrupt-priority tiers and the second core become graph
-  citizens instead of hand-spawned parked nodes. Their futures must be `Send`; an
-  unfilled slot fails the spawn with `SpawnError::Busy` (loud, not silent).
-- **`#[cfg(...)]`** — on any `node`/`pool` *and on individual deps*. Absent nodes keep their
-  slot as `None` and are skipped everywhere at runtime.
-- **`pool`** — the mode list declares the members (floor first: typically
-  `[Terminate, OnDemand, ...]`). The macro generates the member array `NAME: [TaskNode; K]`,
-  per-member spawn glue, and a `NAME_POOL: ElasticPool<P>`. `policy:` takes the scaling
-  policy; annotate the type explicitly (`policy: DeferredShrink = make_policy()`) when the
-  value isn't a `Type::new(..)` constructor.
-- **Limits** — at most 256 slots per graph; `min <= max <= K`. Violations are compile errors.
+### Spawn forms
+
+A bare path `f` spawns `f(&NAME)`; a partial call `f(a, b)` spawns `f(&NAME, a, b)` (the node
+is always injected first); a closure is emitted verbatim (nodes only). Omit `spawn:` for a
+**parked** node whose task the application spawns itself (e.g. a `Pause` sensor holding a
+peripheral handle) — the supervisor tracks it but never spawns it.
+
+### `disabled`
+
+Declared but not started at boot; a control `Activate` starts it later (e.g. an OTA task).
+
+### `executor NAME;` and `executor: NAME`
+
+`executor NAME;` emits a `SpawnerSlot` static; the app fills it with a `SendSpawner`
+(`InterruptExecutor::start()`, `Spawner::make_send()`), and annotated nodes spawn through it.
+`start()` awaits the slot (bounded) as part of bring-up; a slot still empty at the deadline
+fails the spawn with `SpawnError::Busy` — loud, not silent. Constraints: `executor:` requires
+a `spawn:` fn (it cannot combine with a verbatim closure), and the routed task's future must
+be `Send`.
+
+### Dependencies
+
+`deps:` names declared nodes *or pools*. A pool name resolves to the pool's **floor member**
+(member 0, the `min`-kept one), so `deps: [POOL]` means "start after the pool is up".
+
+### `#[cfg(...)]`
+
+Allowed on any `node`/`pool` *and on individual deps*. Absent nodes keep their slot as `None`
+and are skipped everywhere at runtime.
+
+### `pool`
+
+The mode list declares the members (floor first: typically `[Terminate, OnDemand, ...]`). The
+macro generates the member array `NAME: [TaskNode; K]`, per-member spawn glue, and a
+`NAME_POOL: ElasticPool<P>`. Pool fields are positional and fixed:
+`deps → executor? → spawn → policy → min → max`. `policy:` takes the scaling policy; annotate
+the type explicitly (`policy: DeferredShrink = make_policy()`) when the value isn't a
+`Type::new(..)` constructor.
+
+### Limits
+
+At most **256 slots** per graph — all graph indices are `u8`, which keeps the dep table and
+order arrays byte-sized on flash-constrained targets. Pool bounds must satisfy
+`min <= max <= K`. Violations are compile errors, as are dependency cycles and unknown dep
+names.
 
 Generated surface at the call site: one `pub static` per node, the pool array + `NAME_POOL`,
-and `pub static GRAPH` — nothing else.
+one `SpawnerSlot` static per `executor NAME;`, and `pub static GRAPH` — nothing else.
 
-## Runtime control
+## Recipes by use case
 
-The `Supervisor` lives on the driver task's stack, so control is decoupled through a small
-channel: any context calls `request_control(&NODE, ControlOp::Activate | Deactivate)` and
-returns immediately; the driver loop receives it via `wait_control()` and runs
-`apply_control`, which:
+Node and pool names below are invented; swap in your own task fns.
 
-- **Deactivate** — tears down the node *and its transitive dependents*, dependents first.
-- **Activate** — brings up the node's transitive deps first, then the node (respawn for
-  `Terminate`, resume for `Pause`); a `disabled` node becomes enabled.
-- **Pools** — control targeting any pool member is applied to the whole pool atomically.
-- **Detached nodes** — a node that calls `set_detached(true)` manages its own lifecycle and
-  is skipped by dependency cascades (see the OTA pattern below).
+### Simple dependency chain
+
+```rust,ignore
+supervisor_graph! {
+    node SENSOR   = Terminate, deps: [], spawn: sensor_task;
+    node REPORTER = Terminate, deps: [SENSOR], spawn: reporter_task;
+}
+```
+
+`REPORTER` is brought up only after `SENSOR`. The topological order is computed at compile
+time — a cycle or an unknown dep name is a compile error.
+
+### Elastic worker pool with `DeferredShrink`
+
+```rust,ignore
+supervisor_graph! {
+    node BROKER = Terminate, deps: [], spawn: broker_task;
+    pool WORKERS = [Terminate, OnDemand, OnDemand, OnDemand], deps: [BROKER],
+        spawn: worker_task,
+        policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(4)),
+        min: 1, max: 4;
+}
+```
+
+Four member slots; `min: 1` is the always-on floor, growth up to `max: 4` under load.
+`DeferredShrink` waits 4 s of idle surplus before shrinking so brief lulls don't thrash.
+Requires the `pool` feature.
+
+### Pause node holding a resource (parked, app-spawned)
+
+```rust,ignore
+supervisor_graph! {
+    node SENSOR = Pause, deps: [];   // no `spawn:` => parked node
+    node READER = Terminate, deps: [SENSOR], spawn: reader_task;
+}
+
+// main() spawns the sensor task itself, with the peripheral handle it owns:
+spawner.spawn(sensor_task(&SENSOR, i2c)).unwrap();
+```
+
+A `Pause` node acks a shutdown, then parks on `wait_resume()` — the I2C handle it holds is
+never dropped. `resume_pausable()` thaws it in place after a wake.
+
+### Control-started node (`disabled`)
+
+```rust,ignore
+supervisor_graph! {
+    node NET     = Terminate, deps: [], spawn: net_task;
+    node UPDATER = Terminate, deps: [NET], spawn: updater_task, disabled;
+}
+```
+
+`start()` skips `UPDATER` at boot; it comes up only when runtime control targets it with
+`request_control(&UPDATER, ControlOp::Activate)`. Use for on-demand subsystems (a firmware
+updater, a debug server) that shouldn't run until explicitly asked for.
+
+### Detached self-managed daemon
+
+```rust,ignore
+supervisor_graph! {
+    node LOG_DRAIN = Terminate, deps: [], spawn: log_drain_task;
+}
+
+#[embassy_executor::task]
+async fn log_drain_task(node: &'static embassy_supervisor::TaskNode) {
+    node.set_detached(true); // full hands-off from here on
+    loop { /* drain forever, self-managed */ }
+}
+```
+
+After `set_detached(true)` the supervisor never drives the node again — teardown, control
+cascades, `stop_node`, respawn and pause-resume all skip it. The graph stays the single place
+it's declared and ordered; management stops after the first spawn.
+
+### Interrupt-priority executor tier
+
+```rust,ignore
+supervisor_graph! {
+    executor HIGH;   // runtime-filled SendSpawner slot (an interrupt-priority tier)
+    node SAMPLER = Terminate, deps: [], executor: HIGH, spawn: sampler_task;
+    node LOGGER  = Terminate, deps: [SAMPLER], spawn: logger_task;
+}
+
+// app side, before `sup.start(...)` (embassy-rp shown; any HAL works):
+static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
+interrupt::SWI_IRQ_0.set_priority(Priority::P2);
+HIGH.set(EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0));
+```
+
+`SAMPLER` runs at raised priority while `LOGGER` stays on the thread executor — yet the
+dependency between them is still honored. `sampler_task`'s future must be `Send`; if the slot
+is never filled, `start()` fails with `SpawnError::Busy` after a bounded wait.
+
+### Second-core pool
+
+```rust,ignore
+supervisor_graph! {
+    executor CORE1;
+    pool CRUNCHERS = [OnDemand, OnDemand], deps: [], executor: CORE1,
+        spawn: cruncher_task,
+        policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(2)),
+        min: 0, max: 2;
+}
+```
+
+The pool members run on core 1's executor while core 0's supervisor scales them. Core 1's
+entry publishes its spawner (`CORE1.set(sp.make_send())` inside `executor.run`); `start()`
+and `start_node` await the slot, so a late-booting core is a rendezvous, not a race.
+`min: 0` lets the pool scale fully down when idle.
+
+### Node depending on a pool
+
+```rust,ignore
+supervisor_graph! {
+    pool WORKERS = [Terminate, OnDemand], deps: [],
+        spawn: worker_task,
+        policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(3)),
+        min: 1, max: 2;
+    node DISPATCHER = Terminate, deps: [WORKERS], spawn: dispatcher_task;
+}
+```
+
+A dep on a pool name resolves to the pool's **floor member**, so `deps: [WORKERS]` means
+"start `DISPATCHER` once the pool floor is up".
+
+### Run-once check, ordered last
+
+```rust,ignore
+supervisor_graph! {
+    node NET = Terminate, deps: [], spawn: net_task;
+    pool WORKERS = [Terminate, OnDemand], deps: [NET],
+        spawn: worker_task,
+        policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(3)),
+        min: 1, max: 2;
+    node READY_PROBE = Terminate, deps: [WORKERS], spawn: ready_probe_task;
+}
+
+#[embassy_executor::task]
+async fn ready_probe_task(node: &'static embassy_supervisor::TaskNode) {
+    node.set_detached(true);
+    // everything above is up now; do a one-shot post-boot self-check, then return
+}
+```
+
+`deps: [WORKERS]` on a leaf node makes it the last thing brought up; detaching lets it exit
+without ever being waited on by a teardown.
+
+### Composite: sensor tier + parked diagnostics + power coordinator
+
+```rust,ignore
+supervisor_graph! {
+    executor HIGH;                    // interrupt-priority tier
+
+    node SENSOR   = Terminate, deps: [], executor: HIGH, spawn: sensor_task;
+    node NET      = Terminate, deps: [], spawn: net_task;
+    node UPLOADER = Terminate, deps: [NET, SENSOR], spawn: uploader_task;
+    node STATS    = Pause, deps: [], spawn: stats_task;   // parked through sleep
+    node POWER    = Terminate, deps: [];  // parked: main spawns it with the Spawner
+}
+
+static SUP: Supervisor<5> = Supervisor::new(&GRAPH);
+
+// A parked node (no `spawn:`): main spawns it by hand because it needs a value
+// only main has — here the `Spawner` that `respawn_terminate` takes:
+//     spawner.spawn(power_task(&POWER, spawner)).unwrap();
+#[embassy_executor::task]
+async fn power_task(node: &'static embassy_supervisor::TaskNode, spawner: Spawner) {
+    node.set_detached(true); // survives the teardown it is about to drive
+    loop {
+        wait_for_idle().await;
+        SUP.teardown().await;                       // quiesce the graph; POWER is skipped
+        enter_low_power().await;                    // Pause nodes stay parked
+        SUP.resume_pausable();                      // thaw the parked diagnostics
+        SUP.respawn_terminate(spawner).await.ok();  // respawn the stateless services
+    }
+}
+```
+
+The common shapes combined: a latency-critical node on an interrupt tier, a `Pause`
+diagnostics node that keeps its state across the sleep, and a detached coordinator that
+drives the whole sleep/wake cycle itself — because it's detached, its own `teardown()` and
+`respawn_terminate()` calls skip it.
 
 ## Elastic pools
 
@@ -156,17 +407,20 @@ returns immediately; the driver loop receives it via `wait_control()` and runs
 Workers report load (`mark_busy`/`mark_idle` + `request_scale`); the supervisor's
 `run_pools(spawner)` future — `select`ed against `wait_control()` in the driver loop — wakes
 on each scale request (it never polls), asks each pool's `ScalingPolicy` for a `PoolAction`,
-and starts/stops one member accordingly.
+and starts/stops one member accordingly. A member is never grown while one of its declared
+dependencies is down.
 
 The built-in `DeferredShrink` policy grows immediately when saturated (no idle member, below
 `max`) and shrinks only after an idle surplus has persisted for a configurable cooldown —
-responsive up, lazy down. Swap in your own policy by implementing `ScalingPolicy` (a sync,
-allocation-free decision fn).
+responsive up, lazy down. One idle spare is the stable dead-band, so a single spare never
+flaps. Swap in your own policy by implementing `ScalingPolicy` (a sync, allocation-free
+decision fn).
 
-## Multi-core
+## Multi-executor tiers and multi-core
 
-The `executor` mechanism extends to a second core: each core runs its **own** executor,
-tasks never migrate, and the graph is the single source of *placement*.
+The `executor` mechanism is one story at two scales: an `InterruptExecutor` tier on the same
+core, or a second core running its **own** executor. Either way, tasks never migrate and the
+graph is the single source of *placement*.
 
 ```rust,ignore
 supervisor_graph! {
@@ -179,9 +433,9 @@ spawn_core1(p.CORE1, &mut CORE1_STACK, || {
     EXECUTOR1.run(|sp| CORE1.set(sp.make_send()))
 });
 
-// the supervisor rendezvouses with that asynchronous bring-up:
-CORE1.ready().await;
-sup.start(spawner)?;
+// bring-up rendezvouses with that asynchronous publish as part of `start` itself
+// (bounded wait per `executor:` node, then `SpawnError::Busy`):
+sup.start(spawner).await?;
 ```
 
 Everything the supervisor does is already cross-core sound (atomics + critical-section
@@ -193,43 +447,9 @@ up as its own line in the stats; register `trace::set_core_id_fn` (one line, e.g
 migration and work stealing (futures aren't `Send` across most HALs — each node lives
 where the graph puts it).
 
-## Patterns
+## Observability
 
-Recipes from the two real applications built on this crate (the in-repo `firmware`, and a
-battery-powered sensor node):
-
-- **Boot ordering** — declare `deps:` and call `start()`; done. `net` before `http`, `wifi`
-  before everything.
-- **Deep-sleep cycle** — before sleeping: `teardown().await` (reverse dependency order,
-  every task acks). After waking: `resume_pausable()` for the parked sensors, then
-  `respawn_terminate(spawner)` for the stateless services.
-- **Connection worker pool** — floor of one `Terminate` listener + `OnDemand` spares,
-  `DeferredShrink` policy: burst traffic grows the pool within ~one request, idle shrinks it
-  after the cooldown, and `deps: [NET]` guarantees no worker outlives the network.
-- **Control-started OTA** — declare the node `disabled`; an HTTP `POST /api/ota` calls
-  `request_control(&OTA, Activate)`. The OTA task `set_detached(true)`s itself before
-  draining the worker pool, so stopping its `NET` sibling-dependents doesn't cascade into it.
-- **Status endpoint** — iterate `GRAPH.nodes` (name, `is_running()`, `is_busy()`,
-  `is_disabled()`) and `GRAPH.deps` to render a live task table; the in-repo firmware serves
-  exactly that as JSON + a dashboard.
-
-## Cargo features
-
-| feature   | default | what it adds |
-|-----------|:-------:|--------------|
-| `control` |    ✓    | runtime control plane (`ControlOp`, `request_control`, `apply_control`) |
-| `pool`    |    ✓    | elastic worker pools (`ElasticPool`, `run_pools`, `GRAPH.pools`) |
-| `macros`  |    ✓    | the `supervisor_graph!` graph-declaration macro |
-| `defmt`   |         | route the supervisor's logs through `defmt` (otherwise the log macros are no-ops) |
-| `trace`   |         | trace-hook observability: per-node CPU time / poll counts / max-poll watermark, executor idle time, stall detection (see below) |
-| `trace-hooks` |     | batteries-included: the graph declaration also defines the `_embassy_trace_*` hook symbols |
-| `trace-names` |     | stamp node names into task Metadata for external tooling (SystemView, debuggers) |
-| `trace-nested` |    | preemption-exact accounting: nested higher-tier polls are credited back to the window they interrupt (per-core stacks via `trace::set_core_id_fn` on multi-core) |
-
-`default-features = false` gives a minimal core that only does dependency-ordered
-bring-up/teardown — dropping the control plane and pools trims flash and a couple of statics.
-
-## Observability (feature `trace`)
+*(feature family `trace` — all opt-in)*
 
 embassy-executor ships raw `_embassy_trace_*` instrumentation hooks that identify tasks only
 by an opaque `u32`. The `trace` feature makes the supervisor their batteries-included
@@ -245,22 +465,68 @@ executor poll is attributed to a *named* node — correctly across respawns.
   share — plus poll/pass counters and the in-flight poll (`trace::current_task` /
   `trace::stalled_task(executor, threshold)` for live blocked-task detection from a
   context that can still run).
-- Counters are wrapping `u32` ticks: sample twice, `wrapping_sub`, divide — the in-repo
-  firmware's dashboard renders live per-node CPU% and executor busy% exactly this way.
+- Counters are wrapping `u32` ticks: sample twice, `wrapping_sub`, divide. The in-repo
+  firmware's README covers how to read the numbers in practice (CPU%, busy% vs overhead,
+  polls-per-pass as a wake-storm tell).
 
-`trace-hooks` additionally emits the seven hook symbol definitions at the graph declaration
-site (exactly one set may exist per binary; define your own and forward to the
-`trace::on_*` recorders instead if you need custom hooks). Limitations: accounting is
-preemption-naive by default — an interrupt executor's poll lands in whichever window it
-preempts; enable `trace-nested` for exact charge-splitting (register
-`trace::set_core_id_fn` on multi-core); hardware-ISR time remains invisible either way. Executor busy% exceeds the per-node sum by a per-poll
-accounting gap (executor bookkeeping + the hooks' own cost — it grows with poll rate;
-`ExecutorStats` measures it as `busy − in-poll`), at most 4 executors are tracked, and
-parked / closure-spawned nodes register with one call: `TaskNode::adopt(&token)`. The
-hook API is an executor implementation detail — this feature tracks the executor minor
-version the crate already pins.
+The split across the family: `trace` is recorders only; `trace-hooks` additionally emits the
+seven hook symbol definitions at the graph declaration site (exactly one set may exist per
+binary — define your own hooks and forward to the `trace::on_*` recorders if you need
+custom ones); `trace-names` stamps node names into task Metadata for external tooling
+(SystemView, debuggers); `trace-nested` makes accounting preemption-exact — a nested
+higher-tier poll credits its time back to the window it interrupted (register
+`trace::set_core_id_fn` on multi-core for one preemption stack per core).
 
-## `no_std` / MSRV
+Limitations: accounting is preemption-naive without `trace-nested`; hardware-ISR time is
+invisible either way; executor busy% exceeds the per-node sum by a per-poll accounting gap
+(`ExecutorStats` measures it as `busy − in-poll`); at most 4 executors are tracked. Parked /
+closure-spawned nodes register with one call: `TaskNode::adopt(&token)`. The hook API is an
+executor implementation detail — this feature tracks the executor minor version the crate
+already pins.
+
+## Cargo features
+
+| feature   | default | what it adds |
+|-----------|:-------:|--------------|
+| `control` |    ✓    | runtime control plane (`ControlOp`, `request_control`, `apply_control`) |
+| `pool`    |    ✓    | elastic worker pools (`ElasticPool`, `run_pools`, `GRAPH.pools`) |
+| `macros`  |    ✓    | the `supervisor_graph!` graph-declaration macro |
+| `defmt`   |         | route the supervisor's logs through `defmt` (otherwise the log macros are no-ops) |
+| `trace`   |         | trace-hook observability: per-node CPU time / poll counts / max-poll watermark, executor idle time, stall detection |
+| `trace-hooks` |     | batteries-included: the graph declaration also defines the `_embassy_trace_*` hook symbols (implies `trace`) |
+| `trace-names` |     | stamp node names into task Metadata for external tooling (implies `trace`) |
+| `trace-nested` |    | preemption-exact accounting: nested higher-tier polls are credited back to the window they interrupt (implies `trace`) |
+
+`default-features = false` gives a minimal core that only does dependency-ordered
+bring-up/teardown — dropping the control plane and pools trims flash and a couple of statics.
+
+## Supported feature combinations
+
+Every combination below is checked in CI on the embedded target
+(`thumbv8m.main-none-eabihf`, `no_std`), mirroring the workflow's feature-matrix job — if a
+subset a user can select breaks, CI catches it (the `pool`-without-`control` regression that
+motivated this matrix is fixed in 0.3.0):
+
+| combination (`default-features = false` +) | notes |
+|---|---|
+| *(none)* | minimal core: dependency-ordered bring-up/teardown only |
+| `control` | control plane without pools |
+| `pool` | pools without the control plane |
+| `macros` | macro-declared graph, minimal runtime |
+| `pool,macros` | macro-declared pools |
+| `control,pool` | full runtime, hand-declared graph |
+| `control,pool,macros` | = the default feature set |
+| `defmt` | logging composes with any of the above |
+| `trace` | recorders only |
+| `trace,trace-hooks` | + hook symbols (also host-**tested**, not just checked) |
+| `trace,trace-hooks,trace-nested` | + charge-splitting (host-tested) |
+| `trace,trace-names` | + Metadata name stamps |
+| `--all-features` | built, clippy-clean, and doc-built in CI |
+
+The `trace-*` features each imply `trace`, so enabling them alone is equivalent to the pairs
+above. Host tests additionally run the default set and `--no-default-features`.
+
+## no_std / MSRV
 
 `#![no_std]` and `#![forbid(unsafe_code)]`. Requires Rust 1.85+ (edition 2024). The embassy
 dependencies are pre-1.0 (`embassy-executor` 0.10, `embassy-sync` 0.8, `embassy-time` 0.5), so a
@@ -270,7 +536,30 @@ consuming application must use compatible embassy minor versions.
 
 The [`firmware`](https://github.com/cedrivard/embassy-supervisor/tree/main/firmware) crate in the
 repository is a complete working application on an RP2350 — USB-CDC-NCM networking, an HTTP control
-plane, an elastic worker pool, and OTA firmware update — all driven by this supervisor.
+plane, an elastic worker pool, multi-executor tiers on both cores, trace observability, and OTA
+firmware update — all driven by this supervisor.
+
+## Migration
+
+### 0.2 → 0.3
+
+Bring-up went `async`; the callers are already async tasks, so the change is mechanical:
+
+| 0.2.x | 0.3.0 |
+|---|---|
+| `sup.start(spawner)?` | `sup.start(spawner).await?` |
+| `sup.start_node(&N, spawner)?` | `sup.start_node(&N, spawner).await?` |
+| `sup.respawn_terminate(spawner)?` | `sup.respawn_terminate(spawner).await?` |
+| explicit `SLOT.ready().await` before `start()` | no longer needed — `start` awaits each `executor:` node's slot itself |
+
+### 0.1 → 0.2
+
+| 0.1.x | 0.2.0 |
+|---|---|
+| `task_graph! { &A, &B }` | `supervisor_graph! { node A = ...; node B = ...; }` |
+| `Supervisor::new(&ALL_NODES, &DEPS, ORDER)` | `Supervisor::new(&GRAPH)` |
+| `.with_pools(POOLS)` | gone — pools ride in `GRAPH` |
+| `NODE_COUNT` | `GRAPH.nodes.len()` |
 
 ## License
 
