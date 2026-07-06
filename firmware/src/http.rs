@@ -89,12 +89,12 @@ if(/^http[0-9]+$/.test(t.name)){\
 pool=pool||{n:0,r:0,b:0,dis:true,deps:t.deps,e:0,mp:0};\
 pool.n++;if(t.running)pool.r++;if(t.busy)pool.b++;if(!t.disabled)pool.dis=false;\
 pool.e=(pool.e+t.exec_ticks)>>>0;pool.mp=Math.max(pool.mp,t.max_poll_ticks);continue;}\
-let st=t.disabled?'disabled':t.running?(t.busy?'busy':'running'):'stopped';\
+let st=t.detached?'detached':t.disabled?'disabled':t.running?(t.busy?'busy':'running'):'stopped';\
 let pause=t.mode=='pause';let act=t.disabled||!t.running;\
 let op=act?(pause?'resume':'start'):(pause?'pause':'stop');\
 h+='<tr><td>'+t.name+'<td>'+t.mode+'<td>'+st+'<td>'+cpu(t.name,t.exec_ticks)+\
 '<td>'+us(t.max_poll_ticks)+'<td>'+t.deps.join(',')+\
-'<td><button onclick=\"ctl(\\''+t.name+'\\',\\''+op+'\\')\">'+op+'</button>';}\
+'<td>'+(t.detached?'':'<button onclick=\"ctl(\\''+t.name+'\\',\\''+op+'\\')\">'+op+'</button>');}\
 if(pool){let op=pool.dis?'start':'stop';\
 h+='<tr><td>http (pool)<td>elastic<td>'+pool.r+'/'+pool.n+' up, '+pool.b+' busy<td>'+\
 cpu('_pool',pool.e)+'<td>'+us(pool.mp)+'<td>'+pool.deps.join(',')+\
@@ -320,13 +320,14 @@ fn build_tasks_json(json: &mut String) {
         // consecutive samples for CPU%, and converts max_poll to µs via tick_hz.
         let _ = write!(
             json,
-            "{{\"name\":\"{}\",\"mode\":\"{}\",\"running\":{},\"busy\":{},\"disabled\":{},\
+            "{{\"name\":\"{}\",\"mode\":\"{}\",\"running\":{},\"busy\":{},\"disabled\":{},\"detached\":{},\
              \"exec_ticks\":{},\"polls\":{},\"max_poll_ticks\":{},\"deps\":[",
             node.name,
             node.mode.as_str(),
             node.is_running(),
             node.is_busy(),
             node.is_disabled(),
+            node.is_detached(),
             node.exec_ticks(),
             node.poll_count(),
             node.max_poll_ticks()
