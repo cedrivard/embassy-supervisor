@@ -6,7 +6,11 @@
 The `supervisor_graph!` proc-macro for
 [`embassy-supervisor`](https://crates.io/crates/embassy-supervisor): declare a supervised
 task graph once, and get the node `static`s plus a single `GRAPH` bundle whose
-**topological order is computed at compile time** (a dependency cycle is a compile error).
+**topological order is computed at compile time**. The whole graph is validated at compile
+time: dependency cycles, unknown or duplicate dependencies, duplicate node/pool names,
+unknown `executor:` slots, malformed spawn forms, and pool bounds (`min <= max <= member
+count`, 256-slot cap) are all spanned compile errors — see the
+[full list](../supervisor/README.md#limits-and-compile-time-validation).
 
 **Do not depend on this crate directly.** Use `embassy-supervisor` with its default
 `macros` feature, which re-exports the macro and forwards the `pool` feature here.

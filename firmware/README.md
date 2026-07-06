@@ -22,7 +22,6 @@ stays in view.
 8. [OTA update](#ota-update)
 9. [Portability](#portability)
 10. [Implementation notes](#implementation-notes)
-    - [Heap budget (canonical breakdown)](#heap-budget-canonical-breakdown)
 
 ## Overview — what this demo shows
 
@@ -421,39 +420,22 @@ overhead, and check the unsupervised share; (4) per task, compute CPU% and mean
 poll, and treat a large `max_poll_ticks` as the flag for a task that doesn't
 yield.
 
-### SEV wake storm: status
+### Note on RP2350
 
-**Still visible as of 2026-07-06, under investigation.** On a live device
-(46 min uptime, whole-uptime rates from the cumulative counters):
+⚠️ **On RP2350, the executor "idle %" is NOT sleep.** RP2350 has a silicon quirk where any
+exclusive-access atomic (`ldaex`/`strex`) raises a global-monitor event — an effective
+`SEV` — so every atomic in the executor's idle loop (the critical-section spinlock, task
+flags) makes the following `WFE` return immediately. The thread executor therefore
+free-runs at ~1 MHz (`polls/pass` in the wrk report is far below 1) and never actually
+sleeps, regardless of how little work there is. Read `idle %` as "WFE-spin", not power
+saving. This is not specific to this firmware or the supervisor — it affects any
+WFE-idle embassy/pico-SDK program on RP2350. For genuine low power use the `powman`
+peripheral (deep sleep), not WFE.
 
-| Executor | passes/s | polls/s | passes per useful poll | idle% (ticks) |
-|---|---:|---:|---:|---:|
-| core-0 thread | **≈1.12 M** | 20.4 | ~54,700 | 99.81% |
-| core-1 thread (`bench` never started) | **≈1.01 M** | **0** | ∞ | ~100% |
-| `HIGH` interrupt (`heartbeat` only) | 1.18 | 1.18 | **1.00** | 99.997% |
-
-Both thread-mode executors wake ~a million times per second and find nothing
-runnable — the core-1 executor is the purest illustration, spinning at ~1.01 M
-passes/s while polling literally nothing. Because empty passes are (correctly)
-booked as idle, the storm costs almost no CPU by tick accounting and is invisible
-in `busy%` — **the `passes/s` vs `polls/s` gap is the instrument that exposes
-it**. Read the thread executors' `idle%` as WFE-spin, not sleep or power saving.
-The interrupt executor is the clean control case: exactly 1 poll per pass, waking
-only for real work.
-
-The prime suspect — a suspicion, not a conclusion — is the attached **debug
-probe keeping `C_DEBUGEN` set, which turns `WFE` into a NOP**, so the idle loop
-never actually blocks; a probe-free retest is still pending. A second hypothesis
-is the RP2350 behavior where exclusive-access atomics (`ldaex`/`strex`) raise a
-global-monitor event (an effective `SEV`) that makes the next `WFE` return
-immediately. Related public threads:
 
 - raspberrypi/pico-feedback [#482](https://github.com/raspberrypi/pico-feedback/issues/482)
 - embassy-rs/embassy [#4818](https://github.com/embassy-rs/embassy/issues/4818)
 - pico-sdk [#1812](https://github.com/raspberrypi/pico-sdk/issues/1812)
-
-Either way, for genuine low power use the `powman` peripheral (deep sleep), not
-WFE idle.
 
 ## OTA update
 
@@ -516,45 +498,6 @@ target HAL, the USB init, and `embassy-boot-<mcu>` — the supervisor, USB-net,
 HTTP plane, OTA flow, and the whole task graph stay.
 
 ## Implementation notes
-
-### Heap budget (canonical breakdown)
-
-`embedded-alloc` is the global allocator, and the networked subsystems' working
-memory lives on it, so free heap (shown in the task view) moves as the supervisor
-starts and stops tasks. This table is the canonical breakdown that the comments
-in `heap.rs`, `net.rs`, and `ota.rs` refer to:
-
-| Consumer | Bytes | Freed when |
-|---|---:|---|
-| `net` subsystem (USB descriptors + ~12 KB CDC-NCM packet pool + socket storage) | ~16 KB | `net` stops |
-| `http` worker I/O buffers (`rx` 1024 + `tx` 1440 + `req` 1024) | ~3.4 KB / worker | worker exits (shrink or teardown) |
-| `http` in-flight response body/header `String`s | ~0.6–1 KB | request completes |
-| `ota` download (reqwless `TcpClientState` + header/chunk buffers) | ~4.6 KB | download finishes |
-| `ota` decode (`ruzstd`, `windowLog=11` — **measured** by `zstd-heapcheck` on the real image) | 27,615 B | decode finishes |
-
-The arena is sized so the two big consumers peak at the same level and never
-coexist:
-
-| Scenario | Heap used |
-|---|---:|
-| **Serving peak** — `net` + 4 http workers + 1 in-flight response (measured 28,292 B) | **~28 KB** |
-| **OTA decode peak** — `ruzstd` alone; `http` and `net` both drained | **~28 KB** |
-| Arena | 32 KB |
-| Margin at either peak | **~4 KB** |
-
-The two peaks are balanced by design: the pool ceiling (`POOL_MAX = 4`) is chosen
-so serving matches the decode — raising it raises the arena requirement. The zstd
-window is capped at `wlog=11` because ruzstd's footprint ~doubles per `windowLog`
-while the compressed image barely shrinks. Allocation is infallible-but-safe: the
-supervisor's start/stop is admission control that keeps total usage within the
-arena, rather than per-allocation fallibility. `GET /api/tasks` reports the true
-runtime `free_bytes()`.
-
-Note that **task futures are static, their buffers are heap**: net/http/ota
-futures are always reserved even when those tasks are stopped, so stopping `net`
-frees its ~16 KB of heap but not its future slot.
-
-### Other notes
 
 - `embassy-supervisor`'s logging is an optional `defmt` feature (no-op otherwise),
   which this firmware enables so the supervisor's lifecycle events show up over RTT.

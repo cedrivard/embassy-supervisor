@@ -18,8 +18,7 @@ static HEAP: LlffHeap = LlffHeap::empty();
 /// Two peaks bound this, balanced by design at **~28 KB each**: serving (net +
 /// full http pool + one in-flight response; breakdown in `net.rs`/`http.rs`) and
 /// the OTA decode (net + pool drained, `ruzstd` alone; window sizing in `ota.rs`).
-/// They never coexist, so 32 KB leaves ~4 KB margin. The firmware README's budget
-/// table is the canonical breakdown.
+/// They never coexist, so 32 KB leaves ~4 KB margin.
 pub const HEAP_SIZE: usize = 32 * 1024;
 
 /// Initialize the global allocator. Call once, early in `main`, before anything

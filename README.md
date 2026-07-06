@@ -20,7 +20,6 @@ its drop-in core.
 - [Plays well with the rest of the stack](#plays-well-with-the-rest-of-the-stack)
 - [Where it fits](#where-it-fits)
 - [The demo firmware in action](#the-demo-firmware-in-action)
-- [OTA over a USB cable? Yes, over the air.](#ota-over-a-usb-cable-yes-over-the-air)
 - [What's in this repo](#whats-in-this-repo)
 
 ## Why a supervision layer
@@ -63,63 +62,47 @@ Preemptive priority tiers *and* cooperative scheduling from one async codebase, 
 
 ## Architecture at a glance
 
-The picture below is the [demo firmware](firmware/)'s *actual* graph — every box is real code you
-can flash and poke:
+The general shape — a compile-time graph declaration, one supervisor task, and the executors,
+pools, and layers it orchestrates (the [demo firmware](firmware/README.md) is a concrete,
+flashable instantiation of exactly this):
 
-```text
-                                            COMPILE TIME
+```mermaid
+flowchart TD
+    subgraph CT["Compile time"]
+        DSL["supervisor_graph!<br/>nodes · deps · modes · pools · executor slots"]
+        GRAPH["static GRAPH<br/>node slots · dep table · pools · topological order<br/>(an invalid graph — cycle, unknown/duplicate dep, bad bounds — is a compile error)"]
+        DSL -- generates --> GRAPH
+    end
 
-  supervisor_graph! {
-      executor HIGH;   executor CORE1;          // interrupt-priority tier + second core
-      node WATCHDOG / NET / HEARTBEAT(Pause, executor: HIGH) / OTA(disabled)
-           / BENCH(executor: CORE1, disabled) / OTA_CONFIRM(deps: [HTTP]);
-      pool HTTP = [Terminate, OnDemand ×3], deps: [NET], min: 1, max: 4;
-  }
-        │  generates — topological order solved at compile time
-        │  (a dependency cycle is a *compile error*)
-        ▼
-  static GRAPH · node slots · dep table · elastic pool · topo order
+    subgraph RT["Run time"]
+        SUP["Supervisor task<br/>bring-up: start(spawner).await, dependency-ordered<br/>teardown: reverse order, stops cascade through dependents<br/>control: wait_control → apply_control<br/>pool scaling: run_pools — grow under load, shrink after cooldown"]
 
-════════════════════════════════════════════ RUN TIME ═════════════════════════════════════════════
+        subgraph EXEC["Spawn targets"]
+            T0["Thread executor<br/>cooperative tier (default)"]
+            IE["Interrupt executor<br/>preemptive tier via executor: slot"]
+            C1["Second core's executor<br/>multi-core placement, no migration"]
+            POOL["Elastic pool<br/>min..max single-instance workers"]
+        end
 
-  Supervisor::new(&GRAPH)          — infallible
-        │
-        ▼
-┌─────────────────────────── SUPERVISOR TASK · core 0, thread executor ───────────────────────────┐
-│ bring-up    start(spawner).await — dependency-ordered; awaits each cross-core spawn             │
-│ teardown    reverse order; a stop cascades through dependents                                   │
-│ control     wait_control() → apply_control(cmd) — start/stop/pause/resume any node or pool      │
-│ pool scale  run_pools(spawner) — grow under load, DeferredShrink after cooldown (min..max)      │
-└──────────┬────────────────────────┬────────────────────────┬────────────────────────┬───────────┘
-           │ spawns onto slots      │                        │                        │
-           ▼                        ▼                        ▼                        ▼
-┌──────────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐
-│ CORE 0 · THREAD EXEC │ │HIGH · INTERRUPT EXEC │ │ CORE 1 · THREAD EXEC │ │ ELASTIC POOL · HTTP  │
-│   cooperative tier   │ │   SWI_IRQ_0 @ P2 —   │ │ second core; spawner │ │  1 Terminate base +  │
-│                      │ │     preempts the     │ │ handed over at boot  │ │  3 OnDemand workers  │
-│ WATCHDOG (detached)  │ │   cooperative tier   │ │                      │ │                      │
-│  NET (USB-CDC-NCM)   │ │                      │ │   BENCH (disabled,   │ │   grow on demand,    │
-│  OTA · OTA_CONFIRM   │ │  HEARTBEAT (Pause)   │ │   control-started)   │ │ DeferredShrink after │
-│  HTTP pool workers   │ │                      │ │  no task migration   │ │    a 4 s cooldown    │
-│   supervisor task    │ │                      │ │                      │ │                      │
-└──────────────────────┘ └──────────────────────┘ └──────────────────────┘ └──────────────────────┘
+        CTRL["Control plane<br/>request_control from anywhere:<br/>start / stop / pause / resume a node or pool"]
+        TRACE["Trace layer (feature-gated)<br/>per-node ticks and polls · executor stats · stall detection"]
+    end
 
-┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ CONTROL PLANE   dashboard + /api/control (start/stop/pause/resume, pool scale, OTA upload)      │
-│                 — rides the USB-CDC-NCM IP link served by the NET node                          │
-├─────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ TRACE LAYER     feature-gated: trace-hooks glue · per-task ticks & poll counts ·                │
-│ (observability) executor_stats (idle vs in-poll) · trace-nested per-core stacks · adopt()       │
-├─────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ PLATFORM        embassy-boot A/B flash + rollback · fallible governed heap ·                    │
-│                 deep-sleep / warm-resume power                                                  │
-└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+    GRAPH --> SUP
+    SUP --> T0
+    SUP --> IE
+    SUP --> C1
+    SUP <--> POOL
+    CTRL --> SUP
+    T0 -.-> TRACE
+    IE -.-> TRACE
+    C1 -.-> TRACE
 ```
 
 App tasks are the graph *nodes* — each hangs off whichever executor slot its `executor:` annotation
-names (unannotated → core 0's thread executor). The supervisor never runs task code itself; it only
-spawns, parks, and tears down tasks onto the tiers, and scales the pool. A **detached** node
-(here: `WATCHDOG`) is a self-managed daemon the supervisor starts once and then leaves alone.
+names (unannotated → the default thread executor). The supervisor never runs task code itself; it
+only spawns, parks, and tears down tasks onto the tiers, and scales the pool. A **detached** node
+is a self-managed daemon the supervisor starts once and then leaves alone.
 
 ## What the supervisor adds
 
@@ -127,8 +110,10 @@ spawns, parks, and tears down tasks onto the tiers, and scales the pool. A **det
 once with the `supervisor_graph!` macro; the supervisor does the rest:
 
 - **Dependency-ordered bring-up and reverse teardown** — the topological order is computed **at
-  compile time** (a dependency cycle is a *compile error*); bring-up follows it, teardown reverses
-  it. Bring-up is `async`: it awaits each cross-executor spawn rendezvous instead of blocking.
+  compile time**, and the whole graph is validated there too: cycles, unknown or duplicate deps,
+  duplicate names, bad pool bounds are all *compile errors*. Bring-up follows the order, teardown
+  reverses it, and bring-up is `async`: it awaits each cross-executor spawn rendezvous instead of
+  blocking.
 - **Lifecycle modes** — `Terminate` (exit and respawn), `Pause` (park and resume while keeping a
   held resource like an open bus or socket), `OnDemand` (started on demand to scale a pool) — plus
   `disabled` (control-started) and `detached` (self-managed daemon) node states.
@@ -157,8 +142,8 @@ sup.start(spawner).await.expect("spawn");             // brings up net, then app
 
 The library is feature-gated — the control plane, pools, and tracing are optional, so a minimal
 build is just the dependency-ordered core. The full model — lifecycle matrix (what each operation
-does per mode), the `supervisor_graph!` DSL, recipes, and the supported feature combinations —
-lives in [`supervisor/README.md`](supervisor/README.md).
+does per mode), the `supervisor_graph!` DSL, and the recipes — lives in
+[`supervisor/README.md`](supervisor/README.md).
 
 ## Plays well with the rest of the stack
 
@@ -173,7 +158,7 @@ The supervisor focuses on *lifecycle*; it composes naturally with the patterns a
   supervisor *coordinates the transition* — drain services in dependency order before the rails
   drop, then resume paused tasks and respawn the rest on wake.
 - **OTA firmware update** with a safe A/B swap and automatic rollback — demonstrated end-to-end in
-  the demo firmware ([over USB, and yes, it still counts](#ota-over-a-usb-cable-yes-over-the-air)).
+  the demo firmware.
 
 ## Where it fits
 
@@ -208,35 +193,6 @@ put every part of the supervisor through its paces:
 It's the approachable, runnable example — clone the repo and follow
 [`firmware/README.md`](firmware/README.md) for the build and run steps, the per-task breakdown,
 the heap budget, and how to read the observability data.
-
-## OTA over a USB cable? Yes, over the air.
-
-The air is just a wire. We ship over-the-air firmware updates over a USB cable, and we are not
-sorry: the RP2350 has no radio, so the "air" in OTA is roughly one meter of shielded copper. Think
-of it as an air gap you can trip over. The bootloader has no idea it's being lied to about the
-weather.
-
-**Why it's genuinely OTA, minus the ozone:** OTA is about the *update path*, not the transport
-medium — a device that updates itself from a live network link without a debug probe, a flash
-programmer, or a person holding BOOTSEL. This firmware qualifies on every count:
-
-- **USB-net is the board's only IP link.** With no radio on the chip, networking runs over
-  USB-CDC-NCM — the USB cable presents as an Ethernet interface with a real IP stack. From the
-  update's point of view it's an ordinary network socket; the physical layer just happens to be a
-  wire.
-- **The control plane already rides that link.** The dashboard and the `/api/control` endpoints
-  travel over the same USB-net link. Pushing an image is one more request on a path that's already
-  the device's network — not a special cable-only side channel.
-- **embassy-boot does A/B flash + rollback.** The new image is written to the inactive slot, the
-  bootloader swaps A/B on reset, and `OTA_CONFIRM` marks the boot good only after the network is
-  back up. An update too broken to reach that point never confirms, so the next reset rolls back
-  automatically — the same safety story a radio-delivered OTA needs.
-- **The graph is transport-agnostic.** Nothing downstream of the `NET` node knows or cares what the
-  physical link is. Swap in a real Wi-Fi/BLE/Thread `net` node and the entire OTA path — control
-  plane, download, swap, confirm, rollback — carries over unchanged.
-
-Same self-updating, network-delivered, roll-back-on-failure flow as a radio OTA. The only
-difference is that the air is a wire — which, on a chip with no radio, is exactly the point.
 
 ## What's in this repo
 

@@ -21,7 +21,6 @@ target. The only third-party deps are pure-embassy crates (`embassy-executor`/`-
 - [Multi-executor tiers and multi-core](#multi-executor-tiers-and-multi-core)
 - [Observability](#observability)
 - [Cargo features](#cargo-features)
-- [Supported feature combinations](#supported-feature-combinations)
 - [no_std / MSRV](#no_std--msrv)
 - [Full example](#full-example)
 - [Migration](#migration)
@@ -47,8 +46,6 @@ The supervisor deliberately does **not** allocate, own a HAL, manage power state
 tasks do — it orchestrates their *lifecycle* and leaves the rest to you.
 
 ## Highlights in 0.3.0
-
-**Breaking release** — bring-up is now `async` (see [Migration](#migration)).
 
 - **Async bring-up.** `Supervisor::start`, `start_node`, and `respawn_terminate` are `async fn`
   and must be `.await`ed. Bringing up an `executor:` node awaits its `SpawnerSlot` (bounded,
@@ -204,12 +201,29 @@ macro generates the member array `NAME: [TaskNode; K]`, per-member spawn glue, a
 the type explicitly (`policy: DeferredShrink = make_policy()`) when the value isn't a
 `Type::new(..)` constructor.
 
-### Limits
+### Limits and compile-time validation
 
 At most **256 slots** per graph — all graph indices are `u8`, which keeps the dep table and
-order arrays byte-sized on flash-constrained targets. Pool bounds must satisfy
-`min <= max <= K`. Violations are compile errors, as are dependency cycles and unknown dep
-names.
+order arrays byte-sized on flash-constrained targets.
+
+The macro rejects an invalid graph at compile time, each with a spanned error at the
+offending token:
+
+- **unknown dependency** — a `deps:` name that is not a declared node or pool
+- **duplicate dependency** — `deps: [A, A]` (compared by resolved slot, so a repeated
+  pool name counts too)
+- **duplicate node/pool name** — a redeclared name would silently rewire earlier deps
+- **unknown `executor:` name** — on a node or pool, checked against declared
+  `executor NAME;` slots
+- **`executor:` with a closure spawn** — the closure owns the spawn, so routing through a
+  slot must happen inside it; only the task-fn-path forms combine with `executor:`
+- **malformed spawn form** — anything other than a task-fn path, a partial call, or a
+  closure
+- **pool bounds** — `min <= max <= K` (member count), values must fit `u8`
+- **pool without the `pool` feature** — a `pool` item requires enabling it
+- **more than 256 slots** — the `u8` index cap above
+- **dependency cycle** — caught by the `const` topological sort, so it surfaces at
+  const-eval of `GRAPH` rather than at macro expansion; still a compile error
 
 Generated surface at the call site: one `pub static` per node, the pool array + `NAME_POOL`,
 one `SpawnerSlot` static per `executor NAME;`, and `pub static GRAPH` — nothing else.
@@ -500,32 +514,6 @@ already pins.
 `default-features = false` gives a minimal core that only does dependency-ordered
 bring-up/teardown — dropping the control plane and pools trims flash and a couple of statics.
 
-## Supported feature combinations
-
-Every combination below is checked in CI on the embedded target
-(`thumbv8m.main-none-eabihf`, `no_std`), mirroring the workflow's feature-matrix job — if a
-subset a user can select breaks, CI catches it (the `pool`-without-`control` regression that
-motivated this matrix is fixed in 0.3.0):
-
-| combination (`default-features = false` +) | notes |
-|---|---|
-| *(none)* | minimal core: dependency-ordered bring-up/teardown only |
-| `control` | control plane without pools |
-| `pool` | pools without the control plane |
-| `macros` | macro-declared graph, minimal runtime |
-| `pool,macros` | macro-declared pools |
-| `control,pool` | full runtime, hand-declared graph |
-| `control,pool,macros` | = the default feature set |
-| `defmt` | logging composes with any of the above |
-| `trace` | recorders only |
-| `trace,trace-hooks` | + hook symbols (also host-**tested**, not just checked) |
-| `trace,trace-hooks,trace-nested` | + charge-splitting (host-tested) |
-| `trace,trace-names` | + Metadata name stamps |
-| `--all-features` | built, clippy-clean, and doc-built in CI |
-
-The `trace-*` features each imply `trace`, so enabling them alone is equivalent to the pairs
-above. Host tests additionally run the default set and `--no-default-features`.
-
 ## no_std / MSRV
 
 `#![no_std]` and `#![forbid(unsafe_code)]`. Requires Rust 1.85+ (edition 2024). The embassy
@@ -535,9 +523,9 @@ consuming application must use compatible embassy minor versions.
 ## Full example
 
 The [`firmware`](https://github.com/cedrivard/embassy-supervisor/tree/main/firmware) crate in the
-repository is a complete working application on an RP2350 — USB-CDC-NCM networking, an HTTP control
-plane, an elastic worker pool, multi-executor tiers on both cores, trace observability, and OTA
-firmware update — all driven by this supervisor.
+repository is a complete working application on an RP2350 — networking, an HTTP control plane, an
+elastic worker pool, multi-executor tiers on both cores, trace observability, and OTA firmware
+update — all driven by this supervisor.
 
 ## Migration
 
