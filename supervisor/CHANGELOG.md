@@ -6,9 +6,6 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 
 ## [0.3.0] - 2026-07-05
 
-**Breaking release** — bring-up is now `async` (see *Changed*). Adds multi-executor
-graphs, multi-core support, and trace-hook observability.
-
 ### Added
 - Multi-executor graphs: the `executor NAME;` item declares a runtime-filled
   `SpawnerSlot` (a `SendSpawner` — `InterruptExecutor` tiers, the second core, or a
@@ -62,9 +59,6 @@ graphs, multi-core support, and trace-hook observability.
   restarts) the node's dependencies: a detached node's `deps:` are start-ordering
   only, so the activate cascade now skips expanding from a detached member, matching
   the deactivate cascade.
-- `trace-nested`: an unpaired executor-end hook (its begin was skipped because the
-  executor registered mid-poll) no longer underflows the per-core nesting depth,
-  which permanently desynced preemption attribution on that core.
 
 ## [0.2.0] - 2026-07-01
 

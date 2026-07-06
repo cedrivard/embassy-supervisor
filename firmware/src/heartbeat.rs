@@ -108,7 +108,7 @@ pub async fn heartbeat_task(node: &'static TaskNode) {
 /// Warn (once per blink tick) about any executor whose current poll has run past
 /// the stall threshold. Called from the HIGH tier: our own executor's in-flight
 /// poll is this very task (microseconds — filtered by the threshold), so in
-/// practice this observes the THREAD executor from above.
+/// practice this observes the THREAD executor.
 fn warn_stalled() {
     const STALL_TICKS: u32 = (embassy_time::TICK_HZ / 10) as u32; // 100 ms
     for id in embassy_supervisor::trace::executors() {
