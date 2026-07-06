@@ -26,8 +26,6 @@
 //! Static IPv4 so no host DHCP server is needed: set your host's `usb0` to
 //! `10.42.0.1/24` and reach the device at `10.42.0.61`.
 
-use core::ptr::{addr_of, addr_of_mut};
-
 use alloc::boxed::Box;
 use embassy_futures::join::{join, join3};
 use embassy_futures::select::select;
@@ -70,7 +68,7 @@ static mut STACK: Option<Stack<'static>> = None;
 /// The current network stack, or `None` until `net` has brought it up.
 pub fn try_stack() -> Option<Stack<'static>> {
     // SAFETY: single-core; written only by the net task.
-    unsafe { *addr_of!(STACK) }
+    unsafe { *&raw const STACK }
 }
 
 /// Await the network stack becoming available. Dependents must use this rather
@@ -94,12 +92,12 @@ unsafe fn publish_stack(s: Stack<'_>) {
     // Lifetime-extend the `Copy` handle. `Stack<'a>`'s layout is independent of
     // `'a`, so this is a pure lifetime cast.
     let s: Stack<'static> = unsafe { core::mem::transmute(s) };
-    unsafe { *addr_of_mut!(STACK) = Some(s) };
+    unsafe { *&raw mut STACK = Some(s) };
 }
 
 fn unpublish_stack() {
     // SAFETY: single-core; called on teardown after all dependents are down.
-    unsafe { *addr_of_mut!(STACK) = None };
+    unsafe { *&raw mut STACK = None };
 }
 
 // ─── The supervised net node ───────────────────────────────────────────────
@@ -124,19 +122,13 @@ pub(crate) async fn net_task(node: &'static TaskNode) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
 
-    // Every buffer on the heap (net's heap budget), owned by this task → freed
+    // Every buffer on the heap (net's ~16 KB budget), owned by this task → freed
     // when it returns on teardown. Declared up front, before the objects that
     // borrow them: embassy ties each buffer's lifetime into the borrowing object's
     // type, so at scope-end (reverse-order) drop the buffers must outlive them.
-    // `net_state` (the ~12 KB packet pool) + `resources` are the bulk of the budget.
-    //
-    // Note `Box::new(NetState::new())` has no *guaranteed* placement-new: the
-    // language constructs the value as a temporary first, then moves it into the
-    // heap, so an unoptimized build copies ~12 KB through this poll's stack frame.
-    // In release (opt + LTO) the optimizer elides that copy and constructs in
-    // place — verified: the largest task-poll frame in the whole binary is ~2.9 KB,
-    // so there is no 12 KB stack spike here. (`StaticCell::init(v)` would be no
-    // different — it also takes the value by move.)
+    // `net_state` (the ~12 KB packet pool) + `resources` are the bulk. Release+LTO
+    // constructs the Boxes in place (verified: largest poll frame in the binary is
+    // ~2.9 KB — no 12 KB stack spike from the `Box::new` move).
     let mut config_desc = Box::new([0u8; 256]);
     let mut bos_desc = Box::new([0u8; 256]);
     let mut control_buf = Box::new([0u8; 128]);

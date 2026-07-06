@@ -1,0 +1,5 @@
+error: unknown executor `TYPO`; declare it in the graph with `executor TYPO;` (declared: [HIGH])
+ --> tests/ui/compile_fail/unknown_executor.rs:8:45
+  |
+8 |     node A = Terminate, deps: [], executor: TYPO, spawn: worker;
+  |                                             ^^^^

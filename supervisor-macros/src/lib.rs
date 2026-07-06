@@ -5,12 +5,27 @@
 //! the topological order at **compile time**. A dependency cycle is a compile
 //! error; an unknown dependency name is a compile error.
 //!
-//! Surface (each `node`/`pool` may be `#[cfg(...)]`-prefixed):
+//! Surface (each item may be `#[cfg(...)]`-prefixed):
 //! ```text
-//! node NAME = Mode, deps: [A, B], spawn: <spawn>[, disabled];
+//! node NAME = Mode, deps: [A, B], spawn: <spawn>[, executor: EXEC][, disabled];
 //! node NAME = Mode, deps: [A];                 // no `spawn:` => a parked node the app spawns
-//! pool NAME = [Mode, ..], deps: [A], spawn: <fn>, policy: [<Ty> =] <expr>, min: N, max: M;
+//! executor EXEC;                               // runtime-filled SendSpawner slot
+//! pool NAME = [Mode, ..], deps: [A][, executor: EXEC], spawn: <fn>,
+//!     policy: [<Ty> =] <expr>, min: N, max: M;
 //! ```
+//! `deps:` entries name a `node` or a `pool`; a `pool` dep resolves to that pool's floor
+//! member (member 0, the `min`-kept one), i.e. "start after the pool is up". A repeated
+//! dep or a redeclared node/pool name is a compile error.
+//!
+//! An `executor NAME;` slot may carry `#[cfg(...)]`, but validation does not model cfg
+//! predicates: a node referencing a slot that is cfg'd *out* while the node is cfg'd
+//! *in* surfaces as rustc's `cannot find value NAME`, not a macro error — don't gate an
+//! executor slot more restrictively than the nodes that reference it.
+//! `executor EXEC;` emits a `pub static EXEC: SpawnerSlot`; the app fills it with a
+//! `SendSpawner` (`InterruptExecutor::start`, `Spawner::make_send`) before
+//! `Supervisor::start`, and nodes carrying `executor: EXEC` spawn through it instead
+//! of the supervisor's own executor (their futures must be `Send`; an unfilled slot
+//! fails the spawn with `SpawnError::Busy`).
 //! A pool is emitted as `ElasticPool<P>`, so the macro needs the policy type `P`. By
 //! default it derives `P` from a `Ty::new(..)`-shaped `policy:` value (e.g.
 //! `DeferredShrink::new(..)` => `P = DeferredShrink`). Give `policy: <Ty> = <expr>` to
@@ -39,6 +54,14 @@
 //! `Supervisor::new`. The backing tables are private; read them through `GRAPH.nodes`
 //! / `GRAPH.deps` / `GRAPH.order` / `GRAPH.pools` (node count is `GRAPH.nodes.len()`).
 //!
+//! With the supervisor's `trace` feature (forwarded here) the generated spawn glue
+//! also captures each `SpawnToken`'s task id into its node (`set_task_id`), and
+//! `trace-names` stamps the node name into the task Metadata. With `trace-hooks`
+//! the macro additionally defines the seven `_embassy_trace_*` hook symbols at the
+//! declaration site (the supervisor crate is `forbid(unsafe_code)` and cannot),
+//! forwarding to the supervisor's `trace` recorders — requires an edition-2024
+//! consumer, and exactly one graph declaration (or hook set) per binary.
+//!
 //! Types are referenced absolutely (`::embassy_supervisor::…`), so the consuming
 //! crate must depend on `embassy-supervisor` under its real name (not aliased).
 
@@ -61,6 +84,7 @@ mod kw {
     syn::custom_keyword!(min);
     syn::custom_keyword!(max);
     syn::custom_keyword!(disabled);
+    syn::custom_keyword!(executor);
 }
 
 /// A dependency reference: a node ident, optionally `#[cfg(...)]`-gated.
@@ -102,6 +126,20 @@ struct NodeItem {
     /// `None` = a parked node the app spawns itself (no `spawn:` given).
     spawn: Option<Expr>,
     disabled: bool,
+    /// `executor: NAME` — spawn through the named [`SpawnerSlot`] (a
+    /// `SendSpawner` the app registers at runtime) instead of the supervisor's
+    /// own `Spawner`. `None` = the default executor.
+    executor: Option<Ident>,
+}
+
+/// `executor NAME;` — declares a `pub static NAME: SpawnerSlot` the application
+/// fills with a `SendSpawner` before (or concurrently with) `Supervisor::start` (an
+/// InterruptExecutor tier, core1, ...). Nodes reference it with `executor: NAME`; the
+/// supervisor awaits the slot before spawning such a node (bounded by
+/// `SLOT_READY_TIMEOUT`, then `SpawnError::Busy`).
+struct ExecutorItem {
+    cfg: Vec<Attribute>,
+    ident: Ident,
 }
 
 struct PoolItem {
@@ -124,6 +162,9 @@ struct PoolItem {
     /// bypasses `policy_type` derivation, allowing a value the deriver can't handle
     /// (a free fn, a const, a builder chain, a qualified path).
     policy_ty: Option<Type>,
+    /// `executor: NAME` — spawn every member through the named [`SpawnerSlot`]
+    /// (e.g. a worker pool on the second core, scaled by this core's supervisor).
+    executor: Option<Ident>,
     min: LitInt,
     max: LitInt,
 }
@@ -137,6 +178,7 @@ struct PoolItem {
 enum Item {
     Node(NodeItem),
     Pool(PoolItem),
+    Executor(ExecutorItem),
 }
 
 /// The parsed macro input: the list of `node`/`pool` declarations, in source order.
@@ -155,10 +197,18 @@ impl Parse for GraphSpec {
                 items.push(Item::Node(parse_node(input, cfg)?));
             } else if input.peek(kw::pool) {
                 items.push(Item::Pool(parse_pool(input, cfg)?));
+            } else if input.peek(kw::executor) {
+                // `executor NAME;` — a runtime-filled SendSpawner slot; nodes
+                // carrying `executor: NAME` spawn through it (the supervisor awaits
+                // the slot before spawning them).
+                input.parse::<kw::executor>()?;
+                let ident: Ident = input.parse()?;
+                input.parse::<Token![;]>()?;
+                items.push(Item::Executor(ExecutorItem { cfg, ident }));
             } else {
-                return Err(
-                    input.error("expected `node` or `pool` (optionally `#[cfg(...)]`-prefixed)")
-                );
+                return Err(input.error(
+                    "expected `node`, `pool`, or `executor` (optionally `#[cfg(...)]`-prefixed)",
+                ));
             }
         }
         Ok(GraphSpec { items })
@@ -178,6 +228,7 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
 
     let mut spawn = None;
     let mut disabled = false;
+    let mut executor = None;
     while input.peek(Token![,]) {
         input.parse::<Token![,]>()?;
         if input.peek(kw::spawn) {
@@ -187,8 +238,12 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
         } else if input.peek(kw::disabled) {
             input.parse::<kw::disabled>()?;
             disabled = true;
+        } else if input.peek(kw::executor) {
+            input.parse::<kw::executor>()?;
+            input.parse::<Token![:]>()?;
+            executor = Some(input.parse::<Ident>()?);
         } else {
-            return Err(input.error("expected `spawn:` or `disabled`"));
+            return Err(input.error("expected `spawn:`, `executor:`, or `disabled`"));
         }
     }
     input.parse::<Token![;]>()?;
@@ -199,10 +254,11 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
         deps,
         spawn,
         disabled,
+        executor,
     })
 }
 
-// pool IDENT = [MODES], deps: [..], spawn: <fn>, policy: EXPR, min: N, max: M;
+// pool IDENT = [MODES], deps: [..][, executor: EXEC], spawn: <fn>, policy: EXPR, min: N, max: M;
 fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
     input.parse::<kw::pool>()?;
     let ident: Ident = input.parse()?;
@@ -213,6 +269,17 @@ fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
     input.parse::<Token![:]>()?;
     let deps = parse_dep_list(input)?;
     input.parse::<Token![,]>()?;
+    // Optional `executor: NAME,` — run the whole pool on the named SpawnerSlot's
+    // executor (e.g. a worker pool on the second core, scaled from this one).
+    let executor = if input.peek(kw::executor) {
+        input.parse::<kw::executor>()?;
+        input.parse::<Token![:]>()?;
+        let ex: Ident = input.parse()?;
+        input.parse::<Token![,]>()?;
+        Some(ex)
+    } else {
+        None
+    };
     // The member task: a path, or a partial call supplying extra args (the macro
     // injects `&POOL[j]` as the first argument in either case).
     input.parse::<kw::spawn>()?;
@@ -255,6 +322,7 @@ fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
         spawn,
         policy,
         policy_ty,
+        executor,
         min,
         max,
     })
@@ -343,24 +411,90 @@ struct Slot {
 fn node_spawn(
     ident: &Ident,
     spawn: &Option<Expr>,
+    executor: &Option<Ident>,
     spawn_fn: &TokenStream2,
 ) -> SynResult<TokenStream2> {
-    Ok(match spawn {
-        None => quote!(::core::option::Option::None),
+    Ok(match (spawn, executor) {
+        (None, None) => quote!(::core::option::Option::None),
+        // `executor:` needs the macro to perform the spawn, so it composes only
+        // with the path / partial-call `spawn:` forms below.
+        (None, Some(ex)) => {
+            return Err(syn::Error::new_spanned(
+                ex,
+                "`executor:` requires a `spawn:` (a parked node is spawned by the \
+                 application, which picks its own spawner)",
+            ));
+        }
         // A path or a partial call: a task fn taking `&NODE` first (plus any
         // given args); generate `|s| { s.spawn(<task>(&NODE, ..)?); Ok(()) }`.
-        Some(e @ (Expr::Path(_) | Expr::Call(_))) => {
+        // With `executor: NAME` the glue ignores the supervisor's `Spawner` and
+        // spawns through the named `SpawnerSlot` (a `SendSpawner` the app
+        // registers at runtime): an unfilled slot fails the spawn with
+        // `SpawnError::Busy` — loud misconfiguration, not a missing task. The
+        // task future must then be `Send` (enforced by `SendSpawner::spawn`).
+        (Some(e @ (Expr::Path(_) | Expr::Call(_))), executor) => {
             let call = inject_node_call(e, &quote!(&#ident))?;
-            quote!(::core::option::Option::Some(
-                (|s| {
-                    s.spawn(#call?);
-                    ::core::result::Result::Ok(())
-                }) as #spawn_fn
-            ))
+            match executor {
+                None => {
+                    let stmts = spawn_stmts(&call, &quote!(&#ident), &quote!(s));
+                    quote!(::core::option::Option::Some(
+                        (|s| {
+                            #stmts
+                            ::core::result::Result::Ok(())
+                        }) as #spawn_fn
+                    ))
+                }
+                Some(ex) => {
+                    let stmts = spawn_stmts(&call, &quote!(&#ident), &quote!(__sp));
+                    quote!(::core::option::Option::Some(
+                        (|_s| {
+                            // The supervisor awaits this slot's `ready()` before
+                            // invoking the glue (the node carries `.with_executor(&EX)`
+                            // and the bring-up bounds the wait), so `get()` is already
+                            // filled; `ok_or` is the belt-and-braces unfilled guard.
+                            let __sp = #ex
+                                .get()
+                                .ok_or(::embassy_executor::SpawnError::Busy)?;
+                            #stmts
+                            ::core::result::Result::Ok(())
+                        }) as #spawn_fn
+                    ))
+                }
+            }
+        }
+        (Some(_), Some(ex)) => {
+            return Err(syn::Error::new_spanned(
+                ex,
+                "`executor:` cannot be combined with a verbatim spawn closure (the \
+                 closure owns the spawn; use the named SpawnerSlot inside it instead)",
+            ));
         }
         // Anything else (a closure, or a ready spawn fn) is emitted verbatim.
-        Some(e) => quote!(::core::option::Option::Some((#e) as #spawn_fn)),
+        // NOTE: with the `trace` feature such a node is not auto-mapped — the
+        // closure owns the SpawnToken; call `adopt`/`set_task_id` in it yourself.
+        (Some(e), None) => quote!(::core::option::Option::Some((#e) as #spawn_fn)),
     })
+}
+
+/// The spawn statement(s) for the generated glue. Plain `s.spawn(<call>?)`
+/// normally; with the `trace` feature the `SpawnToken` is bound first so its task
+/// id can be captured into the node (`set_task_id`) — the id→node mapping the
+/// supervisor's `trace` recorders resolve against (in embassy-executor 0.10 the
+/// task-fn call returns `Result<SpawnToken, SpawnError>` and `Spawner::spawn`
+/// itself is infallible, so the token is available between the two). Under
+/// `trace-names` the node's name is also stamped into the task Metadata so
+/// external consumers (rtos-trace/SystemView) see names instead of raw ids.
+fn spawn_stmts(call: &TokenStream2, node_ref: &TokenStream2, sp: &TokenStream2) -> TokenStream2 {
+    if cfg!(feature = "trace") {
+        // `adopt` = set_task_id + (under trace-names) Metadata name stamp.
+        quote! {
+            let __token = #call?;
+            (#node_ref).adopt(&__token);
+            #sp.spawn(__token);
+        }
+    } else {
+        quote!(#sp.spawn(#call?);)
+    }
 }
 
 /// Emit a `node`: its `pub static #ident: TaskNode` definition and its `Slot`. The
@@ -375,11 +509,17 @@ fn emit_node(
     let mode = &n.mode;
     let name = name_string(&n.ident);
     let disabled = n.disabled;
-    let spawn = node_spawn(ident, &n.spawn, spawn_fn)?;
+    let spawn = node_spawn(ident, &n.spawn, &n.executor, spawn_fn)?;
+    // `executor: NAME` routes the node through that SpawnerSlot; the supervisor
+    // awaits the slot before spawning (see `TaskNode::with_executor`).
+    let with_exec = match &n.executor {
+        Some(ex) => quote!( .with_executor(&#ex) ),
+        None => quote!(),
+    };
     let def = quote! {
         #(#cfg)*
         pub static #ident: #cr::TaskNode =
-            #cr::TaskNode::new(#name, #cr::Mode::#mode, #spawn, #disabled);
+            #cr::TaskNode::new(#name, #cr::Mode::#mode, #spawn, #disabled) #with_exec;
     };
     let slot = Slot {
         cfg_pred: cfg_predicate(cfg),
@@ -429,20 +569,47 @@ fn emit_pool(
     // Build member `I`'s spawn call from the `spawn:` expr, injecting
     // `&POOL[I]` as the first argument (see `inject_node_call`).
     let call = inject_node_call(&p.spawn, &quote!(&#ident[I]))?;
-    // Per-member spawn fn: a generated `spawn_<pool>::<I>` wrapper.
+    // Per-member spawn fn: a generated `spawn_<pool>::<I>` wrapper. Same optional
+    // trace capture as a node's closure, against member `I`'s slot. With
+    // `executor: NAME` the wrapper ignores the supervisor's `Spawner` and spawns
+    // through the named SpawnerSlot; each member node carries `.with_executor(&EX)`,
+    // so the supervisor awaits the slot (bounded) before invoking the wrapper and
+    // the wrapper's `get()` is already filled (`SpawnError::Busy` guards a never-
+    // filled slot; member futures must be `Send`). A whole worker pool can thus live
+    // on another executor — e.g. the second core — while this core scales it.
+    let (param, prelude, sp_tokens) = match &p.executor {
+        None => (quote!(s), quote!(), quote!(s)),
+        Some(ex) => (
+            quote!(_s),
+            quote! {
+                let __sp = #ex
+                    .get()
+                    .ok_or(::embassy_executor::SpawnError::Busy)?;
+            },
+            quote!(__sp),
+        ),
+    };
+    let pool_spawn_stmts = spawn_stmts(&call, &quote!(&#ident[I]), &sp_tokens);
     let wrapper = format_ident!("spawn_{}", lname);
     let mut defs: Vec<TokenStream2> = Vec::new();
     defs.push(quote! {
         #(#cfg)*
         fn #wrapper<const I: usize>(
-            s: ::embassy_executor::Spawner,
+            #param: ::embassy_executor::Spawner,
         ) -> ::core::result::Result<(), ::embassy_executor::SpawnError> {
-            s.spawn(#call?);
+            #prelude
+            #pool_spawn_stmts
             ::core::result::Result::Ok(())
         }
     });
     let member_spawn: Vec<TokenStream2> = (0..k).map(|j| quote!(#wrapper::<#j>)).collect();
 
+    // `executor: NAME` on the pool routes every member through that SpawnerSlot; the
+    // supervisor awaits it before spawning each member (see `TaskNode::with_executor`).
+    let member_with_exec = match &p.executor {
+        Some(ex) => quote!( .with_executor(&#ex) ),
+        None => quote!(),
+    };
     let members = p
         .modes
         .iter()
@@ -454,7 +621,7 @@ fn emit_pool(
                 #cr::TaskNode::new(
                     #nm, #cr::Mode::#mode,
                     ::core::option::Option::Some((#sp) as #spawn_fn), false,
-                )
+                ) #member_with_exec
             }
         });
     defs.push(quote! {
@@ -473,13 +640,15 @@ fn emit_pool(
             quote!(#path)
         }
     };
-    let (min, max) = (&p.min, &p.max);
+    // Emit the *validated* u8 values (`min_v`/`max_v`), not the raw literals: a
+    // suffixed literal like `min: 3usize` parses as u8 above but would emit a
+    // mismatched-type rustc error into the u8 field.
     defs.push(quote! {
         #(#cfg)*
         pub static #pool_static: #cr::ElasticPool<#policy_ty> = #cr::ElasticPool {
             nodes: &[ #(#member_refs),* ],
-            min: #min,
-            max: #max,
+            min: #min_v,
+            max: #max_v,
             policy: #policy,
         };
     });
@@ -521,17 +690,34 @@ fn slot_tables(
         });
 
         let mut dep_toks: Vec<TokenStream2> = Vec::new();
+        // Duplicate deps are a compile error: `deps: [A, A]` would emit a doubled
+        // index, which `topo_sort_const` counts twice in the in-degree but decrements
+        // once — misreported as a dependency cycle. Compared by *resolved* slot index
+        // (so a repeated pool name trips it too); two cfg-gated variants of the same
+        // dep are allowed only when their cfg predicates differ.
+        let mut seen: Vec<(u8, String)> = Vec::new();
         for d in &slot.deps {
             let idx = match names.get(&d.ident.to_string()) {
                 Some(&i) => i as u8,
                 None => {
                     return Err(syn::Error::new_spanned(
                         &d.ident,
-                        format!("unknown dependency `{}` — not a declared node", d.ident),
+                        format!(
+                            "unknown dependency `{}` — not a declared node or pool",
+                            d.ident
+                        ),
                     ));
                 }
             };
             let cfg = &d.cfg;
+            let cfg_key = quote!( #(#cfg)* ).to_string();
+            if seen.iter().any(|(i, k)| *i == idx && *k == cfg_key) {
+                return Err(syn::Error::new_spanned(
+                    &d.ident,
+                    format!("duplicate dependency `{}`", d.ident),
+                ));
+            }
+            seen.push((idx, cfg_key));
             dep_toks.push(quote!( #(#cfg)* #idx ));
         }
         deps_entries.push(quote!( &[ #(#dep_toks),* ] ));
@@ -550,23 +736,68 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
     );
 
     // First pass: emit the statics/glue in declaration order, assign stable slot
-    // indices, and record each slot + its raw deps. `names` maps a node ident to its
-    // slot index for dep resolution — keyed on the *raw* ident (not the runtime
-    // `name_string`), and populated for `node`s only (pool members occupy slots but
-    // aren't name-addressable, so a dep on a pool name stays an "unknown dependency").
+    // indices, and record each slot + its raw deps. `names` maps a dep-addressable ident
+    // to its slot index for dep resolution — keyed on the *raw* ident (not the runtime
+    // `name_string`). A `node` maps to its own slot; a `pool` maps to its floor member's
+    // slot (so `deps: [POOL]` = "after the pool is up"). Individual pool members are not
+    // separately name-addressable.
     let mut defs: Vec<TokenStream2> = Vec::new();
     let mut pool_entries: Vec<TokenStream2> = Vec::new();
     let mut slots: Vec<Slot> = Vec::new();
     let mut names: HashMap<String, usize> = HashMap::new();
 
+    // Pre-pass: collect the declared `executor NAME;` slots so a node's
+    // `executor:` reference can be validated regardless of declaration order.
+    let executor_names: Vec<String> = graph
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Executor(x) => Some(x.ident.to_string()),
+            _ => None,
+        })
+        .collect();
+
     for item in &graph.items {
         match item {
             Item::Node(n) => {
+                if let Some(ex) = &n.executor
+                    && !executor_names.contains(&ex.to_string())
+                {
+                    return Err(syn::Error::new_spanned(
+                        ex,
+                        format!(
+                            "unknown executor `{ex}`; declare it in the graph with \
+                             `executor {ex};` (declared: [{}])",
+                            executor_names.join(", ")
+                        ),
+                    ));
+                }
                 // The index is the slot's position, taken *before* the push.
-                names.insert(n.ident.to_string(), slots.len());
+                // A redeclared name is a hard error here (not just the downstream
+                // `duplicate definition of static`): deps resolve through this map,
+                // so a silent overwrite would silently rewire earlier `deps:` edges.
+                if names.insert(n.ident.to_string(), slots.len()).is_some() {
+                    return Err(syn::Error::new_spanned(
+                        &n.ident,
+                        format!("duplicate node/pool name `{}`", n.ident),
+                    ));
+                }
                 let (def, slot) = emit_node(n, &cr, &spawn_fn)?;
                 defs.push(def);
                 slots.push(slot);
+            }
+            Item::Executor(x) => {
+                let (cfg, ident) = (&x.cfg, &x.ident);
+                // A runtime-filled SendSpawner slot: the app registers the
+                // executor's spawner before `Supervisor::start`; nodes declared
+                // `executor: NAME` spawn through it. Occupies no graph slot.
+                defs.push(quote! {
+                    #(#cfg)*
+                    /// Spawner slot for the graph's `executor:`-annotated nodes
+                    /// (generated by `supervisor_graph!`). Fill with
+                    /// `SpawnerSlot::set` before `Supervisor::start`.
+                    pub static #ident: #cr::SpawnerSlot = #cr::SpawnerSlot::new();
+                });
             }
             Item::Pool(p) => {
                 // Pools are only meaningful with the supervisor's `pool` feature (which
@@ -574,7 +805,30 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                 // `ElasticPool` doesn't exist — so refuse a `pool` with a clear message
                 // rather than emitting dangling references.
                 if cfg!(feature = "pool") {
+                    if let Some(ex) = &p.executor
+                        && !executor_names.contains(&ex.to_string())
+                    {
+                        return Err(syn::Error::new_spanned(
+                            ex,
+                            format!(
+                                "unknown executor `{ex}`; declare it in the graph with \
+                                 `executor {ex};` (declared: [{}])",
+                                executor_names.join(", ")
+                            ),
+                        ));
+                    }
                     let (pool_defs, pool_entry, pool_slots) = emit_pool(p, &cr, &spawn_fn)?;
+                    // A dep on the pool NAME resolves to the pool's floor member (member 0
+                    // — the `min`-kept, always-started member): `deps: [POOL]` means "after
+                    // the pool is up". `slots.len()` here is that member's slot index, taken
+                    // *before* the extend below (pool_slots[0] lands at exactly this index).
+                    // A redeclared name errors, same as the node arm.
+                    if names.insert(p.ident.to_string(), slots.len()).is_some() {
+                        return Err(syn::Error::new_spanned(
+                            &p.ident,
+                            format!("duplicate node/pool name `{}`", p.ident),
+                        ));
+                    }
                     defs.extend(pool_defs);
                     pool_entries.push(pool_entry);
                     slots.extend(pool_slots);
@@ -611,6 +865,45 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
         quote!()
     };
 
+    // embassy-executor's trace hooks (declared `unsafe extern "Rust"` in the
+    // executor), defined once here at the graph declaration site — the supervisor
+    // crate is `forbid(unsafe_code)` and cannot carry `#[unsafe(no_mangle)]` items.
+    // They forward to the supervisor's `trace` recorders. `task_new` and
+    // `task_ready_begin` carry nothing the recorders need (the id→node mapping
+    // comes from the spawn glue above), so they are no-ops. Exactly one definition
+    // of each may exist per binary: enable `trace-hooks` OR write your own set.
+    // Requires an edition-2024 consumer (`#[unsafe(no_mangle)]` syntax).
+    let trace_hooks = if cfg!(feature = "trace-hooks") {
+        quote! {
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_poll_start(executor_id: u32) {
+                #cr::trace::on_poll_start(executor_id);
+            }
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_task_new(_executor_id: u32, _task_id: u32) {}
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_task_end(executor_id: u32, task_id: u32) {
+                #cr::trace::on_task_end(executor_id, task_id);
+            }
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_task_exec_begin(executor_id: u32, task_id: u32) {
+                #cr::trace::on_task_exec_begin(executor_id, task_id);
+            }
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_task_exec_end(executor_id: u32, task_id: u32) {
+                #cr::trace::on_task_exec_end(executor_id, task_id);
+            }
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_task_ready_begin(_executor_id: u32, _task_id: u32) {}
+            #[unsafe(no_mangle)]
+            fn _embassy_trace_executor_idle(executor_id: u32) {
+                #cr::trace::on_executor_idle(executor_id);
+            }
+        }
+    } else {
+        quote!()
+    };
+
     Ok(quote! {
         #(#defs)*
 
@@ -628,6 +921,8 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
             order: #cr::topo_sort_const(&DEPS),
             #pools_field
         };
+
+        #trace_hooks
     })
 }
 

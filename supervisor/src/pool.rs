@@ -90,6 +90,8 @@ impl ScalingPolicy for DeferredShrink {
             return ScaleAction::Grow;
         }
         // Shrink only after the surplus has persisted the whole cooldown.
+        // idle == 1 is the stable dead-band (grow at 0, shrink at >= 2) so a
+        // single spare never flaps; at most one spare is released per cooldown.
         if s.idle() >= 2 && s.running > s.min {
             match self.pending.lock(|p| p.get()) {
                 None => {
@@ -219,10 +221,12 @@ async fn drive_pools<const N: usize>(
     for pool in pools {
         match pool.evaluate(now) {
             PoolAction::Start(n) => {
-                // Only grow when the candidate's dependencies are up.
-                // SpawnError::Busy at the pool ceiling → can't grow, no-op.
+                // Only grow when the candidate's dependencies are up. Spawn
+                // errors ignored: a lost start (e.g. SpawnError::Busy from
+                // embassy task-pool exhaustion — the policy itself enforces the
+                // pool ceiling) is simply re-driven on the next pass.
                 if sup.deps_running(n) {
-                    let _ = sup.start_node(n, spawner);
+                    let _ = sup.start_node(n, spawner).await;
                 }
             }
             PoolAction::Stop(n) => sup.stop_node(n).await,

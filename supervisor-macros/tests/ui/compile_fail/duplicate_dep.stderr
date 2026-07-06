@@ -1,0 +1,5 @@
+error: duplicate dependency `A`
+ --> tests/ui/compile_fail/duplicate_dep.rs:9:35
+  |
+9 |     node B = Terminate, deps: [A, A];
+  |                                   ^

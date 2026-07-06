@@ -1,0 +1,5 @@
+error: `executor:` cannot be combined with a verbatim spawn closure (the closure owns the spawn; use the named SpawnerSlot inside it instead)
+ --> tests/ui/compile_fail/executor_closure_spawn.rs:9:45
+  |
+9 |     node A = Terminate, deps: [], executor: HIGH,
+  |                                             ^^^^

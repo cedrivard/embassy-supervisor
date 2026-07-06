@@ -70,7 +70,16 @@ pub async fn heartbeat_task(node: &'static TaskNode) {
                 )
                 .await
                 {
-                    Either3::First(()) => led.toggle(),
+                    Either3::First(()) => {
+                        led.toggle();
+                        // Live blocked-task observer: this task runs on the HIGH
+                        // interrupt tier, so it still gets CPU while the thread
+                        // executor is wedged — unlike the watchdog feeder, it can
+                        // name the culprit BEFORE the watchdog resets. A poll
+                        // running >100 ms means a task is hogging its executor
+                        // without an await point.
+                        warn_stalled();
+                    }
                     Either3::Second(()) => {} // changed → re-read
                     Either3::Third(()) => break 'active, // pause requested
                 }
@@ -93,5 +102,26 @@ pub async fn heartbeat_task(node: &'static TaskNode) {
         led.set_low();
         node.ack_dropped();
         node.wait_resume().await;
+    }
+}
+
+/// Warn (once per blink tick) about any executor whose current poll has run past
+/// the stall threshold. Called from the HIGH tier: our own executor's in-flight
+/// poll is this very task (microseconds — filtered by the threshold), so in
+/// practice this observes the THREAD executor.
+fn warn_stalled() {
+    const STALL_TICKS: u32 = (embassy_time::TICK_HZ / 10) as u32; // 100 ms
+    for id in embassy_supervisor::trace::executors() {
+        if id == 0 {
+            continue;
+        }
+        if let Some((task, ticks)) = embassy_supervisor::trace::stalled_task(id, STALL_TICKS) {
+            defmt::warn!(
+                "trace: {} is blocking executor {:x} ({} ticks and counting)",
+                task.name,
+                id,
+                ticks
+            );
+        }
     }
 }

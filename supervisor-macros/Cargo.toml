@@ -4,7 +4,7 @@ name = "embassy-supervisor-macros"
 # version (`=x.y.z`): the generated code references doc(hidden) supervisor internals,
 # so only the tested pair is guaranteed compatible. Bump only when the macro changes;
 # the supervisor updates its pin to match.
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -29,6 +29,15 @@ all-features = true
 # Cargo.toml), so this tracks the supervisor's pool feature — the macro emits
 # pools iff the supervisor was built with pools.
 pool = []
+# Forwarded from the supervisor's `trace` feature: the generated spawn glue captures
+# each SpawnToken's task id into the node (`set_task_id`) before spawning it.
+trace = []
+# Forwarded from `trace-names`: additionally stamp the node name into task Metadata.
+trace-names = ["trace"]
+# Forwarded from the supervisor's `trace-hooks`: emit the seven `no_mangle`
+# `_embassy_trace_*` hook definitions at the graph declaration site (the supervisor
+# crate itself is `forbid(unsafe_code)` and cannot define them).
+trace-hooks = ["trace"]
 
 [dependencies]
 syn = { version = "2", features = ["full"] }

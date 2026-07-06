@@ -1,4 +1,4 @@
-error: unknown dependency `MISSING` — not a declared node
+error: unknown dependency `MISSING` — not a declared node or pool
  --> tests/ui/compile_fail/unknown_dep_cfg_gated.rs:8:54
   |
 8 |     node A = Terminate, deps: [#[cfg(feature = "x")] MISSING];

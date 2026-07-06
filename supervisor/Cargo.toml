@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.2.0"
+version = "0.3.0"
 description = "A generic, HAL-agnostic task-lifecycle supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, and runtime start/stop/pause/resume control."
 edition.workspace = true
 authors.workspace = true
@@ -25,7 +25,7 @@ embassy-futures = { version = "0.1" }
 portable-atomic = { version = "1", features = ["critical-section"] }
 defmt = { version = "1", optional = true }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.1.0", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.2.0", path = "../supervisor-macros", optional = true }
 
 [features]
 # Full-featured out of the box; a footprint-constrained consumer trims with
@@ -41,6 +41,28 @@ pool = ["embassy-supervisor-macros?/pool"]
 defmt = ["dep:defmt"]
 # Re-export the `supervisor_graph!` proc-macro.
 macros = ["dep:embassy-supervisor-macros"]
+# Trace-hook observability: the `trace` module (task-id -> node registry,
+# per-node exec-tick/poll/max-poll accounting, per-executor idle accounting,
+# stall detection). Recorders only — the `_embassy_trace_*` hook SYMBOLS are
+# gated separately (see `trace-hooks`) so an application with its own hooks can
+# forward to the recorders manually, and so the recorders stay host-testable.
+trace = ["embassy-executor/trace", "embassy-supervisor-macros?/trace"]
+# Batteries-included: `supervisor_graph!` defines the seven `no_mangle`
+# `_embassy_trace_*` symbols at the graph declaration site. Exactly ONE
+# definition may exist per binary: enable this OR define your own hooks and
+# forward to the `trace` recorders.
+trace-hooks = ["trace", "embassy-supervisor-macros?/trace-hooks"]
+# Stamp each node's name into its task Metadata at spawn, so external consumers
+# (rtos-trace/SystemView, debuggers) see node names instead of opaque ids. Separate
+# from `trace` because `metadata-name` grows every TaskStorage in the binary.
+trace-names = ["trace", "embassy-executor/metadata-name", "embassy-supervisor-macros?/trace-names"]
+# Preemption-accurate (charge-splitting) accounting: a nested poll (an
+# InterruptExecutor preempting a lower tier mid-poll) credits its wall time back
+# to the interrupted window, so the victim's exec/max-poll numbers stay exact.
+# LIFO hook nesting only holds per core: on multi-core systems register
+# `trace::set_core_id_fn` (one per-core stack each); without it everything maps
+# to core 0's stack — correct on a single core.
+trace-nested = ["trace"]
 
 [package.metadata.docs.rs]
 # Document every feature (control/pool/defmt) on docs.rs.
@@ -58,3 +80,28 @@ all-features = true
 [target.'cfg(not(target_os = "none"))'.dev-dependencies]
 critical-section = { version = "1", features = ["std"] }
 embassy-time = { version = "0.5", features = ["mock-driver"] }
+# Real executors on std threads for the cross-thread (multi-core analog) tests:
+# critical-section/std makes two host threads a faithful model of two cores
+# sharing the same atomics/Signals the MCU cores would.
+embassy-executor = { version = "0.10", features = ["platform-std", "executor-thread"] }
+
+# Host tests for the `trace` recorders.
+[[test]]
+name = "trace"
+required-features = ["trace-hooks", "macros"]
+
+# Host tests for the `trace-nested` charge-splitting (preemption accounting).
+[[test]]
+name = "trace_nested"
+required-features = ["trace-nested", "trace-hooks", "macros"]
+
+# Cross-thread (multi-core analog) tests: two real executors on std threads.
+[[test]]
+name = "multicore"
+required-features = ["trace-nested", "trace-hooks", "macros"]
+
+# Async teardown / respawn_terminate lifecycle (incl. detached self-managed nodes):
+# a real executor on a std thread drives start -> teardown -> respawn.
+[[test]]
+name = "teardown"
+required-features = ["macros", "control"]
