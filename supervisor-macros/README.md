@@ -14,7 +14,9 @@ The macro's output references `embassy-supervisor` internals, so the supervisor 
 this crate by exact version — the pair it was tested with.
 
 See the [`embassy-supervisor` documentation](https://docs.rs/embassy-supervisor) for the
-macro's surface syntax and examples.
+macro's surface syntax and examples, and this crate's
+[CHANGELOG](CHANGELOG.md) for what each release adds (0.2.0: `executor:` slots,
+pool-name deps, trace spawn glue, duplicate-dep/name rejection).
 
 ## License
 
