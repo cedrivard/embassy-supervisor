@@ -65,6 +65,31 @@ jobs:
       - run: cargo build -p embassy-supervisor --features trace
       - run: cargo build -p embassy-supervisor --all-features
 
+  # Independent feature combinations: the crate markets `default-features = false`,
+  # so every subset a user can select must at least type-check on its own. Checked on
+  # the pinned embedded target (also guards no_std per combo). One job, one cache;
+  # a loop instead of a runner matrix because each check is seconds.
+  # Regression guard: `pool` without `control` once failed to compile (0.3.0 Fixed).
+  features:
+    name: check (feature matrix, thumbv8m)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: Check each supported feature combination
+        run: |
+          set -e
+          for f in "" control pool macros pool,macros control,pool \
+                   control,pool,macros defmt trace trace,trace-hooks \
+                   trace,trace-hooks,trace-nested trace,trace-names; do
+            echo "::group::features=[${f:-none}]"
+            cargo check -p embassy-supervisor --no-default-features ${f:+--features "$f"}
+            echo "::endgroup::"
+          done
+
   # Canary against embassy's main branch (allow-failure): the executor's trace-hook
   # API is documented as unstable, so this job builds the trace feature with
   # embassy-executor patched to git.
