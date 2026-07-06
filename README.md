@@ -192,7 +192,7 @@ put every part of the supervisor through its paces:
 
 It's the approachable, runnable example — clone the repo and follow
 [`firmware/README.md`](firmware/README.md) for the build and run steps, the per-task breakdown,
-the heap budget, and how to read the observability data.
+and how to read the observability data.
 
 ## What's in this repo
 

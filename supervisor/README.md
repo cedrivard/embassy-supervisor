@@ -47,26 +47,25 @@ tasks do — it orchestrates their *lifecycle* and leaves the rest to you.
 
 ## Highlights in 0.3.0
 
-- **Async bring-up.** `Supervisor::start`, `start_node`, and `respawn_terminate` are `async fn`
-  and must be `.await`ed. Bringing up an `executor:` node awaits its `SpawnerSlot` (bounded,
-  then `SpawnError::Busy`), so a tier filled late — or from another core — is handled without a
-  race, a busy-spin, or a hardware timer-queue hazard. Same-executor nodes never touch the timer.
 - **Multi-executor graphs.** `executor NAME;` declares a runtime-filled `SendSpawner` slot;
   `executor: NAME` on a node (or a whole pool) routes its spawn through it — interrupt-priority
   tiers become graph citizens.
 - **Multi-core placement.** The same mechanism spans the second core: `start()` rendezvouses
   with the other core's asynchronous executor bring-up as part of the bring-up loop, and a whole
-  elastic pool can live on core 1, scaled by core 0's supervisor. Covered by cross-thread host
-  tests running two real executors.
-- **Pool-name deps.** `deps:` may name a `pool`; it resolves to the pool's floor member —
-  "start after the pool is up".
+  elastic pool can live on core 1, scaled by core 0's supervisor.
+- **Trace observability.** The opt-in `trace` / `trace-hooks` / `trace-names` / `trace-nested`
+  features turn embassy-executor's raw trace hooks into named per-node accounting (see
+  [Observability](#observability)), plus `TaskNode::adopt(&token)` for spawns the macro can't see.
+- **Async bring-up.** `Supervisor::start`, `start_node`, and `respawn_terminate` are `async fn`
+  and must be `.await`ed. Bringing up an `executor:` node awaits its `SpawnerSlot` (bounded,
+  then `SpawnError::Busy`), so a tier filled late — or from another core — is handled without a
+  race, a busy-spin, or a hardware timer-queue hazard. Same-executor nodes never touch the timer.
 - **Detached is fully hands-off.** After `set_detached(true)`, *nothing* the supervisor does
   touches the node: `teardown`, `deactivate`/`activate` cascades, `stop_node`,
   `respawn_terminate`, and `resume_pausable` all skip it (see the
   [Lifecycle reference](#lifecycle-reference)).
-- **Trace observability.** The opt-in `trace` / `trace-hooks` / `trace-names` / `trace-nested`
-  features turn embassy-executor's raw trace hooks into named per-node accounting (see
-  [Observability](#observability)), plus `TaskNode::adopt(&token)` for spawns the macro can't see.
+- **Pool-name deps.** `deps:` may name a `pool`; it resolves to the pool's floor member —
+  "start after the pool is up".
 
 ## Quickstart
 

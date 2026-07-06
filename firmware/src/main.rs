@@ -25,11 +25,6 @@ mod ota;
 mod watchdog;
 
 // The supervised task graph — the single source of nodes, deps, pool, and order.
-// `supervisor_graph!` generates the `static` nodes, the `HTTP` pool + `HTTP_POOL`,
-// and the `GRAPH` bundle (node slots, dep table, elastic pools, and the compile-time
-// topological order — a dependency cycle is a *compile* error) that `Supervisor::new`
-// takes. `heartbeat` is standalone; `http` and `ota` depend on `net`; `ota` is
-// disabled-at-boot (control-started).
 embassy_supervisor::supervisor_graph! {
     executor HIGH;  // Interrupt-priority tier (SWI_IRQ_0)
     executor CORE1; // Core 1's thread executor (filled by core1_entry via spawn_core1)
