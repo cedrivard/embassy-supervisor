@@ -54,6 +54,18 @@ graphs, AMP (multi-core) support, and trace-hook observability.
   panic on hardware). A node with no `executor:` slot skips the wait. Callers on the
   supervisor task simply add `.await`.
 
+### Fixed
+- `pool` without `control` (`default-features = false, features = ["pool"]`) failed to
+  compile: the graph-index helpers the pool driver needs lived in a `control`-gated
+  impl. They are now gated on either feature.
+- Control `Activate` of a detached node no longer re-enables (and potentially
+  restarts) the node's dependencies: a detached node's `deps:` are start-ordering
+  only, so the activate cascade now skips expanding from a detached member, matching
+  the deactivate cascade.
+- `trace-nested`: an unpaired executor-end hook (its begin was skipped because the
+  executor registered mid-poll) no longer underflows the per-core nesting depth,
+  which permanently desynced preemption attribution on that core.
+
 ## [0.2.0] - 2026-07-01
 
 The graph moved to compile time, and the `supervisor_graph!` proc-macro shipped in the

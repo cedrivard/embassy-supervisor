@@ -955,7 +955,9 @@ impl<const N: usize> Supervisor<N> {
 // lifecycle-spanning `disabled` flag, so it sticks against the elastic policy and
 // the wake respawn.
 
-#[cfg(feature = "control")]
+// Graph-index helpers used by BOTH the control plane and the pool driver, so they
+// are gated on either feature — `pool` alone (no `control`) must still compile.
+#[cfg(any(feature = "control", feature = "pool"))]
 impl<const N: usize> Supervisor<N> {
     /// Position of `node` in `self.nodes` (pointer identity — every node is a
     /// `&'static`). `None` only if the node isn't in this graph (impossible for
@@ -979,7 +981,10 @@ impl<const N: usize> Supervisor<N> {
             None => false,
         }
     }
+}
 
+#[cfg(feature = "control")]
+impl<const N: usize> Supervisor<N> {
     /// Seed a membership set with `target` plus — if `target` belongs to an
     /// elastic pool — every member of that pool, so control is applied to the
     /// whole pool atomically. Pool membership is read from `GRAPH.pools`; with no
@@ -1076,9 +1081,13 @@ impl<const N: usize> Supervisor<N> {
 
         // Grow the set to include transitive deps. Walk dependents-first
         // (reverse topo); when a set member is seen, pull in its direct deps.
+        // A detached member's `deps:` are start-ordering only (the node is
+        // self-managed), so don't expand from it — mirrors deactivate's guard;
+        // otherwise activating a detached target would un-disable deps that
+        // were independently disabled.
         for i in self.order.iter().rev() {
             let j = *i as usize;
-            if set[j] {
+            if set[j] && !self.nodes[j].is_some_and(|n| n.is_detached()) {
                 for &di in self.deps[j] {
                     set[di as usize] = true;
                 }

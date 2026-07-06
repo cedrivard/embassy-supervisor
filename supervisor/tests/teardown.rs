@@ -213,6 +213,28 @@ async fn driver(spawner: Spawner) {
     );
     assert_eq!(ONESHOT_SPAWNS.load(Ordering::SeqCst), 1, "one-shot still ran exactly once");
 
+    // ── activate the detached one-shot directly: its `deps: [NORMAL]` edge is start-
+    //    ordering only, so activate's growth loop must not expand from the detached
+    //    target — else NORMAL (independently control-stopped just above) would be
+    //    un-disabled and force-started. Expected: a complete no-op — the detached
+    //    target is skipped by the bring-up loop, and the disabled dep is left alone.
+    request_control(&ONESHOT, ControlOp::Activate);
+    let cmd = wait_control().await;
+    sup.apply_control(cmd, spawner).await;
+    assert!(
+        NORMAL.is_disabled(),
+        "disabled dep NOT re-enabled by Activate(detached target)"
+    );
+    assert!(
+        !NORMAL.is_running(),
+        "disabled dep NOT restarted by Activate(detached target)"
+    );
+    assert_eq!(
+        ONESHOT_SPAWNS.load(Ordering::SeqCst),
+        1,
+        "detached one-shot not respawned by Activate"
+    );
+
     DONE.store(true, Ordering::SeqCst);
 }
 

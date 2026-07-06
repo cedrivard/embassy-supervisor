@@ -336,11 +336,18 @@ pub fn on_task_exec_end(executor_id: u32, task_id: u32) {
     let elapsed = {
         let stolen = slot.stolen_ticks.swap(0, Ordering::Relaxed);
         // Pop our frame from this core's stack; the new top (if any) is the
-        // poll we preempted on this core.
+        // poll we preempted on this core. Guard depth 0: an unpaired end is
+        // possible (the matching `exec_begin` early-returned because the
+        // executor registered mid-poll), and an unguarded fetch_sub would
+        // wrap to usize::MAX, permanently desyncing attribution on this core.
+        // Plain load/store, no CAS: begin/end hooks for one core run on that
+        // core, never concurrently with each other.
         let core = core_id();
-        let depth = NEST_DEPTH[core]
-            .fetch_sub(1, Ordering::Relaxed)
-            .saturating_sub(1);
+        let cur = NEST_DEPTH[core].load(Ordering::Relaxed);
+        let depth = cur.saturating_sub(1);
+        if cur > 0 {
+            NEST_DEPTH[core].store(depth, Ordering::Relaxed);
+        }
         if depth > 0
             && let Some(frame) = NEST_STACK[core].get(depth - 1)
         {
