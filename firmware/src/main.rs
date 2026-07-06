@@ -22,6 +22,7 @@ mod heartbeat;
 mod http;
 mod net;
 mod ota;
+mod watchdog;
 
 // The supervised task graph — the single source of nodes, deps, pool, and order.
 // `supervisor_graph!` generates the `static` nodes, the `HTTP` pool + `HTTP_POOL`,
@@ -32,6 +33,7 @@ mod ota;
 embassy_supervisor::supervisor_graph! {
     executor HIGH;  // Interrupt-priority tier (SWI_IRQ_0)
     executor CORE1; // Core 1's thread executor (filled by core1_entry via spawn_core1)
+    node WATCHDOG = Terminate, deps: [], spawn: crate::watchdog::watchdog_task;
     node NET = Terminate, deps: [], spawn: crate::net::net_task;
     node HEARTBEAT = Pause, deps: [], executor: HIGH, spawn: crate::heartbeat::heartbeat_task;
     pool HTTP = [Terminate, OnDemand, OnDemand, OnDemand], deps: [NET],
@@ -40,6 +42,7 @@ embassy_supervisor::supervisor_graph! {
         min: 1, max: 4;
     node OTA = Terminate, deps: [NET], spawn: crate::ota::ota_task, disabled;
     node BENCH = Terminate, deps: [], executor: CORE1, spawn: crate::bench::bench_task, disabled;
+    node OTA_CONFIRM = Terminate, deps: [HTTP], spawn: crate::ota_confirm;
 }
 
 // The interrupt-priority executor backing the graph's `HIGH` slot. Its poll loop
@@ -90,9 +93,9 @@ async fn main(spawner: Spawner) {
         heap::HEAP_SIZE
     );
 
-    spawner.spawn(defmt::unwrap!(watchdog_feed()));
+    // `watchdog` and `ota_confirm` are now graph nodes (WATCHDOG / OTA_CONFIRM),
+    // brought up by the supervisor; only the supervisor task is spawned by hand.
     spawner.spawn(defmt::unwrap!(app_supervisor(spawner)));
-    spawner.spawn(defmt::unwrap!(ota_confirm()));
 }
 
 /// The supervisor task: build the graph, bring everything up in dependency
@@ -119,47 +122,12 @@ async fn app_supervisor(spawner: Spawner) {
     }
 }
 
-/// Feed the bootloader's 8 s watchdog (armed by `WatchdogFlash`, left running on
-/// jump): a healthy app keeps feeding; a crashed/hung one stops -> reset -> the
-/// bootloader rolls back an unconfirmed update.
+/// Confirm the running image once the network is up — the `OTA_CONFIRM` node.
+/// Started LAST (via `deps: [HTTP]`), so it only runs after the whole graph is up.
+/// An update broken enough not to reach here never calls `mark_booted`, so the
+/// bootloader rolls back on next reset. Runs once and exits.
 #[embassy_executor::task]
-async fn watchdog_feed() {
-    let mut wd =
-        embassy_rp::watchdog::Watchdog::new(unsafe { embassy_rp::peripherals::WATCHDOG::steal() });
-    // Blocked-task detector (feature `trace`). Two complementary checks:
-    // - `stalled_task`: an in-flight poll > 100 ms. On this single-executor
-    //   firmware it can rarely fire (a blocked executor also blocks this task;
-    //   it is here as the pattern for an ISR-priority observer), so additionally:
-    // - `max_poll_ticks` watermark: post-hoc, names any node whose longest single
-    //   poll exceeded the threshold — works even when observed after the fact.
-    //   Warn only on increase to avoid log spam (16 slots cover this graph).
-    const STALL_TICKS: u32 = (embassy_time::TICK_HZ / 10) as u32; // 100 ms
-    let mut warned = [0u32; 16];
-    loop {
-        wd.feed(embassy_time::Duration::from_secs(8)); // `feed` also sets the timeout
-        for id in embassy_supervisor::trace::executors() {
-            if id == 0 {
-                continue;
-            }
-            if let Some((node, ticks)) = embassy_supervisor::trace::stalled_task(id, STALL_TICKS) {
-                defmt::warn!("trace: {} has been polling for {} ticks", node.name, ticks);
-            }
-        }
-        for (node, w) in GRAPH.nodes.iter().flatten().zip(warned.iter_mut()) {
-            let max = node.max_poll_ticks();
-            if max > STALL_TICKS && max > *w {
-                *w = max;
-                defmt::warn!("trace: {} once held the executor {} ticks", node.name, max);
-            }
-        }
-        embassy_time::Timer::after(embassy_time::Duration::from_secs(2)).await;
-    }
-}
-
-/// Confirm the running image once the network is up. An update broken enough not to
-/// reach here never calls `mark_booted`, so the bootloader rolls back on next reset.
-#[embassy_executor::task]
-async fn ota_confirm() {
+async fn ota_confirm(_node: &'static embassy_supervisor::TaskNode) {
     let stack = net::stack_ready().await;
     stack.wait_config_up().await;
     match ota::mark_booted() {
