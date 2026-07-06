@@ -1,4 +1,4 @@
-//! Cross-thread tests for the multi-core (AMP) story: with the std
+//! Cross-thread tests for the multi-core story: with the std
 //! critical-section impl, two host threads running real embassy executors are a
 //! faithful model of two cores — same atomics, same Signals, same SendSpawner
 //! enqueue path the MCU cores would use.

@@ -15,22 +15,11 @@ static HEAP: LlffHeap = LlffHeap::empty();
 /// Heap arena size. Sized to hold the subsystem budgets at once; the
 /// supervisor's start/stop is what keeps usage under it.
 ///
-/// Two peaks bound this, balanced by design at ~28 KB:
-/// - **Serving:** net (~15 KB; `SOCKET_BUDGET = POOL_MAX + 1 = 5` — 4 worker sockets
-///   + 1 DNS) + 4 http workers × 3.07 KB + one in-flight response `String` ≈ ~28 KB.
-///     (Only one `String` is ever live — small bodies fit the tx buffer so the write
-///     never yields.)
-/// - **OTA decode:** the OTA task drains the http pool *and* `net` (it decodes the
-///   staged image from flash, not the network), so `ruzstd` decodes alone — ~28 KB
-///   on-device for a `windowLog=11` image (measured 27.6 KB host peak; see the
-///   `zstd-heapcheck` tool).
-///
-/// The pool size is chosen so the serving peak matches the OTA decode peak, and
-/// `net` is drained for the decode so it never coexists with the decoder — that's
-/// what keeps both peaks at ~28 KB and lets the arena be 32 KB (~4 KB margin). The
-/// window is capped at 11 because ruzstd's heap ~doubles per `windowLog` (11→13 =
-/// 28→71 KB) while the compressed image barely shrinks (firmware has few long-range
-/// matches).
+/// Two peaks bound this, balanced by design at **~28 KB each**: serving (net +
+/// full http pool + one in-flight response; breakdown in `net.rs`/`http.rs`) and
+/// the OTA decode (net + pool drained, `ruzstd` alone; window sizing in `ota.rs`).
+/// They never coexist, so 32 KB leaves ~4 KB margin. The firmware README's budget
+/// table is the canonical breakdown.
 pub const HEAP_SIZE: usize = 32 * 1024;
 
 /// Initialize the global allocator. Call once, early in `main`, before anything

@@ -2,8 +2,8 @@
 //!
 //! Demonstrates the multi-core graph: this node is declared `executor: CORE1`,
 //! so the core-0 supervisor spawns, stops, and restarts it on core 1's executor
-//! through the graph's `SpawnerSlot` — placement stays supervisor-mediated (AMP:
-//! each task lives on one core; nothing migrates).
+//! through the graph's `SpawnerSlot` — placement stays supervisor-mediated (each
+//! task lives on one core; nothing migrates).
 //!
 //! `Terminate` + `disabled`: it does nothing until a control `Activate`
 //! (`POST /api/control?node=bench&op=start` or the dashboard button), then burns

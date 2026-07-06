@@ -53,6 +53,12 @@
 //!     [`Supervisor::run_pools`], and the `pools` field of [`Graph`].
 //!   * `defmt` — route the supervisor's logs through `defmt`; without it the log
 //!     macros are no-ops.
+//!   * `trace` family (all opt-in) — `trace`: the [`trace`] recorders consuming
+//!     embassy-executor's `_embassy_trace_*` hooks; `trace-hooks`:
+//!     `supervisor_graph!` also *defines* the hook symbols; `trace-names`: node
+//!     names stamped into task Metadata for external consumers; `trace-nested`:
+//!     preemption-exact accounting (a nested higher-tier poll credits its time
+//!     back to the window it interrupted).
 //!
 //! Build with `default-features = false` for a minimal core that only does
 //! dependency-ordered bring-up/teardown (drops the control plane and pools,
@@ -296,14 +302,9 @@ pub struct TaskHandle {
     /// Because it lives in a `static`, it also survives a power-state transition
     /// that retains RAM (e.g. a warm-resume from deep sleep).
     disabled: AtomicBool,
-    /// The node manages its own lifecycle and must NOT be stopped by the supervisor.
-    /// A dependency normally means "stop me when my dep stops", but a node can declare
-    /// a dep purely for *start* ordering and then intend to outlive it — e.g. a
-    /// sleep/power coordinator that needs the graph up to initialize, then tears it
-    /// down, sleeps, and wakes it, all while itself staying alive. While set, the node
-    /// is skipped by `deactivate` (transitive-dependent teardown), by full `teardown`,
-    /// and by `respawn_terminate` — so it runs continuously across a teardown/wake
-    /// cycle. Self-managed, so `reset()` leaves it (the node clears it itself when done).
+    /// Self-managed: while set, the supervisor never drives this node — teardown,
+    /// deactivate/activate, `stop_node`, respawn, and pause-resume all skip it. Not
+    /// cleared by `reset()`. Full rationale on [`TaskNode::set_detached`].
     detached: AtomicBool,
     /// The executor task id currently running this node (`TaskRef::id()`, captured
     /// from the `SpawnToken` by the macro's spawn glue). `0` = unknown (not yet
@@ -406,9 +407,11 @@ impl SpawnerSlot {
     /// Await the slot and return the spawner. The rendezvous primitive: the
     /// supervisor's bring-up awaits this for a node's `executor:` slot before
     /// spawning it (bounded, see [`Supervisor::start`]), so a tier filled late — or
-    /// from another core — is handled without a race. An application may also await
-    /// it directly to gate other work on the executor being up. Single-waiter (the
-    /// one supervisor task); returns immediately if the slot is already filled.
+    /// from another core — is handled without a race. Returns immediately once the
+    /// slot is filled, so any number of *late* callers are fine (an application can
+    /// gate work on the executor being up). While the slot is still empty, at most
+    /// one task should be parked here: the underlying `Signal` holds a single waker,
+    /// so a second pre-fill waiter would displace the first.
     pub async fn ready(&self) -> SendSpawner {
         loop {
             if let Some(sp) = self.get() {
@@ -590,6 +593,8 @@ impl TaskNode {
     pub fn is_detached(&self) -> bool {
         self.handle.detached.load(Ordering::Acquire)
     }
+
+    // ── Trace/observability API (features `trace`/`trace-names`) ───────────
 
     /// Record the executor task id (`SpawnToken::id()` / `TaskRef::id()`) currently
     /// backing this node, so the [`trace`] recorders can attribute executor polls to
@@ -799,6 +804,12 @@ impl<const N: usize> Supervisor<N> {
     /// `start_node`. A **parked** node (no `spawn` fn) is spawned externally by
     /// `main()` (with hardware handles main owns); it's still marked `running`
     /// here. Disabled nodes, and `#[cfg]`-ed-out slots, are skipped.
+    ///
+    /// Async because an `executor: NAME` node first awaits its [`SpawnerSlot::ready`]
+    /// (bounded by `SLOT_READY_TIMEOUT` — the rendezvous with a tier or second core
+    /// that comes up asynchronously); a slot still empty at the deadline fails the
+    /// bring-up with [`SpawnError::Busy`]. A node with no `executor:` slot never
+    /// touches the timer.
     pub async fn start(&self, spawner: Spawner) -> Result<(), SpawnError> {
         // Register the node slots with the trace recorders.
         #[cfg(feature = "trace")]
@@ -888,9 +899,8 @@ impl<const N: usize> Supervisor<N> {
             if !node.is_running() {
                 continue;
             }
-            // A detached node manages its own lifecycle (e.g. a sleep/power
-            // coordinator that must outlive the teardown it drives), so the
-            // supervisor never tears it down. See [`TaskNode::set_detached`].
+            // A detached node is self-managed; never tear it down. See
+            // [`TaskNode::set_detached`].
             if node.is_detached() {
                 continue;
             }
@@ -903,7 +913,8 @@ impl<const N: usize> Supervisor<N> {
     /// were parked on `wait_resume()` and pick up immediately. Called separately
     /// from `respawn_terminate` so the application can fire resume independently
     /// of the respawn step. Disabled (manually-paused) nodes are skipped so a
-    /// manual pause sticks; there is intentionally no dependency gate here.
+    /// manual pause sticks, and detached (self-managed) Pause nodes are left
+    /// parked; there is intentionally no dependency gate here.
     pub fn resume_pausable(&self) {
         for i in self.order.iter() {
             let Some(node) = self.nodes[*i as usize] else {

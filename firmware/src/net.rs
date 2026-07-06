@@ -123,19 +123,13 @@ pub(crate) async fn net_task(node: &'static TaskNode) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
 
-    // Every buffer on the heap (net's heap budget), owned by this task → freed
+    // Every buffer on the heap (net's ~16 KB budget), owned by this task → freed
     // when it returns on teardown. Declared up front, before the objects that
     // borrow them: embassy ties each buffer's lifetime into the borrowing object's
     // type, so at scope-end (reverse-order) drop the buffers must outlive them.
-    // `net_state` (the ~12 KB packet pool) + `resources` are the bulk of the budget.
-    //
-    // Note `Box::new(NetState::new())` has no *guaranteed* placement-new: the
-    // language constructs the value as a temporary first, then moves it into the
-    // heap, so an unoptimized build copies ~12 KB through this poll's stack frame.
-    // In release (opt + LTO) the optimizer elides that copy and constructs in
-    // place — verified: the largest task-poll frame in the whole binary is ~2.9 KB,
-    // so there is no 12 KB stack spike here. (`StaticCell::init(v)` would be no
-    // different — it also takes the value by move.)
+    // `net_state` (the ~12 KB packet pool) + `resources` are the bulk. Release+LTO
+    // constructs the Boxes in place (verified: largest poll frame in the binary is
+    // ~2.9 KB — no 12 KB stack spike from the `Box::new` move).
     let mut config_desc = Box::new([0u8; 256]);
     let mut bos_desc = Box::new([0u8; 256]);
     let mut control_buf = Box::new([0u8; 128]);

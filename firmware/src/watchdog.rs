@@ -19,9 +19,10 @@ pub(crate) async fn watchdog_task(node: &'static TaskNode) -> ! {
     let mut wd =
         embassy_rp::watchdog::Watchdog::new(unsafe { embassy_rp::peripherals::WATCHDOG::steal() });
     // Blocked-task detector (feature `trace`). Two complementary checks:
-    // - `stalled_task`: an in-flight poll > 100 ms. On this single-executor
-    //   firmware it can rarely fire (a blocked executor also blocks this task;
-    //   it is here as the pattern for an ISR-priority observer), so additionally:
+    // - `stalled_task`: an in-flight poll > 100 ms. For a stall on this task's OWN
+    //   thread executor it can rarely fire (a blocked executor also blocks the
+    //   feeder), but stalls on the other executors (HIGH tier, core 1) are
+    //   observable live — see the README's executor table. So additionally:
     // - `max_poll_ticks` watermark: post-hoc, names any node whose longest single
     //   poll exceeded the threshold — works even when observed after the fact.
     //   Warn only on increase to avoid log spam (16 slots cover this graph).

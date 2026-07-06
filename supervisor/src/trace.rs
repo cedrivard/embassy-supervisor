@@ -28,21 +28,20 @@
 //!
 //!   * All counters are wrapping `u32`s of **embassy-time ticks**. Consumers sample
 //!     twice and `wrapping_sub` the readings to compute a rate over their own
-//!     window; the crate does no windowing of its own.
+//!     window; the crate does no windowing of its own. Any single delta (a sample
+//!     window, or one uninterrupted idle stretch) longer than 2³² ticks (~71 min at
+//!     1 MHz) aliases — sample more often than that, and expect the idle counter to
+//!     under-report across very long sleeps.
 //!   * Accounting is **preemption-naive**: on systems with interrupt executors, a
 //!     thread-executor poll that gets preempted silently absorbs the preemptor's
 //!     CPU time, and idle is tracked per executor, not per core. Hardware-ISR time
 //!     is likewise invisible: during a poll it inflates that node, between polls it
 //!     lands in the unattributed share.
 //!   * Executor busy% exceeds the sum of per-node CPU% by a **per-poll accounting
-//!     gap**: executor bookkeeping between `exec_end` and the next `exec_begin`,
-//!     plus these hooks' own cost (two `Instant::now()` reads + the O(N) id scan),
-//!     is busy time attributed to no node — order 10 µs per poll, so it grows with
-//!     poll rate (measured ~13% of a 150 MHz core at ~8k polls/s under HTTP load).
-//!     [`ExecutorStats`] measures it directly: `overhead = busy - exec_ticks`, and
-//!     `exec_ticks - Σ node exec` separates the unsupervised-task share from it.
-//!     Empty scheduler passes (interrupt wakeups that poll nothing) are counted as
-//!     idle, not overhead — see [`ExecutorStats`].
+//!     gap** (executor bookkeeping + these hooks' own cost, dominated by the
+//!     O(N ≤ 256) id scan, not the two `Instant::now()` reads) — it grows with poll
+//!     rate. [`ExecutorStats`] owns the full busy/in-poll/overhead/unsupervised
+//!     decomposition and the measured figures.
 //!   * At most [`MAX_EXECUTORS`] executors are tracked (first come, first served);
 //!     hooks from further executors are dropped.
 //!   * Parked nodes (no `spawn:`) and verbatim-closure `spawn:` forms are not
@@ -121,11 +120,9 @@ struct ExecutorSlot {
     idle_since: AtomicU32,
     /// Accumulated idle ticks (wrapping).
     idle_ticks: AtomicU32,
-    /// Accumulated in-poll ticks (wrapping): EVERY `exec_begin..exec_end` window,
-    /// whether or not the task id resolves to a supervised node. `busy - exec`
-    /// is therefore pure executor overhead (bookkeeping + hook cost + ISR time
-    /// between polls), and `exec - sum(node exec_ticks)` is the unsupervised-task
-    /// share.
+    /// Accumulated in-poll ticks (wrapping) over EVERY poll, resolvable to a
+    /// supervised node or not; see [`ExecutorStats`] for the busy/overhead/
+    /// unsupervised decomposition.
     exec_ticks: AtomicU32,
     /// Task polls on this executor (wrapping), supervised or not.
     polls: AtomicU32,
@@ -420,6 +417,10 @@ pub fn on_task_end(_executor_id: u32, task_id: u32) {
 /// unsupervised = Δexec_ticks - Σ Δnode.exec_ticks()   (task polls that resolve
 ///                                        to no supervised node)
 /// ```
+///
+/// Overhead is per-poll (~15–20 µs, dominated by the O(N ≤ 256) id scan in the
+/// hooks), so it scales with poll rate — measured ~13% of a 150 MHz core at ~8k
+/// polls/s under HTTP load.
 ///
 /// **Empty scheduler passes count as idle**, not overhead: the idle window stays
 /// open across a pass that polls nothing (see [`on_poll_start`]), because such a

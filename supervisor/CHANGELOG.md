@@ -7,7 +7,7 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 ## [0.3.0] - 2026-07-05
 
 **Breaking release** — bring-up is now `async` (see *Changed*). Adds multi-executor
-graphs, AMP (multi-core) support, and trace-hook observability.
+graphs, multi-core support, and trace-hook observability.
 
 ### Added
 - Multi-executor graphs: the `executor NAME;` item declares a runtime-filled
