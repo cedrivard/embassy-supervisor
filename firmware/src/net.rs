@@ -26,7 +26,6 @@
 //! Static IPv4 so no host DHCP server is needed: set your host's `usb0` to
 //! `10.42.0.1/24` and reach the device at `10.42.0.61`.
 
-use core::ptr::{addr_of, addr_of_mut};
 
 use alloc::boxed::Box;
 use embassy_futures::join::{join, join3};
@@ -70,7 +69,7 @@ static mut STACK: Option<Stack<'static>> = None;
 /// The current network stack, or `None` until `net` has brought it up.
 pub fn try_stack() -> Option<Stack<'static>> {
     // SAFETY: single-core; written only by the net task.
-    unsafe { *addr_of!(STACK) }
+    unsafe { *&raw const STACK }
 }
 
 /// Await the network stack becoming available. Dependents must use this rather
@@ -94,12 +93,12 @@ unsafe fn publish_stack(s: Stack<'_>) {
     // Lifetime-extend the `Copy` handle. `Stack<'a>`'s layout is independent of
     // `'a`, so this is a pure lifetime cast.
     let s: Stack<'static> = unsafe { core::mem::transmute(s) };
-    unsafe { *addr_of_mut!(STACK) = Some(s) };
+    unsafe { *&raw mut STACK = Some(s) };
 }
 
 fn unpublish_stack() {
     // SAFETY: single-core; called on teardown after all dependents are down.
-    unsafe { *addr_of_mut!(STACK) = None };
+    unsafe { *&raw mut STACK = None };
 }
 
 // ─── The supervised net node ───────────────────────────────────────────────

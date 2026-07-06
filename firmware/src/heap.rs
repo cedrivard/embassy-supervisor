@@ -39,7 +39,7 @@ pub fn init() {
     static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
     // SAFETY: called exactly once at boot, before any allocation; HEAP_MEM is a
     // dedicated static never referenced elsewhere.
-    unsafe { HEAP.init(core::ptr::addr_of_mut!(HEAP_MEM) as usize, HEAP_SIZE) }
+    unsafe { HEAP.init(&raw mut HEAP_MEM as usize, HEAP_SIZE) }
 }
 
 /// Bytes currently free in the arena (observable heap budget headroom).

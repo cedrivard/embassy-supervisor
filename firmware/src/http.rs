@@ -178,7 +178,11 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &Tas
             ("GET", "/api/tasks") => {
                 // Built on the heap (freed at the end of this match) so the worker
                 // future stays small — the JSON body is never inline in the future.
-                let mut body = String::with_capacity(1408);
+                // Capacity: 9 nodes x ~200 B/row (keys + name + 4 bools + three u32
+                // counters + deps) + ~450 B heap/executors prefix + slack. Growth
+                // still works (String reallocs) but a realloc at the ~28 KB serving
+                // peak transiently doubles the body's footprint, so reserve enough.
+                let mut body = String::with_capacity(2560);
                 build_tasks_json(&mut body);
                 send(socket, "application/json", &body, keep).await;
             }
