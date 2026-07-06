@@ -36,7 +36,11 @@ pub(crate) async fn watchdog_task(node: &'static TaskNode) -> ! {
             }
             if let Some((stalled, ticks)) = embassy_supervisor::trace::stalled_task(id, STALL_TICKS)
             {
-                defmt::warn!("trace: {} has been polling for {} ticks", stalled.name, ticks);
+                defmt::warn!(
+                    "trace: {} has been polling for {} ticks",
+                    stalled.name,
+                    ticks
+                );
             }
         }
         for (n, w) in GRAPH.nodes.iter().flatten().zip(warned.iter_mut()) {

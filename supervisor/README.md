@@ -15,6 +15,7 @@ target. The only third-party deps are pure-embassy crates (`embassy-executor`/`-
 - [Quickstart](#quickstart)
 - [The model](#the-model)
 - [Lifecycle reference](#lifecycle-reference)
+- [Writing supervised tasks (the TaskNode API)](#writing-supervised-tasks-the-tasknode-api)
 - [The `supervisor_graph!` DSL](#the-supervisor_graph-dsl)
 - [Recipes by use case](#recipes-by-use-case)
 - [Elastic pools](#elastic-pools)
@@ -102,9 +103,7 @@ Three pieces, all `static`:
 
 - **`TaskNode`** — one per managed task: a name, a `Mode`, an optional spawn fn, and a
   private handle of atomic flags + signals. The *task side* of the protocol is a handful of
-  node methods: a task selects its work against `wait_shutdown()`, calls `ack_dropped()` when
-  it exits (or before parking), and — for `Pause` nodes — parks on `wait_resume()`. Pool
-  workers additionally report load with `mark_busy()` / `mark_idle()` + `request_scale()`.
+  node methods — see [Writing supervised tasks](#writing-supervised-tasks-the-tasknode-api).
 - **`Graph<N>`** — the macro-emitted `GRAPH`: `nodes` (fixed `[Option<&TaskNode>; N]` — a
   `#[cfg]`-ed-out node keeps its slot as `None`), `deps` (per-node dependency indices),
   `order` (the compile-time topological order), and `pools` (with the `pool` feature). The
@@ -122,8 +121,8 @@ Three pieces, all `static`:
 | `Pause` | spawned (or app-spawned if parked) | acks, then parks on `wait_resume()` | **resumed in place** (`resume_pausable`) — keeps held resources |
 | `OnDemand` | not started | stopped like `Terminate` | not auto-started — pools/control start it |
 
-A task that never acks a shutdown within the timeout panics the supervisor with the node's
-name — a loud bug report, not a hang.
+How a task implements its half of these transitions is the
+[TaskNode API](#writing-supervised-tasks-the-tasknode-api).
 
 ## Lifecycle reference
 
@@ -148,6 +147,114 @@ Two flags cut across the modes:
 - **`detached`** (`TaskNode::set_detached(true)`) is full hands-off: the node manages its own
   lifecycle and the supervisor never drives it again. Its `deps:` still order its *first*
   spawn — after that, the graph only remembers where it was declared.
+
+## Writing supervised tasks (the TaskNode API)
+
+A supervised task is an ordinary `#[embassy_executor::task]` whose first parameter is its
+node — the macro's `spawn:` glue passes it automatically; extra arguments come from the
+partial-call spawn form (`spawn: my_task(EXTRA)`):
+
+```rust,ignore
+#[embassy_executor::task]
+async fn my_task(node: &'static TaskNode) { /* ... */ }
+```
+
+The node is the task's half of the lifecycle protocol. Four rules cover all of it:
+
+1. **Select your work against `wait_shutdown()`** at every await point that can block
+   indefinitely — that's how a teardown/stop reaches you.
+2. **Ack exactly once per stop** with `ack_dropped()`: on exit (`Terminate`/`OnDemand`),
+   or on each pause (`Pause`) *before* parking. A task that never acks panics the
+   supervisor after a timeout with the node's name — a loud bug report, not a hang.
+3. **An autonomous exit also acks** — a worker backing off on its own calls
+   `ack_dropped()` too, so the pool sees it as down and can re-grow it later.
+4. **Resources follow the mode**: a `Terminate` task re-acquires everything on respawn
+   (drop-on-exit is the cleanup); a `Pause` task keeps what it holds across
+   pause→resume and never re-acquires.
+
+Task-side methods:
+
+| method | role |
+|---|---|
+| `wait_shutdown().await` | park until a stop/pause is requested (returns immediately if already requested) |
+| `shutdown_requested()` | synchronous check, e.g. at the loop top before starting new work |
+| `ack_dropped()` | complete the handshake: clears `running`, wakes the supervisor's ack wait |
+| `wait_resume().await` | `Pause` only: park (after acking) until resumed |
+| `mark_busy()` / `mark_idle()` | pool workers: report load; a *real* transition fires the scale signal itself — no manual `request_scale()` needed |
+| `set_detached(true)` | opt out of supervision from now on (self-managed daemon or run-once — see the [lifecycle reference](#lifecycle-reference)) |
+| `adopt(&token)` | parked nodes: register a hand-spawned task's id so trace accounting sees it |
+
+**`Terminate` / `OnDemand` worker** — the canonical select loop:
+
+```rust,ignore
+#[embassy_executor::task]
+async fn worker_task(node: &'static TaskNode) {
+    let mut conn = acquire();                    // re-acquired on every respawn
+    loop {
+        if node.shutdown_requested() {
+            node.ack_dropped();
+            return;                              // drop(conn) is the cleanup
+        }
+        match select(conn.serve(), node.wait_shutdown()).await {
+            Either::First(res) => handle(res),
+            Either::Second(()) => {
+                node.ack_dropped();
+                return;
+            }
+        }
+    }
+}
+```
+
+**`Pause` node** — ack, then park; held resources survive:
+
+```rust,ignore
+#[embassy_executor::task]
+async fn sensor_task(node: &'static TaskNode) {
+    let mut bus = acquire_once();                // kept across pause/resume
+    loop {
+        'active: loop {
+            match select(sample(&mut bus), node.wait_shutdown()).await {
+                Either::First(v) => publish(v),
+                Either::Second(()) => break 'active,
+            }
+        }
+        node.ack_dropped();                      // ack the pause...
+        node.wait_resume().await;                // ...then park, still owning `bus`
+    }
+}
+```
+
+**Pool worker** — same as `Terminate`, plus load reporting around the busy section:
+
+```rust,ignore
+node.mark_busy();                                // idle→busy fires the scale signal
+serve_connection(&mut socket).await;
+node.mark_idle();                                // busy→idle fires it again
+```
+
+Keep `mark_busy()` held for the whole session the worker's resource is tied up (e.g. a
+keep-alive connection): the policy only shrinks non-busy workers.
+
+**Detached daemon / run-once** — detach as the first act, then own your lifecycle:
+
+```rust,ignore
+#[embassy_executor::task]
+async fn confirm_task(node: &'static TaskNode) {
+    node.set_detached(true);                     // supervisor is hands-off from here
+    wait_until_ready().await;
+    confirm();                                   // runs once and simply returns
+}
+```
+
+**Parked node** (declared with no `spawn:`) — the app spawns it by hand, typically because
+it needs values only `main` owns; `adopt` keeps trace attribution working:
+
+```rust,ignore
+let token = pump_task(&PUMP, hw_handle);         // build the SpawnToken first
+PUMP.adopt(&token);                              // register its task id for trace
+spawner.spawn(token).unwrap();
+```
 
 ## The `supervisor_graph!` DSL
 

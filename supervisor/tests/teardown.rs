@@ -122,13 +122,19 @@ async fn driver(spawner: Spawner) {
     assert!(DAEMON.is_running(), "daemon running after start");
     assert!(DAEMON.is_detached(), "daemon marked itself detached");
     assert!(!NORMAL.is_detached(), "normal is not detached");
-    assert!(ONESHOT.is_detached(), "one-shot marked itself detached and exited");
+    assert!(
+        ONESHOT.is_detached(),
+        "one-shot marked itself detached and exited"
+    );
     PHASE.store(1, Ordering::SeqCst);
 
     // ── teardown(): tears down NORMAL + PAUSED, skips the detached DAEMON ─────
     sup.teardown().await;
     assert!(!NORMAL.is_running(), "normal torn down");
-    assert!(!PAUSED.is_running(), "paused parked (torn down) by teardown");
+    assert!(
+        !PAUSED.is_running(),
+        "paused parked (torn down) by teardown"
+    );
     assert!(DAEMON.is_running(), "detached daemon survives teardown");
     assert!(
         !DAEMON_SHUTDOWN_SEEN.load(Ordering::SeqCst),
@@ -136,7 +142,10 @@ async fn driver(spawner: Spawner) {
     );
     // The detached one-shot already exited (stale is_running); teardown must skip it.
     // Reaching this line at all proves it did — else the frozen-clock ack wait hangs.
-    assert!(ONESHOT.is_detached(), "detached one-shot skipped by teardown");
+    assert!(
+        ONESHOT.is_detached(),
+        "detached one-shot skipped by teardown"
+    );
     PHASE.store(2, Ordering::SeqCst);
 
     // ── resume_pausable(): resumes PAUSED in place (not respawned) ───────────
@@ -206,12 +215,19 @@ async fn driver(spawner: Spawner) {
     request_control(&ONESHOT, ControlOp::Deactivate);
     let cmd = wait_control().await;
     sup.apply_control(cmd, spawner).await;
-    assert!(ONESHOT.is_detached(), "detached one-shot still detached after direct deactivate");
+    assert!(
+        ONESHOT.is_detached(),
+        "detached one-shot still detached after direct deactivate"
+    );
     assert!(
         !ONESHOT.is_disabled(),
         "detached one-shot left untouched by deactivate (not even disabled)"
     );
-    assert_eq!(ONESHOT_SPAWNS.load(Ordering::SeqCst), 1, "one-shot still ran exactly once");
+    assert_eq!(
+        ONESHOT_SPAWNS.load(Ordering::SeqCst),
+        1,
+        "one-shot still ran exactly once"
+    );
 
     // ── activate the detached one-shot directly: its `deps: [NORMAL]` edge is start-
     //    ordering only, so activate's growth loop must not expand from the detached

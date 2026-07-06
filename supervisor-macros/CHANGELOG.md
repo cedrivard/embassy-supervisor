@@ -6,7 +6,7 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
-## [0.2.0] - 2026-07-05
+## [0.2.0] - 2026-07-06
 
 Requires `embassy-supervisor` >= 0.3.0 (the generated `executor:` glue uses that
 release's async slot rendezvous); pinned by exact version from the supervisor crate.

@@ -112,10 +112,13 @@ What each node demonstrates:
   storage); on stop it drops them, returning the whole budget.
 - **`heartbeat`** (`heartbeat.rs`) — *Pause/Resume with a retained resource*: the
   LED `Output` is owned across pause→resume, never re-acquired. Its blink period
-  is a runtime parameter (`POST /api/heartbeat?ms=`). Running on the `HIGH`
-  interrupt tier, it also observes thread-executor stalls live (it still gets CPU
-  when the thread executor is wedged) and can name the culprit *before* the
-  watchdog resets.
+  is a runtime parameter (`POST /api/heartbeat?ms=`). It is also the firmware's
+  **live consumer of `embassy_supervisor::trace`**: on every blink tick it walks
+  `trace::executors()` and calls `trace::stalled_task(id, 100ms)` — and because it
+  runs on the `HIGH` interrupt tier it still gets CPU while the thread executor is
+  wedged, so it names the blocking task *while the stall is happening*, before the
+  watchdog resets (the watchdog's `max_poll_ticks` watermark is the post-hoc
+  complement).
 - **`http` pool** (`http.rs`) — *elastic pool + socket & heap budgeting*. Each
   worker owns one embassy-net socket and heap I/O buffers, so the pool scales
   within the fixed `StackResources` budget and its heap footprint tracks the live

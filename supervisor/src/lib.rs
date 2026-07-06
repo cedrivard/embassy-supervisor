@@ -7,19 +7,32 @@
 //!
 //! Application- and HAL-agnostic primitives for orchestrating a set of embassy
 //! tasks: bringing them up in dependency order, tearing them down in reverse,
-//! scaling an elastic worker pool with load, and starting/stopping/pausing/
-//! resuming individual tasks at runtime while keeping the dependency graph
-//! consistent.
+//! scaling an elastic worker pool with load, placing nodes on interrupt-priority
+//! tiers or a second core, and starting/stopping/pausing/resuming individual
+//! tasks at runtime while keeping the dependency graph consistent. The supervisor
+//! orchestrates task *lifecycle* and leaves the rest — allocation, HAL, power,
+//! what the tasks do — to the application.
 //!
 //! ## The model
 //!
 //!   * The graph is declared once with the [`supervisor_graph!`] macro: each
 //!     managed task becomes a [`TaskNode`] `static`, and the macro bundles the node
 //!     slots, dependency table, and a topological order computed **at compile time**
-//!     (a dependency cycle is a compile error) into a single [`Graph`] (`GRAPH`).
+//!     into a single [`Graph`] (`GRAPH`). The whole graph is validated at compile
+//!     time — a dependency cycle, an unknown or duplicate dependency, a duplicate
+//!     name, or bad pool bounds are compile errors.
 //!   * [`Supervisor::new`] takes `&GRAPH` (no work, no failure) and uses the order
 //!     to bring tasks up in dependency order ([`Supervisor::start`]) and tear them
 //!     down in reverse ([`Supervisor::teardown`]).
+//!   * `executor NAME;` items declare runtime-filled [`SpawnerSlot`]s, and
+//!     `executor: NAME` on a node (or a whole pool) routes its spawn through one —
+//!     an interrupt-priority tier or the second core. Bring-up *awaits* the slot
+//!     (bounded), so an executor that comes up late — or on another core — is a
+//!     rendezvous, not a race.
+//!   * Two flags span every lifecycle operation: **disabled** (stopped until an
+//!     explicit `Activate` — declared `disabled` in the graph or control-stopped;
+//!     see [`TaskNode::set_disabled`]) and **detached** (self-managed: after
+//!     [`TaskNode::set_detached`] no supervisor operation touches the node).
 //!   * Each node carries a `TaskHandle` of per-node atomic flags and
 //!     single-consumer `Signal`s. Every node is single-instance — no counts, no
 //!     fan-out. See [`TaskHandle`].
@@ -34,6 +47,28 @@
 //!   * [`Mode::OnDemand`] — like `Terminate`, but not started at boot and not
 //!     auto-respawned; the supervisor brings it up and down at runtime to scale
 //!     an elastic worker pool ([`ElasticPool`]) with load.
+//!
+//! ## Writing a supervised task
+//!
+//! A supervised task is a plain `#[embassy_executor::task]` whose first parameter
+//! is its node (the macro's `spawn:` glue passes it; extra arguments come from the
+//! partial-call spawn form). Four rules cover the task side of the protocol:
+//!
+//!   1. select long-lived work against [`TaskNode::wait_shutdown`] — that's how a
+//!      stop reaches you;
+//!   2. ack exactly once per stop with [`TaskNode::ack_dropped`]: on exit
+//!      (`Terminate`/`OnDemand`), or on each pause (`Pause`) *before* parking on
+//!      [`TaskNode::wait_resume`];
+//!   3. an autonomous exit acks too, so the supervisor sees the node as down;
+//!   4. resources follow the mode: a `Terminate` task re-acquires everything on
+//!      respawn (drop-on-exit is the cleanup), a `Pause` task keeps what it holds
+//!      across the park.
+//!
+//! Pool workers additionally report load with [`TaskNode::mark_busy`] /
+//! [`TaskNode::mark_idle`] (a real transition fires the scale signal itself), and
+//! a self-managed daemon or run-once job opts out of supervision with
+//! [`TaskNode::set_detached`]. The README's *Writing supervised tasks* section has
+//! per-mode skeletons.
 //!
 //! ## What the supervisor does *not* do
 //!
@@ -492,7 +527,15 @@ impl TaskNode {
 
     // ── Task-side API ────────────────────────────────────────────────────
     //
-    // Called from inside the `#[embassy_executor::task] async fn` body.
+    // Called from inside the `#[embassy_executor::task] async fn` body. The
+    // whole task-side protocol is four rules (the README's "Writing supervised
+    // tasks" section has per-mode skeletons):
+    //   1. select long-lived work against `wait_shutdown()`;
+    //   2. `ack_dropped()` exactly once per stop — on exit (Terminate/OnDemand)
+    //      or on each pause (Pause), before parking on `wait_resume()`;
+    //   3. an autonomous exit acks too;
+    //   4. resources follow the mode: Terminate re-acquires on respawn, Pause
+    //      retains across park.
 
     /// True iff the supervisor has requested shutdown. Checked at the loop top
     /// alongside `wait_shutdown()` in a `select`.
@@ -525,7 +568,9 @@ impl TaskNode {
         self.handle.dropped_wake.signal(());
     }
 
-    /// Pause-mode only: park until the supervisor signals resume.
+    /// Pause-mode only: park until the supervisor signals resume. Call *after*
+    /// [`ack_dropped`](Self::ack_dropped) — ack the pause, then park; held
+    /// resources stay owned across the park.
     pub async fn wait_resume(&self) {
         self.handle.resume_wake.wait().await;
     }
@@ -560,9 +605,10 @@ impl TaskNode {
         self.handle.running.load(Ordering::Acquire)
     }
 
-    /// True while the node has been manually deactivated via the control
-    /// interface and not yet re-activated. Read by a task-state view and by the
-    /// automatic bring-up paths (which skip a disabled node).
+    /// True while the node is disabled: declared `disabled` in the graph
+    /// (stopped-at-boot, up on an explicit `Activate`), or manually deactivated
+    /// via the control interface and not yet re-activated. Read by a task-state
+    /// view and by the automatic bring-up paths (which skip a disabled node).
     pub fn is_disabled(&self) -> bool {
         self.handle.disabled.load(Ordering::Acquire)
     }

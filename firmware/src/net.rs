@@ -26,7 +26,6 @@
 //! Static IPv4 so no host DHCP server is needed: set your host's `usb0` to
 //! `10.42.0.1/24` and reach the device at `10.42.0.61`.
 
-
 use alloc::boxed::Box;
 use embassy_futures::join::{join, join3};
 use embassy_futures::select::select;
