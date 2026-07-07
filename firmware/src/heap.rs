@@ -21,8 +21,8 @@ static HEAP: LlffHeap = LlffHeap::empty();
 /// in `ota.rs`). They never coexist; serving is the high-water mark (each worker's
 /// `tx` buffer holds a whole /api/tasks response so only one body String is ever
 /// live — see `http.rs`), so 32 KB leaves ~2 KB margin at peak. The pool ceiling
-/// (`POOL_MAX = 2`) is what keeps serving inside the arena: a third worker's
-/// ~4.6 KB would blow it.
+/// (the graph's `max: 2`, exported by the macro as `crate::HTTP_MAX`) is what
+/// keeps serving inside the arena: a third worker's ~4.6 KB would blow it.
 pub const HEAP_SIZE: usize = 32 * 1024;
 
 /// Initialize the global allocator. Call once, early in `main`, before anything

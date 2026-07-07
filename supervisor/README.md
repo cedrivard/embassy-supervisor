@@ -11,7 +11,7 @@ target. The only third-party deps are pure-embassy crates (`embassy-executor`/`-
 ## Table of contents
 
 - [What it is](#what-it-is)
-- [Highlights in 0.3.0](#highlights-in-030)
+- [Highlights in 0.3.1](#highlights-in-031)
 - [Quickstart](#quickstart)
 - [The model](#the-model)
 - [Lifecycle reference](#lifecycle-reference)
@@ -39,34 +39,47 @@ target. The only third-party deps are pure-embassy crates (`embassy-executor`/`-
   endpoint, a button, …) through a decoupled mailbox (`request_control` / `apply_control`) that
   honors dependencies and pool membership.
 - **Multi-executor placement** — `executor:` annotations route nodes onto interrupt-priority
-  tiers or the second core; the graph is the single source of *where each task runs*.
+  tiers; the graph is the single source of *where each task runs*.
+- **Multi-core placement.** The same mechanism spans the second core: `start()` rendezvouses
+  with the other core's asynchronous executor bring-up as part of the bring-up loop, and a whole
+  elastic pool can live on core 1, scaled by core 0's supervisor.
+- **Safe resource threading** — `resources:` annotations move owned peripherals from `main`
+  into workers through `ResourceSlot`s (compile-time exclusive ownership — no `steal()`),
+  restored on task exit so a respawn re-takes the same instance.
 - **Observability** *(feature family `trace`)* — per-node CPU time, poll counts and stall
   detection by consuming embassy-executor's trace hooks, with node *names* attached.
 
 The supervisor deliberately does **not** allocate, own a HAL, manage power states, or know what your
 tasks do — it orchestrates their *lifecycle* and leaves the rest to you.
 
-## Highlights in 0.3.0
+## Highlights in 0.3.1
 
-- **Multi-executor graphs.** `executor NAME;` declares a runtime-filled `SendSpawner` slot;
-  `executor: NAME` on a node (or a whole pool) routes its spawn through it — interrupt-priority
-  tiers become graph citizens.
-- **Multi-core placement.** The same mechanism spans the second core: `start()` rendezvouses
-  with the other core's asynchronous executor bring-up as part of the bring-up loop, and a whole
-  elastic pool can live on core 1, scaled by core 0's supervisor.
-- **Trace observability.** The opt-in `trace` / `trace-hooks` / `trace-names` / `trace-nested`
-  features turn embassy-executor's raw trace hooks into named per-node accounting (see
-  [Observability](#observability)), plus `TaskNode::adopt(&token)` for spawns the macro can't see.
-- **Async bring-up.** `Supervisor::start`, `start_node`, and `respawn_terminate` are `async fn`
-  and must be `.await`ed. Bringing up an `executor:` node awaits its `SpawnerSlot` (bounded,
-  then `SpawnError::Busy`), so a tier filled late — or from another core — is handled without a
-  race, a busy-spin, or a hardware timer-queue hazard. Same-executor nodes never touch the timer.
-- **Detached is fully hands-off.** After `set_detached(true)`, *nothing* the supervisor does
-  touches the node: `teardown`, `deactivate`/`activate` cascades, `stop_node`,
-  `respawn_terminate`, and `resume_pausable` all skip it (see the
-  [Lifecycle reference](#lifecycle-reference)).
-- **Pool-name deps.** `deps:` may name a `pool`; it resolves to the pool's floor member —
-  "start after the pool is up".
+Ships with `embassy-supervisor-macros` 0.3.0 .
+
+- **`task:` — generated shells.** Declare a **plain async worker fn** — possibly generic —
+  and the macro stamps its concrete `#[embassy_executor::task]` shell per declaration; a
+  `task:` pool's shell is auto-sized to the member count. No attribute boilerplate, and
+  the graph becomes the single place task plumbing lives (see
+  [`spawn:` vs `task:`](#spawn-vs-task--which-to-use) — `task:` is now the preferred form).
+- **Safe resource threading.** `resources: [NAME: Type, ..]` on a `task:` node emits a
+  `ResourceSlot<Type>` static: `main` **moves** the peripheral in with `provide()`
+  (consuming the `Peripherals` field — compile-time exclusive ownership, no `steal()`
+  inside tasks), the glue `take()`s it before each (re)spawn (unprovided → `SpawnError::Busy`
+  out of `start()`, fail-closed), the worker receives `&mut Type`, and the shell
+  `restore()`s it on exit so a respawn re-takes the *same instance*. See
+  [`resources:`](#resources--safe-resource-threading).
+- **`ResourceSlot` / `ResourceGate` API.** The slot type behind `resources:` is public and
+  usable by hand — e.g. share one slot between the generated glue and a manual
+  `take()`/`restore()` borrower elsewhere in the app; `TaskNode::with_resources` makes
+  bring-up await provisioning (bounded, then `SpawnError::Busy`).
+- **Pool structural consts.** Each `pool` also emits `NAME_MIN` / `NAME_MAX` /
+  `NAME_MEMBERS` (`usize`) for downstream const-context sizing
+  (`const SOCKET_BUDGET: usize = HTTP_MAX + 1;`) — a `const` can't read them off the
+  member `static` array.
+
+Measured on the demo firmware (RP2350, release + fat LTO): the whole feature set costs
+~1.5 KiB flash and a few dozen bytes of RAM; the generated shells add **zero**
+steady-state stack — a threaded resource travels inside the task's future.
 
 ## Quickstart
 
@@ -76,11 +89,16 @@ use embassy_supervisor::{supervisor_graph, Supervisor, wait_control};
 
 // Declare the graph once: `supervisor_graph!` generates the node `static`s and a
 // single `GRAPH` bundling the node slots, dep table, compile-time order, and pools.
-// Each `spawn:` names a task fn that is `s.spawn`ed with the node; `app` depends on `net`.
+// Each `task:` names a plain async worker fn (the macro stamps its
+// `#[embassy_executor::task]` shell); `app` depends on `net`.
 supervisor_graph! {
-    node NET = Terminate, deps: [], spawn: net_task;
-    node APP = Terminate, deps: [NET], spawn: app_task;
+    node NET = Terminate, deps: [], task: net_task;
+    node APP = Terminate, deps: [NET], task: app_task;
 }
+
+// Plain async fns taking the node first — no embassy attribute needed.
+async fn net_task(node: &'static embassy_supervisor::TaskNode) { /* ... */ }
+async fn app_task(node: &'static embassy_supervisor::TaskNode) { /* ... */ }
 
 #[embassy_executor::task]
 async fn supervisor_task(spawner: Spawner) {
@@ -150,14 +168,20 @@ Two flags cut across the modes:
 
 ## Writing supervised tasks (the TaskNode API)
 
-A supervised task is an ordinary `#[embassy_executor::task]` whose first parameter is its
-node — the macro's `spawn:` glue passes it automatically; extra arguments come from the
-partial-call spawn form (`spawn: my_task(EXTRA)`):
+A supervised task is an async fn whose first parameter is its node — the macro's glue
+passes it automatically; extra arguments come from the partial-call form
+(`task: my_task(EXTRA)`). The preferred style is a **plain worker fn** declared with
+[`task:`](#task--generated-shells-for-plain-or-generic-workers) — the graph stamps the
+`#[embassy_executor::task]` shell for you:
 
 ```rust,ignore
-#[embassy_executor::task]
 async fn my_task(node: &'static TaskNode) { /* ... */ }
 ```
+
+Alternatively, write the attribute yourself and declare the fn with `spawn:` — needed in a
+few situations ([which to use](#spawn-vs-task--which-to-use)). Everything below (the four
+rules, the method table) applies identically to both styles; only who writes the
+`#[embassy_executor::task]` differs.
 
 The node is the task's half of the lifecycle protocol. Four rules cover all of it:
 
@@ -261,9 +285,11 @@ spawner.spawn(token).unwrap();
 ```text
 executor NAME;                        // runtime-filled SendSpawner slot (tier / second core)
 node NAME = Mode, deps: [A, B][, executor: EXEC], spawn: <spawn>[, disabled];
-node NAME = Mode, deps: [A];          // no `spawn:` => parked node the app spawns itself
+node NAME = Mode, deps: [A, B][, executor: EXEC], task: <worker>[, pool_size: N]
+    [, resources: [RES: Type, ..]][, disabled];
+node NAME = Mode, deps: [A];          // neither => parked node the app spawns itself
 pool NAME = [Mode, ..], deps: [A][, executor: EXEC],
-    spawn: <fn>,
+    spawn: <fn> | task: <worker>,
     policy: [<Type> =] <expr>,
     min: N, max: M;
 ```
@@ -271,9 +297,147 @@ pool NAME = [Mode, ..], deps: [A][, executor: EXEC],
 ### Spawn forms
 
 A bare path `f` spawns `f(&NAME)`; a partial call `f(a, b)` spawns `f(&NAME, a, b)` (the node
-is always injected first); a closure is emitted verbatim (nodes only). Omit `spawn:` for a
-**parked** node whose task the application spawns itself (e.g. a `Pause` sensor holding a
-peripheral handle) — the supervisor tracks it but never spawns it.
+is always injected first); a closure is emitted verbatim (nodes only). These forms apply to
+both `spawn:` (a hand-written `#[embassy_executor::task]` fn) and `task:` (a plain worker fn
+the macro wraps) — **prefer `task:`**; see
+[`spawn:` vs `task:`](#spawn-vs-task--which-to-use) for the cases where `spawn:` is the
+right tool. Omit both for a **parked** node whose task the application spawns itself (e.g. a
+`Pause` sensor holding a peripheral handle) — the supervisor tracks it but never spawns it.
+
+### `task:` — generated shells for plain (or generic) workers
+
+`spawn:` names a hand-written `#[embassy_executor::task]` fn. `task:` instead names a **plain
+async fn** — possibly generic — and the macro stamps the concrete
+`#[embassy_executor::task]` shell for you. This is the escape hatch for embassy's
+"task functions must not be generic" rule (one static `TaskPool` per concrete future type):
+write the worker once, declare one node per concrete instantiation, and each declaration gets
+its own monomorphized shell.
+
+```rust,ignore
+async fn sensor<D: Sensor>(node: &'static TaskNode, dev: D) { /* ... */ }
+
+supervisor_graph! {
+    node BME = Terminate, deps: [BUS], task: sensor::<Bme280>(bme_dev());
+    node SHT = Terminate, deps: [BUS], task: sensor(sht_dev());   // turbofish optional
+}
+```
+
+Semantics:
+
+- Same path / partial-call forms as `spawn:` (no closures — the shell needs a name to call).
+- **Worker args are evaluated inside the shell**, at the task's first poll, on the node's own
+  executor — so the DSL never needs the arg types, an `executor:`/second-core node builds its
+  resources on the core that runs them, and cross-node data should go through awaited
+  accessors (a spawn batch polls last-first).
+- `pool_size: N` (default 1) sizes the shell's `TaskPool` — headroom for a respawn issued
+  while the previous instance is still draining.
+- On a `pool`, `task:` emits ONE shell sized to the member count.
+- Trace adoption and `executor:` routing compose exactly as with `spawn:`.
+- The ceiling embassy imposes still stands: concrete types are fixed per binary — `task:`
+  removes the boilerplate, not the monomorphization.
+
+### `spawn:` vs `task:` — which to use
+
+**Prefer `task:`.** It drops the `#[embassy_executor::task]` boilerplate, admits generic
+workers, sizes a pool's `TaskPool` from the member count automatically (no
+`pool_size = MAX` constant to keep in sync with the DSL's `max:`), and is the only form
+that supports `resources:`. The generated shell is free at runtime: its wrapper inlines
+into the same poll, and its `TaskPool` static simply replaces the one the attribute would
+have emitted.
+
+`spawn:` remains the right tool in four situations:
+
+1. **The task fn already carries `#[embassy_executor::task]` and you can't (or shouldn't)
+   strip it** — it lives in another crate, or other code depends on it staying a task fn.
+   `task:` needs a *plain* async fn to wrap; a token-returning task fn can't be re-wrapped.
+
+   ```rust,ignore
+   // other_crate exports: #[embassy_executor::task] pub async fn modem_task(..) { .. }
+   node MODEM = Terminate, deps: [], spawn: other_crate::modem_task(&NODES[0]);
+   ```
+
+2. **The same task is also spawned outside the graph.** `spawn:` reuses the one existing
+   `TaskPool`; `task:` would stamp a second shell + pool — duplicate RAM for the same
+   future type.
+
+   ```rust,ignore
+   #[embassy_executor::task(pool_size = 2)]
+   async fn logger(node: &'static TaskNode, sink: Sink) { /* ... */ }
+
+   // One instance supervised ...
+   node LOG = Pause, deps: [], spawn: logger(uart_sink());
+   // ... and one spawned by hand elsewhere, sharing logger's pool:
+   spawner.spawn(logger(&NODES[log_idx], usb_sink()).unwrap());
+   ```
+
+3. **Custom spawn-time logic** — the verbatim closure form (nodes only). `task:` rejects
+   closures (the shell needs a name to call).
+
+   ```rust,ignore
+   node SENSOR = Terminate, deps: [BUS],
+       spawn: |s: Spawner| {
+           let token = sensor_task(&SENSOR, if fast_variant() { Odr::Hz30 } else { Odr::Hz8 })?;
+           SENSOR.adopt(&token);   // closures bypass the macro's trace glue — adopt by hand
+           s.spawn(token)
+       };
+   ```
+
+4. **Arguments that must be evaluated at spawn time, on the supervisor's executor.**
+   `spawn:` partial-call args run in the spawn glue, at the moment of the (re)spawn;
+   `task:` extras run inside the shell at its *first poll, on the node's own executor*.
+   The `task:` behavior is what you usually want (an `executor:`/second-core node builds
+   its state on the core that runs it) — reach for `spawn:` when an argument snapshots
+   something that must be read *now* or must not run on the target tier.
+
+   ```rust,ignore
+   // Snapshot the respawn count at the moment of this spawn, not at first poll
+   // (an interrupt-tier node's first poll can preempt and land arbitrarily later):
+   node REPORT = Terminate, deps: [], executor: HIGH, spawn: report_task(boot_epoch());
+   ```
+
+Omitting both keeps the node **parked** (see [Spawn forms](#spawn-forms)) — that's a third
+option, not a tie-breaker between the two.
+
+### `resources:` — safe resource threading
+
+By default a supervised task that needs a peripheral re-acquires it inside its body
+(`Peripherals::steal()`), giving up embassy's compile-time ownership guarantee.
+`resources: [NAME: Type, ..]` (requires `task:`; node-only) restores it: each entry emits a
+`pub static NAME: ResourceSlot<Type>` at the declaration site, and `main` **moves** the
+resource in:
+
+```rust,ignore
+async fn blink(node: &'static TaskNode, led: &mut Output<'static>) { /* ... */ }
+
+supervisor_graph! {
+    node BLINK = Terminate, deps: [], task: blink,
+        resources: [LED: Output<'static>];
+}
+
+// main, after the Peripherals split:
+LED.provide(Output::new(p.PIN_25, Level::Low)); // consumes p.PIN_25 — no steal, no 2nd owner
+sup.start(spawner).await?;
+```
+
+The protocol, per (re)spawn:
+
+1. `main` `provide()`s the value once. Consuming the `Peripherals` field is the
+   **compile-time exclusive-ownership guarantee** — a second owner cannot exist.
+2. The generated glue `take()`s it just before the spawn. An unprovided slot fails
+   `Supervisor::start` with `SpawnError::Busy` after a bounded wait (the supervisor logs the
+   node name) — fail-closed at bring-up, not a panic inside a running task. Provisioning is
+   the runtime-checked half of the contract.
+3. The generated shell hands the worker `&mut Type` — after the node arg, in declared order,
+   before any partial-call extras — and `restore()`s the value after the worker returns
+   (i.e. after its shutdown ack). A Terminate respawn therefore re-takes the **same
+   instance**; a Pause worker never returns, so it simply retains its resources.
+
+The supervisor awaits a node's slots being filled before each (re)spawn (same bounded wait
+as `executor` slots), so late provisioning and the respawn-vs-restore window on another core
+are both covered. Caveats: a panic in the worker skips the restore (embedded panic = reboot);
+`pool_size > 1` on a `resources:` node buys nothing (the slot holds ONE value — a second
+concurrent spawn fails at `take()`); pools reject `resources:` (members would contend for a
+single instance).
 
 ### `disabled`
 
@@ -301,11 +465,22 @@ and are skipped everywhere at runtime.
 ### `pool`
 
 The mode list declares the members (floor first: typically `[Terminate, OnDemand, ...]`). The
-macro generates the member array `NAME: [TaskNode; K]`, per-member spawn glue, and a
-`NAME_POOL: ElasticPool<P>`. Pool fields are positional and fixed:
+macro generates the member array `NAME: [TaskNode; K]`, per-member spawn glue, a
+`NAME_POOL: ElasticPool<P>`, and the structural constants `NAME_MIN` / `NAME_MAX` /
+`NAME_MEMBERS` (`usize`). Pool fields are positional and fixed:
 `deps → executor? → spawn → policy → min → max`. `policy:` takes the scaling policy; annotate
 the type explicitly (`policy: DeferredShrink = make_policy()`) when the value isn't a
 `Type::new(..)` constructor.
+
+The constants exist for downstream **const-context sizing** — deriving a related capacity
+from the DSL instead of duplicating the number by hand (a `const` cannot read the member
+`static` array, so `NAME.len()` doesn't work there):
+
+```rust,ignore
+// One TCP socket per concurrently-running worker, plus one for DNS:
+pub const SOCKET_BUDGET: usize = HTTP_MAX + 1;
+let resources = StackResources::<SOCKET_BUDGET>::new();
+```
 
 ### Limits and compile-time validation
 
@@ -325,13 +500,24 @@ offending token:
   slot must happen inside it; only the task-fn-path forms combine with `executor:`
 - **malformed spawn form** — anything other than a task-fn path, a partial call, or a
   closure
+- **`task:` and `spawn:` together** — mutually exclusive per node/pool
+- **a closure in `task:`** — the generated shell needs a worker fn it can name
+- **`pool_size:` without `task:`** (or `pool_size: 0`) — it sizes the generated shell's
+  `TaskPool`; a hand-written task fn declares its own
+- **`resources:` without `task:`** — resources are taken/restored by the generated shell; a
+  hand-written `spawn:` fn manages its own arguments
+- **empty `resources:` list / duplicate resource name** — slot names are statics, unique
+  across the whole graph
+- **`resources:` on a `pool`** — members would contend for a single instance; declare
+  per-node
 - **pool bounds** — `min <= max <= K` (member count), values must fit `u8`
 - **pool without the `pool` feature** — a `pool` item requires enabling it
 - **more than 256 slots** — the `u8` index cap above
 - **dependency cycle** — caught by the `const` topological sort, so it surfaces at
   const-eval of `GRAPH` rather than at macro expansion; still a compile error
 
-Generated surface at the call site: one `pub static` per node, the pool array + `NAME_POOL`,
+Generated surface at the call site: one `pub static` per node, the pool array + `NAME_POOL`
+\+ the `NAME_MIN`/`NAME_MAX`/`NAME_MEMBERS` consts,
 one `SpawnerSlot` static per `executor NAME;`, and `pub static GRAPH` — nothing else.
 
 ## Recipes by use case
@@ -349,6 +535,30 @@ supervisor_graph! {
 
 `REPORTER` is brought up only after `SENSOR`. The topological order is computed at compile
 time — a cycle or an unknown dep name is a compile error.
+
+### Generic worker over N driver types (`task:`)
+
+```rust,ignore
+// ONE generic worker — a plain async fn, not a #[embassy_executor::task]:
+async fn poll_sensor<D: Sensor>(node: &'static TaskNode, dev: D) {
+    loop {
+        match select(dev.sample(), node.wait_shutdown()).await {
+            Either::First(v) => publish(v),
+            Either::Second(()) => return node.ack_dropped(),
+        }
+    }
+}
+
+supervisor_graph! {
+    node BUS = Terminate, deps: [], spawn: bus_task;
+    // One node per concrete driver; the macro stamps a monomorphized shell each:
+    node BME = Terminate, deps: [BUS], task: poll_sensor::<Bme280>(bme());
+    node SHT = Terminate, deps: [BUS], task: poll_sensor(sht());  // inferred
+}
+```
+
+Args (`bme()`, `sht()`) are evaluated inside each shell at first poll, on the
+node's own executor.
 
 ### Elastic worker pool with `DeferredShrink`
 

@@ -120,6 +120,9 @@ once with the `supervisor_graph!` macro; the supervisor does the rest:
 - **Elastic pools** — grow workers under load, shrink them after a cooldown, within a fixed budget.
 - **Multi-executor, multi-core placement** — `executor:` slots put nodes on an interrupt-priority
   tier or a second core, straight from the graph declaration.
+- **Safe resource threading** — `resources:` entries move owned peripherals from `main` into
+  workers through `ResourceSlot`s (compile-time exclusive ownership, no `steal()` in tasks),
+  restored on exit so a respawn re-takes the same instance.
 - **Dependency- and pool-honoring runtime control** — start/stop/pause/resume a task (or a whole
   pool) from anywhere; a stop cascades through dependents, a start through dependencies.
 - **Trace observability (feature-gated)** — per-task CPU ticks, poll counts, and per-executor

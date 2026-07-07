@@ -90,12 +90,12 @@ one-line `executor:` field in the graph:
 
 | Node | Mode | Deps | Executor | Boot state | How the supervisor manages it |
 |---|---|---|---|---|---|
-| `watchdog` | Terminate | — | thread | started | Detaches itself as its first act (`set_detached(true)`): the supervisor starts it once and then never tears it down, respawns it, or includes it in cascades — a self-managed daemon. |
-| `net` | Terminate | — | thread | started | Root of the data plane: torn down last among its subtree, dependents (`http`, `ota`) cascaded down first. Stopping it returns its whole ~16 KB heap budget. |
-| `heartbeat` | Pause | — | `HIGH` | started | Pause parks the task (it acks and keeps its LED `Output`); resume continues the same future. Never respawned. |
+| `watchdog` | Terminate | — | thread | started | Detaches itself as its first act (`set_detached(true)`): the supervisor starts it once and then never tears it down, respawns it, or includes it in cascades — a self-managed daemon. Its `Watchdog` driver is threaded from `main` via `resources:` (retained for life — the task never returns). |
+| `net` | Terminate | — | thread | started | Root of the data plane: torn down last among its subtree, dependents (`http`, `ota`) cascaded down first. Stopping it returns its whole ~16 KB heap budget. Its USB peripheral is threaded from `main` via `resources:` — restored on stop, re-taken on restart (same instance, no `steal()`). |
+| `heartbeat` | Pause | — | `HIGH` | started | Declared via `task:` — a plain **generic** worker over embedded-hal's `StatefulOutputPin`; the macro stamps its concrete `#[task]` shell. Its LED `Output` is threaded from `main` via `resources:`. Pause parks the task (it acks and keeps the pin); resume continues the same future. Never respawned. |
 | `http0` | Terminate | `net` | thread | started | The pool floor: always on while `net` is up; a manual stop of the floor seeds a whole-pool deactivate. |
 | `http1` | OnDemand | `net` | thread | stopped | Elastic burst worker: `ElasticPool<DeferredShrink>` (4 s cooldown, `min: 1, max: 2`) grows it when every running worker is busy, shrinks it back after the cooldown. |
-| `ota` | Terminate | `net` | thread | **disabled** | Control-started (`Activate` via `POST /api/ota` or the dashboard). Detaches itself at start, so once running it is uninterruptible; it then drains `http` and `net` itself and exits only via reset. |
+| `ota` | Terminate | `net` | thread | **disabled** | Control-started (`Activate` via `POST /api/ota` or the dashboard). Detaches itself at start, so once running it is uninterruptible; it then drains `http` and `net` itself and exits only via reset. The FLASH peripheral is threaded from `main` via `resources:` (`FLASH_DEV`); `mark_booted` (the `ota-confirm` path) borrows the same slot manually with `take()`/`restore()`, so the two FLASH users exclude each other at runtime. |
 | `bench` | Terminate | — | `CORE1` | **disabled** | Control-started compute load on core 1: the core-0 supervisor spawns/stops it cross-core through the `CORE1` spawner slot. Honors shutdown (`ack_dropped`) like any Terminate node. |
 | `ota-confirm` | Terminate | `http` (= pool floor) | thread | started | Depending on the pool name resolves to its floor member, so this node is spawned **last** in topological order. It detaches, waits for the network to come up, calls `mark_booted` to confirm the running image, and exits — a run-once job. |
 
@@ -109,9 +109,18 @@ What each node demonstrates:
 - **`net`** (`net.rs`) — a *reclaimable subsystem*, not a fixed reservation. The
   task owns the entire USB-CDC-NCM + embassy-net bring-up: on start it
   heap-allocates all buffers (descriptors, the ~12 KB packet pool, socket
-  storage); on stop it drops them, returning the whole budget.
-- **`heartbeat`** (`heartbeat.rs`) — *Pause/Resume with a retained resource*: the
-  LED `Output` is owned across pause→resume, never re-acquired. Its blink period
+  storage); on stop it drops them, returning the whole budget. It is also the
+  *restore-on-respawn showcase* for `resources:`: `main` moves `p.USB` into the
+  `USB_DEV` slot once; each bring-up reborrows it
+  (`Driver::new(usb.reborrow(), ..)`) and each stop restores it — a control-plane
+  stop/start cycles the same peripheral instance with zero `unsafe`.
+- **`heartbeat`** (`heartbeat.rs`) — *Pause/Resume with a retained resource*, and
+  the *`task:` generated-shell demo*: the worker
+  is a plain generic `async fn` over embedded-hal's `StatefulOutputPin` — portable
+  to any HAL — and `supervisor_graph!` stamps its concrete
+  `#[embassy_executor::task]` shell at the declaration. The LED `Output` is
+  threaded from `main` via `resources:` (`LED.provide(Output::new(p.PIN_25, ..))`)
+  and owned across pause→resume, never re-acquired. Its blink period
   is a runtime parameter (`POST /api/heartbeat?ms=`). It is also the firmware's
   **live consumer of `embassy_supervisor::trace`**: on every blink tick it walks
   `trace::executors()` and calls `trace::stalled_task(id, 100ms)` — and because it
@@ -125,7 +134,11 @@ What each node demonstrates:
   worker count. `mark_busy`/`mark_idle` drive the scaling.
 - **`ota`** (`ota.rs`) — the supervisor's signature *drain-to-free-budget* move:
   a disabled-at-boot node that, once control-started, orchestrates its own
-  resource draining (see [OTA update](#ota-update)).
+  resource draining (see [OTA update](#ota-update)). Also the *shared-slot*
+  pattern: FLASH is glue-threaded to the OTA worker, while `mark_booted` (called
+  from `ota-confirm`) borrows the same `FLASH_DEV` slot manually with
+  `take()`/`restore()` — the two users exclude each other at runtime, replacing
+  per-phase `steal()`s that a SAFETY comment used to justify.
 - **`bench`** (`bench.rs`) — *multi-core placement*: yield-chunked xorshift
   busywork that pins core 1's executor near 100% in-poll while core 0's numbers
   are untouched. Each task lives on one core; nothing migrates.
@@ -142,7 +155,10 @@ What each node demonstrates:
 | Deps on a pool name | `ota-confirm` depends on `http` → its floor member, so it runs last |
 | Detached daemon | `watchdog` — started once, excluded from every cascade |
 | Detached teardown | `ota` outlives the `net` it tears down (`set_detached`) |
-| Lifecycle: Pause/Resume | `heartbeat` keeps its LED `Output` across a pause |
+| Lifecycle: Pause/Resume | `heartbeat` keeps its LED pin across a pause |
+| Generated task shells (`task:`) | `heartbeat` is a generic worker over `StatefulOutputPin`; the macro stamps its `#[task]` shell |
+| Safe resource threading (`resources:`) | Every peripheral is moved from `main` — zero `steal()` in the firmware: `net`'s USB (`Peri`, restored across stop/start), `heartbeat`'s LED `Output`, `watchdog`'s driver (retained for life), and `ota`'s FLASH (glue-threaded, plus a manual `take()`/`restore()` borrow of the same slot by `mark_booted`) |
+| `task:`-only graph | All nodes and the pool are declared with `task:` — no hand-written `#[embassy_executor::task]` remains except the hand-spawned `app_supervisor` |
 | Lifecycle: control-started | `ota` and `bench` are pre-disabled, started by control |
 | Multi-executor tier | `heartbeat` on the `HIGH` `InterruptExecutor` (SWI_IRQ_0 @ P2) |
 | Multi-core placement | `bench` on `CORE1` via the graph's spawner slot |

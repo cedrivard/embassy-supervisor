@@ -29,6 +29,12 @@
 //!     an interrupt-priority tier or the second core. Bring-up *awaits* the slot
 //!     (bounded), so an executor that comes up late — or on another core — is a
 //!     rendezvous, not a race.
+//!   * `resources: [NAME: Type, ..]` on a `task:` node threads **owned resources
+//!     from `main`** into the worker through macro-emitted [`ResourceSlot`]s —
+//!     compile-time exclusive ownership (the `Peripherals` field is consumed, no
+//!     `steal()` inside the task), fail-closed provisioning (an unprovided slot
+//!     fails `start` with `SpawnError::Busy`), and restore-on-exit so a respawn
+//!     re-takes the *same instance*.
 //!   * Two flags span every lifecycle operation: **disabled** (stopped until an
 //!     explicit `Activate` — declared `disabled` in the graph or control-stopped;
 //!     see [`TaskNode::set_disabled`]) and **detached** (self-managed: after
@@ -460,6 +466,119 @@ impl Default for SpawnerSlot {
     }
 }
 
+// ─── ResourceSlot ────────────────────────────────────────────────────────
+
+/// Type-erased readiness view of a [`ResourceSlot`], for the supervisor's
+/// bring-up wait.
+///
+/// A `TaskNode` can gate on any number of slots of *different* `T`s, so the node
+/// stores `&'static [&'static dyn ResourceGate]` (object-safe: no `T` in the
+/// signatures). Same shape as embassy's `dyn` driver registries — see
+/// <https://doc.rust-lang.org/reference/items/traits.html#object-safety>.
+/// The supervisor only needs "is it filled?" plus the signal to park on; taking
+/// the value stays in the generated spawn glue, where the concrete `T` is known.
+pub trait ResourceGate: Sync {
+    /// Non-consuming "is the slot currently filled" check.
+    fn is_filled(&self) -> bool;
+    /// The latching [`Signal`] fired by `provide`/`restore`, for the supervisor's
+    /// bounded pre-spawn wait (see [`Supervisor::start`]).
+    fn filled_signal(&self) -> &Signal<CriticalSectionRawMutex, ()>;
+}
+
+/// A one-value handoff cell threading an owned resource from `main` into a
+/// supervised task — the safe replacement for `Peripherals::steal()` inside
+/// the task body.
+///
+/// Declared (as a `pub static`) by [`supervisor_graph!`] for each entry in a
+/// node's `resources:` clause. The protocol:
+///
+/// 1. `main` splits `Peripherals` and **moves** the resource in with
+///    [`provide`](Self::provide). This is where the compile-time guarantee
+///    lives: the singleton field is *consumed*, so no second owner — and no
+///    `unsafe` steal — can exist.
+/// 2. The generated spawn glue [`take`](Self::take)s it just before spawning
+///    the node. An empty slot fails the spawn with `SpawnError::Busy` — a
+///    fail-closed error out of [`Supervisor::start`], not a panic inside the
+///    task (compare `static_cell::StaticCell`, which panics on misuse).
+/// 3. The generated task shell hands the worker `&mut T` and
+///    [`restore`](Self::restore)s the value after the worker returns, so a
+///    `Terminate` respawn re-takes the *same instance* instead of stealing a
+///    fresh one. (A `Pause` worker never returns — it parks — so it simply
+///    retains the resource, exactly like a hand-written parked task.)
+///
+/// Same primitives as [`SpawnerSlot`]: a critical-section
+/// [`BlockingMutex`]`<`[`Cell`]`<Option<T>>>` for the value (`Sync` for
+/// `T: Send`, provided by embassy-sync — no `unsafe` here) plus a latching
+/// [`Signal`] so the supervisor can await late provisioning (bounded; see
+/// [`Supervisor::start`]).
+pub struct ResourceSlot<T> {
+    slot: BlockingMutex<CriticalSectionRawMutex, Cell<Option<T>>>,
+    /// Wakes the supervisor's pre-spawn wait when `provide`/`restore` fills the
+    /// slot (latching, so a fill racing the check-then-wait still wakes it).
+    filled: Signal<CriticalSectionRawMutex, ()>,
+}
+
+impl<T> ResourceSlot<T> {
+    /// An empty slot (`const` — it lives in a `static` the macro emits).
+    pub const fn new() -> Self {
+        Self {
+            slot: BlockingMutex::new(Cell::new(None)),
+            filled: Signal::new(),
+        }
+    }
+
+    /// Move the resource in (from `main`'s `Peripherals` split) and wake the
+    /// supervisor's pre-spawn wait. Call before [`Supervisor::start`]; a slot
+    /// still empty after the supervisor's bounded wait fails that node's spawn
+    /// with `SpawnError::Busy`. Filling an occupied slot replaces (drops) the
+    /// old value — don't: one resource, one slot, moved exactly once.
+    pub fn provide(&self, value: T) {
+        self.slot.lock(|c| c.set(Some(value)));
+        self.filled.signal(());
+    }
+
+    /// Take the resource out, leaving the slot empty. Called by the generated
+    /// spawn glue just before the spawn; `None` means "not provided yet" or
+    /// "currently held by a live task instance".
+    pub fn take(&self) -> Option<T> {
+        self.slot.lock(Cell::take)
+    }
+
+    /// Put the resource back for the next spawn. Called by the generated task
+    /// shell after the worker returns (i.e. after its clean shutdown ack), so a
+    /// respawn re-takes the same instance.
+    pub fn restore(&self, value: T) {
+        self.provide(value);
+    }
+}
+
+// `T: Send` (not just any `T`): the gate is reachable from the supervisor task,
+// which may run on a different core than the provider — the same bound the
+// inner `BlockingMutex` requires for `Sync`, restated here so the `dyn` upcast
+// can't outrun it.
+impl<T: Send> ResourceGate for ResourceSlot<T> {
+    fn is_filled(&self) -> bool {
+        // Peek without consuming: `Cell` has no `&T` access (no `T: Copy`
+        // here), so take-and-put-back under the same critical section.
+        self.slot.lock(|c| {
+            let v = c.take();
+            let filled = v.is_some();
+            c.set(v);
+            filled
+        })
+    }
+
+    fn filled_signal(&self) -> &Signal<CriticalSectionRawMutex, ()> {
+        &self.filled
+    }
+}
+
+impl<T> Default for ResourceSlot<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ─── TaskNode ────────────────────────────────────────────────────────────
 
 /// A node in the supervisor's task graph.
@@ -486,6 +605,15 @@ pub struct TaskNode {
     /// generated glue's own non-blocking `SpawnerSlot::get` is already filled. Set
     /// by the macro via [`with_executor`](Self::with_executor); `const`, zero-cost.
     spawn_slot: Option<&'static SpawnerSlot>,
+    /// The [`ResourceSlot`]s this node's spawn takes from (`resources:` in the
+    /// graph), type-erased to their [`ResourceGate`] readiness view. The
+    /// supervisor awaits every gate being filled (bounded by
+    /// [`SLOT_READY_TIMEOUT`]) *before* invoking `spawn`, so (a) a `main` that
+    /// provides late is tolerated and (b) a respawn cannot race the previous
+    /// instance's shell restoring the value (the restore happens after the
+    /// worker's shutdown ack). Empty for nodes without `resources:`. Set by the
+    /// macro via [`with_resources`](Self::with_resources); `const`, zero-cost.
+    resource_gates: &'static [&'static dyn ResourceGate],
     handle: TaskHandle,
 }
 
@@ -511,6 +639,7 @@ impl TaskNode {
             mode,
             spawn,
             spawn_slot: None,
+            resource_gates: &[],
             handle: TaskHandle::new(disabled_at_boot),
         }
     }
@@ -522,6 +651,16 @@ impl TaskNode {
     /// `const` and chainable in a `static` initializer; emitted by [`supervisor_graph!`].
     pub const fn with_executor(mut self, slot: &'static SpawnerSlot) -> Self {
         self.spawn_slot = Some(slot);
+        self
+    }
+
+    /// Declare the [`ResourceSlot`]s this node's spawn takes from (the
+    /// `resources:` graph clause). The supervisor awaits every gate being
+    /// filled before spawning the node, so the generated glue's non-blocking
+    /// `take()` finds the value. `const` and chainable in a `static`
+    /// initializer; emitted by [`supervisor_graph!`].
+    pub const fn with_resources(mut self, gates: &'static [&'static dyn ResourceGate]) -> Self {
+        self.resource_gates = gates;
         self
     }
 
@@ -824,6 +963,34 @@ async fn await_spawn_slot(node: &'static TaskNode) -> Result<(), SpawnError> {
     Ok(())
 }
 
+/// Await every [`ResourceSlot`] a node's `resources:` clause takes from being
+/// filled, bounded by [`SLOT_READY_TIMEOUT`] per gate. Covers two windows:
+/// `main` providing after `start` was entered, and — on respawn — the previous
+/// instance's shell still between the shutdown ack and its `restore()` call
+/// (on another core the two can genuinely overlap). A gate still empty at the
+/// deadline yields [`SpawnError::Busy`] — an unprovided slot is a loud
+/// misconfiguration, not a silent hang. Nodes without `resources:` have an
+/// empty gate list and never touch the timer. Same check-then-park loop as
+/// [`SpawnerSlot::ready`]; the `filled` signal latches, so a fill racing the
+/// check still wakes the wait (and the same single-pre-fill-waiter caveat
+/// applies — the supervisor task is the only intended waiter).
+async fn await_resources(node: &'static TaskNode) -> Result<(), SpawnError> {
+    for gate in node.resource_gates {
+        let wait = async {
+            loop {
+                if gate.is_filled() {
+                    break;
+                }
+                gate.filled_signal().wait().await;
+            }
+        };
+        with_timeout(SLOT_READY_TIMEOUT, wait)
+            .await
+            .map_err(|_| SpawnError::Busy)?;
+    }
+    Ok(())
+}
+
 impl<const N: usize> Supervisor<N> {
     /// Build a supervisor from a precomputed [`Graph`] — the `GRAPH` that
     /// `supervisor_graph!` emits (node slots, dependency-index table, compile-time
@@ -867,8 +1034,11 @@ impl<const N: usize> Supervisor<N> {
             if let Some(spawn) = node.spawn {
                 // For an `executor:` node, wait (bounded) for its slot to be filled
                 // before spawning; a same-executor node has no slot, so this is an
-                // immediate no-op and the bring-up loop stays tight.
+                // immediate no-op and the bring-up loop stays tight. Then wait for
+                // the node's `resources:` slots (if any) so the glue's take() finds
+                // the value even if main provides late.
                 await_spawn_slot(node).await?;
+                await_resources(node).await?;
                 spawn(spawner)?;
             }
             node.set_running(true);
@@ -889,6 +1059,7 @@ impl<const N: usize> Supervisor<N> {
         node.reset();
         if let Some(spawn) = node.spawn {
             await_spawn_slot(node).await?;
+            await_resources(node).await?;
             spawn(spawner)?;
         }
         node.set_running(true);
@@ -987,6 +1158,10 @@ impl<const N: usize> Supervisor<N> {
                 info!("supervisor: respawning {}", node.name);
                 if let Some(spawn) = node.spawn {
                     await_spawn_slot(node).await?;
+                    // A `resources:` node's previous instance restores its slot
+                    // value only after the shutdown ack, so wait (bounded) for
+                    // the restore before the glue's take().
+                    await_resources(node).await?;
                     spawn(spawner)?;
                 }
                 node.set_running(true);

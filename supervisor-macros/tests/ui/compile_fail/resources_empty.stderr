@@ -1,0 +1,5 @@
+error: `resources:` must declare at least one `NAME: Type` entry
+ --> tests/ui/compile_fail/resources_empty.rs:8:49
+  |
+8 |     node W = Terminate, deps: [], task: worker, resources: [];
+  |                                                 ^^^^^^^^^

@@ -6,6 +6,40 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.3.0] - 2026-07-07
+
+Requires `embassy-supervisor` >= 0.3.0; pinned by exact version from the supervisor
+crate (`=0.3.0` as of supervisor 0.3.1).
+
+### Added
+- The `task:` node/pool clause: name a **plain async worker fn** — possibly generic —
+  and the macro stamps the concrete `#[embassy_executor::task]` shell per declaration
+  (embassy forbids generic tasks: one static `TaskPool` per concrete future type).
+  Same path/partial-call forms as `spawn:`; worker args are evaluated inside the shell
+  at the task's first poll, on the node's own executor; trace adoption and `executor:`
+  routing compose unchanged.
+- `pool_size: N` on a `task:` node sizes the generated shell's `TaskPool` (default 1);
+  a `task:` pool emits one shell sized to the member count.
+- The `resources: [NAME: Type, ..]` node clause (requires `task:`) — **safe resource
+  threading**: each entry emits a `pub static NAME: ResourceSlot<Type>` at the
+  declaration site. `main` moves the resource in with `NAME.provide(..)` (consuming
+  the `Peripherals` field — compile-time exclusive ownership, no `steal()` inside the
+  task), the generated glue `take()`s it just before the spawn (an unprovided slot
+  fails `Supervisor::start` with `SpawnError::Busy`, not a task-side panic), and the
+  shell hands the worker `&mut Type` (after the node arg, in declared order, before
+  partial-call extras) and `restore()`s the value after the worker returns — a
+  Terminate respawn re-takes the *same instance*. The node is emitted with
+  `.with_resources(..)` so the supervisor awaits provisioning/restore before each
+  (re)spawn.
+- Each `pool` also emits the structural `pub const`s `<POOL>_MIN`, `<POOL>_MAX`, and
+  `<POOL>_MEMBERS` (`usize`), so downstream compile-time sizing can derive from the
+  DSL instead of duplicating it (e.g. `const SOCKET_BUDGET: usize = HTTP_MAX + 1`) —
+  a `const` cannot read these off the member `static` array (E0013).
+- New compile errors: `task:` combined with `spawn:`, a closure in `task:`,
+  `pool_size:` without `task:` (or zero), `resources:` without `task:`, an empty
+  `resources:` list, a duplicate resource name (within a node or across the graph),
+  and `resources:` on a `pool` (members would contend for a single instance).
+
 ## [0.2.0] - 2026-07-06
 
 Requires `embassy-supervisor` >= 0.3.0 (the generated `executor:` glue uses that
@@ -52,5 +86,6 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
+[0.3.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.2.0...embassy-supervisor-macros-v0.3.0
 [0.2.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.1.0...embassy-supervisor-macros-v0.2.0
 [0.1.0]: https://github.com/cedrivard/embassy-supervisor/releases/tag/embassy-supervisor-macros-v0.1.0

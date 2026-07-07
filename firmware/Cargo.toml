@@ -31,6 +31,10 @@ embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"]
 embassy-sync = { version = "0.8", features = ["defmt"] }
 embassy-futures = "0.1"
 
+# HAL-agnostic pin trait for the generic heartbeat worker (the `task:` demo):
+# the task is generic over StatefulOutputPin, so it ports to any embedded-hal HAL.
+embedded-hal = "1"
+
 # RP2350 HAL. `rp235xb` matches the SparkFun IoT RedBoard RP2350 (48-GPIO B
 # variant); switch to `rp235xa` for a standard Raspberry Pi Pico 2.
 # `binary-info` embeds the RP2350 image-definition the boot ROM requires.
