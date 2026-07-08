@@ -234,7 +234,6 @@ async fn download_to_scratch(t: &Target, flash: Peri<'_, FLASH>) -> Result<usize
 
 type Blk<'a> = Flash<'a, FLASH, Blocking, FLASH_SIZE>;
 
-
 /// Streams the compressed download into scratch flash, erasing sectors on first
 /// touch (offsets grow monotonically).
 struct Scratch<'a> {

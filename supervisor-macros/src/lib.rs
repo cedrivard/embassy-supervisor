@@ -94,12 +94,16 @@
 //! / `GRAPH.deps` / `GRAPH.order` / `GRAPH.pools` (node count is `GRAPH.nodes.len()`).
 //!
 //! With the supervisor's `trace` feature (forwarded here) the generated spawn glue
-//! also captures each `SpawnToken`'s task id into its node (`set_task_id`), and
-//! `trace-names` stamps the node name into the task Metadata. With `trace-hooks`
-//! the macro additionally defines the seven `_embassy_trace_*` hook symbols at the
-//! declaration site (the supervisor crate is `forbid(unsafe_code)` and cannot),
-//! forwarding to the supervisor's `trace` recorders — requires an edition-2024
-//! consumer, and exactly one graph declaration (or hook set) per binary.
+//! also captures each `SpawnToken`'s task id into its node (`set_task_id`); with
+//! `metadata-names` it stamps the node name into the task Metadata. These are
+//! independent: `metadata-names` without `trace` emits a name-only spawn path
+//! (`stamp_name`, no id capture, no `_embassy_trace_*` dependency), so node names
+//! reach external tooling (rtos-trace/SystemView) without the trace recorders.
+//! With `trace-hooks` the macro additionally defines the seven `_embassy_trace_*`
+//! hook symbols at the declaration site (the supervisor crate is
+//! `forbid(unsafe_code)` and cannot), forwarding to the supervisor's `trace`
+//! recorders — requires an edition-2024 consumer, and exactly one graph declaration
+//! (or hook set) per binary.
 //!
 //! Types are referenced absolutely (`::embassy_supervisor::…`), so the consuming
 //! crate must depend on `embassy-supervisor` under its real name (not aliased).
@@ -718,15 +722,28 @@ fn node_spawn(
 /// id can be captured into the node (`set_task_id`) — the id→node mapping the
 /// supervisor's `trace` recorders resolve against (in embassy-executor 0.10 the
 /// task-fn call returns `Result<SpawnToken, SpawnError>` and `Spawner::spawn`
-/// itself is infallible, so the token is available between the two). Under
-/// `trace-names` the node's name is also stamped into the task Metadata so
-/// external consumers (rtos-trace/SystemView) see names instead of raw ids.
+/// itself is infallible, so the token is available between the two).
+///
+/// Three shapes, resolved at expansion by the macro crate's own features:
+/// * `trace` on → bind the token and `adopt` it (`set_task_id` + name stamp under
+///   `metadata-names`).
+/// * `trace` off but `metadata-names` on → bind the token and `stamp_name` only:
+///   the node name reaches the task Metadata (for rtos-trace/SystemView) with no id
+///   capture and no dependency on the `_embassy_trace_*` hooks.
+/// * neither → plain infallible spawn.
 fn spawn_stmts(call: &TokenStream2, node_ref: &TokenStream2, sp: &TokenStream2) -> TokenStream2 {
     if cfg!(feature = "trace") {
-        // `adopt` = set_task_id + (under trace-names) Metadata name stamp.
+        // `adopt` = set_task_id + (under metadata-names) Metadata name stamp.
         quote! {
             let __token = #call?;
             (#node_ref).adopt(&__token);
+            #sp.spawn(__token);
+        }
+    } else if cfg!(feature = "metadata-names") {
+        // Name-only path: stamp the node name into the task Metadata, nothing else.
+        quote! {
+            let __token = #call?;
+            (#node_ref).stamp_name(&__token);
             #sp.spawn(__token);
         }
     } else {

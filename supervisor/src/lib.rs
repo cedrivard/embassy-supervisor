@@ -105,10 +105,12 @@
 //!     macros are no-ops.
 //!   * `trace` family (all opt-in) — `trace`: the [`trace`] recorders consuming
 //!     embassy-executor's `_embassy_trace_*` hooks; `trace-hooks`:
-//!     `supervisor_graph!` also *defines* the hook symbols; `trace-names`: node
-//!     names stamped into task Metadata for external consumers; `trace-nested`:
-//!     preemption-exact accounting (a nested higher-tier poll credits its time
-//!     back to the window it interrupted).
+//!     `supervisor_graph!` also *defines* the hook symbols; `metadata-names`: node
+//!     names stamped into task Metadata for external consumers (rtos-trace/
+//!     SystemView) — independent of `trace`, so it needs no hook symbols and pairs
+//!     with embassy's own `rtos-trace`; `trace-names`: shorthand for `trace` +
+//!     `metadata-names`; `trace-nested`: preemption-exact accounting (a nested
+//!     higher-tier poll credits its time back to the window it interrupted).
 //!
 //! Build with `default-features = false` for a minimal core that only does
 //! dependency-ordered bring-up/teardown (drops the control plane and pools,
@@ -797,7 +799,7 @@ impl TaskNode {
     }
 
     /// Register an externally-spawned token as this node's live task: records
-    /// the task id for the [`trace`] recorders and (feature `trace-names`)
+    /// the task id for the [`trace`] recorders and (feature `metadata-names`)
     /// stamps the node name into the task Metadata. One call replaces the
     /// manual [`set_task_id`](Self::set_task_id) dance wherever the macro can't
     /// see the token — parked nodes and verbatim-closure `spawn:` forms:
@@ -810,7 +812,24 @@ impl TaskNode {
     #[cfg(feature = "trace")]
     pub fn adopt<S>(&self, token: &embassy_executor::SpawnToken<S>) {
         self.set_task_id(token.id());
-        #[cfg(feature = "trace-names")]
+        #[cfg(feature = "metadata-names")]
+        self.stamp_name(token);
+    }
+
+    /// Stamp this node's name into the task's embassy `Metadata` (feature
+    /// `metadata-names`), so external consumers — rtos-trace/SystemView, debuggers —
+    /// show the graph node name instead of an opaque task id. Unlike
+    /// [`adopt`](Self::adopt) this does **not** capture the task id or touch the
+    /// supervisor's [`trace`] recorders, so it needs neither the `trace` feature nor
+    /// the `_embassy_trace_*` hook symbols: it is the name-only spawn path emitted
+    /// when `metadata-names` is on but `trace` is off (pair it with embassy's
+    /// `rtos-trace`). Called automatically by the spawn glue; call it manually only
+    /// for a parked or verbatim-closure node the macro can't see.
+    ///
+    /// Requires `embassy-executor`'s `metadata-name` feature, which `metadata-names`
+    /// pulls in; without a registered name the task keeps embassy's default.
+    #[cfg(feature = "metadata-names")]
+    pub fn stamp_name<S>(&self, token: &embassy_executor::SpawnToken<S>) {
         token.metadata().set_name(self.name);
     }
 

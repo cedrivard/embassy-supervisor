@@ -4,7 +4,7 @@ name = "embassy-supervisor-macros"
 # version (`=x.y.z`): the generated code references doc(hidden) supervisor internals,
 # so only the tested pair is guaranteed compatible. Bump only when the macro changes;
 # the supervisor updates its pin to match.
-version = "0.3.0"
+version = "0.3.1"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -32,8 +32,14 @@ pool = []
 # Forwarded from the supervisor's `trace` feature: the generated spawn glue captures
 # each SpawnToken's task id into the node (`set_task_id`) before spawning it.
 trace = []
-# Forwarded from `trace-names`: additionally stamp the node name into task Metadata.
-trace-names = ["trace"]
+# Forwarded from the supervisor's `metadata-names` feature: the generated spawn glue
+# stamps the node name into the task's Metadata (`stamp_name`). Read at expansion
+# time by `spawn_stmts`; independent of `trace`, so a graph built with names but not
+# `trace` emits the name-only spawn path (no `adopt`, no id capture).
+metadata-names = []
+# Forwarded from `trace-names`: the full trace layer with node names = trace + the
+# name stamp. Kept as an alias for back-compat; effective behavior unchanged.
+trace-names = ["trace", "metadata-names"]
 # Forwarded from the supervisor's `trace-hooks`: emit the seven `no_mangle`
 # `_embassy_trace_*` hook definitions at the graph declaration site (the supervisor
 # crate itself is `forbid(unsafe_code)` and cannot define them).
