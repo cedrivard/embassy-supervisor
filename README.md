@@ -134,8 +134,8 @@ use embassy_supervisor::{supervisor_graph, Supervisor};
 // One declaration generates the node `static`s and a single `GRAPH` bundling the
 // node slots, deps, and compile-time order. `app` depends on `net`, so it starts after it.
 supervisor_graph! {
-    node NET = Terminate, deps: [],    spawn: net_task;
-    node APP = Terminate, deps: [NET], spawn: app_task;
+    node NET = Terminate, deps: [],    task: net_task;
+    node APP = Terminate, deps: [NET], task: app_task;
 }
 
 // in your supervisor task (an async context):

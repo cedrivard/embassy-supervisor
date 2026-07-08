@@ -29,6 +29,12 @@
 //!     an interrupt-priority tier or the second core. Bring-up *awaits* the slot
 //!     (bounded), so an executor that comes up late — or on another core — is a
 //!     rendezvous, not a race.
+//!   * Each managed task names its worker with either `task:` (preferred) — a
+//!     **plain `async fn`** that the macro wraps in a generated
+//!     `#[embassy_executor::task]` shell (one concrete shell per declaration, so a
+//!     *generic* worker is fine) — or `spawn:`, naming a hand-written
+//!     `#[embassy_executor::task]` directly. A `task:` pool emits one shell sized to
+//!     its members; `pool_size: N` sizes a single node's shell.
 //!   * `resources: [NAME: Type, ..]` on a `task:` node threads **owned resources
 //!     from `main`** into the worker through macro-emitted [`ResourceSlot`]s —
 //!     compile-time exclusive ownership (the `Peripherals` field is consumed, no
@@ -56,9 +62,12 @@
 //!
 //! ## Writing a supervised task
 //!
-//! A supervised task is a plain `#[embassy_executor::task]` whose first parameter
-//! is its node (the macro's `spawn:` glue passes it; extra arguments come from the
-//! partial-call spawn form). Four rules cover the task side of the protocol:
+//! A supervised worker's first parameter is its node. With `task:` you write a
+//! plain `async fn` and the macro stamps the `#[embassy_executor::task]` shell
+//! (and, with `resources:`, hands it `&mut` resource handles after the node, in
+//! declared order); with `spawn:` you write the `#[embassy_executor::task]`
+//! yourself. Either way the macro's glue passes the node, and extra arguments come
+//! from the partial-call spawn form. Four rules cover the task side of the protocol:
 //!
 //!   1. select long-lived work against [`TaskNode::wait_shutdown`] — that's how a
 //!      stop reaches you;
@@ -116,10 +125,11 @@
 //! use embassy_executor::Spawner;
 //! use embassy_supervisor::{supervisor_graph, Supervisor, wait_control};
 //!
-//! // `app` depends on `net`; each `spawn:` names a task fn spawned with the node.
+//! // `app` depends on `net`; `task:` names a plain async worker fn the macro wraps
+//! // in its `#[embassy_executor::task]` shell (`spawn:` takes one you wrote yourself).
 //! supervisor_graph! {
-//!     node NET = Terminate, deps: [], spawn: net_task;
-//!     node APP = Terminate, deps: [NET], spawn: app_task;
+//!     node NET = Terminate, deps: [], task: net_task;
+//!     node APP = Terminate, deps: [NET], task: app_task;
 //! }
 //!
 //! #[embassy_executor::task]
