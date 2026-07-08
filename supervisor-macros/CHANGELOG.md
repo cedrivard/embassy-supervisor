@@ -6,6 +6,23 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.3.1] - 2026-07-08
+
+Requires `embassy-supervisor` >= 0.3.2; pinned by exact version from the supervisor
+crate (`=0.3.1` as of supervisor 0.3.2).
+
+### Added
+- The `metadata-names` feature: a name-only spawn path. When it is on but `trace` is
+  off, `spawn_stmts` binds the `SpawnToken` and calls `TaskNode::stamp_name(&token)`
+  (node name → task `Metadata`) instead of `adopt` — no task-id capture and no
+  dependency on the `_embassy_trace_*` hooks, so a graph gets its node names into
+  external consumers (rtos-trace/SystemView) without pulling in the trace recorders.
+
+### Changed
+- `trace-names` is redefined as `["trace", "metadata-names"]` (was `["trace"]`). Same
+  effective codegen when `trace` is on (the `adopt` path, which stamps the name under
+  `metadata-names`); the split just lets the name stamp be requested on its own.
+
 ## [0.3.0] - 2026-07-07
 
 Requires `embassy-supervisor` >= 0.3.0; pinned by exact version from the supervisor
@@ -86,6 +103,7 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
+[0.3.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.3.0...embassy-supervisor-macros-v0.3.1
 [0.3.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.2.0...embassy-supervisor-macros-v0.3.0
 [0.2.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.1.0...embassy-supervisor-macros-v0.2.0
 [0.1.0]: https://github.com/cedrivard/embassy-supervisor/releases/tag/embassy-supervisor-macros-v0.1.0

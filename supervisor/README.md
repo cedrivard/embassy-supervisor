@@ -11,6 +11,7 @@ target. The only third-party deps are pure-embassy crates (`embassy-executor`/`-
 ## Table of contents
 
 - [What it is](#what-it-is)
+- [Highlights in 0.3.2](#highlights-in-032)
 - [Highlights in 0.3.1](#highlights-in-031)
 - [Quickstart](#quickstart)
 - [The model](#the-model)
@@ -51,6 +52,22 @@ target. The only third-party deps are pure-embassy crates (`embassy-executor`/`-
 
 The supervisor deliberately does **not** allocate, own a HAL, manage power states, or know what your
 tasks do — it orchestrates their *lifecycle* and leaves the rest to you.
+
+## Highlights in 0.3.2
+
+Ships with `embassy-supervisor-macros` 0.3.1 .
+
+New **`metadata-names`** feature: stamp node names into task `Metadata` independently of the
+`trace` recorders (no `_embassy_trace_*` symbols). Use it to:
+
+- **See graph node names in SystemView / a debugger** while profiling on a J-Link — enable it
+  next to embassy's `rtos-trace` and the timeline reads `NET`, `HTTP`, `OTA` instead of opaque
+  task ids, with none of the supervisor's per-poll recorder overhead.
+- **Get readable task names in a RAM dump or `defmt` task view** on a shipping build where you
+  don't want the trace layer's cost but still want to tell tasks apart in a crash log.
+
+`trace-names` is now shorthand for `trace` + `metadata-names`, so the full trace layer (with
+names) is unchanged; the name stamp is just usable on its own now.
 
 ## Highlights in 0.3.1
 
@@ -802,10 +819,19 @@ executor poll is attributed to a *named* node — correctly across respawns.
 The split across the family: `trace` is recorders only; `trace-hooks` additionally emits the
 seven hook symbol definitions at the graph declaration site (exactly one set may exist per
 binary — define your own hooks and forward to the `trace::on_*` recorders if you need
-custom ones); `trace-names` stamps node names into task Metadata for external tooling
-(SystemView, debuggers); `trace-nested` makes accounting preemption-exact — a nested
-higher-tier poll credits its time back to the window it interrupted (register
-`trace::set_core_id_fn` on multi-core for one preemption stack per core).
+custom ones); `metadata-names` stamps node names into task Metadata for external tooling
+(SystemView, debuggers); `trace-names` is shorthand for `trace` + `metadata-names`;
+`trace-nested` makes accounting preemption-exact — a nested higher-tier poll credits its
+time back to the window it interrupted (register `trace::set_core_id_fn` on multi-core for
+one preemption stack per core).
+
+`metadata-names` is independent of `trace`: it pulls only `embassy-executor/metadata-name`,
+not `embassy-executor/trace`, so it emits **no** `_embassy_trace_*` hook symbols and links
+cleanly on its own. That makes it the piece you want for a pure external tracer: enable
+`metadata-names` alongside embassy's own `rtos-trace` feature (which also pulls
+`metadata-name`) and SystemView shows your graph's node names — with none of the supervisor's
+recorder overhead and no hook-symbol requirement. Enabling `trace`/`trace-names` instead
+brings the recorders back and, as ever, requires the hook symbols (`trace-hooks` or your own).
 
 Limitations: accounting is preemption-naive without `trace-nested`; hardware-ISR time is
 invisible either way; executor busy% exceeds the per-node sum by a per-poll accounting gap
@@ -824,7 +850,8 @@ already pins.
 | `defmt`   |         | route the supervisor's logs through `defmt` (otherwise the log macros are no-ops) |
 | `trace`   |         | trace-hook observability: per-node CPU time / poll counts / max-poll watermark, executor idle time, stall detection |
 | `trace-hooks` |     | batteries-included: the graph declaration also defines the `_embassy_trace_*` hook symbols (implies `trace`) |
-| `trace-names` |     | stamp node names into task Metadata for external tooling (implies `trace`) |
+| `metadata-names` |  | stamp node names into task Metadata for external tooling (rtos-trace/SystemView); independent of `trace` — no hook symbols |
+| `trace-names` |     | shorthand for `trace` + `metadata-names` |
 | `trace-nested` |    | preemption-exact accounting: nested higher-tier polls are credited back to the window they interrupt (implies `trace`) |
 
 `default-features = false` gives a minimal core that only does dependency-ordered

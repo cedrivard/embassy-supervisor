@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.3.1"
+version = "0.3.2"
 description = "A generic, HAL-agnostic task-lifecycle supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, and runtime start/stop/pause/resume control."
 edition.workspace = true
 authors.workspace = true
@@ -25,7 +25,7 @@ embassy-futures = { version = "0.1" }
 portable-atomic = { version = "1", features = ["critical-section"] }
 defmt = { version = "1.1.0", optional = true }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.3.0", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.3.1", path = "../supervisor-macros", optional = true }
 
 [features]
 # Full-featured out of the box; a footprint-constrained consumer trims with
@@ -47,15 +47,26 @@ macros = ["dep:embassy-supervisor-macros"]
 # gated separately (see `trace-hooks`) so an application with its own hooks can
 # forward to the recorders manually, and so the recorders stay host-testable.
 trace = ["embassy-executor/trace", "embassy-supervisor-macros?/trace"]
+# Stamp each node's name into its task Metadata at spawn, so external consumers
+# (rtos-trace/SystemView, debuggers) see node names instead of opaque ids —
+# WITHOUT the supervisor's own trace recorders/hooks. Independent of `trace`: it
+# pulls only `embassy-executor/metadata-name` (not `embassy-executor/trace`), so it
+# adds no `_embassy_trace_*` symbols and links cleanly alongside embassy's own
+# `rtos-trace` feature (which also pulls `metadata-name`). Costs a `&str` slot on
+# every TaskStorage in the binary.
+metadata-names = [
+    "embassy-executor/metadata-name",
+    "embassy-supervisor-macros?/metadata-names",
+]
 # Batteries-included: `supervisor_graph!` defines the seven `no_mangle`
 # `_embassy_trace_*` symbols at the graph declaration site. Exactly ONE
 # definition may exist per binary: enable this OR define your own hooks and
 # forward to the `trace` recorders.
 trace-hooks = ["trace", "embassy-supervisor-macros?/trace-hooks"]
-# Stamp each node's name into its task Metadata at spawn, so external consumers
-# (rtos-trace/SystemView, debuggers) see node names instead of opaque ids. Separate
-# from `trace` because `metadata-name` grows every TaskStorage in the binary.
-trace-names = ["trace", "embassy-executor/metadata-name", "embassy-supervisor-macros?/trace-names"]
+# The supervisor's trace layer WITH node names: `trace` (recorders) plus the
+# `metadata-names` stamp. Effective behavior is unchanged from prior releases; it is
+# now expressed as a composition of the two independent capabilities.
+trace-names = ["trace", "metadata-names"]
 # Preemption-accurate (charge-splitting) accounting: a nested poll (an
 # InterruptExecutor preempting a lower tier mid-poll) credits its wall time back
 # to the interrupted window, so the victim's exec/max-poll numbers stay exact.
@@ -111,6 +122,12 @@ required-features = ["macros", "control"]
 [[test]]
 name = "task_shells"
 required-features = ["macros"]
+
+# `metadata-names` WITHOUT `trace`: proves the name-only spawn glue (`stamp_name`,
+# no `adopt`) compiles, links with no `_embassy_trace_*` symbols, and runs.
+[[test]]
+name = "metadata_names"
+required-features = ["metadata-names", "macros"]
 
 # `resources:` safe resource threading: an owned value moved from "main" into a
 # ResourceSlot round-trips through take -> worker(&mut) -> restore across a
