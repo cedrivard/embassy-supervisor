@@ -1,0 +1,5 @@
+error: `resources:` requires `task:` — resources are handed to the generated shell as owned arguments and restored by it; a `spawn:` task fn manages its own arguments
+ --> tests/ui/compile_fail/resources_on_parked.rs:9:40
+  |
+9 |     node PARKED = Terminate, deps: [], resources: [LED: FakeLed];
+  |                                        ^^^^^^^^^

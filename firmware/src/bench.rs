@@ -20,7 +20,9 @@ use embassy_supervisor::TaskNode;
 /// executor responsive to the shutdown signal).
 const SLICE_ITERS: u32 = 50_000;
 
-#[embassy_executor::task]
+// A plain worker fn: the graph's `task:` declaration stamps the embassy shell. The
+// node carries `executor: CORE1`, so the shell is spawned through that slot's
+// SendSpawner — the future must be `Send`.
 pub(crate) async fn bench_task(node: &'static TaskNode) {
     // xorshift32: cheap, unoptimizable-away busywork (the state feeds back).
     let mut x: u32 = 0x1234_5678;

@@ -1,0 +1,5 @@
+error: `pool_size:` requires `task:` — a `spawn:` task fn sets its own `#[embassy_executor::task(pool_size = ...)]`
+  --> tests/ui/compile_fail/pool_size_without_task.rs:11:64
+   |
+11 |     node A = Terminate, deps: [], spawn: real_task, pool_size: 2;
+   |                                                                ^

@@ -1,0 +1,5 @@
+error: `task:` names an async worker fn — a path or a partial call like `worker(args)`; for a closure or a ready spawn fn use `spawn:`
+ --> tests/ui/compile_fail/task_closure.rs:7:41
+  |
+7 |     node A = Terminate, deps: [], task: |_s| Ok(());
+  |                                         ^^^^^^^^^^^

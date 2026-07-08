@@ -39,6 +39,7 @@ use embassy_boot_rp::{BlockingFirmwareUpdater, FirmwareUpdaterConfig};
 use embassy_net::Ipv4Address;
 use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
+use embassy_rp::Peri;
 use embassy_rp::flash::{Blocking, ERASE_SIZE, FLASH_BASE, Flash};
 use embassy_rp::peripherals::FLASH;
 use embassy_supervisor::{ControlOp, TaskNode};
@@ -129,11 +130,18 @@ fn parse_ip(s: &str) -> Option<Ipv4Address> {
 // below (success or clean failure); detachment also keeps net's later teardown from
 // cascading back into this task (net is a start-only dep: needed for the download,
 // not the decode).
-#[embassy_executor::task]
-pub(crate) async fn ota_task(node: &'static TaskNode) {
+//
+// A plain worker fn: the graph's `task:` stamps the shell, and the FLASH peripheral
+// arrives moved in from `main` via the `FLASH_DEV` resource slot (`resources:`) —
+// the scratch write and the DFU decode reborrow it per phase.
+// The task ends in sys_reset, so the shell's restore
+// never runs — irrelevant, the chip reboots. [`mark_booted`] (the OTA_CONFIRM path)
+// borrows the SAME slot manually with take()/restore(), so the two FLASH users
+// exclude each other at runtime.
+pub(crate) async fn ota_task(node: &'static TaskNode, flash: &mut Peri<'static, FLASH>) {
     node.set_detached(true);
     // http has been drained by now, so the heap has room for the ~16 KB window.
-    match run().await {
+    match run(flash).await {
         Ok(()) => defmt::info!("ota: image staged to DFU, resetting to swap"),
         // No `mark_updated` on failure, so the reset just reboots the current
         // image (clean recovery).
@@ -151,7 +159,7 @@ pub(crate) async fn ota_task(node: &'static TaskNode) {
 /// arena stays small. The task is already detached (first act of `ota_task`), so
 /// net's teardown here can't cascade back into it. The sync decode blocks the
 /// executor anyway, so net couldn't serve during it.
-async fn run() -> Result<(), &'static str> {
+async fn run(flash: &mut Peri<'static, FLASH>) -> Result<(), &'static str> {
     // Fall back to the default target when started without one (e.g. the
     // dashboard's Activate button, which doesn't call set_target).
     let target = TARGET
@@ -168,7 +176,7 @@ async fn run() -> Result<(), &'static str> {
         Timer::after(Duration::from_millis(20)).await;
     }
 
-    let len = download_to_scratch(&target).await?;
+    let len = download_to_scratch(&target, flash.reborrow()).await?;
     defmt::info!("ota: downloaded {} B, draining net for the decode", len);
     // Already detached (ota_task's first act), so this net teardown won't cascade
     // back into us and no control op can interrupt the decode below.
@@ -180,13 +188,13 @@ async fn run() -> Result<(), &'static str> {
         "ota: net down, {} B heap free, decoding",
         crate::heap::free_bytes()
     );
-    apply(len)
+    apply(len, flash.reborrow())
 }
 
 /// HTTP client (reqwless): GET the image and stream the body into scratch flash.
 /// All transfer buffers are heap-allocated so they come from the drained budgeted
 /// heap, not this task's static future storage.
-async fn download_to_scratch(t: &Target) -> Result<usize, &'static str> {
+async fn download_to_scratch(t: &Target, flash: Peri<'_, FLASH>) -> Result<usize, &'static str> {
     let stack = crate::net::try_stack().ok_or("net not up")?;
     let state: Box<TcpClientState<1, 512, 2048>> = Box::new(TcpClientState::new());
     let tcp = TcpClient::new(stack, &state);
@@ -208,7 +216,7 @@ async fn download_to_scratch(t: &Target) -> Result<usize, &'static str> {
 
     let mut reader = resp.body().reader();
     let mut chunk = vec![0u8; 1024];
-    let mut scratch = Scratch::new();
+    let mut scratch = Scratch::new(flash);
     let mut written: u32 = 0;
     loop {
         let n = reader
@@ -224,26 +232,20 @@ async fn download_to_scratch(t: &Target) -> Result<usize, &'static str> {
     Ok(written as usize)
 }
 
-type Blk = Flash<'static, FLASH, Blocking, FLASH_SIZE>;
+type Blk<'a> = Flash<'a, FLASH, Blocking, FLASH_SIZE>;
 
-/// Blocking flash handle. SAFETY: only the OTA path touches FLASH, one OTA at a
-/// time, and the download (scratch write) and decode (DFU write) phases never run
-/// concurrently, so stealing per phase is sound.
-fn flash() -> Blk {
-    Flash::new_blocking(unsafe { FLASH::steal() })
-}
 
 /// Streams the compressed download into scratch flash, erasing sectors on first
 /// touch (offsets grow monotonically).
-struct Scratch {
-    flash: Blk,
+struct Scratch<'a> {
+    flash: Blk<'a>,
     erased_sectors: u32,
 }
 
-impl Scratch {
-    fn new() -> Self {
+impl<'a> Scratch<'a> {
+    fn new(p: Peri<'a, FLASH>) -> Self {
         Self {
-            flash: flash(),
+            flash: Flash::new_blocking(p),
             erased_sectors: 0,
         }
     }
@@ -271,7 +273,7 @@ impl Scratch {
 }
 
 /// Decode the staged image (XIP-mapped scratch slice) into DFU and arm the swap.
-fn apply(compressed_len: usize) -> Result<(), &'static str> {
+fn apply(compressed_len: usize, flash: Peri<'_, FLASH>) -> Result<(), &'static str> {
     // SAFETY: scratch is flash-resident and XIP-mapped; the download is over, so
     // reading it as a slice is sound.
     let compressed = unsafe {
@@ -281,7 +283,8 @@ fn apply(compressed_len: usize) -> Result<(), &'static str> {
         )
     };
 
-    let shared: Mutex<NoopRawMutex, _> = Mutex::new(RefCell::new(flash()));
+    let blk: Blk<'_> = Flash::new_blocking(flash);
+    let shared: Mutex<NoopRawMutex, _> = Mutex::new(RefCell::new(blk));
     let config = FirmwareUpdaterConfig::from_linkerfile_blocking(&shared, &shared);
     let mut state_buf = [0u8; 1]; // == STATE::WRITE_SIZE
     let mut updater = BlockingFirmwareUpdater::new(config, &mut state_buf);
@@ -305,10 +308,23 @@ fn apply(compressed_len: usize) -> Result<(), &'static str> {
 
 /// Confirm the running image so the bootloader keeps it instead of rolling back
 /// on the next reset. Safe to call on a normal (non-updated) boot.
+///
+/// Called from the OTA_CONFIRM node — a *different* node from OTA, so the shared
+/// FLASH cannot ride the `resources:` glue (one `Peri` provides one slot). Instead
+/// it borrows the same `FLASH_DEV` slot **manually**: `take()` the peripheral, use
+/// it, `restore()` it — the safe-slot equivalent of a scoped lock. An empty slot
+/// means the OTA task currently owns the flash; failing with an error here is
+/// strictly better than the old `steal()`, which would have raced it silently.
 pub fn mark_booted() -> Result<(), &'static str> {
-    let shared: Mutex<NoopRawMutex, _> = Mutex::new(RefCell::new(flash()));
-    let config = FirmwareUpdaterConfig::from_linkerfile_blocking(&shared, &shared);
-    let mut state_buf = [0u8; 1];
-    let mut updater = BlockingFirmwareUpdater::new(config, &mut state_buf);
-    updater.mark_booted().map_err(|_| "mark_booted failed")
+    let mut p = crate::FLASH_DEV.take().ok_or("flash busy (ota running)")?;
+    let result = {
+        let blk: Blk<'_> = Flash::new_blocking(p.reborrow());
+        let shared: Mutex<NoopRawMutex, _> = Mutex::new(RefCell::new(blk));
+        let config = FirmwareUpdaterConfig::from_linkerfile_blocking(&shared, &shared);
+        let mut state_buf = [0u8; 1];
+        let mut updater = BlockingFirmwareUpdater::new(config, &mut state_buf);
+        updater.mark_booted().map_err(|_| "mark_booted failed")
+    };
+    crate::FLASH_DEV.restore(p);
+    result
 }

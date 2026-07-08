@@ -1,0 +1,5 @@
+error: `task:` and `spawn:` are mutually exclusive — `spawn:` names a hand-written `#[embassy_executor::task]` fn, `task:` generates one
+  --> tests/ui/compile_fail/task_and_spawn.rs:12:53
+   |
+12 |     node A = Terminate, deps: [], spawn: real_task, task: worker;
+   |                                                     ^^^^

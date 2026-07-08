@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.3.0"
+version = "0.3.1"
 description = "A generic, HAL-agnostic task-lifecycle supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, and runtime start/stop/pause/resume control."
 edition.workspace = true
 authors.workspace = true
@@ -25,7 +25,7 @@ embassy-futures = { version = "0.1" }
 portable-atomic = { version = "1", features = ["critical-section"] }
 defmt = { version = "1.1.0", optional = true }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.2.0", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.3.0", path = "../supervisor-macros", optional = true }
 
 [features]
 # Full-featured out of the box; a footprint-constrained consumer trims with
@@ -105,3 +105,16 @@ required-features = ["trace-nested", "trace-hooks", "macros"]
 [[test]]
 name = "teardown"
 required-features = ["macros", "control"]
+
+# `task:` generated shells: a real executor drives two monomorphizations of one
+# generic worker (plus a shell-driven pool floor) through start/teardown/respawn.
+[[test]]
+name = "task_shells"
+required-features = ["macros"]
+
+# `resources:` safe resource threading: an owned value moved from "main" into a
+# ResourceSlot round-trips through take -> worker(&mut) -> restore across a
+# start/teardown/respawn cycle (same-instance proof via an internal counter).
+[[test]]
+name = "resource_slots"
+required-features = ["macros"]

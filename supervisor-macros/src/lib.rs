@@ -8,9 +8,11 @@
 //! Surface (each item may be `#[cfg(...)]`-prefixed):
 //! ```text
 //! node NAME = Mode, deps: [A, B], spawn: <spawn>[, executor: EXEC][, disabled];
-//! node NAME = Mode, deps: [A];                 // no `spawn:` => a parked node the app spawns
+//! node NAME = Mode, deps: [A, B], task: <worker>[, pool_size: N][, executor: EXEC]
+//!     [, resources: [RES: Type, ..]][, disabled];
+//! node NAME = Mode, deps: [A];                 // neither => a parked node the app spawns
 //! executor EXEC;                               // runtime-filled SendSpawner slot
-//! pool NAME = [Mode, ..], deps: [A][, executor: EXEC], spawn: <fn>,
+//! pool NAME = [Mode, ..], deps: [A][, executor: EXEC], spawn: <fn> | task: <worker>,
 //!     policy: [<Ty> =] <expr>, min: N, max: M;
 //! ```
 //! `deps:` entries name a `node` or a `pool`; a `pool` dep resolves to that pool's floor
@@ -38,6 +40,40 @@
 //! injected first, via a generated `spawn_<pool>::<j>` glue fn; a pool has no closure
 //! form (members are instantiated per index).
 //!
+//! `task:` takes the same path/partial-call forms but names a **plain async worker
+//! fn** — possibly generic (turbofish or inferred) — instead of a hand-written
+//! `#[embassy_executor::task]`. The macro stamps a concrete shell task per
+//! declaration (embassy forbids generic tasks: one static `TaskPool` per concrete
+//! future type), sized by `pool_size:` on a node (default 1) or by the member count
+//! on a pool. Worker args are evaluated **inside the shell** — at the task's first
+//! poll, on the node's own executor — so cross-node data should go through awaited
+//! accessors, and a cross-core node builds its resources on its own core. `task:`
+//! and `spawn:` are mutually exclusive; `pool_size:` requires `task:`.
+//!
+//! **Prefer `task:`** — no attribute boilerplate, generic workers, auto-sized pool
+//! shells, and it is the only form supporting `resources:`; the shell inlines into
+//! the same poll and its `TaskPool` replaces the one the attribute would emit.
+//! `spawn:` remains for: a fn that already carries `#[embassy_executor::task]` and
+//! can't be de-attributed (another crate); a task also spawned outside the graph
+//! (sharing its one `TaskPool` instead of duplicating it as a shell); the verbatim
+//! closure form (custom spawn-time logic); and args that must be evaluated at
+//! spawn time on the supervisor's executor rather than at the shell's first poll.
+//! Worked examples: README "`spawn:` vs `task:` — which to use".
+//!
+//! `resources: [RES: Type, ..]` (requires `task:`; node-only) threads **owned
+//! resources from `main`** into the worker instead of re-acquiring them inside the
+//! task (`Peripherals::steal()`). Each entry emits a
+//! `pub static RES: ResourceSlot<Type>` at the declaration site; `main` moves the
+//! resource in with `RES.provide(..)` (consuming the `Peripherals` field — the
+//! compile-time exclusive-ownership guarantee), the generated glue `take()`s it just
+//! before the spawn (an unprovided slot fails `Supervisor::start` with
+//! `SpawnError::Busy` after a bounded wait — fail-closed, not a task-side panic),
+//! and the shell passes the worker `&mut Type` (after the node arg, in declared
+//! order, before any partial-call extras) and `restore()`s the value after the
+//! worker returns, so a Terminate respawn re-takes the *same instance*. Slot names
+//! are statics: unique across the graph. Pools reject `resources:` (members would
+//! contend for one instance).
+//!
 //! A graph holds at most **256 node slots** (including pool members): all graph
 //! indices are `u8`, and the macro rejects a larger declaration at expansion.
 //!
@@ -48,7 +84,10 @@
 //! `topo_sort_const` at const-eval (after cfg). Absent nodes are skipped at runtime.
 //!
 //! Generated items (at the call site): one `pub static` per `node`, a `[TaskNode; K]`
-//! array + `spawn_<pool>` glue fn + `<POOL>_POOL` `ElasticPool` per `pool`, plus a
+//! array + `spawn_<pool>` glue fn + `<POOL>_POOL` `ElasticPool` + the structural
+//! `pub const`s `<POOL>_MIN` / `<POOL>_MAX` / `<POOL>_MEMBERS` (usize; for
+//! const-context sizing downstream — a `const` cannot read them off the member
+//! `static`) per `pool`, plus a
 //! single `pub static GRAPH: Graph<M>` bundling the node slots, the dependency table,
 //! the topological order, and (with the `pool` feature) the pools — pass `&GRAPH` to
 //! `Supervisor::new`. The backing tables are private; read them through `GRAPH.nodes`
@@ -68,7 +107,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{
@@ -80,11 +119,14 @@ mod kw {
     syn::custom_keyword!(pool);
     syn::custom_keyword!(deps);
     syn::custom_keyword!(spawn);
+    syn::custom_keyword!(task);
+    syn::custom_keyword!(pool_size);
     syn::custom_keyword!(policy);
     syn::custom_keyword!(min);
     syn::custom_keyword!(max);
     syn::custom_keyword!(disabled);
     syn::custom_keyword!(executor);
+    syn::custom_keyword!(resources);
 }
 
 /// A dependency reference: a node ident, optionally `#[cfg(...)]`-gated.
@@ -118,13 +160,63 @@ fn parse_mode_list(input: ParseStream) -> SynResult<Vec<Ident>> {
     Ok(punct.into_iter().collect())
 }
 
+/// How a node/pool member gets its task: `spawn:` names a hand-written
+/// `#[embassy_executor::task]` fn (path / partial call / verbatim closure), while
+/// `task:` names a **plain async fn** — possibly generic — for which the macro
+/// emits a concrete `#[embassy_executor::task]` shell (embassy forbids generic
+/// tasks: one static `TaskPool` per concrete future type, so per-type shells are
+/// the only way — the macro stamps them so the user doesn't).
+enum TaskSource {
+    /// `spawn: <expr>` — the expr *is* (or produces) the task fn.
+    Spawn(Expr),
+    /// `task: <path | partial call>` — wrap in a generated shell; args are
+    /// evaluated inside the shell (at the task's first poll, on its own executor).
+    Shell(Expr),
+}
+
+/// One `NAME: Type` entry of a `resources:` clause. The macro emits a
+/// `pub static NAME: ResourceSlot<Type>` at the declaration site; `main` moves
+/// the resource in with `NAME.provide(..)` (consuming the `Peripherals` field —
+/// the compile-time ownership guarantee), the generated spawn glue `take()`s it
+/// before the spawn, and the generated shell `restore()`s it after the worker
+/// returns so a respawn re-takes the same instance.
+struct ResourceDecl {
+    ident: Ident,
+    ty: Type,
+}
+
+/// `resources: [LED: Output<'static>, …]`
+fn parse_resource_list(input: ParseStream) -> SynResult<Vec<ResourceDecl>> {
+    let content;
+    bracketed!(content in input);
+    let mut resources = Vec::new();
+    while !content.is_empty() {
+        let ident: Ident = content.parse()?;
+        content.parse::<Token![:]>()?;
+        let ty: Type = content.parse()?;
+        resources.push(ResourceDecl { ident, ty });
+        if content.peek(Token![,]) {
+            content.parse::<Token![,]>()?;
+        }
+    }
+    Ok(resources)
+}
+
 struct NodeItem {
     cfg: Vec<Attribute>,
     ident: Ident,
     mode: Ident,
     deps: Vec<Dep>,
-    /// `None` = a parked node the app spawns itself (no `spawn:` given).
-    spawn: Option<Expr>,
+    /// `None` = a parked node the app spawns itself (neither `spawn:` nor `task:`).
+    source: Option<TaskSource>,
+    /// `pool_size: N` on a `task:` node — sizes the generated shell's `TaskPool`
+    /// (headroom for a respawn while the previous instance is still draining).
+    pool_size: Option<LitInt>,
+    /// `resources: [NAME: Type, ..]` on a `task:` node — owned values threaded
+    /// from `main` through macro-emitted `ResourceSlot` statics into the
+    /// generated shell (which hands the worker `&mut Type` and restores the
+    /// value on exit). Empty for `spawn:`/parked nodes (enforced at parse).
+    resources: Vec<ResourceDecl>,
     disabled: bool,
     /// `executor: NAME` — spawn through the named [`SpawnerSlot`] (a
     /// `SendSpawner` the app registers at runtime) instead of the supervisor's
@@ -151,7 +243,10 @@ struct PoolItem {
     /// extra args (`mcp_server_task(stack())`); the macro spawns member `j` as
     /// `s.spawn(<fn>(&POOL[j] [, extra args])?)` — the node is always the first arg.
     /// No closure form (members are instantiated per index), unlike a node's `spawn:`.
-    spawn: Expr,
+    /// The `Shell` variant (`task:`) wraps a plain — possibly generic — async fn in
+    /// ONE generated `#[embassy_executor::task(pool_size = K)]` shell shared by all
+    /// members (they share one concrete future type, like a `spawn:` pool).
+    source: TaskSource,
     /// The scaling policy value, emitted as the `policy:` field of the `ElasticPool`
     /// static. The static is typed `ElasticPool<P>`, so the macro needs the policy
     /// *type* `P`: when `policy_ty` is `None` it derives `P` from this expr via
@@ -227,14 +322,25 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
     let deps = parse_dep_list(input)?;
 
     let mut spawn = None;
+    let mut task: Option<(kw::task, Expr)> = None;
+    let mut pool_size = None;
     let mut disabled = false;
     let mut executor = None;
+    let mut resources: Option<(kw::resources, Vec<ResourceDecl>)> = None;
     while input.peek(Token![,]) {
         input.parse::<Token![,]>()?;
         if input.peek(kw::spawn) {
             input.parse::<kw::spawn>()?;
             input.parse::<Token![:]>()?;
             spawn = Some(input.parse::<Expr>()?);
+        } else if input.peek(kw::task) {
+            let k = input.parse::<kw::task>()?;
+            input.parse::<Token![:]>()?;
+            task = Some((k, input.parse::<Expr>()?));
+        } else if input.peek(kw::pool_size) {
+            input.parse::<kw::pool_size>()?;
+            input.parse::<Token![:]>()?;
+            pool_size = Some(input.parse::<LitInt>()?);
         } else if input.peek(kw::disabled) {
             input.parse::<kw::disabled>()?;
             disabled = true;
@@ -242,19 +348,89 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
             input.parse::<kw::executor>()?;
             input.parse::<Token![:]>()?;
             executor = Some(input.parse::<Ident>()?);
+        } else if input.peek(kw::resources) {
+            let k = input.parse::<kw::resources>()?;
+            input.parse::<Token![:]>()?;
+            resources = Some((k, parse_resource_list(input)?));
         } else {
-            return Err(input.error("expected `spawn:`, `executor:`, or `disabled`"));
+            return Err(input.error(
+                "expected `spawn:`, `task:`, `pool_size:`, `executor:`, `resources:`, or `disabled`",
+            ));
         }
     }
     input.parse::<Token![;]>()?;
+
+    // Exactly one of `spawn:` / `task:` may pick the node's task.
+    if let (Some(_), Some((k, _))) = (&spawn, &task) {
+        return Err(syn::Error::new_spanned(
+            k,
+            "`task:` and `spawn:` are mutually exclusive — `spawn:` names a \
+             hand-written `#[embassy_executor::task]` fn, `task:` generates one",
+        ));
+    }
+    // `pool_size:` sizes the generated shell's TaskPool; without `task:` there is
+    // no generated shell to size (a `spawn:` task fn declares its own).
+    if let (Some(ps), None) = (&pool_size, &task) {
+        return Err(syn::Error::new_spanned(
+            ps,
+            "`pool_size:` requires `task:` — a `spawn:` task fn sets its own \
+             `#[embassy_executor::task(pool_size = ...)]`",
+        ));
+    }
+    // `resources:` only makes sense with `task:`: the generated shell is what
+    // takes the values out of their slots at spawn and restores them after the
+    // worker returns. A hand-written `spawn:` fn (or a parked node) manages its
+    // own arguments.
+    if let Some((k, decls)) = &resources {
+        if task.is_none() {
+            return Err(syn::Error::new_spanned(
+                k,
+                "`resources:` requires `task:` — resources are handed to the \
+                 generated shell as owned arguments and restored by it; a \
+                 `spawn:` task fn manages its own arguments",
+            ));
+        }
+        if decls.is_empty() {
+            return Err(syn::Error::new_spanned(
+                k,
+                "`resources:` must declare at least one `NAME: Type` entry",
+            ));
+        }
+        // Duplicate names within one node would emit two statics with the same
+        // ident; catch it here with a clearer message than rustc's E0428.
+        for (i, d) in decls.iter().enumerate() {
+            if decls[..i].iter().any(|prev| prev.ident == d.ident) {
+                return Err(syn::Error::new_spanned(
+                    &d.ident,
+                    format!("duplicate resource name `{}`", d.ident),
+                ));
+            }
+        }
+    }
+    if let Some(ps) = &pool_size {
+        if ps.base10_parse::<usize>()? == 0 {
+            return Err(syn::Error::new_spanned(
+                ps,
+                "`pool_size:` must be at least 1",
+            ));
+        }
+    }
+    let source = match (spawn, task) {
+        (Some(e), _) => Some(TaskSource::Spawn(e)),
+        (None, Some((_, e))) => Some(TaskSource::Shell(e)),
+        (None, None) => None,
+    };
+
     Ok(NodeItem {
         cfg,
         ident,
         mode,
         deps,
-        spawn,
+        source,
+        pool_size,
         disabled,
         executor,
+        resources: resources.map(|(_, decls)| decls).unwrap_or_default(),
     })
 }
 
@@ -281,11 +457,32 @@ fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
         None
     };
     // The member task: a path, or a partial call supplying extra args (the macro
-    // injects `&POOL[j]` as the first argument in either case).
-    input.parse::<kw::spawn>()?;
-    input.parse::<Token![:]>()?;
-    let spawn: Expr = input.parse()?;
+    // injects `&POOL[j]` as the first argument in either case). `spawn:` names a
+    // hand-written `#[embassy_executor::task(pool_size = K)]` fn; `task:` names a
+    // plain (possibly generic) async fn the macro wraps in ONE generated shell
+    // task sized `pool_size = K`.
+    let source = if input.peek(kw::task) {
+        input.parse::<kw::task>()?;
+        input.parse::<Token![:]>()?;
+        TaskSource::Shell(input.parse()?)
+    } else {
+        input.parse::<kw::spawn>()?;
+        input.parse::<Token![:]>()?;
+        TaskSource::Spawn(input.parse()?)
+    };
     input.parse::<Token![,]>()?;
+    // `resources:` is node-only: a ResourceSlot holds ONE value, and pool
+    // members all run the same worker — they would contend for that single
+    // instance and every member past the first would fail its spawn. Reject
+    // with a targeted message instead of the generic "expected `policy`".
+    if input.peek(kw::resources) {
+        let k = input.parse::<kw::resources>()?;
+        return Err(syn::Error::new_spanned(
+            k,
+            "`resources:` is not supported on `pool` — members would contend \
+             for a single instance; declare per-node",
+        ));
+    }
     input.parse::<kw::policy>()?;
     input.parse::<Token![:]>()?;
     // Optional explicit policy type: `policy: <Ty> = <expr>`. Fork to see if a `Type`
@@ -319,7 +516,7 @@ fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
         ident,
         modes,
         deps,
-        spawn,
+        source,
         policy,
         policy_ty,
         executor,
@@ -337,12 +534,20 @@ fn name_string(ident: &Ident) -> String {
 /// a bare path `f` => `f(node_ref)`; a partial call `f(a, b)` => `f(node_ref, a, b)`.
 /// The task fn is thus expected to take the node/`&POOL[i]` first, then any extra args.
 fn inject_node_call(task: &Expr, node_ref: &TokenStream2) -> SynResult<TokenStream2> {
+    inject_call_with(task, core::slice::from_ref(node_ref))
+}
+
+/// Like [`inject_node_call`] but injecting several leading arguments (the node
+/// ref, then a node's threaded `resources:` values) ahead of the user-supplied
+/// extras. Split out so the `resources:` paths don't disturb the single-arg
+/// callers.
+fn inject_call_with(task: &Expr, lead: &[TokenStream2]) -> SynResult<TokenStream2> {
     match task {
-        Expr::Path(_) => Ok(quote!(#task(#node_ref))),
+        Expr::Path(_) => Ok(quote!(#task(#(#lead),*))),
         Expr::Call(c) => {
             let f = &c.func;
             let args = c.args.iter();
-            Ok(quote!(#f(#node_ref #(, #args)*)))
+            Ok(quote!(#f(#(#lead),* #(, #args)*)))
         }
         other => Err(syn::Error::new_spanned(
             other,
@@ -412,8 +617,34 @@ fn node_spawn(
     ident: &Ident,
     spawn: &Option<Expr>,
     executor: &Option<Ident>,
+    resources: &[ResourceDecl],
     spawn_fn: &TokenStream2,
 ) -> SynResult<TokenStream2> {
+    // `resources:` take-prelude + the taken values as extra shell arguments.
+    // Taking here — in the glue, BEFORE the spawn — is the point: an unprovided
+    // slot fails `Supervisor::start` with `SpawnError::Busy` (the supervisor
+    // logs the node name), instead of panicking inside an already-spawned task.
+    // The values ride into the task as ordinary `#[embassy_executor::task]`
+    // arguments (embassy stores them in the shell's TaskPool slot).
+    let take_prelude: Vec<TokenStream2> = resources
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let res = &r.ident;
+            let var = format_ident!("__r{}", i);
+            quote! {
+                let #var = #res
+                    .take()
+                    .ok_or(::embassy_executor::SpawnError::Busy)?;
+            }
+        })
+        .collect();
+    let res_args: Vec<TokenStream2> = (0..resources.len())
+        .map(|i| {
+            let var = format_ident!("__r{}", i);
+            quote!(#var)
+        })
+        .collect();
     Ok(match (spawn, executor) {
         (None, None) => quote!(::core::option::Option::None),
         // `executor:` needs the macro to perform the spawn, so it composes only
@@ -433,12 +664,15 @@ fn node_spawn(
         // `SpawnError::Busy` — loud misconfiguration, not a missing task. The
         // task future must then be `Send` (enforced by `SendSpawner::spawn`).
         (Some(e @ (Expr::Path(_) | Expr::Call(_))), executor) => {
-            let call = inject_node_call(e, &quote!(&#ident))?;
+            let mut lead: Vec<TokenStream2> = vec![quote!(&#ident)];
+            lead.extend(res_args.iter().cloned());
+            let call = inject_call_with(e, &lead)?;
             match executor {
                 None => {
                     let stmts = spawn_stmts(&call, &quote!(&#ident), &quote!(s));
                     quote!(::core::option::Option::Some(
                         (|s| {
+                            #(#take_prelude)*
                             #stmts
                             ::core::result::Result::Ok(())
                         }) as #spawn_fn
@@ -452,9 +686,12 @@ fn node_spawn(
                             // invoking the glue (the node carries `.with_executor(&EX)`
                             // and the bring-up bounds the wait), so `get()` is already
                             // filled; `ok_or` is the belt-and-braces unfilled guard.
+                            // Resources are taken AFTER the spawner guard, so an
+                            // unfilled executor never consumes (and strands) them.
                             let __sp = #ex
                                 .get()
                                 .ok_or(::embassy_executor::SpawnError::Busy)?;
+                            #(#take_prelude)*
                             #stmts
                             ::core::result::Result::Ok(())
                         }) as #spawn_fn
@@ -497,8 +734,85 @@ fn spawn_stmts(call: &TokenStream2, node_ref: &TokenStream2, sp: &TokenStream2) 
     }
 }
 
+/// Emit the `#[embassy_executor::task]` shell for a `task:` clause: a concrete,
+/// non-generic task fn that takes only the node and awaits the user's worker with
+/// the node injected first. This is how a **generic** worker becomes spawnable —
+/// embassy forbids generic tasks (one static `TaskPool` per concrete future type),
+/// so a monomorphized shell is stamped per declaration. Worker args are evaluated
+/// inside the shell — at the task's first poll, on the node's own executor — so
+/// the DSL never needs the arg types and a cross-core node builds its resources on
+/// the core that runs them.
+///
+/// Returns the shell item and a path `Expr` naming it, which feeds the ordinary
+/// `spawn:` path-form glue (executor routing and trace `adopt` compose unchanged).
+fn emit_shell(
+    owner: &Ident,
+    cfg: &[Attribute],
+    worker: &Expr,
+    pool_size: usize,
+    resources: &[ResourceDecl],
+    cr: &TokenStream2,
+) -> SynResult<(TokenStream2, Expr)> {
+    if !matches!(worker, Expr::Path(_) | Expr::Call(_)) {
+        return Err(syn::Error::new_spanned(
+            worker,
+            "`task:` names an async worker fn — a path or a partial call like \
+             `worker(args)`; for a closure or a ready spawn fn use `spawn:`",
+        ));
+    }
+    let shell = format_ident!("__sv_task_{}", owner.to_string().to_lowercase());
+    // `resources:` values arrive as owned task arguments (the spawn glue took
+    // them out of their slots); the shell keeps ownership, lends the worker
+    // `&mut`, and restores each value to its slot after the worker returns —
+    // i.e. after the worker's clean shutdown ack — so a Terminate respawn
+    // re-takes the SAME instance instead of re-acquiring hardware. A `Pause`
+    // worker parks instead of returning, so it simply retains its resources
+    // (the restore lines below are unreachable for it — correct, same as a
+    // hand-written parked task holding its arguments).
+    let res_params: Vec<TokenStream2> = resources
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let var = format_ident!("__r{}", i);
+            let ty = &r.ty;
+            quote!(mut #var: #ty)
+        })
+        .collect();
+    let res_leases: Vec<TokenStream2> = (0..resources.len())
+        .map(|i| {
+            let var = format_ident!("__r{}", i);
+            quote!(&mut #var)
+        })
+        .collect();
+    let restores: Vec<TokenStream2> = resources
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let res = &r.ident;
+            let var = format_ident!("__r{}", i);
+            quote!(#res.restore(#var);)
+        })
+        .collect();
+    let mut lead: Vec<TokenStream2> = vec![quote!(__node)];
+    lead.extend(res_leases);
+    let call = inject_call_with(worker, &lead)?;
+    // Unsuffixed literal: `#[task]`'s own parser wants a plain integer.
+    let ps = LitInt::new(&pool_size.to_string(), proc_macro2::Span::call_site());
+    let def = quote! {
+        #(#cfg)*
+        #[::embassy_executor::task(pool_size = #ps)]
+        async fn #shell(__node: &'static #cr::TaskNode #(, #res_params)*) {
+            #call.await;
+            #(#restores)*
+        }
+    };
+    let path: Expr = syn::parse_quote!(#shell);
+    Ok((def, path))
+}
+
 /// Emit a `node`: its `pub static #ident: TaskNode` definition and its `Slot`. The
 /// caller assigns the slot index and records the name, so this touches neither.
+/// A `task:` node additionally emits its generated shell ahead of the static.
 fn emit_node(
     n: &NodeItem,
     cr: &TokenStream2,
@@ -509,17 +823,69 @@ fn emit_node(
     let mode = &n.mode;
     let name = name_string(&n.ident);
     let disabled = n.disabled;
-    let spawn = node_spawn(ident, &n.spawn, &n.executor, spawn_fn)?;
+    let (shell_def, spawn_expr) = match &n.source {
+        Some(TaskSource::Shell(worker)) => {
+            let ps = match &n.pool_size {
+                Some(l) => l.base10_parse::<usize>()?,
+                None => 1,
+            };
+            let (def, path) = emit_shell(ident, cfg, worker, ps, &n.resources, cr)?;
+            (def, Some(path))
+        }
+        Some(TaskSource::Spawn(e)) => (quote!(), Some(e.clone())),
+        None => (quote!(), None),
+    };
+    let spawn = node_spawn(ident, &spawn_expr, &n.executor, &n.resources, spawn_fn)?;
     // `executor: NAME` routes the node through that SpawnerSlot; the supervisor
     // awaits the slot before spawning (see `TaskNode::with_executor`).
     let with_exec = match &n.executor {
         Some(ex) => quote!( .with_executor(&#ex) ),
         None => quote!(),
     };
+    // `resources: [NAME: Type, ..]` — one `pub static NAME: ResourceSlot<Type>`
+    // per entry (main moves the resource in with `NAME.provide(..)`), plus a
+    // type-erased gate array wired into the node so the supervisor can await
+    // provisioning/restore before each (re)spawn (see `TaskNode::with_resources`).
+    // The unsized coercion `&NAME` -> `&dyn ResourceGate` happens in the static
+    // initializer, where it is allowed.
+    let (res_defs, with_res) = if n.resources.is_empty() {
+        (quote!(), quote!())
+    } else {
+        let gates_ident = format_ident!("__SV_GATES_{}", ident);
+        let slot_defs = n.resources.iter().map(|r| {
+            let res = &r.ident;
+            let ty = &r.ty;
+            let doc = format!(
+                "Resource slot for node `{ident}` (generated by `supervisor_graph!`). \
+                 Move the resource in with `.provide(..)` before `Supervisor::start`."
+            );
+            quote! {
+                #(#cfg)*
+                #[doc = #doc]
+                pub static #res: #cr::ResourceSlot<#ty> = #cr::ResourceSlot::new();
+            }
+        });
+        let gate_refs = n.resources.iter().map(|r| {
+            let res = &r.ident;
+            quote!(&#res)
+        });
+        let gate_count = n.resources.len();
+        (
+            quote! {
+                #(#slot_defs)*
+                #(#cfg)*
+                static #gates_ident: [&'static dyn #cr::ResourceGate; #gate_count] =
+                    [#(#gate_refs),*];
+            },
+            quote!( .with_resources(&#gates_ident) ),
+        )
+    };
     let def = quote! {
+        #res_defs
+        #shell_def
         #(#cfg)*
         pub static #ident: #cr::TaskNode =
-            #cr::TaskNode::new(#name, #cr::Mode::#mode, #spawn, #disabled) #with_exec;
+            #cr::TaskNode::new(#name, #cr::Mode::#mode, #spawn, #disabled) #with_exec #with_res;
     };
     let slot = Slot {
         cfg_pred: cfg_predicate(cfg),
@@ -566,9 +932,16 @@ fn emit_pool(
         ));
     }
 
-    // Build member `I`'s spawn call from the `spawn:` expr, injecting
+    // Resolve the member task: `spawn:` uses the given expr directly; `task:`
+    // first stamps ONE generated shell sized `pool_size = K` (all members share a
+    // single concrete future type) and targets that.
+    let (shell_def, member_expr) = match &p.source {
+        TaskSource::Spawn(e) => (quote!(), e.clone()),
+        TaskSource::Shell(worker) => emit_shell(ident, cfg, worker, k, &[], cr)?,
+    };
+    // Build member `I`'s spawn call from the member task, injecting
     // `&POOL[I]` as the first argument (see `inject_node_call`).
-    let call = inject_node_call(&p.spawn, &quote!(&#ident[I]))?;
+    let call = inject_node_call(&member_expr, &quote!(&#ident[I]))?;
     // Per-member spawn fn: a generated `spawn_<pool>::<I>` wrapper. Same optional
     // trace capture as a node's closure, against member `I`'s slot. With
     // `executor: NAME` the wrapper ignores the supervisor's `Spawner` and spawns
@@ -592,6 +965,7 @@ fn emit_pool(
     let pool_spawn_stmts = spawn_stmts(&call, &quote!(&#ident[I]), &sp_tokens);
     let wrapper = format_ident!("spawn_{}", lname);
     let mut defs: Vec<TokenStream2> = Vec::new();
+    defs.push(shell_def);
     defs.push(quote! {
         #(#cfg)*
         fn #wrapper<const I: usize>(
@@ -627,6 +1001,27 @@ fn emit_pool(
     defs.push(quote! {
         #(#cfg)*
         pub static #ident: [#cr::TaskNode; #k] = [ #(#members),* ];
+    });
+
+    // Structural constants, for downstream compile-time sizing (e.g. a socket
+    // budget: `const BUDGET: usize = HTTP_MAX + 1`). Emitted because user code
+    // can't derive them from the member array — a `const` cannot refer to a
+    // `static` (E0013), so `HTTP.len()` is unusable in const context and the
+    // count would otherwise have to be duplicated by hand next to the DSL.
+    let min_const = format_ident!("{}_MIN", ident);
+    let max_const = format_ident!("{}_MAX", ident);
+    let members_const = format_ident!("{}_MEMBERS", ident);
+    let (min_u, max_u) = (usize::from(min_v), usize::from(max_v));
+    defs.push(quote! {
+        #(#cfg)*
+        #[doc = concat!("Pool `", stringify!(#ident), "`'s `min:` floor (validated at expansion).")]
+        pub const #min_const: usize = #min_u;
+        #(#cfg)*
+        #[doc = concat!("Pool `", stringify!(#ident), "`'s `max:` scaling ceiling — the most members ever running concurrently.")]
+        pub const #max_const: usize = #max_u;
+        #(#cfg)*
+        #[doc = concat!("Pool `", stringify!(#ident), "`'s declared member count (the `[TaskNode; K]` array length).")]
+        pub const #members_const: usize = #k;
     });
 
     let member_refs = (0..k).map(|j| quote!(&#ident[#j]));
@@ -756,6 +1151,31 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
             _ => None,
         })
         .collect();
+
+    // Pre-pass: `resources:` slot names become `pub static`s at the declaration
+    // site, so they must be unique across the whole graph — and must not shadow
+    // an `executor NAME;` static. Caught here with a targeted message instead of
+    // rustc's downstream duplicate-static E0428 on generated code.
+    {
+        let mut seen: HashSet<String> = HashSet::new();
+        for item in &graph.items {
+            if let Item::Node(n) = item {
+                for r in &n.resources {
+                    let key = r.ident.to_string();
+                    if !seen.insert(key.clone()) || executor_names.contains(&key) {
+                        return Err(syn::Error::new_spanned(
+                            &r.ident,
+                            format!(
+                                "duplicate resource name `{}` — resource slots are \
+                                 statics and must be unique across the graph",
+                                r.ident
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
 
     for item in &graph.items {
         match item {

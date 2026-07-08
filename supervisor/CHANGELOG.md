@@ -4,6 +4,34 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-07-07
+
+Ships the `supervisor_graph!` `task:` clause by updating the macro pin to
+`embassy-supervisor-macros = "=0.3.0"`: declare a **plain async worker fn** —
+possibly generic — and the macro stamps its concrete `#[embassy_executor::task]`
+shell per node. See the macros CHANGELOG and the README's "`task:` —
+generated shells" section.
+
+### Added
+- **Safe resource threading** (backs the macro's new `resources:` clause):
+  `ResourceSlot<T>` — a one-value handoff cell moving an owned resource from `main`
+  into a supervised task, replacing `Peripherals::steal()` inside the task body.
+  `main` `provide()`s the value (consuming the `Peripherals` field — the
+  compile-time exclusive-ownership guarantee), the generated spawn glue `take()`s it
+  before the spawn (empty slot → `SpawnError::Busy` out of `start()`, fail-closed),
+  and the generated shell `restore()`s it after the worker returns so a Terminate
+  respawn re-takes the *same instance*. Provisioning is runtime-checked; ownership
+  is compile-time.
+- `ResourceGate` (the slot's type-erased readiness view) and
+  `TaskNode::with_resources`: `start` / `start_node` / `respawn_terminate` await a
+  node's resource slots being filled (bounded by the same `SLOT_READY_TIMEOUT` as
+  executor slots) before spawning — tolerating late provisioning and closing the
+  respawn-races-the-restore window on multi-core graphs.
+
+### Changed
+- `defmt` dependency requirement stated as `1.1.0` (the version the crate is built
+  and tested against) instead of the imprecise `1`.
+
 ## [0.3.0] - 2026-07-06
 
 ### Added

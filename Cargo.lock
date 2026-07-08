@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "embassy-supervisor"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "critical-section",
  "defmt 1.1.0",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "embassy-supervisor-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "critical-section",
  "embassy-executor",
@@ -919,6 +919,7 @@ dependencies = [
  "embassy-time",
  "embassy-usb",
  "embedded-alloc",
+ "embedded-hal 1.0.0",
  "embedded-io-async 0.7.0",
  "embedded-storage",
  "panic-probe",

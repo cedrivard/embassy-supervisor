@@ -1,4 +1,4 @@
-error: expected `spawn:`, `executor:`, or `disabled`
+error: expected `spawn:`, `task:`, `pool_size:`, `executor:`, `resources:`, or `disabled`
  --> tests/ui/compile_fail/missing_keyword.rs:7:35
   |
 7 |     node A = Terminate, deps: [], oops;

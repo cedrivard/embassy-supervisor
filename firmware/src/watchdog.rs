@@ -12,12 +12,18 @@ use crate::GRAPH;
 /// A **detached** node ([`TaskNode::set_detached`]): the supervisor starts it once
 /// and never tears it down or respawns it — it must keep feeding the watchdog for the
 /// entire life of the app, independent of any teardown/respawn cycle.
-#[embassy_executor::task]
-pub(crate) async fn watchdog_task(node: &'static TaskNode) -> ! {
+///
+/// A plain worker fn (`task:` in the graph): the `Watchdog` driver arrives moved
+/// in from `main` via the `WD_DEV` resource slot instead of a `steal()` here. The
+/// slot holds the built driver, not the `Peri`, because `Watchdog::new` consumes
+/// `Peri<'static, WATCHDOG>` (the driver has no lifetime parameter to reborrow
+/// into). The task never returns (detached, loops forever), so the shell's restore
+/// is moot — the resource is retained for life, exactly the watchdog contract.
+pub(crate) async fn watchdog_task(
+    node: &'static TaskNode,
+    wd: &mut embassy_rp::watchdog::Watchdog,
+) {
     node.set_detached(true);
-
-    let mut wd =
-        embassy_rp::watchdog::Watchdog::new(unsafe { embassy_rp::peripherals::WATCHDOG::steal() });
     // Blocked-task detector (feature `trace`). Two complementary checks:
     // - `stalled_task`: an in-flight poll > 100 ms. For a stall on this task's OWN
     //   thread executor it can rarely fire (a blocked executor also blocks the

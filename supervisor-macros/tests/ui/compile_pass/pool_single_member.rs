@@ -20,4 +20,11 @@ fn main() {
     assert_eq!(GRAPH.pools.len(), 1);
     assert_eq!(GRAPH.deps[0].len(), 0);
     assert_eq!(GRAPH.deps[1], [0u8].as_slice());
+    // The emitted structural constants: usable in const context (a `const` can't
+    // read them off the `static P` array — constants cannot refer to statics).
+    const BUDGET: usize = P_MAX + 1;
+    assert_eq!(P_MIN, 1);
+    assert_eq!(P_MAX, 1);
+    assert_eq!(P_MEMBERS, P.len());
+    assert_eq!(BUDGET, 2);
 }

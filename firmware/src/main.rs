@@ -28,16 +28,22 @@ mod watchdog;
 embassy_supervisor::supervisor_graph! {
     executor HIGH;  // Interrupt-priority tier (SWI_IRQ_0)
     executor CORE1; // Core 1's thread executor (filled by core1_entry via spawn_core1)
-    node WATCHDOG = Terminate, deps: [], spawn: crate::watchdog::watchdog_task;
-    node NET = Terminate, deps: [], spawn: crate::net::net_task;
-    node HEARTBEAT = Pause, deps: [], executor: HIGH, spawn: crate::heartbeat::heartbeat_task;
+    node WATCHDOG = Terminate, deps: [], task: crate::watchdog::watchdog_task,
+        resources: [WD_DEV: embassy_rp::watchdog::Watchdog];
+    node NET = Terminate, deps: [], task: crate::net::net_task,
+        resources: [USB_DEV: embassy_rp::Peri<'static, embassy_rp::peripherals::USB>];
+    node HEARTBEAT = Pause, deps: [], executor: HIGH,
+        task: crate::heartbeat::heartbeat_task,
+        resources: [LED: embassy_rp::gpio::Output<'static>];
     pool HTTP = [Terminate, OnDemand], deps: [NET],
-        spawn: crate::http::http_task,
+        task: crate::http::http_task,
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(4)),
         min: 1, max: 2;
-    node OTA = Terminate, deps: [NET], spawn: crate::ota::ota_task, disabled;
-    node BENCH = Terminate, deps: [], executor: CORE1, spawn: crate::bench::bench_task, disabled;
-    node OTA_CONFIRM = Terminate, deps: [HTTP], spawn: crate::ota_confirm;
+    node OTA = Terminate, deps: [NET], task: crate::ota::ota_task,
+        resources: [FLASH_DEV: embassy_rp::Peri<'static, embassy_rp::peripherals::FLASH>],
+        disabled;
+    node BENCH = Terminate, deps: [], executor: CORE1, task: crate::bench::bench_task, disabled;
+    node OTA_CONFIRM = Terminate, deps: [HTTP], task: crate::ota_confirm;
 }
 
 // The interrupt-priority executor backing the graph's `HIGH` slot. Its poll loop
@@ -59,10 +65,19 @@ static mut CORE1_STACK: embassy_rp::multicore::Stack<4096> = embassy_rp::multico
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // Init the HAL; each subsystem steals the hardware it needs (USB in net,
-    // PIN_25 in heartbeat, FLASH/WATCHDOG below) — `main` keeps only CORE1.
+    // Init the HAL and split the Peripherals singleton. Every peripheral the graph
+    // uses is moved into its ResourceSlot below — no task steals hardware anymore.
     let p = embassy_rp::init(Default::default());
     heap::init();
+
+    // Provide the graph's threaded resources BEFORE the supervisor starts.
+    USB_DEV.provide(p.USB);
+    WD_DEV.provide(embassy_rp::watchdog::Watchdog::new(p.WATCHDOG));
+    FLASH_DEV.provide(p.FLASH);
+    LED.provide(embassy_rp::gpio::Output::new(
+        p.PIN_25,
+        embassy_rp::gpio::Level::Low,
+    ));
 
     // Bring up the HIGH tier and fill the graph's spawner slot BEFORE the
     // supervisor starts (an unfilled slot would fail heartbeat's spawn loudly).
@@ -76,6 +91,9 @@ async fn main(spawner: Spawner) {
     // Boot core 1: its executor publishes a SendSpawner into the graph's CORE1
     // slot.
     // SAFETY: CORE1_STACK is borrowed exactly once, here, before core 1 runs.
+    // `&mut *&raw mut` is deliberate: it materializes the one exclusive reference
+    // from a raw pointer without tripping rustc's `static_mut_refs` lint.
+    #[allow(clippy::deref_addrof)]
     let core1_stack = unsafe { &mut *&raw mut CORE1_STACK };
     embassy_rp::multicore::spawn_core1(p.CORE1, core1_stack, || {
         let executor =
@@ -121,7 +139,6 @@ async fn app_supervisor(spawner: Spawner) {
 /// Started LAST (via `deps: [HTTP]`), so it only runs after the whole graph is up.
 /// An update broken enough not to reach here never calls `mark_booted`, so the
 /// bootloader rolls back on next reset. Runs once and exits.
-#[embassy_executor::task]
 async fn ota_confirm(node: &'static embassy_supervisor::TaskNode) {
     node.set_detached(true);
     let stack = net::stack_ready().await;

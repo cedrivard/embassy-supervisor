@@ -4,7 +4,7 @@ name = "embassy-supervisor-macros"
 # version (`=x.y.z`): the generated code references doc(hidden) supervisor internals,
 # so only the tested pair is guaranteed compatible. Bump only when the macro changes;
 # the supervisor updates its pin to match.
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -40,7 +40,7 @@ trace-names = ["trace"]
 trace-hooks = ["trace"]
 
 [dependencies]
-syn = { version = "2", features = ["full"] }
+syn = { version = "2.0.118", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
 
