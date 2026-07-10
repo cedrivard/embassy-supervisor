@@ -1,0 +1,5 @@
+error: `slot_timeout:` must be at least 1 (milliseconds)
+ --> tests/ui/compile_fail/slot_timeout_zero.rs:8:63
+  |
+8 |     node N = Terminate, deps: [], task: worker, slot_timeout: 0;
+  |                                                               ^

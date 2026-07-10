@@ -1,5 +1,5 @@
-error: `resources:` is not supported on `pool` — members would contend for a single instance; declare per-node
-  --> tests/ui/compile_fail/resources_on_pool.rs:13:9
+error: only `shared` resources are supported on `pool` — members would contend for a take-kind slot's single instance; declare take/consume resources per-node
+  --> tests/ui/compile_fail/resources_on_pool.rs:13:21
    |
 13 |         resources: [LED: FakeLed],
-   |         ^^^^^^^^^
+   |                     ^^^

@@ -6,6 +6,53 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.4.0] - 2026-07-09
+
+Requires `embassy-supervisor` >= 0.3.3 (the generated `local` slot type names its
+`_export` shim); pinned by exact version from the supervisor crate (`=0.4.0` as of
+supervisor 0.3.3).
+
+### Added
+- `resources:` **kind markers** — per-entry, order-free, composable:
+  `resources: [NAME: [local] [shared|consume] Type, ..]`.
+  - `consume`: the worker receives the value **by value** and the shell emits no
+    restore — the slot stays empty after the task exits, so the worker may *drop* the
+    resource at teardown (a driver whose `Drop` releases pins/DMA) and a respawn
+    fail-closes with `SpawnError::Busy` until the application `provide()`s a fresh
+    value (the pattern for resources rebuilt each wake cycle).
+  - `local`: the entry's slot is a graph-site type (`__SvLocalResourceSlot`) with the
+    `ResourceSlot` protocol but no `T: Send` bound, for `!Send` driver handles
+    (`RefCell`-/`NoopRawMutex`-based) on a single core. Emitted at the declaration
+    site because it carries an `unsafe impl Sync`; its soundness contract is
+    single-core use, and a consumer crate forbidding `unsafe_code` cannot use it.
+  - `shared`: a fan-out slot for a `Copy` handle — the glue copies the value out
+    non-destructively (`get()`, whose `T: Copy` bound enforces the kind), the worker
+    receives it by value, no restore, and the slot STAYS FILLED. Any number of nodes
+    (and whole `task:` pools — the only `resources:` kind pools accept) may declare
+    the SAME slot name: the static is emitted once, gated by the union of the
+    declaring sites' `#[cfg]` predicates, and every re-declaration must repeat the
+    kinds + type verbatim. Mutually exclusive with `consume`.
+  - The markers are contextual keywords: `local`/`consume`/`shared` followed by `::`,
+    `<`, or the entry end still parse as (part of) the type.
+- `resources:` entries accept per-entry `#[cfg(...)]`: the slot static, gate entry,
+  glue take/get, shell parameter, and worker-call argument all follow it (gate the
+  worker fn's matching parameter with the same attribute). The node's gate array
+  length is cfg-aware.
+- The `slot_timeout: MS` clause (nodes and pools; milliseconds ≥ 1) — emits
+  `TaskNode::with_slot_timeout`, overriding the 100 ms default bound on the pre-spawn
+  `executor:`-slot and `resources:`-gate waits. Sized to a **provider node**'s async
+  build time, it turns runtime provisioning into a rendezvous (see the README's
+  provider-node recipe).
+- New compile errors: a repeated kind marker on one entry; `shared` combined with
+  `consume`; a `shared` slot re-declared with different kinds/type; a non-`shared`
+  resource on a `pool` (previously all pool `resources:` were rejected); pool
+  `resources:` without `task:`; `slot_timeout: 0`; and `local` combined with
+  `executor:` on a node or a pool (a `SpawnerSlot`-routed spawn needs a `Send`
+  future).
+- Generated shells with restore statements carry `#[allow(unreachable_code)]`, so a
+  diverging (`-> !`) worker with restore-kind resources no longer warns on the
+  (legitimately) unreachable restores.
+
 ## [0.3.1] - 2026-07-08
 
 Requires `embassy-supervisor` >= 0.3.2; pinned by exact version from the supervisor
@@ -103,6 +150,7 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
+[0.4.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.3.1...embassy-supervisor-macros-v0.4.0
 [0.3.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.3.0...embassy-supervisor-macros-v0.3.1
 [0.3.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.2.0...embassy-supervisor-macros-v0.3.0
 [0.2.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.1.0...embassy-supervisor-macros-v0.2.0

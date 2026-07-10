@@ -9,11 +9,13 @@
 //! ```text
 //! node NAME = Mode, deps: [A, B], spawn: <spawn>[, executor: EXEC][, disabled];
 //! node NAME = Mode, deps: [A, B], task: <worker>[, pool_size: N][, executor: EXEC]
-//!     [, resources: [RES: Type, ..]][, disabled];
+//!     [, resources: [[#[cfg(..)]] RES: [local] [shared|consume] Type, ..]]
+//!     [, slot_timeout: MS][, disabled];
 //! node NAME = Mode, deps: [A];                 // neither => a parked node the app spawns
 //! executor EXEC;                               // runtime-filled SendSpawner slot
 //! pool NAME = [Mode, ..], deps: [A][, executor: EXEC], spawn: <fn> | task: <worker>,
-//!     policy: [<Ty> =] <expr>, min: N, max: M;
+//!     [resources: [RES: [local] shared Type, ..],]
+//!     policy: [<Ty> =] <expr>, min: N, max: M[, slot_timeout: MS];
 //! ```
 //! `deps:` entries name a `node` or a `pool`; a `pool` dep resolves to that pool's floor
 //! member (member 0, the `min`-kept one), i.e. "start after the pool is up". A repeated
@@ -60,19 +62,66 @@
 //! spawn time on the supervisor's executor rather than at the shell's first poll.
 //! Worked examples: README "`spawn:` vs `task:` — which to use".
 //!
-//! `resources: [RES: Type, ..]` (requires `task:`; node-only) threads **owned
-//! resources from `main`** into the worker instead of re-acquiring them inside the
-//! task (`Peripherals::steal()`). Each entry emits a
-//! `pub static RES: ResourceSlot<Type>` at the declaration site; `main` moves the
+//! Two `task:` footguns, spelled out because nothing warns about either:
+//!
+//! * a partial-call **extra that can be missing at first poll is a task-side
+//!   panic**, not a failed spawn — extras are for infallible accessors. A value
+//!   that might not exist yet belongs in `resources:` (a `shared` entry for a
+//!   fan-out handle), where the pre-spawn gate turns "missing" into a clean
+//!   `SpawnError::Busy`;
+//! * a **verbatim-closure `spawn:` node is invisible to the trace/name glue** —
+//!   the closure owns the `SpawnToken`, so `adopt`/`stamp_name` is YOUR job
+//!   inside it, and a stable proc-macro cannot emit a warning when you forget.
+//!
+//! `resources: [RES: [local] [shared|consume] Type, ..]` (requires `task:`)
+//! threads **owned resources from `main`** into the worker instead of re-acquiring
+//! them inside the task (`Peripherals::steal()`). Each entry emits a
+//! `pub static RES` slot at the declaration site; `main` moves the
 //! resource in with `RES.provide(..)` (consuming the `Peripherals` field — the
 //! compile-time exclusive-ownership guarantee), the generated glue `take()`s it just
 //! before the spawn (an unprovided slot fails `Supervisor::start` with
 //! `SpawnError::Busy` after a bounded wait — fail-closed, not a task-side panic),
 //! and the shell passes the worker `&mut Type` (after the node arg, in declared
 //! order, before any partial-call extras) and `restore()`s the value after the
-//! worker returns, so a Terminate respawn re-takes the *same instance*. Slot names
-//! are statics: unique across the graph. Pools reject `resources:` (members would
-//! contend for one instance).
+//! worker returns, so a Terminate respawn re-takes the *same instance*. Take-kind
+//! slot names are statics: unique across the graph. Entries may carry per-entry
+//! `#[cfg(...)]` (the slot, gate, glue, shell param, and worker-call argument all
+//! follow it — gate the worker fn's matching parameter with the same `#[cfg]`).
+//!
+//! Per-entry kind markers refine that default (order-free; `local` composes with
+//! either of the mutually-exclusive `consume`/`shared`):
+//!
+//! * `consume` — the worker receives the value **by value** and no restore is
+//!   emitted: the slot stays empty after the task exits, so the worker may *drop*
+//!   the resource at teardown (a driver whose `Drop` releases pins/DMA) and a
+//!   respawn fail-closes (`SpawnError::Busy`) until the application `provide()`s
+//!   a fresh value — the pattern for resources rebuilt each run (e.g. radio
+//!   driver objects that go stale across a power cycle).
+//! * `shared` — a fan-out slot for a `Copy` handle (an `embassy_net::Stack`, a
+//!   `&'static` shared-bus ref): the glue copies the value out non-destructively
+//!   (`get()` — `T: Copy` enforced by its bound), the worker receives it by
+//!   value, no restore, and the slot STAYS FILLED — so any number of nodes
+//!   (and whole `pool`s: the only `resources:` kind pools accept, `task:` pools
+//!   only) may declare the SAME slot name. The static is emitted once, with the
+//!   union of the declaring sites' cfg predicates; every re-declaration must
+//!   repeat the kinds + type verbatim.
+//! * `local` — the slot is the graph-site `__SvLocalResourceSlot` type instead of
+//!   `ResourceSlot`: same protocol, no `T: Send` bound, for `!Send` driver
+//!   handles (`RefCell`-/`NoopRawMutex`-based). Emitted at the call site because
+//!   it carries an `unsafe impl Sync` whose soundness is the **single-core
+//!   contract**: all `provide`/`take`/`restore` of the slot on one core. It
+//!   cannot combine with `executor:` (a `SendSpawner`-routed node needs a `Send`
+//!   future — macro error), and a consumer crate forbidding `unsafe_code` cannot
+//!   use `local` (the assertion lands in *its* code, like the `trace-hooks`
+//!   symbols).
+//!
+//! `slot_timeout: MS` (node and pool; milliseconds ≥ 1) overrides the node's
+//! pre-spawn wait bound for its `executor:` slot and `resources:` gates (default
+//! 100 ms — sized for "provided before `start()`"). Raise it for consumers of a
+//! **provider node** — a first-in-topo node whose worker *builds* the resources
+//! at runtime and `provide()`s them (the graph-native `hw_init`): size the
+//! timeout to the provider's async build time and the gate wait becomes a
+//! rendezvous instead of a `Busy`. See the README's provider-node recipe.
 //!
 //! A graph holds at most **256 node slots** (including pool members): all graph
 //! indices are `u8`, and the macro rejects a larger declaration at expansion.
@@ -87,7 +136,9 @@
 //! array + `spawn_<pool>` glue fn + `<POOL>_POOL` `ElasticPool` + the structural
 //! `pub const`s `<POOL>_MIN` / `<POOL>_MAX` / `<POOL>_MEMBERS` (usize; for
 //! const-context sizing downstream — a `const` cannot read them off the member
-//! `static`) per `pool`, plus a
+//! `static`) per `pool`, one slot `pub static` per `resources:` entry (shared
+//! entries: one per unique name; plus, iff any entry is `local`, the
+//! `__SvLocalResourceSlot` type), plus a
 //! single `pub static GRAPH: Graph<M>` bundling the node slots, the dependency table,
 //! the topological order, and (with the `pool` feature) the pools — pass `&GRAPH` to
 //! `Supervisor::new`. The backing tables are private; read them through `GRAPH.nodes`
@@ -131,7 +182,14 @@ mod kw {
     syn::custom_keyword!(disabled);
     syn::custom_keyword!(executor);
     syn::custom_keyword!(resources);
+    syn::custom_keyword!(slot_timeout);
 }
+
+/// The graph-site slot type emitted (once per graph, iff any `resources:` entry
+/// is `local`-marked) for `!Send` resources. A single shared name: `emit_node`
+/// types the slot statics with it and `expand` emits its definition. Like the
+/// fixed `GRAPH` static, at most one `supervisor_graph!` per module.
+const LOCAL_SLOT_TYPE: &str = "__SvLocalResourceSlot";
 
 /// A dependency reference: a node ident, optionally `#[cfg(...)]`-gated.
 #[derive(Clone)]
@@ -178,27 +236,128 @@ enum TaskSource {
     Shell(Expr),
 }
 
-/// One `NAME: Type` entry of a `resources:` clause. The macro emits a
-/// `pub static NAME: ResourceSlot<Type>` at the declaration site; `main` moves
-/// the resource in with `NAME.provide(..)` (consuming the `Peripherals` field —
-/// the compile-time ownership guarantee), the generated spawn glue `take()`s it
+/// One `[#[cfg(..)]] NAME: [local] [shared|consume] Type` entry of a
+/// `resources:` clause. The macro emits a `pub static NAME` slot at the
+/// declaration site (`ResourceSlot<Type>`, or the graph-site local slot type
+/// for `local` entries); `main` moves the resource in with `NAME.provide(..)`
+/// (consuming the `Peripherals` field — the compile-time ownership guarantee),
+/// the generated spawn glue `take()`s (or, for `shared`, copies via `get()`) it
 /// before the spawn, and the generated shell `restore()`s it after the worker
-/// returns so a respawn re-takes the same instance.
+/// returns so a respawn re-takes the same instance (unless `consume`/`shared`).
 struct ResourceDecl {
+    /// Per-entry `#[cfg(...)]` attributes: the slot static, gate entry, glue
+    /// take/get, shell param, worker-call argument, and restore all carry them,
+    /// so a feature-varying resource set works within one node (the worker fn
+    /// must gate its matching parameter with the same `#[cfg]`).
+    cfg: Vec<Attribute>,
     ident: Ident,
     ty: Type,
+    /// `local` marker: the slot holds a `!Send`-capable value (`Rc`-, `RefCell`-,
+    /// `NoopRawMutex`-based driver handles). Kept as the marker `Ident` for
+    /// span-attached errors (`local` composes with neither `executor:` nor a
+    /// multi-core provider — see `parse_node`).
+    local: Option<Ident>,
+    /// `consume` marker: the worker receives the value **by value** and the shell
+    /// emits no restore — the slot is left empty when the worker exits, so a
+    /// respawn gates on an explicit re-`provide()`. For resources that must be
+    /// *dropped* at teardown (a driver whose `Drop` releases pins/DMA) or that go
+    /// stale across a power cycle and must be rebuilt each run.
+    consume: Option<Ident>,
+    /// `shared` marker: a fan-out slot for a `Copy` handle. The glue copies the
+    /// value out non-destructively (`get()`), the worker receives it **by
+    /// value**, no restore — so any number of nodes (and whole pools) may
+    /// declare the SAME slot name (the static is emitted once; re-declarations
+    /// must repeat kinds + type exactly). Mutually exclusive with `consume`.
+    shared: Option<Ident>,
 }
 
-/// `resources: [LED: Output<'static>, …]`
+impl ResourceDecl {
+    /// The kinds+type signature every re-declaration of a `shared` slot must
+    /// repeat verbatim (compared as token strings — same-name shared slots are
+    /// ONE static, so their declared shapes must agree).
+    fn shared_signature(&self) -> String {
+        let ty = &self.ty;
+        format!(
+            "{}shared {}",
+            if self.local.is_some() { "local " } else { "" },
+            quote!(#ty)
+        )
+    }
+}
+
+/// Peek whether the next token of a `resources:` entry is a kind *marker*
+/// (`local` / `consume` / `shared`) rather than the start of the resource
+/// `Type` itself. Contextual-keyword rule (no reserved words): the ident is a
+/// marker only when something else of the entry still follows it — i.e. it is
+/// NOT a marker when followed by `::` or `<` (it starts a path/generic type
+/// like `local::Foo` or `local<T>`) or by `,` / end-of-list (it IS the whole
+/// type, a type literally named `local`). Same fork-and-peek disambiguation as
+/// the pool `policy:` type annotation.
+fn peek_kind_marker(content: ParseStream) -> Option<Ident> {
+    if !content.peek(syn::Ident) {
+        return None;
+    }
+    let fork = content.fork();
+    let ident: Ident = fork.parse().ok()?;
+    if ident != "local" && ident != "consume" && ident != "shared" {
+        return None;
+    }
+    if fork.is_empty() || fork.peek(Token![,]) || fork.peek(Token![::]) || fork.peek(Token![<]) {
+        return None;
+    }
+    Some(ident)
+}
+
+/// `resources: [LED: Output<'static>, RUNNER: local consume Runner, …]`
 fn parse_resource_list(input: ParseStream) -> SynResult<Vec<ResourceDecl>> {
     let content;
     bracketed!(content in input);
     let mut resources = Vec::new();
     while !content.is_empty() {
+        let cfg = content.call(Attribute::parse_outer)?;
         let ident: Ident = content.parse()?;
         content.parse::<Token![:]>()?;
+        // Kind markers between the colon and the type, order-free: `local`
+        // plus at most one of `consume` / `shared`. A repeated marker is a
+        // declaration bug; `consume` (exclusive take, slot empty after exit)
+        // and `shared` (non-destructive fan-out copy) contradict each other.
+        let mut local: Option<Ident> = None;
+        let mut consume: Option<Ident> = None;
+        let mut shared: Option<Ident> = None;
+        while let Some(marker) = peek_kind_marker(&content) {
+            content.parse::<Ident>()?; // commit the peeked marker
+            let slot = if marker == "local" {
+                &mut local
+            } else if marker == "consume" {
+                &mut consume
+            } else {
+                &mut shared
+            };
+            if slot.is_some() {
+                return Err(syn::Error::new_spanned(
+                    &marker,
+                    format!("duplicate `{marker}` marker"),
+                ));
+            }
+            *slot = Some(marker);
+        }
+        if let (Some(_), Some(s)) = (&consume, &shared) {
+            return Err(syn::Error::new_spanned(
+                s,
+                "`consume` and `shared` are mutually exclusive — `consume` takes \
+                 the single value out for one owner, `shared` copies it out to \
+                 any number of consumers",
+            ));
+        }
         let ty: Type = content.parse()?;
-        resources.push(ResourceDecl { ident, ty });
+        resources.push(ResourceDecl {
+            cfg,
+            ident,
+            ty,
+            local,
+            consume,
+            shared,
+        });
         if content.peek(Token![,]) {
             content.parse::<Token![,]>()?;
         }
@@ -226,6 +385,11 @@ struct NodeItem {
     /// `SendSpawner` the app registers at runtime) instead of the supervisor's
     /// own `Spawner`. `None` = the default executor.
     executor: Option<Ident>,
+    /// `slot_timeout: N` (milliseconds) — overrides the node's pre-spawn
+    /// slot/gate wait bound (default 100 ms). Needed when the node's resources
+    /// are filled by a **provider node** at runtime: size it to the provider's
+    /// async build time.
+    slot_timeout: Option<LitInt>,
 }
 
 /// `executor NAME;` — declares a `pub static NAME: SpawnerSlot` the application
@@ -264,6 +428,13 @@ struct PoolItem {
     /// `executor: NAME` — spawn every member through the named [`SpawnerSlot`]
     /// (e.g. a worker pool on the second core, scaled by this core's supervisor).
     executor: Option<Ident>,
+    /// Pool `resources:` — **`shared` entries only** (enforced at parse): each
+    /// member's glue copies the same `Copy` handle out non-destructively, so
+    /// members don't contend (the reason non-shared kinds stay rejected).
+    resources: Vec<ResourceDecl>,
+    /// `slot_timeout: N` (milliseconds) — applied to every member (see the
+    /// node field of the same name).
+    slot_timeout: Option<LitInt>,
     min: LitInt,
     max: LitInt,
 }
@@ -285,6 +456,25 @@ enum Item {
 /// [`embassy_supervisor::Graph`] that `expand` produces as the `GRAPH` static.
 struct GraphSpec {
     items: Vec<Item>,
+}
+
+/// An item's `resources:` entries (nodes and pools both carry them; an
+/// `executor` slot has none) — for the graph-wide pre-passes in `expand`.
+fn item_resources(item: &Item) -> &[ResourceDecl] {
+    match item {
+        Item::Node(n) => &n.resources,
+        Item::Pool(p) => &p.resources,
+        Item::Executor(_) => &[],
+    }
+}
+
+/// An item's own name + cfg attributes (for shared-slot bookkeeping/docs).
+fn item_ident_cfg(item: &Item) -> Option<(&Ident, &[Attribute])> {
+    match item {
+        Item::Node(n) => Some((&n.ident, &n.cfg)),
+        Item::Pool(p) => Some((&p.ident, &p.cfg)),
+        Item::Executor(_) => None,
+    }
 }
 
 impl Parse for GraphSpec {
@@ -331,6 +521,7 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
     let mut disabled = false;
     let mut executor = None;
     let mut resources: Option<(kw::resources, Vec<ResourceDecl>)> = None;
+    let mut slot_timeout = None;
     while input.peek(Token![,]) {
         input.parse::<Token![,]>()?;
         if input.peek(kw::spawn) {
@@ -356,13 +547,30 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
             let k = input.parse::<kw::resources>()?;
             input.parse::<Token![:]>()?;
             resources = Some((k, parse_resource_list(input)?));
+        } else if input.peek(kw::slot_timeout) {
+            input.parse::<kw::slot_timeout>()?;
+            input.parse::<Token![:]>()?;
+            slot_timeout = Some(input.parse::<LitInt>()?);
         } else {
             return Err(input.error(
-                "expected `spawn:`, `task:`, `pool_size:`, `executor:`, `resources:`, or `disabled`",
+                "expected `spawn:`, `task:`, `pool_size:`, `executor:`, `resources:`, \
+                 `slot_timeout:`, or `disabled`",
             ));
         }
     }
     input.parse::<Token![;]>()?;
+
+    // `slot_timeout: 0` would make every gated spawn fail instantly — reject it
+    // as the declaration bug it is (`base10_parse::<u64>` also rejects suffixed
+    // or oversized literals with a span-attached error).
+    if let Some(st) = &slot_timeout {
+        if st.base10_parse::<u64>()? == 0 {
+            return Err(syn::Error::new_spanned(
+                st,
+                "`slot_timeout:` must be at least 1 (milliseconds)",
+            ));
+        }
+    }
 
     // Exactly one of `spawn:` / `task:` may pick the node's task.
     if let (Some(_), Some((k, _))) = (&spawn, &task) {
@@ -419,6 +627,23 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
             ));
         }
     }
+    // A `local` resource makes the shell future hold a `!Send`-capable value, and
+    // an `executor:`-routed node spawns through a `SendSpawner`, whose `spawn`
+    // requires a `Send` future. Reject here with the reason instead of letting
+    // rustc surface it as an opaque `F: Send` bound failure deep in the glue.
+    if let (Some((_, decls)), Some(ex)) = (&resources, &executor) {
+        if let Some(l) = decls.iter().find_map(|d| d.local.as_ref()) {
+            return Err(syn::Error::new_spanned(
+                l,
+                format!(
+                    "`local` resources cannot be combined with `executor: {ex}` — a \
+                     local slot exists to carry `!Send` values, and a node routed \
+                     through a `SpawnerSlot` (`SendSpawner`) must have a `Send` \
+                     future; run the node on the supervisor's own executor"
+                ),
+            ));
+        }
+    }
     let source = match (spawn, task) {
         (Some(e), _) => Some(TaskSource::Spawn(e)),
         (None, Some((_, e))) => Some(TaskSource::Shell(e)),
@@ -435,6 +660,7 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
         disabled,
         executor,
         resources: resources.map(|(_, decls)| decls).unwrap_or_default(),
+        slot_timeout,
     })
 }
 
@@ -475,18 +701,28 @@ fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
         TaskSource::Spawn(input.parse()?)
     };
     input.parse::<Token![,]>()?;
-    // `resources:` is node-only: a ResourceSlot holds ONE value, and pool
-    // members all run the same worker — they would contend for that single
-    // instance and every member past the first would fail its spawn. Reject
-    // with a targeted message instead of the generic "expected `policy`".
-    if input.peek(kw::resources) {
-        let k = input.parse::<kw::resources>()?;
-        return Err(syn::Error::new_spanned(
-            k,
-            "`resources:` is not supported on `pool` — members would contend \
-             for a single instance; declare per-node",
-        ));
-    }
+    // Pool `resources:` — `shared` entries only. A take-kind slot holds ONE
+    // value and pool members all run the same worker: they would contend for
+    // that single instance and every member past the first would fail its
+    // spawn. A `shared` entry is a non-destructive fan-out copy, so members
+    // don't contend — each glue `get()`s the same `Copy` handle.
+    let resources = if input.peek(kw::resources) {
+        input.parse::<kw::resources>()?;
+        input.parse::<Token![:]>()?;
+        let decls = parse_resource_list(input)?;
+        if let Some(bad) = decls.iter().find(|d| d.shared.is_none()) {
+            return Err(syn::Error::new_spanned(
+                &bad.ident,
+                "only `shared` resources are supported on `pool` — members \
+                 would contend for a take-kind slot's single instance; declare \
+                 take/consume resources per-node",
+            ));
+        }
+        input.parse::<Token![,]>()?;
+        decls
+    } else {
+        Vec::new()
+    };
     input.parse::<kw::policy>()?;
     input.parse::<Token![:]>()?;
     // Optional explicit policy type: `policy: <Ty> = <expr>`. Fork to see if a `Type`
@@ -514,7 +750,39 @@ fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
     input.parse::<kw::max>()?;
     input.parse::<Token![:]>()?;
     let max: LitInt = input.parse()?;
+    // Optional trailing `, slot_timeout: N` (milliseconds, ≥ 1) — every member's
+    // pre-spawn slot/gate wait bound (see the node clause of the same name).
+    let slot_timeout = if input.peek(Token![,]) && input.peek2(kw::slot_timeout) {
+        input.parse::<Token![,]>()?;
+        input.parse::<kw::slot_timeout>()?;
+        input.parse::<Token![:]>()?;
+        let st: LitInt = input.parse()?;
+        if st.base10_parse::<u64>()? == 0 {
+            return Err(syn::Error::new_spanned(
+                &st,
+                "`slot_timeout:` must be at least 1 (milliseconds)",
+            ));
+        }
+        Some(st)
+    } else {
+        None
+    };
     input.parse::<Token![;]>()?;
+    // Same `Send` reasoning as the node-side check: a `local` (i.e. `!Send`able)
+    // resource cannot ride members routed through a `SendSpawner`.
+    if let Some(ex) = &executor {
+        if let Some(l) = resources.iter().find_map(|d| d.local.as_ref()) {
+            return Err(syn::Error::new_spanned(
+                l,
+                format!(
+                    "`local` resources cannot be combined with `executor: {ex}` — a \
+                     local slot exists to carry `!Send` values, and a pool routed \
+                     through a `SpawnerSlot` (`SendSpawner`) must have `Send` \
+                     futures; run the pool on the supervisor's own executor"
+                ),
+            ));
+        }
+    }
     Ok(PoolItem {
         cfg,
         ident,
@@ -524,6 +792,8 @@ fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
         policy,
         policy_ty,
         executor,
+        resources,
+        slot_timeout,
         min,
         max,
     })
@@ -534,17 +804,10 @@ fn name_string(ident: &Ident) -> String {
     ident.to_string().to_lowercase().replace('_', "-")
 }
 
-/// Build a task-call expression with `node_ref` injected as the **first** argument:
-/// a bare path `f` => `f(node_ref)`; a partial call `f(a, b)` => `f(node_ref, a, b)`.
-/// The task fn is thus expected to take the node/`&POOL[i]` first, then any extra args.
-fn inject_node_call(task: &Expr, node_ref: &TokenStream2) -> SynResult<TokenStream2> {
-    inject_call_with(task, core::slice::from_ref(node_ref))
-}
-
-/// Like [`inject_node_call`] but injecting several leading arguments (the node
-/// ref, then a node's threaded `resources:` values) ahead of the user-supplied
-/// extras. Split out so the `resources:` paths don't disturb the single-arg
-/// callers.
+/// Build a task-call expression with leading arguments injected ahead of the
+/// user-supplied extras — the node ref (`&NODE` / `&POOL[i]`) first, then the
+/// item's threaded `resources:` values: a bare path `f` => `f(lead..)`; a
+/// partial call `f(a, b)` => `f(lead.., a, b)`.
 fn inject_call_with(task: &Expr, lead: &[TokenStream2]) -> SynResult<TokenStream2> {
     match task {
         Expr::Path(_) => Ok(quote!(#task(#(#lead),*))),
@@ -575,6 +838,47 @@ fn cfg_predicate(attrs: &[Attribute]) -> Option<TokenStream2> {
         1 => Some(preds[0].clone()),
         _ => Some(quote!(all(#(#preds),*))),
     }
+}
+
+/// Gate-array tokens for a `resources:` list: the element list (each entry
+/// `#[cfg]`-gated — cfg on array elements is stable, same as the deps table)
+/// and a matching length expression. A cfg'd-out element must also subtract
+/// from the fixed array length, so with any per-entry cfg the length becomes a
+/// sum of cfg-block 1/0 terms (the `GRAPH.nodes` Some/None trick, in const
+/// position); without, it stays the plain count.
+fn gate_tokens(resources: &[ResourceDecl]) -> (TokenStream2, Vec<TokenStream2>) {
+    let gate_refs: Vec<TokenStream2> = resources
+        .iter()
+        .map(|r| {
+            let cfg = &r.cfg;
+            let res = &r.ident;
+            quote!(#(#cfg)* &#res)
+        })
+        .collect();
+    let any_cfg = resources.iter().any(|r| cfg_predicate(&r.cfg).is_some());
+    let len = if any_cfg {
+        let terms: Vec<TokenStream2> = resources
+            .iter()
+            .map(|r| match cfg_predicate(&r.cfg) {
+                None => quote!(1usize),
+                Some(pred) => quote!({
+                    #[cfg(#pred)]
+                    {
+                        1usize
+                    }
+                    #[cfg(not(#pred))]
+                    {
+                        0usize
+                    }
+                }),
+            })
+            .collect();
+        quote!(0usize #(+ #terms)*)
+    } else {
+        let n = resources.len();
+        quote!(#n)
+    };
+    (len, gate_refs)
 }
 
 /// Extract the policy *type* from a `Type::new(..)` constructor expression. Only used
@@ -629,24 +933,41 @@ fn node_spawn(
     // slot fails `Supervisor::start` with `SpawnError::Busy` (the supervisor
     // logs the node name), instead of panicking inside an already-spawned task.
     // The values ride into the task as ordinary `#[embassy_executor::task]`
-    // arguments (embassy stores them in the shell's TaskPool slot).
+    // arguments (embassy stores them in the shell's TaskPool slot). A `shared`
+    // entry copies the value out non-destructively (`get()` — the slot stays
+    // filled for the other consumers) instead of `take()`ing it; `get`'s
+    // `T: Copy` bound is what enforces "shared handles must be Copy".
     let take_prelude: Vec<TokenStream2> = resources
         .iter()
         .enumerate()
         .map(|(i, r)| {
+            let cfg = &r.cfg;
             let res = &r.ident;
             let var = format_ident!("__r{}", i);
+            let getter = if r.shared.is_some() {
+                quote!(get)
+            } else {
+                quote!(take)
+            };
             quote! {
+                #(#cfg)*
                 let #var = #res
-                    .take()
+                    .#getter()
                     .ok_or(::embassy_executor::SpawnError::Busy)?;
             }
         })
         .collect();
-    let res_args: Vec<TokenStream2> = (0..resources.len())
-        .map(|i| {
+    // Per-entry `#[cfg]` rides on the call ARGUMENT too (stable in call
+    // position, like the cfg'd array elements in the deps table), so a
+    // cfg'd-out entry vanishes from the glue, the shell signature, and the
+    // worker call consistently.
+    let res_args: Vec<TokenStream2> = resources
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let cfg = &r.cfg;
             let var = format_ident!("__r{}", i);
-            quote!(#var)
+            quote!(#(#cfg)* #var)
         })
         .collect();
     Ok(match (spawn, executor) {
@@ -786,28 +1107,57 @@ fn emit_shell(
     // worker parks instead of returning, so it simply retains its resources
     // (the restore lines below are unreachable for it — correct, same as a
     // hand-written parked task holding its arguments).
+    //
+    // A `consume` entry is forwarded to the worker BY VALUE instead — the worker
+    // owns it (it can drop it at teardown, e.g. a driver whose `Drop` releases
+    // pins/DMA) and no restore is emitted: the slot stays empty until the app
+    // re-`provide()`s, which the supervisor's pre-respawn gate wait turns into
+    // fail-closed `SpawnError::Busy` rather than a stale-value reuse.
+    //
+    // A `shared` entry is also by value with no restore — but because the glue
+    // COPIED it out (`get()`), the slot stays filled; the worker's value is its
+    // own copy of the fan-out handle.
+    //
+    // Per-entry `#[cfg]` rides on params, worker-call arguments, and restore
+    // statements alike, so a cfg'd-out entry disappears from the whole chain
+    // (the worker fn must gate its matching parameter with the same `#[cfg]`).
+    let by_value = |r: &ResourceDecl| r.consume.is_some() || r.shared.is_some();
     let res_params: Vec<TokenStream2> = resources
         .iter()
         .enumerate()
         .map(|(i, r)| {
+            let cfg = &r.cfg;
             let var = format_ident!("__r{}", i);
             let ty = &r.ty;
-            quote!(mut #var: #ty)
+            if by_value(r) {
+                quote!(#(#cfg)* #var: #ty)
+            } else {
+                quote!(#(#cfg)* mut #var: #ty)
+            }
         })
         .collect();
-    let res_leases: Vec<TokenStream2> = (0..resources.len())
-        .map(|i| {
+    let res_leases: Vec<TokenStream2> = resources
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let cfg = &r.cfg;
             let var = format_ident!("__r{}", i);
-            quote!(&mut #var)
+            if by_value(r) {
+                quote!(#(#cfg)* #var)
+            } else {
+                quote!(#(#cfg)* &mut #var)
+            }
         })
         .collect();
     let restores: Vec<TokenStream2> = resources
         .iter()
         .enumerate()
+        .filter(|(_, r)| !by_value(r))
         .map(|(i, r)| {
+            let cfg = &r.cfg;
             let res = &r.ident;
             let var = format_ident!("__r{}", i);
-            quote!(#res.restore(#var);)
+            quote!(#(#cfg)* #res.restore(#var);)
         })
         .collect();
     let mut lead: Vec<TokenStream2> = vec![quote!(__node)];
@@ -815,9 +1165,19 @@ fn emit_shell(
     let call = inject_call_with(worker, &lead)?;
     // Unsuffixed literal: `#[task]`'s own parser wants a plain integer.
     let ps = LitInt::new(&pool_size.to_string(), proc_macro2::Span::call_site());
+    // A diverging (`-> !`) worker makes the restore statements unreachable —
+    // legitimate (a detached/`Pause` worker retains its resources forever), so
+    // silence rustc's `unreachable_code` lint on the generated body. Only
+    // emitted when there ARE trailing statements to reach.
+    let allow_unreachable = if restores.is_empty() {
+        quote!()
+    } else {
+        quote!(#[allow(unreachable_code)])
+    };
     let def = quote! {
         #(#cfg)*
         #[::embassy_executor::task(pool_size = #ps)]
+        #allow_unreachable
         async fn #shell(__node: &'static #cr::TaskNode #(, #res_params)*) {
             #call.await;
             #(#restores)*
@@ -869,40 +1229,68 @@ fn emit_node(
         (quote!(), quote!())
     } else {
         let gates_ident = format_ident!("__SV_GATES_{}", ident);
-        let slot_defs = n.resources.iter().map(|r| {
+        // `shared` slots are emitted once per graph in `expand` (several items
+        // may declare the same one); only this node's exclusive (take-kind)
+        // slots are emitted here.
+        let slot_defs = n.resources.iter().filter(|r| r.shared.is_none()).map(|r| {
+            let ecfg = &r.cfg;
             let res = &r.ident;
             let ty = &r.ty;
-            let doc = format!(
-                "Resource slot for node `{ident}` (generated by `supervisor_graph!`). \
-                 Move the resource in with `.provide(..)` before `Supervisor::start`."
-            );
+            // `local` entries use the graph-site slot type (emitted once per
+            // graph in `expand`): same provide/take protocol as `ResourceSlot`
+            // but without its `T: Send` bound, for `!Send` driver handles on a
+            // single-core system. `consume` changes only shell codegen (by-value
+            // arg, no restore) — the slot type is the same either way.
+            let slot_ty = if r.local.is_some() {
+                let local = format_ident!("{LOCAL_SLOT_TYPE}");
+                quote!(#local<#ty>)
+            } else {
+                quote!(#cr::ResourceSlot<#ty>)
+            };
+            let doc = if r.consume.is_some() {
+                format!(
+                    "Resource slot for node `{ident}` (generated by `supervisor_graph!`). \
+                         Move the resource in with `.provide(..)` before `Supervisor::start`. \
+                         `consume`: the worker owns (and may drop) the value, so the slot is \
+                         empty after the task exits — re-`provide()` before any respawn."
+                )
+            } else {
+                format!(
+                    "Resource slot for node `{ident}` (generated by `supervisor_graph!`). \
+                         Move the resource in with `.provide(..)` before `Supervisor::start`."
+                )
+            };
             quote! {
                 #(#cfg)*
+                #(#ecfg)*
                 #[doc = #doc]
-                pub static #res: #cr::ResourceSlot<#ty> = #cr::ResourceSlot::new();
+                pub static #res: #slot_ty = <#slot_ty>::new();
             }
         });
-        let gate_refs = n.resources.iter().map(|r| {
-            let res = &r.ident;
-            quote!(&#res)
-        });
-        let gate_count = n.resources.len();
+        let (gates_len, gate_refs) = gate_tokens(&n.resources);
         (
             quote! {
                 #(#slot_defs)*
                 #(#cfg)*
-                static #gates_ident: [&'static dyn #cr::ResourceGate; #gate_count] =
+                static #gates_ident: [&'static dyn #cr::ResourceGate; #gates_len] =
                     [#(#gate_refs),*];
             },
             quote!( .with_resources(&#gates_ident) ),
         )
+    };
+    // `slot_timeout: N` — override the node's pre-spawn slot/gate wait bound
+    // (see `TaskNode::with_slot_timeout`; sized to a provider node's build time).
+    let with_timeout = match &n.slot_timeout {
+        Some(ms) => quote!( .with_slot_timeout(#cr::_export::Duration::from_millis(#ms)) ),
+        None => quote!(),
     };
     let def = quote! {
         #res_defs
         #shell_def
         #(#cfg)*
         pub static #ident: #cr::TaskNode =
-            #cr::TaskNode::new(#name, #cr::Mode::#mode, #spawn, #disabled) #with_exec #with_res;
+            #cr::TaskNode::new(#name, #cr::Mode::#mode, #spawn, #disabled)
+                #with_exec #with_res #with_timeout;
     };
     let slot = Slot {
         cfg_pred: cfg_predicate(cfg),
@@ -949,16 +1337,42 @@ fn emit_pool(
         ));
     }
 
+    // Pool `resources:` (all `shared`, enforced at parse) additionally require
+    // `task:` — same rule as nodes: the generated shell is what receives the
+    // values as arguments (a hand-written `spawn:` task fn manages its own).
+    if !p.resources.is_empty() && matches!(p.source, TaskSource::Spawn(_)) {
+        return Err(syn::Error::new_spanned(
+            &p.resources[0].ident,
+            "pool `resources:` requires `task:` — the shared values are handed \
+             to the generated shell as arguments; a `spawn:` task fn manages \
+             its own arguments",
+        ));
+    }
+
     // Resolve the member task: `spawn:` uses the given expr directly; `task:`
     // first stamps ONE generated shell sized `pool_size = K` (all members share a
-    // single concrete future type) and targets that.
+    // single concrete future type) and targets that. Shared resources become
+    // by-value shell parameters, exactly like a node's.
     let (shell_def, member_expr) = match &p.source {
         TaskSource::Spawn(e) => (quote!(), e.clone()),
-        TaskSource::Shell(worker) => emit_shell(ident, cfg, worker, k, &[], cr)?,
+        TaskSource::Shell(worker) => emit_shell(ident, cfg, worker, k, &p.resources, cr)?,
     };
-    // Build member `I`'s spawn call from the member task, injecting
-    // `&POOL[I]` as the first argument (see `inject_node_call`).
-    let call = inject_node_call(&member_expr, &quote!(&#ident[I]))?;
+    // Build member `I`'s spawn call from the member task, injecting `&POOL[I]`
+    // as the first argument, then the shared resource copies (see
+    // `inject_call_with`).
+    let res_args: Vec<TokenStream2> = p
+        .resources
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let ecfg = &r.cfg;
+            let var = format_ident!("__r{}", i);
+            quote!(#(#ecfg)* #var)
+        })
+        .collect();
+    let mut lead: Vec<TokenStream2> = vec![quote!(&#ident[I])];
+    lead.extend(res_args);
+    let call = inject_call_with(&member_expr, &lead)?;
     // Per-member spawn fn: a generated `spawn_<pool>::<I>` wrapper. Same optional
     // trace capture as a node's closure, against member `I`'s slot. With
     // `executor: NAME` the wrapper ignores the supervisor's `Spawner` and spawns
@@ -979,6 +1393,26 @@ fn emit_pool(
             quote!(__sp),
         ),
     };
+    // Shared-resource prelude: copy each fan-out handle out non-destructively
+    // (the slot stays filled for the next member/consumer); an unprovided slot
+    // fail-closes the member's spawn with `SpawnError::Busy`. After the
+    // executor-slot guard, same ordering rationale as a node's glue.
+    let get_prelude: Vec<TokenStream2> = p
+        .resources
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let ecfg = &r.cfg;
+            let res = &r.ident;
+            let var = format_ident!("__r{}", i);
+            quote! {
+                #(#ecfg)*
+                let #var = #res
+                    .get()
+                    .ok_or(::embassy_executor::SpawnError::Busy)?;
+            }
+        })
+        .collect();
     let pool_spawn_stmts = spawn_stmts(&call, &quote!(&#ident[I]), &sp_tokens);
     let wrapper = format_ident!("spawn_{}", lname);
     let mut defs: Vec<TokenStream2> = Vec::new();
@@ -989,6 +1423,7 @@ fn emit_pool(
             #param: ::embassy_executor::Spawner,
         ) -> ::core::result::Result<(), ::embassy_executor::SpawnError> {
             #prelude
+            #(#get_prelude)*
             #pool_spawn_stmts
             ::core::result::Result::Ok(())
         }
@@ -999,6 +1434,31 @@ fn emit_pool(
     // supervisor awaits it before spawning each member (see `TaskNode::with_executor`).
     let member_with_exec = match &p.executor {
         Some(ex) => quote!( .with_executor(&#ex) ),
+        None => quote!(),
+    };
+    // Shared-resource gates: ONE array for the whole pool (every member awaits
+    // the same fan-out slots), wired into each member via `.with_resources`.
+    // The shared slot statics themselves are emitted once per graph in `expand`.
+    let gates_ident = format_ident!("__SV_GATES_{}", ident);
+    let member_with_res = if p.resources.is_empty() {
+        quote!()
+    } else {
+        quote!( .with_resources(&#gates_ident) )
+    };
+    let gates_def = if p.resources.is_empty() {
+        quote!()
+    } else {
+        let (gates_len, gate_refs) = gate_tokens(&p.resources);
+        quote! {
+            #(#cfg)*
+            static #gates_ident: [&'static dyn #cr::ResourceGate; #gates_len] =
+                [#(#gate_refs),*];
+        }
+    };
+    defs.push(gates_def);
+    // `slot_timeout: N` — every member's pre-spawn slot/gate wait bound.
+    let member_with_timeout = match &p.slot_timeout {
+        Some(ms) => quote!( .with_slot_timeout(#cr::_export::Duration::from_millis(#ms)) ),
         None => quote!(),
     };
     let members = p
@@ -1012,7 +1472,7 @@ fn emit_pool(
                 #cr::TaskNode::new(
                     #nm, #cr::Mode::#mode,
                     ::core::option::Option::Some((#sp) as #spawn_fn), false,
-                ) #member_with_exec
+                ) #member_with_exec #member_with_res #member_with_timeout
             }
         });
     defs.push(quote! {
@@ -1158,6 +1618,115 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
     let mut slots: Vec<Slot> = Vec::new();
     let mut names: HashMap<String, usize> = HashMap::new();
 
+    // Iff any `resources:` entry is `local`-marked, emit the local slot TYPE once
+    // per graph (the per-entry statics in `emit_node` reference it by name). It
+    // mirrors `embassy_supervisor::ResourceSlot` — same provide/take/restore
+    // protocol, same critical-section interior, same `ResourceGate` view — but
+    // WITHOUT the `T: Send` bound, so it can carry the `!Send` driver handles
+    // (`RefCell`-/`NoopRawMutex`-based: `embassy_net::Stack` runners,
+    // `cyw43::Control`, …) that a single-core system hands between its own tasks.
+    // That requires asserting `Sync` for a `!Send` payload, so like the
+    // `trace-hooks` symbols it is emitted here, at the graph declaration site,
+    // where the application owns the soundness contract (see the SAFETY note).
+    let any_local = graph
+        .items
+        .iter()
+        .any(|item| item_resources(item).iter().any(|r| r.local.is_some()));
+    if any_local {
+        let local = format_ident!("{LOCAL_SLOT_TYPE}");
+        // `Cell<Option<T>>` spelled through absolute paths (macro output must not
+        // rely on the caller's prelude/imports); the mutex/signal types come from
+        // the supervisor's `_export` shim so the consumer needs no direct
+        // `embassy-sync` dependency.
+        let cell = quote!(::core::cell::Cell<::core::option::Option<T>>);
+        let raw = quote!(#cr::_export::CriticalSectionRawMutex);
+        let signal = quote!(#cr::_export::Signal<#raw, ()>);
+        defs.push(quote! {
+            /// One-value handoff cell for a `local`-marked `resources:` entry
+            /// (generated by `supervisor_graph!`). Protocol and fail-closed
+            /// semantics of `embassy_supervisor::ResourceSlot`, minus its
+            /// `T: Send` bound — for `!Send` driver handles on a single core.
+            ///
+            /// Contract (see the `unsafe impl Sync` below): every `provide` /
+            /// `take` / `restore` of a given slot must happen on the SAME core.
+            // `dead_code`/`missing_docs` in the consumer: the type is emitted
+            // whenever a `local` entry is *declared*, even if every declaring
+            // node is `#[cfg]`-compiled out of this build.
+            #[allow(dead_code)]
+            pub struct #local<T> {
+                slot: #cr::_export::BlockingMutex<#raw, #cell>,
+                filled: #signal,
+            }
+            // SAFETY: the payload is intentionally NOT `Send` — this assertion is
+            // exactly the single-core contract: the value only ever moves between
+            // executors/tasks of one core (interrupt-safe via the critical-section
+            // mutex around every access), never across cores. The macro rejects
+            // `local` + `executor:` so a slot cannot feed a `SendSpawner`-routed
+            // node, and a multi-core application must not `provide`/`take` a given
+            // slot from different cores.
+            unsafe impl<T> ::core::marker::Sync for #local<T> {}
+            #[allow(dead_code)]
+            impl<T> #local<T> {
+                /// An empty slot (`const` — it lives in the generated `static`s).
+                pub const fn new() -> Self {
+                    Self {
+                        slot: #cr::_export::BlockingMutex::new(
+                            ::core::cell::Cell::new(::core::option::Option::None),
+                        ),
+                        filled: #cr::_export::Signal::new(),
+                    }
+                }
+                /// Move the resource in and wake the supervisor's pre-spawn wait.
+                pub fn provide(&self, value: T) {
+                    self.slot.lock(|c| c.set(::core::option::Option::Some(value)));
+                    self.filled.signal(());
+                }
+                /// Take the resource out, leaving the slot empty (spawn glue).
+                pub fn take(&self) -> ::core::option::Option<T> {
+                    self.slot.lock(::core::cell::Cell::take)
+                }
+                /// Put the resource back for the next spawn (generated shell;
+                /// not emitted for `consume` entries).
+                pub fn restore(&self, value: T) {
+                    self.provide(value);
+                }
+            }
+            #[allow(dead_code)]
+            impl<T: ::core::marker::Copy> #local<T> {
+                /// Copy the value out WITHOUT emptying the slot — the `shared`
+                /// kind's fan-out read (any number of consumers, slot stays
+                /// filled). `T: Copy` only.
+                pub fn get(&self) -> ::core::option::Option<T> {
+                    self.slot.lock(|c| {
+                        let v = c.take();
+                        c.set(v);
+                        v
+                    })
+                }
+            }
+            impl<T> ::core::default::Default for #local<T> {
+                fn default() -> Self {
+                    Self::new()
+                }
+            }
+            impl<T> #cr::ResourceGate for #local<T> {
+                fn is_filled(&self) -> bool {
+                    // Peek without consuming: `Cell` has no `&T` access, so
+                    // take-and-put-back under the same critical section.
+                    self.slot.lock(|c| {
+                        let v = c.take();
+                        let filled = v.is_some();
+                        c.set(v);
+                        filled
+                    })
+                }
+                fn filled_signal(&self) -> &#signal {
+                    &self.filled
+                }
+            }
+        });
+    }
+
     // Pre-pass: collect the declared `executor NAME;` slots so a node's
     // `executor:` reference can be validated regardless of declaration order.
     let executor_names: Vec<String> = graph
@@ -1170,21 +1739,100 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
         .collect();
 
     // Pre-pass: `resources:` slot names become `pub static`s at the declaration
-    // site, so they must be unique across the whole graph — and must not shadow
-    // an `executor NAME;` static. Caught here with a targeted message instead of
-    // rustc's downstream duplicate-static E0428 on generated code.
+    // site, so take-kind names must be unique across the whole graph — and no
+    // resource may shadow an `executor NAME;` static. `shared` entries are the
+    // deliberate exception: the SAME name on several items is one fan-out slot,
+    // emitted once (below, with the union of the declaring sites' cfg
+    // predicates so it exists whenever any consumer does) — provided every
+    // re-declaration repeats the kinds + type verbatim. Caught here with
+    // targeted messages instead of rustc's downstream duplicate-static E0428.
+    struct SharedPlan<'a> {
+        /// First declaration — supplies the emitted static's ident (span), type,
+        /// and `local` flag.
+        decl: &'a ResourceDecl,
+        /// Kinds+type token string every re-declaration must match.
+        sig: String,
+        /// One entry per declaring site: `None` = unconditional (the slot is
+        /// then unconditional too), `Some(pred)` = that site's combined
+        /// item-level + entry-level cfg predicate.
+        preds: Vec<Option<TokenStream2>>,
+        /// Declaring node/pool names, for the generated doc comment.
+        owners: Vec<String>,
+    }
+    let mut shared_plans: Vec<(String, SharedPlan)> = Vec::new();
     {
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut taken: HashSet<String> = HashSet::new();
         for item in &graph.items {
-            if let Item::Node(n) = item {
-                for r in &n.resources {
-                    let key = r.ident.to_string();
-                    if !seen.insert(key.clone()) || executor_names.contains(&key) {
+            let Some((owner, item_cfg)) = item_ident_cfg(item) else {
+                continue;
+            };
+            let item_pred = cfg_predicate(item_cfg);
+            for r in item_resources(item) {
+                let key = r.ident.to_string();
+                if executor_names.contains(&key) {
+                    return Err(syn::Error::new_spanned(
+                        &r.ident,
+                        format!(
+                            "resource name `{}` shadows an `executor {};` slot — \
+                             both are statics at the declaration site",
+                            r.ident, r.ident
+                        ),
+                    ));
+                }
+                // A site's presence predicate: the item's cfg AND the entry's.
+                let pred = match (item_pred.clone(), cfg_predicate(&r.cfg)) {
+                    (None, None) => None,
+                    (Some(p), None) | (None, Some(p)) => Some(p),
+                    (Some(a), Some(b)) => Some(quote!(all(#a, #b))),
+                };
+                if r.shared.is_some() {
+                    if taken.contains(&key) {
+                        return Err(syn::Error::new_spanned(
+                            &r.ident,
+                            format!(
+                                "`{}` is already a take-kind resource elsewhere in \
+                                 the graph — a name is either one exclusive slot or \
+                                 one `shared` slot, not both",
+                                r.ident
+                            ),
+                        ));
+                    }
+                    let sig = r.shared_signature();
+                    match shared_plans.iter_mut().find(|(k, _)| *k == key) {
+                        Some((_, plan)) => {
+                            if plan.sig != sig {
+                                return Err(syn::Error::new_spanned(
+                                    &r.ident,
+                                    format!(
+                                        "shared resource `{}` re-declared with a \
+                                         different shape: `{}` here vs `{}` on \
+                                         `{}` — every declaration of a shared slot \
+                                         must repeat the same kind markers and type",
+                                        r.ident, sig, plan.sig, plan.owners[0]
+                                    ),
+                                ));
+                            }
+                            plan.preds.push(pred);
+                            plan.owners.push(owner.to_string());
+                        }
+                        None => shared_plans.push((
+                            key,
+                            SharedPlan {
+                                decl: r,
+                                sig,
+                                preds: vec![pred],
+                                owners: vec![owner.to_string()],
+                            },
+                        )),
+                    }
+                } else {
+                    if !taken.insert(key.clone()) || shared_plans.iter().any(|(k, _)| *k == key) {
                         return Err(syn::Error::new_spanned(
                             &r.ident,
                             format!(
                                 "duplicate resource name `{}` — resource slots are \
-                                 statics and must be unique across the graph",
+                                 statics and must be unique across the graph (only \
+                                 `shared` entries may repeat a name)",
                                 r.ident
                             ),
                         ));
@@ -1192,6 +1840,38 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                 }
             }
         }
+    }
+    // Emit each shared slot once. Presence: unconditional if ANY declaring site
+    // is, else `#[cfg(any(<site preds>))]` — the slot exists whenever at least
+    // one consumer does.
+    for (_, plan) in &shared_plans {
+        let res = &plan.decl.ident;
+        let ty = &plan.decl.ty;
+        let slot_ty = if plan.decl.local.is_some() {
+            let local = format_ident!("{LOCAL_SLOT_TYPE}");
+            quote!(#local<#ty>)
+        } else {
+            quote!(#cr::ResourceSlot<#ty>)
+        };
+        let cfg_attr = if plan.preds.iter().any(|p| p.is_none()) {
+            quote!()
+        } else {
+            let preds = plan.preds.iter().flatten();
+            quote!(#[cfg(any(#(#preds),*))])
+        };
+        let doc = format!(
+            "Shared (fan-out) resource slot declared by `{}` (generated by \
+             `supervisor_graph!`). `provide()` the `Copy` handle before \
+             `Supervisor::start`; every consumer's glue copies it out with \
+             `get()`, so the slot STAYS FILLED — re-`provide()` only to replace \
+             the handle (e.g. after rebuilding the underlying driver).",
+            plan.owners.join("`, `"),
+        );
+        defs.push(quote! {
+            #cfg_attr
+            #[doc = #doc]
+            pub static #res: #slot_ty = <#slot_ty>::new();
+        });
     }
 
     for item in &graph.items {

@@ -11,6 +11,7 @@ target. The only third-party deps are pure-embassy crates (`embassy-executor`/`-
 ## Table of contents
 
 - [What it is](#what-it-is)
+- [Highlights in 0.3.3](#highlights-in-033)
 - [Highlights in 0.3.2](#highlights-in-032)
 - [Highlights in 0.3.1](#highlights-in-031)
 - [Quickstart](#quickstart)
@@ -52,6 +53,47 @@ target. The only third-party deps are pure-embassy crates (`embassy-executor`/`-
 
 The supervisor deliberately does **not** allocate, own a HAL, manage power states, or know what your
 tasks do — it orchestrates their *lifecycle* and leaves the rest to you.
+
+## Highlights in 0.3.3
+
+Ships with `embassy-supervisor-macros` 0.4.0 .
+
+Three `resources:` kind markers — **`consume`**, **`shared`**, **`local`** — plus
+per-node **`slot_timeout:`** and the **provider-node** pattern: hardware init is now
+fully graph-managed across every power-state transition (cold boot, dormant wake,
+deep-sleep wake), and the hand-rolled statics, `unsafe` accessors, and panic-prone
+init getters they used to require are gone.
+
+- **`consume`: drop-at-teardown / rebuild-per-cycle resources.** The worker owns the value
+  outright, so dropping it at teardown is part of the contract (a driver whose `Drop`
+  releases pins and DMA channels), and the slot stays empty afterwards — a respawn
+  fail-closes with `SpawnError::Busy` until the app `provide()`s a fresh instance, instead of
+  silently reusing a driver that went stale across a power cycle.
+- **`local`: `!Send` driver handles on a single core.** `RefCell`-/`NoopRawMutex`-based
+  handles — driver control handles, network-stack runners — can now ride `resources:`: the
+  entry's slot is a graph-site type without the `T: Send` bound (it carries a documented
+  `unsafe impl Sync` in *your* crate; single-core contract, and `local` + `executor:` is a
+  compile error).
+- **`shared`: one `Copy` handle fanned out to many consumers.** Several nodes — and whole
+  `task:` pools — declare the SAME slot name (a network-stack handle, a `&'static`
+  shared-bus ref); each spawn copies the value out non-destructively and the slot stays
+  filled. This replaces the panicking-accessor pattern (an `is-it-initialized-yet` getter
+  as a `task:` extra): a missing handle is now a gate-awaited, fail-closed
+  `SpawnError::Busy` instead of a first-poll panic.
+- **`slot_timeout:` + provider nodes.** The pre-spawn slot/gate wait is per-node tunable
+  (`slot_timeout: 5000`, `TaskNode::with_slot_timeout`), which makes an async hardware
+  builder an ordinary graph node: build, `provide()`, park; consumers rendezvous on
+  their gates — `start()` and every `respawn_terminate()` alike (the provider re-runs
+  first, in topo order). See
+  [Provider node](#provider-node--async-multi-output-construction-in-the-graph).
+- Also: per-entry `#[cfg(...)]` on `resources:` entries, and generated shells silence the
+  `unreachable_code` warning for `-> !` workers with restore-kind resources.
+
+Combined, they make a whole radio bring-up fully graph-managed — a provider node builds
+the driver objects and `provide()`s them (`RUNNER: local consume …` for the owned `!Send`
+event loop, `STACK: shared local …` for the fanned-out handle), `start()` rendezvouses,
+teardown drops them, and the next wake cycle rebuilds and re-provides. See
+[Resource kinds](#resource-kinds-local-consume-and-shared).
 
 ## Highlights in 0.3.2
 
@@ -303,12 +345,14 @@ spawner.spawn(token).unwrap();
 executor NAME;                        // runtime-filled SendSpawner slot (tier / second core)
 node NAME = Mode, deps: [A, B][, executor: EXEC], spawn: <spawn>[, disabled];
 node NAME = Mode, deps: [A, B][, executor: EXEC], task: <worker>[, pool_size: N]
-    [, resources: [RES: Type, ..]][, disabled];
+    [, resources: [[#[cfg(..)]] RES: [local] [shared|consume] Type, ..]]
+    [, slot_timeout: MS][, disabled];
 node NAME = Mode, deps: [A];          // neither => parked node the app spawns itself
 pool NAME = [Mode, ..], deps: [A][, executor: EXEC],
     spawn: <fn> | task: <worker>,
+    [resources: [RES: [local] shared Type, ..],]   // shared-only on pools
     policy: [<Type> =] <expr>,
-    min: N, max: M;
+    min: N, max: M[, slot_timeout: MS];
 ```
 
 ### Spawn forms
@@ -345,7 +389,10 @@ Semantics:
 - **Worker args are evaluated inside the shell**, at the task's first poll, on the node's own
   executor — so the DSL never needs the arg types, an `executor:`/second-core node builds its
   resources on the core that runs them, and cross-node data should go through awaited
-  accessors (a spawn batch polls last-first).
+  accessors (a spawn batch polls last-first). Corollary: an extra that can be **missing** at
+  first poll is a task-side panic, not a failed spawn — extras are for infallible accessors.
+  A value that might not exist yet belongs in `resources:` (a `shared` entry for a fan-out
+  handle): the pre-spawn gate turns "missing" into a clean `SpawnError::Busy`.
 - `pool_size: N` (default 1) sizes the shell's `TaskPool` — headroom for a respawn issued
   while the previous instance is still draining.
 - On a `pool`, `task:` emits ONE shell sized to the member count.
@@ -398,6 +445,11 @@ have emitted.
            s.spawn(token)
        };
    ```
+
+   ⚠️ The `adopt` line is **your job, and nothing will remind you**: the closure owns the
+   `SpawnToken`, so the macro cannot capture the task id (`trace`) or stamp the node name
+   (`metadata-names`) for you, and a stable proc-macro cannot emit a warning. Forgetting it
+   is silent — the node simply never appears in the trace/name output.
 
 4. **Arguments that must be evaluated at spawn time, on the supervisor's executor.**
    `spawn:` partial-call args run in the spawn glue, at the moment of the (re)spawn;
@@ -455,6 +507,55 @@ are both covered. Caveats: a panic in the worker skips the restore (embedded pan
 `pool_size > 1` on a `resources:` node buys nothing (the slot holds ONE value — a second
 concurrent spawn fails at `take()`); pools reject `resources:` (members would contend for a
 single instance).
+
+#### Resource kinds: `local`, `consume`, and `shared`
+
+Per-entry markers (order-free; `local` composes with either of the mutually exclusive
+`consume`/`shared`) refine the default lend-and-restore protocol for the resources it
+cannot express:
+
+| kind | worker receives | on worker exit | use for |
+|---|---|---|---|
+| *(default)* | `&mut Type` | `restore()`d — respawn re-takes the same instance | long-lived singletons (`Output`, a reborrowable `Peri`) |
+| `consume` | `Type` **by value** (glue `take()`s) | nothing — the slot stays **empty** | resources the worker must *drop* at teardown (a driver whose `Drop` releases pins/DMA) or that go stale across a power cycle and are rebuilt each run |
+| `shared` | `Type` **by value** (glue **copies** via `get()`, `T: Copy`) | nothing — the slot **stays filled** | one handle fanned out to many consumers (`embassy_net::Stack`, a `&'static` shared-bus ref); several nodes — and whole `task:` pools — declare the SAME slot name |
+| `local` | as the kind it composes with | as the kind it composes with | `!Send` values (`RefCell`-/`NoopRawMutex`-based driver handles) on a **single core** |
+
+`consume` makes teardown-drop explicit and turns the wake path into "build fresh, `provide()`,
+respawn": until the application re-provides, a respawn fail-closes with `SpawnError::Busy`
+instead of reusing a stale instance.
+
+`shared` replaces the panicking-accessor pattern for fan-out handles: instead of a
+`task:` extra like `stack()` that panics at first poll when the value is missing, a
+`shared` resource is gate-awaited before the spawn and a missing value is a clean
+`SpawnError::Busy`. The slot static is emitted once per unique name (with the union of
+the declaring sites' `#[cfg]` predicates); every re-declaration must repeat the same
+kind markers and type. Entries may also carry per-entry `#[cfg(...)]` — gate the worker
+fn's matching parameter with the same attribute.
+
+`local` swaps the emitted `ResourceSlot` for a graph-site slot type without the `T: Send`
+bound. That type carries an `unsafe impl Sync` **in your crate** — same reason the `trace-hooks`
+symbols live at the graph site), whose soundness contract is: all `provide`/`take`/`restore`
+of a given slot happen on ONE core. The macro rejects `local` + `executor:`
+(a `SendSpawner`-routed node needs a `Send` future), and a consumer crate that forbids
+`unsafe_code` cannot use `local`.
+
+```rust,ignore
+// The cyw43 pattern: a !Send radio runner, dropped at teardown to release its
+// pins, rebuilt by the app before each wake respawn.
+async fn radio(node: &'static TaskNode, runner: Cyw43Runner) {
+    select(runner.run(), node.wait_shutdown()).await; // drop releases PWR/PIO/DMA
+    node.ack_dropped();
+}
+
+supervisor_graph! {
+    node RADIO = Terminate, deps: [], task: radio,
+        resources: [RUNNER: local consume Cyw43Runner];
+}
+
+// bring-up (and again on every wake cycle, BEFORE the respawn):
+RUNNER.provide(build_radio_runner().await);
+```
 
 ### `disabled`
 
@@ -527,6 +628,15 @@ offending token:
   across the whole graph
 - **`resources:` on a `pool`** — members would contend for a single instance; declare
   per-node
+- **a repeated kind marker on a `resources:` entry** (`local local T`) — declaration bug
+- **`shared` with `consume`** — contradictory: one exclusive owner vs any number of copies
+- **a `shared` slot re-declared with different kinds/type** — every declaration of the
+  same name is ONE static and must repeat its shape verbatim
+- **a non-`shared` resource on a `pool`** — members would contend for a take-kind slot's
+  single instance (and pool `resources:` require `task:`)
+- **`local` resources with `executor:`** — on a node or a pool: a local slot carries
+  `!Send` values; a `SpawnerSlot`-routed spawn needs a `Send` future
+- **`slot_timeout: 0`** — would fail every gated spawn instantly
 - **pool bounds** — `min <= max <= K` (member count), values must fit `u8`
 - **pool without the `pool` feature** — a `pool` item requires enabling it
 - **more than 256 slots** — the `u8` index cap above
@@ -535,7 +645,8 @@ offending token:
 
 Generated surface at the call site: one `pub static` per node, the pool array + `NAME_POOL`
 \+ the `NAME_MIN`/`NAME_MAX`/`NAME_MEMBERS` consts,
-one `SpawnerSlot` static per `executor NAME;`, and `pub static GRAPH` — nothing else.
+one `SpawnerSlot` static per `executor NAME;`, one slot static per `resources:` entry (plus,
+iff any entry is `local`, the local slot type), and `pub static GRAPH` — nothing else.
 
 ## Recipes by use case
 
@@ -576,6 +687,44 @@ supervisor_graph! {
 
 Args (`bme()`, `sht()`) are evaluated inside each shell at first poll, on the
 node's own executor.
+
+### Provider node — async multi-output construction in the graph
+
+One async bring-up often builds SEVERAL correlated driver objects (a cyw43 radio:
+two runners + a `Control` + a `Stack` handle) that different nodes consume, and must
+re-run every wake cycle. That builder becomes an ordinary **provider node** — no
+special DSL, just the gate machinery pointed at runtime provisioning:
+
+```rust,ignore
+// The provider: builds and provide()s, holds NOTHING afterwards. Terminate
+// mode makes respawn_terminate re-run the build each wake cycle.
+async fn radio_hw(node: &'static TaskNode) {
+    let (runner, control, stack) = build_radio().await;  // hundreds of ms
+    RUNNER.provide(runner);     // consume slot: empty again after teardown
+    CONTROL.provide(control);   // consume slot
+    STACK.provide(stack);       // shared slot: fanned out, stays filled
+    node.wait_shutdown().await;
+    node.ack_dropped();
+}
+
+supervisor_graph! {
+    node RADIO_HW = Terminate, deps: [], task: radio_hw;
+    // Consumers: deps order them after the provider, and slot_timeout covers
+    // its build time (the 100 ms default assumes provided-before-start).
+    node LINK = Terminate, deps: [RADIO_HW], task: link_task, slot_timeout: 5000,
+        resources: [RUNNER: local consume Runner];
+    node CTRL = Terminate, deps: [RADIO_HW, LINK], task: ctrl_task, slot_timeout: 5000,
+        resources: [CONTROL: local consume Control, STACK: shared local Stack];
+}
+```
+
+The lifecycle falls out of the existing rules: `start()` spawns `RADIO_HW` first
+(topo order) and parks on the consumers' gates until it has provided; teardown drops
+consumers first (reverse topo — `consume` values are dropped, `shared` handles just
+die with their copies) and the provider last; `respawn_terminate` re-runs the
+provider FIRST, so the consumers' gate waits rendezvous with the freshly built
+values. A provider that dies before providing surfaces as `SpawnError::Busy` on its
+consumers after their `slot_timeout` — fail-closed, never a stale reuse.
 
 ### Elastic worker pool with `DeferredShrink`
 

@@ -1,0 +1,5 @@
+error: `consume` and `shared` are mutually exclusive — `consume` takes the single value out for one owner, `shared` copies it out to any number of consumers
+  --> tests/ui/compile_fail/shared_and_consume.rs:13:24
+   |
+13 |         resources: [H: shared consume Handle];
+   |                        ^^^^^^

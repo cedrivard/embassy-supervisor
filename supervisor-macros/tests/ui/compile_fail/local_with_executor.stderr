@@ -1,0 +1,5 @@
+error: `local` resources cannot be combined with `executor: HIGH` — a local slot exists to carry `!Send` values, and a node routed through a `SpawnerSlot` (`SendSpawner`) must have a `Send` future; run the node on the supervisor's own executor
+  --> tests/ui/compile_fail/local_with_executor.rs:16:27
+   |
+16 |         resources: [BLOB: local consume Rc<Cell<u32>>];
+   |                           ^^^^^

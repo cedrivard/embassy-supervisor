@@ -4,6 +4,30 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-07-09
+
+Ships the `resources:` **kind markers** by updating the macro pin to
+`embassy-supervisor-macros = "=0.4.0"`: `consume` (the worker owns the value — drop it
+at teardown; the slot stays empty, so a respawn fail-closes until the app re-provides a
+fresh instance), `shared` (a fan-out slot for a `Copy` handle — any number of nodes and
+whole pools copy the same value out non-destructively; replaces panicking accessor
+extras with a gate-awaited `SpawnError::Busy`), and `local` (a graph-site slot without
+the `T: Send` bound, for `!Send` driver handles on a single core). Composed
+(`local consume`, `shared local`) they cover the whole radio shape: a `!Send` runner
+whose `Drop` must release pins/DMA at teardown and that is rebuilt each wake cycle,
+plus the `Stack` handle fanned out to every network consumer. With the new
+`slot_timeout:` clause, the builder itself becomes a **provider node** — an ordinary
+first-in-topo node that `provide()`s at runtime while its consumers' gate waits
+rendezvous with the build (the graph-native `hw_init`; see the README's provider-node
+recipe). See the macros CHANGELOG and the README's "Resource kinds" section.
+
+### Added
+- `ResourceSlot::get` (`T: Copy` only): copy the value out **without emptying the
+  slot** — the `shared` kind's fan-out read, also usable by hand.
+- `TaskNode::with_slot_timeout` (backs the macro's `slot_timeout:` clause): per-node
+  override of the pre-spawn `executor:`-slot and `resources:`-gate wait bound (the
+  default is unchanged at 100 ms). Size it to a provider node's async build time.
+
 ## [0.3.2] - 2026-07-08
 
 Decouples node-name stamping from the trace recorders, so a graph's node names can
@@ -170,6 +194,7 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
+[0.3.3]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.2.0...v0.3.0
