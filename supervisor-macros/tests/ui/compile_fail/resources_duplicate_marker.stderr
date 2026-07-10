@@ -1,0 +1,5 @@
+error: duplicate `local` marker
+  --> tests/ui/compile_fail/resources_duplicate_marker.rs:11:32
+   |
+11 |         resources: [LED: local local FakeLed];
+   |                                ^^^^^

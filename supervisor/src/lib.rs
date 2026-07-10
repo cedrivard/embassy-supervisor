@@ -40,7 +40,21 @@
 //!     compile-time exclusive ownership (the `Peripherals` field is consumed, no
 //!     `steal()` inside the task), fail-closed provisioning (an unprovided slot
 //!     fails `start` with `SpawnError::Busy`), and restore-on-exit so a respawn
-//!     re-takes the *same instance*.
+//!     re-takes the *same instance*. Per-entry kind markers refine that
+//!     default: `consume` hands the worker the value **by value** with no
+//!     restore (drop-at-teardown drivers; rebuilt-per-cycle resources — a
+//!     respawn fail-closes until the app re-`provide()`s); `shared` is a
+//!     fan-out slot for a `Copy` handle (the glue copies via
+//!     [`ResourceSlot::get`], the slot stays filled — any number of nodes and
+//!     whole pools may declare the same name); and `local` swaps in a
+//!     graph-site slot without the `T: Send` bound (`!Send` driver handles,
+//!     single-core contract). See the macro docs for the markers' fine print.
+//!   * The pre-spawn waits are per-node tunable (`slot_timeout:` /
+//!     [`TaskNode::with_slot_timeout`]), which makes **provider nodes** work: a
+//!     first-in-topo node whose worker *builds* resources at runtime and
+//!     `provide()`s them into other nodes' slots (the graph-native `hw_init`);
+//!     consumers size their timeout to the build and the gate wait becomes a
+//!     rendezvous.
 //!   * Two flags span every lifecycle operation: **disabled** (stopped until an
 //!     explicit `Activate` — declared `disabled` in the graph or control-stopped;
 //!     see [`TaskNode::set_disabled`]) and **detached** (self-managed: after
@@ -556,6 +570,24 @@ impl<T> ResourceSlot<T> {
         self.slot.lock(Cell::take)
     }
 
+    /// Copy the resource out **without emptying the slot** — the `shared`
+    /// resource kind's read: any number of consumers (several nodes, a whole
+    /// pool) get the same `Copy` handle, and the slot stays filled for the
+    /// next one. Only for `T: Copy` (a `Stack`-like handle, a `&'static`
+    /// registry ref); an owned singleton uses [`take`](Self::take).
+    pub fn get(&self) -> Option<T>
+    where
+        T: Copy,
+    {
+        // Same peek shape as `is_filled`: `Cell` has no `&T` access, so
+        // take-copy-put-back under one critical section.
+        self.slot.lock(|c| {
+            let v = c.take();
+            c.set(v);
+            v
+        })
+    }
+
     /// Put the resource back for the next spawn. Called by the generated task
     /// shell after the worker returns (i.e. after its clean shutdown ack), so a
     /// respawn re-takes the same instance.
@@ -626,6 +658,13 @@ pub struct TaskNode {
     /// worker's shutdown ack). Empty for nodes without `resources:`. Set by the
     /// macro via [`with_resources`](Self::with_resources); `const`, zero-cost.
     resource_gates: &'static [&'static dyn ResourceGate],
+    /// Bound on the pre-spawn waits for this node's `executor:` slot and
+    /// `resources:` gates. Defaults to [`SLOT_READY_TIMEOUT`] (100 ms — sized
+    /// for "main provided before start"); raise it (`slot_timeout:` in the
+    /// graph) for a node whose slots are filled by a **provider node** at
+    /// runtime — e.g. an async radio bring-up worth hundreds of milliseconds.
+    /// Set by the macro via [`with_slot_timeout`](Self::with_slot_timeout).
+    slot_timeout: embassy_time::Duration,
     handle: TaskHandle,
 }
 
@@ -652,6 +691,7 @@ impl TaskNode {
             spawn,
             spawn_slot: None,
             resource_gates: &[],
+            slot_timeout: SLOT_READY_TIMEOUT,
             handle: TaskHandle::new(disabled_at_boot),
         }
     }
@@ -673,6 +713,18 @@ impl TaskNode {
     /// initializer; emitted by [`supervisor_graph!`].
     pub const fn with_resources(mut self, gates: &'static [&'static dyn ResourceGate]) -> Self {
         self.resource_gates = gates;
+        self
+    }
+
+    /// Override the pre-spawn slot/gate wait bound for this node (the
+    /// `slot_timeout: <millis>` graph clause). The default
+    /// (`SLOT_READY_TIMEOUT`, 100 ms) assumes slots are provided *before*
+    /// `start()`; a node consuming a **provider node's** outputs must cover the
+    /// provider's async build time (the failure mode stays a loud
+    /// `SpawnError::Busy`, just later). `const` and chainable in a `static`
+    /// initializer; emitted by [`supervisor_graph!`].
+    pub const fn with_slot_timeout(mut self, timeout: embassy_time::Duration) -> Self {
+        self.slot_timeout = timeout;
         self
     }
 
@@ -979,13 +1031,14 @@ pub struct Supervisor<const N: usize> {
     pools: &'static [&'static dyn Pool],
 }
 
-/// Await a node's `executor:` [`SpawnerSlot`] (if it has one), bounded by
-/// [`SLOT_READY_TIMEOUT`]. A slot still empty after the wait yields
+/// Await a node's `executor:` [`SpawnerSlot`] (if it has one), bounded by the
+/// node's [`slot_timeout`](TaskNode::with_slot_timeout) (default
+/// [`SLOT_READY_TIMEOUT`]). A slot still empty after the wait yields
 /// [`SpawnError::Busy`] — a loud misconfiguration, not a silent hang. A node with no
 /// slot returns immediately, so a same-executor bring-up never touches the timer.
 async fn await_spawn_slot(node: &'static TaskNode) -> Result<(), SpawnError> {
     if let Some(slot) = node.spawn_slot {
-        with_timeout(SLOT_READY_TIMEOUT, slot.ready())
+        with_timeout(node.slot_timeout, slot.ready())
             .await
             .map_err(|_| SpawnError::Busy)?;
     }
@@ -993,16 +1046,20 @@ async fn await_spawn_slot(node: &'static TaskNode) -> Result<(), SpawnError> {
 }
 
 /// Await every [`ResourceSlot`] a node's `resources:` clause takes from being
-/// filled, bounded by [`SLOT_READY_TIMEOUT`] per gate. Covers two windows:
-/// `main` providing after `start` was entered, and — on respawn — the previous
-/// instance's shell still between the shutdown ack and its `restore()` call
-/// (on another core the two can genuinely overlap). A gate still empty at the
-/// deadline yields [`SpawnError::Busy`] — an unprovided slot is a loud
-/// misconfiguration, not a silent hang. Nodes without `resources:` have an
-/// empty gate list and never touch the timer. Same check-then-park loop as
-/// [`SpawnerSlot::ready`]; the `filled` signal latches, so a fill racing the
-/// check still wakes the wait (and the same single-pre-fill-waiter caveat
-/// applies — the supervisor task is the only intended waiter).
+/// filled, bounded by the node's
+/// [`slot_timeout`](TaskNode::with_slot_timeout) (default
+/// [`SLOT_READY_TIMEOUT`]) per gate. Covers three windows: `main` providing
+/// after `start` was entered; — on respawn — the previous instance's shell
+/// still between the shutdown ack and its `restore()` call (on another core
+/// the two can genuinely overlap); and a **provider node** still building the
+/// values this node consumes (size `slot_timeout:` to the build time). A gate
+/// still empty at the deadline yields [`SpawnError::Busy`] — an unprovided
+/// slot is a loud misconfiguration, not a silent hang. Nodes without
+/// `resources:` have an empty gate list and never touch the timer. Same
+/// check-then-park loop as [`SpawnerSlot::ready`]; the `filled` signal
+/// latches, so a fill racing the check still wakes the wait (and the same
+/// single-pre-fill-waiter caveat applies — the supervisor task is the only
+/// intended waiter).
 async fn await_resources(node: &'static TaskNode) -> Result<(), SpawnError> {
     for gate in node.resource_gates {
         let wait = async {
@@ -1013,7 +1070,7 @@ async fn await_resources(node: &'static TaskNode) -> Result<(), SpawnError> {
                 gate.filled_signal().wait().await;
             }
         };
-        with_timeout(SLOT_READY_TIMEOUT, wait)
+        with_timeout(node.slot_timeout, wait)
             .await
             .map_err(|_| SpawnError::Busy)?;
     }
@@ -1489,6 +1546,23 @@ pub mod trace;
 /// `embassy-supervisor-macros` crate for the surface syntax.
 #[cfg(feature = "macros")]
 pub use embassy_supervisor_macros::supervisor_graph;
+
+/// Building blocks for `supervisor_graph!`-generated code — NOT public API.
+///
+/// The macro's `local`-marked `resources:` entries emit a slot *type* at the
+/// graph declaration site (it needs an `unsafe impl Sync`, — same reason the
+/// `trace-hooks` symbols are emitted there). That generated type must name
+/// the exact `Signal`/mutex types in [`ResourceGate`]'s signature; re-exporting
+/// them here keeps the macro's contract that a consumer only needs
+/// `embassy-supervisor` itself as a real-named dependency (not `embassy-sync`).
+#[doc(hidden)]
+pub mod _export {
+    pub use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+    pub use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    pub use embassy_sync::signal::Signal;
+    // For the `slot_timeout:` clause's emitted `with_slot_timeout(..)` call.
+    pub use embassy_time::Duration;
+}
 
 // ─── Tests (host-only) ─────────────────────────────────────────────────────
 //

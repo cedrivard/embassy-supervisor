@@ -1,0 +1,5 @@
+error: shared resource `H` re-declared with a different shape: `local shared Handle` here vs `shared Handle` on `A` — every declaration of a shared slot must repeat the same kind markers and type
+  --> tests/ui/compile_fail/shared_redeclared_mismatch.rs:15:21
+   |
+15 |         resources: [H: shared local Handle]; // kinds differ from A's declaration
+   |                     ^
