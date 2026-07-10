@@ -6,6 +6,18 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.4.1] - 2026-07-09
+
+Safety fix to 0.4.0: the `local` resource kind is the one graph form that makes
+`supervisor_graph!` emit `unsafe` code (the local slot type's `unsafe impl Sync`) into
+the CONSUMER'S crate — injecting unsafe code must be an explicit opt-in.
+
+### Changed
+- The `local` kind marker now requires the new **`local-resources`** feature
+  (non-default; forwarded from the supervisor crate's feature of the same name).
+  Without it, a `local` marker is a span-attached compile error naming the feature.
+  No other behavior changes; graphs not using `local` are unaffected.
+
 ## [0.4.0] - 2026-07-09
 
 Requires `embassy-supervisor` >= 0.3.3 (the generated `local` slot type names its
@@ -150,6 +162,7 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
+[0.4.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.4.0...embassy-supervisor-macros-v0.4.1
 [0.4.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.3.1...embassy-supervisor-macros-v0.4.0
 [0.3.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.3.0...embassy-supervisor-macros-v0.3.1
 [0.3.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.2.0...embassy-supervisor-macros-v0.3.0

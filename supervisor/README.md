@@ -73,7 +73,8 @@ init getters they used to require are gone.
   handles — driver control handles, network-stack runners — can now ride `resources:`: the
   entry's slot is a graph-site type without the `T: Send` bound (it carries a documented
   `unsafe impl Sync` in *your* crate; single-core contract, and `local` + `executor:` is a
-  compile error).
+  compile error). Because that injects unsafe code, `local` requires the non-default
+  `local-resources` feature (since 0.3.4).
 - **`shared`: one `Copy` handle fanned out to many consumers.** Several nodes — and whole
   `task:` pools — declare the SAME slot name (a network-stack handle, a `&'static`
   shared-bus ref); each spawn copies the value out non-destructively and the slot stays
@@ -533,12 +534,14 @@ the declaring sites' `#[cfg]` predicates); every re-declaration must repeat the 
 kind markers and type. Entries may also carry per-entry `#[cfg(...)]` — gate the worker
 fn's matching parameter with the same attribute.
 
-`local` swaps the emitted `ResourceSlot` for a graph-site slot type without the `T: Send`
-bound. That type carries an `unsafe impl Sync` **in your crate** — same reason the `trace-hooks`
-symbols live at the graph site), whose soundness contract is: all `provide`/`take`/`restore`
-of a given slot happen on ONE core. The macro rejects `local` + `executor:`
-(a `SendSpawner`-routed node needs a `Send` future), and a consumer crate that forbids
-`unsafe_code` cannot use `local`.
+`local` **requires the non-default `local-resources` feature**: it swaps the emitted
+`ResourceSlot` for a graph-site slot type without the `T: Send` bound, and that type
+carries an `unsafe impl Sync` — the one graph form that injects unsafe
+code, hence the explicit opt-in (same reason the `trace-hooks` symbols live at the graph
+site). Its soundness contract is: all `provide`/`take`/`restore` of a given slot happen on
+ONE core. Without the feature a `local` marker is a compile error naming it; the macro also
+rejects `local` + `executor:` (a `SendSpawner`-routed node needs a `Send` future), and a
+consumer crate that forbids `unsafe_code` cannot use `local`.
 
 ```rust,ignore
 // The cyw43 pattern: a !Send radio runner, dropped at teardown to release its
@@ -628,7 +631,9 @@ offending token:
   across the whole graph
 - **`resources:` on a `pool`** — members would contend for a single instance; declare
   per-node
-- **a repeated kind marker on a `resources:` entry** (`local local T`) — declaration bug
+- **a repeated kind marker on a `resources:` entry** (`consume consume T`) — declaration bug
+- **`local` without the `local-resources` feature** — the kind emits an `unsafe impl Sync`,
+  so it is strictly opt-in
 - **`shared` with `consume`** — contradictory: one exclusive owner vs any number of copies
 - **a `shared` slot re-declared with different kinds/type** — every declaration of the
   same name is ONE static and must repeat its shape verbatim
@@ -996,6 +1001,7 @@ already pins.
 | `control` |    ✓    | runtime control plane (`ControlOp`, `request_control`, `apply_control`) |
 | `pool`    |    ✓    | elastic worker pools (`ElasticPool`, `run_pools`, `GRAPH.pools`) |
 | `macros`  |    ✓    | the `supervisor_graph!` graph-declaration macro |
+| `local-resources` | | permit the `local` resource kind — ⚠ opt-in to the macro emitting a documented `unsafe impl Sync` (single-core contract) |
 | `defmt`   |         | route the supervisor's logs through `defmt` (otherwise the log macros are no-ops) |
 | `trace`   |         | trace-hook observability: per-node CPU time / poll counts / max-poll watermark, executor idle time, stall detection |
 | `trace-hooks` |     | batteries-included: the graph declaration also defines the `_embassy_trace_*` hook symbols (implies `trace`) |

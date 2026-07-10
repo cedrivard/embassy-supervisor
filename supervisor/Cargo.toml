@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.3.3"
+version = "0.3.4"
 description = "A generic, HAL-agnostic task-lifecycle supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, and runtime start/stop/pause/resume control."
 edition.workspace = true
 authors.workspace = true
@@ -25,7 +25,7 @@ embassy-futures = { version = "0.1" }
 portable-atomic = { version = "1", features = ["critical-section"] }
 defmt = { version = "1.1.0", optional = true }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.4.0", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.4.1", path = "../supervisor-macros", optional = true }
 
 [features]
 # Full-featured out of the box; a footprint-constrained consumer trims with
@@ -41,6 +41,13 @@ pool = ["embassy-supervisor-macros?/pool"]
 defmt = ["dep:defmt"]
 # Re-export the `supervisor_graph!` proc-macro.
 macros = ["dep:embassy-supervisor-macros"]
+# Permit the `local` resource kind (`resources: [R: local Type]` — `!Send`
+# values on a single core). OPT-IN AND OFF BY DEFAULT because it is the one
+# graph form that makes `supervisor_graph!` emit `unsafe` code into YOUR crate:
+# the graph-site local slot type carries an `unsafe impl Sync` whose soundness
+# contract (all provide/take/restore of a slot on ONE core) the application
+# owns. Without this feature a `local` marker is a compile error.
+local-resources = ["embassy-supervisor-macros?/local-resources"]
 # Trace-hook observability: the `trace` module (task-id -> node registry,
 # per-node exec-tick/poll/max-poll accounting, per-executor idle accounting,
 # stall detection). Recorders only — the `_embassy_trace_*` hook SYMBOLS are
@@ -138,10 +145,10 @@ required-features = ["macros"]
 
 # `resources:` kind markers: `consume` (by-value, drop-at-teardown, fail-closed
 # respawn until re-provided) and `local` (a `!Send` value through the graph-site
-# local slot, same-instance across respawn).
+# local slot, same-instance across respawn — hence the opt-in feature).
 [[test]]
 name = "resource_kinds"
-required-features = ["macros"]
+required-features = ["macros", "local-resources"]
 
 # The provider-node pattern: a first-in-topo node builds `consume`/`shared`
 # resources at runtime and provide()s them; consumers rendezvous via their

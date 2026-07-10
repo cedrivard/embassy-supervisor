@@ -42,12 +42,16 @@ jobs:
       - run: cargo test -p embassy-supervisor --target $HOST --no-default-features
       - run: cargo test -p embassy-supervisor --target $HOST --features trace-hooks
       # Charge-splitting (preemption-exact) accounting + the base trace tests again
-      # under the extra feature.
-      - run: cargo test -p embassy-supervisor --target $HOST --features trace-nested,trace-hooks
+      # under the extra feature. `local-resources` rides along so the gated
+      # `resource_kinds` suite (a `!Send` value through a local slot) runs too.
+      - run: cargo test -p embassy-supervisor --target $HOST --features trace-nested,trace-hooks,local-resources
       # `supervisor_graph!` UI tests (trybuild): compile-fail cases lock the macro's
       # error contracts (cycle, unknown dep, ...); compile-pass cases run the generated
       # graph. Host-only — trybuild compiles real graphs — so `--target $HOST`.
+      # Twice: without `local-resources` (the `local`-requires-feature rejection can
+      # only fire then) and with it (the `local` kind's pass/fail cases).
       - run: cargo test -p embassy-supervisor-macros --target $HOST
+      - run: cargo test -p embassy-supervisor-macros --target $HOST --features local-resources
 
   # `no_std` guard: the crate must still cross-compile for the MCU target (the
   # pinned default) across the feature matrix.
@@ -84,7 +88,8 @@ jobs:
           set -e
           for f in "" control pool macros pool,macros control,pool \
                    control,pool,macros defmt trace trace,trace-hooks \
-                   trace,trace-hooks,trace-nested trace,trace-names; do
+                   trace,trace-hooks,trace-nested trace,trace-names \
+                   macros,local-resources; do
             echo "::group::features=[${f:-none}]"
             cargo check -p embassy-supervisor --no-default-features ${f:+--features "$f"}
             echo "::endgroup::"

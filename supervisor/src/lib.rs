@@ -48,7 +48,10 @@
 //!     [`ResourceSlot::get`], the slot stays filled — any number of nodes and
 //!     whole pools may declare the same name); and `local` swaps in a
 //!     graph-site slot without the `T: Send` bound (`!Send` driver handles,
-//!     single-core contract). See the macro docs for the markers' fine print.
+//!     single-core contract) — it makes the macro emit an `unsafe impl Sync`
+//!     into the consuming crate, so it requires the non-default
+//!     `local-resources` feature. See the macro docs for the markers' fine
+//!     print.
 //!   * The pre-spawn waits are per-node tunable (`slot_timeout:` /
 //!     [`TaskNode::with_slot_timeout`]), which makes **provider nodes** work: a
 //!     first-in-topo node whose worker *builds* resources at runtime and

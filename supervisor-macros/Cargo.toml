@@ -4,7 +4,7 @@ name = "embassy-supervisor-macros"
 # version (`=x.y.z`): the generated code references doc(hidden) supervisor internals,
 # so only the tested pair is guaranteed compatible. Bump only when the macro changes;
 # the supervisor updates its pin to match.
-version = "0.4.0"
+version = "0.4.1"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -29,6 +29,11 @@ all-features = true
 # Cargo.toml), so this tracks the supervisor's pool feature — the macro emits
 # pools iff the supervisor was built with pools.
 pool = []
+# Forwarded from the supervisor's `local-resources` feature: permits the `local`
+# resource kind, whose slot type carries an `unsafe impl Sync` EMITTED INTO THE
+# CONSUMER'S CRATE (this is why it is opt-in and off by default). Without it, a
+# `local` marker is a span-attached compile error naming the feature.
+local-resources = []
 # Forwarded from the supervisor's `trace` feature: the generated spawn glue captures
 # each SpawnToken's task id into the node (`set_task_id`) before spawning it.
 trace = []

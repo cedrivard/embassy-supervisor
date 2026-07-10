@@ -4,6 +4,21 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-07-09
+
+Safety fix to 0.3.3 (macro pin -> `embassy-supervisor-macros = "=0.4.1"`): using the
+`local` resource kind now requires the new **`local-resources`** feature, OFF by
+default. `local` is the one graph form that makes `supervisor_graph!` emit `unsafe`
+code into the consuming crate (the local slot type's `unsafe impl Sync`, whose
+soundness contract — every `provide`/`take`/`restore` of a slot on ONE core — the
+application owns), so it is now an explicit per-application opt-in. Graphs not using
+`local` are unaffected; `local` users add the feature and change nothing else.
+
+### Added
+- The `local-resources` feature (non-default): permits the `local` resource kind by
+  forwarding to the macro crate. Without it, a `local` marker is a compile error
+  naming the feature.
+
 ## [0.3.3] - 2026-07-09
 
 Ships the `resources:` **kind markers** by updating the macro pin to
@@ -194,6 +209,7 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
+[0.3.4]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.0...v0.3.1
