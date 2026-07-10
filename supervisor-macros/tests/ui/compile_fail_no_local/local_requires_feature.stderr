@@ -1,0 +1,5 @@
+error: `local` resources emit an `unsafe impl Sync` — opt in by enabling embassy-supervisor's `local-resources` feature
+  --> tests/ui/compile_fail_no_local/local_requires_feature.rs:14:27
+   |
+14 |         resources: [BLOB: local Rc<Cell<u32>>];
+   |                           ^^^^^

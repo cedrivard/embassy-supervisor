@@ -105,14 +105,17 @@
 //!   only) may declare the SAME slot name. The static is emitted once, with the
 //!   union of the declaring sites' cfg predicates; every re-declaration must
 //!   repeat the kinds + type verbatim.
-//! * `local` — the slot is the graph-site `__SvLocalResourceSlot` type instead of
-//!   `ResourceSlot`: same protocol, no `T: Send` bound, for `!Send` driver
-//!   handles (`RefCell`-/`NoopRawMutex`-based). Emitted at the call site because
-//!   it carries an `unsafe impl Sync` whose soundness is the **single-core
-//!   contract**: all `provide`/`take`/`restore` of the slot on one core. It
-//!   cannot combine with `executor:` (a `SendSpawner`-routed node needs a `Send`
-//!   future — macro error), and a consumer crate forbidding `unsafe_code` cannot
-//!   use `local` (the assertion lands in *its* code, like the `trace-hooks`
+//! * `local` — **requires the non-default `local-resources` feature** (of the
+//!   supervisor crate, forwarded here): the slot is the graph-site
+//!   `__SvLocalResourceSlot` type instead of `ResourceSlot` — same protocol, no
+//!   `T: Send` bound, for `!Send` driver handles
+//!   (`RefCell`-/`NoopRawMutex`-based). Feature-gated because it is the one
+//!   graph form that emits `unsafe` code into the CONSUMER'S crate: an
+//!   `unsafe impl Sync` whose soundness is the **single-core contract** (all
+//!   `provide`/`take`/`restore` of the slot on one core). It cannot combine
+//!   with `executor:` (a `SendSpawner`-routed node needs a `Send` future —
+//!   macro error), and a consumer crate forbidding `unsafe_code` cannot use
+//!   `local` (the assertion lands in *its* code, like the `trace-hooks`
 //!   symbols).
 //!
 //! `slot_timeout: MS` (node and pool; milliseconds ≥ 1) overrides the node's
@@ -326,6 +329,17 @@ fn parse_resource_list(input: ParseStream) -> SynResult<Vec<ResourceDecl>> {
         let mut shared: Option<Ident> = None;
         while let Some(marker) = peek_kind_marker(&content) {
             content.parse::<Ident>()?; // commit the peeked marker
+            // `local` is the one kind whose slot type carries an `unsafe impl
+            // Sync` — injecting unsafe code is an explicit opt-in, so the
+            // marker is rejected unless the (non-default) `local-resources`
+            // feature forwarded by the supervisor crate is enabled.
+            if marker == "local" && !cfg!(feature = "local-resources") {
+                return Err(syn::Error::new_spanned(
+                    &marker,
+                    "`local` resources emit an `unsafe impl Sync` — opt in by \
+                     enabling embassy-supervisor's `local-resources` feature",
+                ));
+            }
             let slot = if marker == "local" {
                 &mut local
             } else if marker == "consume" {

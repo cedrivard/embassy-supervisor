@@ -1,5 +1,5 @@
-error: duplicate `local` marker
-  --> tests/ui/compile_fail/resources_duplicate_marker.rs:11:32
+error: duplicate `consume` marker
+  --> tests/ui/compile_fail/resources_duplicate_marker.rs:11:34
    |
-11 |         resources: [LED: local local FakeLed];
-   |                                ^^^^^
+11 |         resources: [LED: consume consume FakeLed];
+   |                                  ^^^^^^^

@@ -4,11 +4,11 @@ use embassy_supervisor::{TaskNode, supervisor_graph};
 
 struct FakeLed;
 
-async fn worker(_node: &'static TaskNode, _led: &mut FakeLed) {}
+async fn worker(_node: &'static TaskNode, _led: FakeLed) {}
 
 supervisor_graph! {
     node BLINK = Terminate, deps: [], task: worker,
-        resources: [LED: local local FakeLed];
+        resources: [LED: consume consume FakeLed];
 }
 
 fn main() {}
