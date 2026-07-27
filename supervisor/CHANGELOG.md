@@ -4,6 +4,21 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-07-27
+
+RAM saving for the `Supervisor` itself: the topological order is now borrowed from
+the `static` graph instead of copied into the struct. No API, feature, or behavior
+change; the macro pin is unchanged (`embassy-supervisor-macros = "=0.4.1"`).
+
+### Changed
+- `Supervisor<N>` holds `&'static [u8; N]` for the precomputed order rather than an
+  inline `[u8; N]`. A supervisor usually lives inside a task future — i.e. in that
+  task's `static` storage — so the copy cost N bytes of RAM per supervisor, plus the
+  code to make it, for no benefit: `Supervisor::new` already takes `&'static Graph<N>`,
+  so the array it copied from outlives the supervisor by construction. Net saving is
+  `N - 4` bytes on 32-bit targets. The field is private and `new` is unchanged, so this
+  is source-compatible.
+
 ## [0.3.4] - 2026-07-09
 
 Safety fix to 0.3.3 (macro pin -> `embassy-supervisor-macros = "=0.4.1"`): using the
@@ -209,6 +224,7 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
+[0.3.5]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.1...v0.3.2

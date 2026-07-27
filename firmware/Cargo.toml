@@ -48,13 +48,14 @@ embassy-rp = { version = "0.10", features = [
 ] }
 
 # Networking over the USB cable: embassy-usb CDC-NCM -> embassy-net stack.
+# Feature set is the minimum this firmware exercises: the link is static-IPv4
+# TCP-only (see net.rs). `udp`/`dhcpv4` are off because no route uses them; `dns`
+# is off by default but available behind this crate's `dns` feature (below).
 embassy-usb = { version = "0.6", features = ["defmt"] }
 embassy-net = { version = "0.9", features = [
     "defmt",
     "tcp",
-    "udp",
-    "dhcpv4",
-    "dns",
+    "proto-ipv4",
     "medium-ethernet",
 ] }
 
@@ -63,6 +64,10 @@ embassy-net = { version = "0.9", features = [
 # but embassy-net 0.9.1 is on nal-async 0.9; reqwless `main` bumped to 0.9 / 0.7.
 # Cargo.lock pins the exact commit.
 reqwless = { git = "https://github.com/drogue-iot/reqwless", default-features = false }
+# For the `Dns` trait bound of reqwless's `HttpClient`, implemented by ota.rs's
+# parse-only `IpDns` when the `dns` feature is off. Already in the tree via
+# reqwless, so naming it directly costs nothing.
+embedded-nal-async = "0.9"
 
 # Note on the HTTP control/observability plane: `picoserve` was evaluated, but
 # its ergonomic embassy router stores an `AppRouter` in a `static`, which needs
@@ -87,3 +92,18 @@ defmt-rtt = "1"
 panic-probe = { version = "1", features = ["print-defmt"] }
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
+
+[features]
+default = []
+# Resolve OTA targets by hostname through a real DNS socket.
+#
+# Off by default because this demo's OTA target is always a literal IPv4, and
+# the three costs of `dns` are all paid for code that never runs: smoltcp's DNS
+# socket implementation is linked, a `StackResources` slot is reserved for it
+# (`net::SOCKET_BUDGET`), and its buffers sit in `.bss`. Measured on this
+# firmware: 6,944 bytes of flash (~4%).
+#
+# Adapting this demo to a hostname target is therefore one flag, not a manual
+# edit across three files — everything the switch touches is `cfg`'d on it:
+#   cargo build --release --features dns
+dns = ["embassy-net/dns"]

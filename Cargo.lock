@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "embassy-supervisor"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "critical-section",
  "defmt 1.1.0",
@@ -921,6 +921,7 @@ dependencies = [
  "embedded-alloc",
  "embedded-hal 1.0.0",
  "embedded-io-async 0.7.0",
+ "embedded-nal-async",
  "embedded-storage",
  "panic-probe",
  "reqwless",

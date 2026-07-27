@@ -655,14 +655,19 @@ iff any entry is `local`, the local slot type), and `pub static GRAPH` — nothi
 
 ## Recipes by use case
 
-Node and pool names below are invented; swap in your own task fns.
+Node and pool names below are invented; swap in your own worker fns. They use `task:`
+throughout (the preferred form — plain async fns, no `#[embassy_executor::task]`);
+substitute `spawn:` in the same position for any of the four cases in
+[`spawn:` vs `task:`](#spawn-vs-task--which-to-use). Nodes shown without either are
+**parked** on purpose: the application spawns them itself, so those workers do keep the
+attribute.
 
 ### Simple dependency chain
 
 ```rust,ignore
 supervisor_graph! {
-    node SENSOR   = Terminate, deps: [], spawn: sensor_task;
-    node REPORTER = Terminate, deps: [SENSOR], spawn: reporter_task;
+    node SENSOR   = Terminate, deps: [], task: sensor_worker;
+    node REPORTER = Terminate, deps: [SENSOR], task: reporter_worker;
 }
 ```
 
@@ -683,7 +688,7 @@ async fn poll_sensor<D: Sensor>(node: &'static TaskNode, dev: D) {
 }
 
 supervisor_graph! {
-    node BUS = Terminate, deps: [], spawn: bus_task;
+    node BUS = Terminate, deps: [], task: bus_worker;
     // One node per concrete driver; the macro stamps a monomorphized shell each:
     node BME = Terminate, deps: [BUS], task: poll_sensor::<Bme280>(bme());
     node SHT = Terminate, deps: [BUS], task: poll_sensor(sht());  // inferred
@@ -716,9 +721,9 @@ supervisor_graph! {
     node RADIO_HW = Terminate, deps: [], task: radio_hw;
     // Consumers: deps order them after the provider, and slot_timeout covers
     // its build time (the 100 ms default assumes provided-before-start).
-    node LINK = Terminate, deps: [RADIO_HW], task: link_task, slot_timeout: 5000,
+    node LINK = Terminate, deps: [RADIO_HW], task: link_worker, slot_timeout: 5000,
         resources: [RUNNER: local consume Runner];
-    node CTRL = Terminate, deps: [RADIO_HW, LINK], task: ctrl_task, slot_timeout: 5000,
+    node CTRL = Terminate, deps: [RADIO_HW, LINK], task: ctrl_worker, slot_timeout: 5000,
         resources: [CONTROL: local consume Control, STACK: shared local Stack];
 }
 ```
@@ -735,9 +740,9 @@ consumers after their `slot_timeout` — fail-closed, never a stale reuse.
 
 ```rust,ignore
 supervisor_graph! {
-    node BROKER = Terminate, deps: [], spawn: broker_task;
+    node BROKER = Terminate, deps: [], task: broker_worker;
     pool WORKERS = [Terminate, OnDemand, OnDemand, OnDemand], deps: [BROKER],
-        spawn: worker_task,
+        task: worker,
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(4)),
         min: 1, max: 4;
 }
@@ -745,14 +750,15 @@ supervisor_graph! {
 
 Four member slots; `min: 1` is the always-on floor, growth up to `max: 4` under load.
 `DeferredShrink` waits 4 s of idle surplus before shrinking so brief lulls don't thrash.
-Requires the `pool` feature.
+Requires the `pool` feature. `task:` on a pool emits ONE shell sized to the member count,
+so there is no `pool_size = 4` constant to keep in sync with `max:`.
 
 ### Pause node holding a resource (parked, app-spawned)
 
 ```rust,ignore
 supervisor_graph! {
-    node SENSOR = Pause, deps: [];   // no `spawn:` => parked node
-    node READER = Terminate, deps: [SENSOR], spawn: reader_task;
+    node SENSOR = Pause, deps: [];   // neither `task:` nor `spawn:` => parked node
+    node READER = Terminate, deps: [SENSOR], task: reader_worker;
 }
 
 // main() spawns the sensor task itself, with the peripheral handle it owns:
@@ -766,8 +772,8 @@ never dropped. `resume_pausable()` thaws it in place after a wake.
 
 ```rust,ignore
 supervisor_graph! {
-    node NET     = Terminate, deps: [], spawn: net_task;
-    node UPDATER = Terminate, deps: [NET], spawn: updater_task, disabled;
+    node NET     = Terminate, deps: [], task: net_worker;
+    node UPDATER = Terminate, deps: [NET], task: updater_worker, disabled;
 }
 ```
 
@@ -779,11 +785,11 @@ updater, a debug server) that shouldn't run until explicitly asked for.
 
 ```rust,ignore
 supervisor_graph! {
-    node LOG_DRAIN = Terminate, deps: [], spawn: log_drain_task;
+    node LOG_DRAIN = Terminate, deps: [], task: log_drain_worker;
 }
 
-#[embassy_executor::task]
-async fn log_drain_task(node: &'static embassy_supervisor::TaskNode) {
+// Plain async fn — `task:` stamps the #[embassy_executor::task] shell:
+async fn log_drain_worker(node: &'static embassy_supervisor::TaskNode) {
     node.set_detached(true); // full hands-off from here on
     loop { /* drain forever, self-managed */ }
 }
@@ -798,8 +804,8 @@ it's declared and ordered; management stops after the first spawn.
 ```rust,ignore
 supervisor_graph! {
     executor HIGH;   // runtime-filled SendSpawner slot (an interrupt-priority tier)
-    node SAMPLER = Terminate, deps: [], executor: HIGH, spawn: sampler_task;
-    node LOGGER  = Terminate, deps: [SAMPLER], spawn: logger_task;
+    node SAMPLER = Terminate, deps: [], executor: HIGH, task: sampler_worker;
+    node LOGGER  = Terminate, deps: [SAMPLER], task: logger_worker;
 }
 
 // app side, before `sup.start(...)` (embassy-rp shown; any HAL works):
@@ -809,8 +815,12 @@ HIGH.set(EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0));
 ```
 
 `SAMPLER` runs at raised priority while `LOGGER` stays on the thread executor — yet the
-dependency between them is still honored. `sampler_task`'s future must be `Send`; if the slot
-is never filled, `start()` fails with `SpawnError::Busy` after a bounded wait.
+dependency between them is still honored. `sampler_worker`'s future must be `Send`; if the
+slot is never filled, `start()` fails with `SpawnError::Busy` after a bounded wait. A
+`task:` extra is evaluated inside the shell, i.e. on the raised-priority tier at its first
+poll — switch that node to `spawn:` when an argument must instead be snapshotted on the
+supervisor's executor at the moment of the spawn (case 4 of
+[`spawn:` vs `task:`](#spawn-vs-task--which-to-use)).
 
 ### Second-core pool
 
@@ -818,7 +828,7 @@ is never filled, `start()` fails with `SpawnError::Busy` after a bounded wait.
 supervisor_graph! {
     executor CORE1;
     pool CRUNCHERS = [OnDemand, OnDemand], deps: [], executor: CORE1,
-        spawn: cruncher_task,
+        task: cruncher_worker,
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(2)),
         min: 0, max: 2;
 }
@@ -834,10 +844,10 @@ and `start_node` await the slot, so a late-booting core is a rendezvous, not a r
 ```rust,ignore
 supervisor_graph! {
     pool WORKERS = [Terminate, OnDemand], deps: [],
-        spawn: worker_task,
+        task: worker,
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(3)),
         min: 1, max: 2;
-    node DISPATCHER = Terminate, deps: [WORKERS], spawn: dispatcher_task;
+    node DISPATCHER = Terminate, deps: [WORKERS], task: dispatcher_worker;
 }
 ```
 
@@ -848,16 +858,15 @@ A dep on a pool name resolves to the pool's **floor member**, so `deps: [WORKERS
 
 ```rust,ignore
 supervisor_graph! {
-    node NET = Terminate, deps: [], spawn: net_task;
+    node NET = Terminate, deps: [], task: net_worker;
     pool WORKERS = [Terminate, OnDemand], deps: [NET],
-        spawn: worker_task,
+        task: worker,
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(3)),
         min: 1, max: 2;
-    node READY_PROBE = Terminate, deps: [WORKERS], spawn: ready_probe_task;
+    node READY_PROBE = Terminate, deps: [WORKERS], task: ready_probe_worker;
 }
 
-#[embassy_executor::task]
-async fn ready_probe_task(node: &'static embassy_supervisor::TaskNode) {
+async fn ready_probe_worker(node: &'static embassy_supervisor::TaskNode) {
     node.set_detached(true);
     // everything above is up now; do a one-shot post-boot self-check, then return
 }
@@ -872,17 +881,17 @@ without ever being waited on by a teardown.
 supervisor_graph! {
     executor HIGH;                    // interrupt-priority tier
 
-    node SENSOR   = Terminate, deps: [], executor: HIGH, spawn: sensor_task;
-    node NET      = Terminate, deps: [], spawn: net_task;
-    node UPLOADER = Terminate, deps: [NET, SENSOR], spawn: uploader_task;
-    node STATS    = Pause, deps: [], spawn: stats_task;   // parked through sleep
+    node SENSOR   = Terminate, deps: [], executor: HIGH, task: sensor_worker;
+    node NET      = Terminate, deps: [], task: net_worker;
+    node UPLOADER = Terminate, deps: [NET, SENSOR], task: uploader_worker;
+    node STATS    = Pause, deps: [], task: stats_worker;   // parked through sleep
     node POWER    = Terminate, deps: [];  // parked: main spawns it with the Spawner
 }
 
 static SUP: Supervisor<5> = Supervisor::new(&GRAPH);
 
-// A parked node (no `spawn:`): main spawns it by hand because it needs a value
-// only main has — here the `Spawner` that `respawn_terminate` takes:
+// A parked node (neither `task:` nor `spawn:`): main spawns it by hand because it
+// needs a value only main has — here the `Spawner` that `respawn_terminate` takes:
 //     spawner.spawn(power_task(&POWER, spawner)).unwrap();
 #[embassy_executor::task]
 async fn power_task(node: &'static embassy_supervisor::TaskNode, spawner: Spawner) {
@@ -926,7 +935,7 @@ graph is the single source of *placement*.
 ```rust,ignore
 supervisor_graph! {
     executor CORE1;
-    node BENCH = Terminate, deps: [], executor: CORE1, spawn: bench_task, disabled;
+    node BENCH = Terminate, deps: [], executor: CORE1, task: bench_worker, disabled;
 }
 
 // core 1 publishes its spawner as it boots (embassy-rp shown; any HAL works):

@@ -207,6 +207,20 @@ cargo build --workspace          # thumbv8m.main-none-eabihf
 cargo build -p embassy-supervisor --target x86_64-unknown-linux-gnu   # crate is host-buildable
 ```
 
+### Cargo features
+
+| feature | default | effect |
+| --- | --- | --- |
+| `dns` | off | Resolve the OTA target by hostname through a real `DnsSocket`, instead of the parse-only `ota::IpDns` that only accepts literal IPv4. Pulls `embassy-net/dns`, adds a `StackResources` slot (`net::SOCKET_BUDGET`), and costs ~7 KB of flash. |
+
+The default is the trimmed build: this demo only ever downloads from a literal
+IPv4, so the whole DNS path is compiled out. Adapting it to a hostname target is
+one flag — every place that changes is `cfg`'d on the feature:
+
+```sh
+cargo build --release -p firmware --features dns
+```
+
 ## Host network setup (USB-net)
 
 Networking is **USB-CDC-NCM** (TCP/IP over the USB cable) — a deliberate demo
@@ -534,6 +548,9 @@ HTTP plane, OTA flow, and the whole task graph stay.
 - Each worker reads a request in a single `socket.read`, which assumes it arrives
   in one segment — true for these short requests over USB-net, but a general
   server would loop until the header terminator.
-- The socket budget is `POOL_MAX + 1` (`net::SOCKET_BUDGET`): one socket per http
-  worker plus embassy-net's internal DNS slot. The OTA download needs no extra
-  slot — the pool is drained before it opens its socket.
+- The socket budget is `POOL_MAX` (`net::SOCKET_BUDGET`): one socket per http
+  worker, and no DNS slot by default — the stack is compiled TCP-only, and the
+  OTA target is a literal IPv4 resolved by the parse-only `ota::IpDns`. Building
+  with `--features dns` (see below) swaps in a real `DnsSocket` and adds its slot
+  back. Either way the OTA download needs no extra slot — the pool is drained
+  before it opens its socket.
