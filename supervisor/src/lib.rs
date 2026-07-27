@@ -1025,7 +1025,11 @@ pub struct Supervisor<const N: usize> {
     /// Topologically sorted indices into `nodes`: dependencies before their
     /// dependents; reverse iteration is the teardown order. Precomputed at
     /// compile time (a cycle is a compile error), so construction does no work.
-    order: [u8; N],
+    /// Borrowed from the `static` [`Graph`] rather than copied: a `Supervisor`
+    /// usually lives inside a task future (i.e. in that task's `static`
+    /// storage), so an inline `[u8; N]` would cost N bytes of RAM per
+    /// supervisor plus the copy code for no benefit.
+    order: &'static [u8; N],
     /// Elastic pools, so the control interface can co-control a whole pool from
     /// any one member (`apply_control` expands the target through
     /// [`Pool::members`]) — the same registry `run_pools` drives. Taken from
@@ -1090,7 +1094,7 @@ impl<const N: usize> Supervisor<N> {
         Self {
             nodes: graph.nodes,
             deps: graph.deps,
-            order: graph.order,
+            order: &graph.order,
             #[cfg(feature = "pool")]
             pools: graph.pools,
         }

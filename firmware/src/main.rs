@@ -121,9 +121,7 @@ async fn app_supervisor(spawner: Spawner) {
     let sup = embassy_supervisor::Supervisor::new(&GRAPH);
     // `ota` is declared `disabled` (disabled-at-boot), so `start()` skips it; a
     // control `Activate` (POST /api/ota or the dashboard start button) starts it.
-    sup.start(spawner)
-        .await
-        .expect("supervisor: initial spawn failed");
+    defmt::unwrap!(sup.start(spawner).await, "supervisor: initial spawn failed");
 
     loop {
         // Race pool scaling against runtime control requests. `run_pools` never
