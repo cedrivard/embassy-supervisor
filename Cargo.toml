@@ -18,6 +18,28 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/cedrivard/embassy-supervisor"
 rust-version = "1.85"
 
+# LOCAL-ONLY: sibling checkout carrying the run-queue idle-path change.
+#
+# `RunQueue::dequeue_all` used to call `TransferStack::take_all` (a `swap`) on
+# every poll, empty or not. On RP2350 that exclusive posts a global-monitor
+# event acting as an effective SEV, so the `WFE` closing the thread executor's
+# idle loop always returned immediately and it never slept. The cordyceps half
+# of that fix is released (`TransferStack::is_empty`, 0.3.5), so only the
+# executor itself still needs patching.
+#
+# The last three entries are the path-dep closure of embassy-executor's own
+# manifest; without them a second copy enters the graph alongside the crates.io
+# ones (embassy-time also reaches embassy-executor-timer-queue, where a
+# duplicate is a type mismatch).
+#
+# Requires the sibling clone below; the build will not resolve without it.
+#   ../embassy   embassy-rs/embassy  branch executor-skip-empty-dequeue
+[patch.crates-io]
+embassy-executor = { path = "../embassy/embassy-executor" }
+embassy-executor-macros = { path = "../embassy/embassy-executor-macros" }
+embassy-executor-timer-queue = { path = "../embassy/embassy-executor-timer-queue" }
+embassy-time-driver = { path = "../embassy/embassy-time-driver" }
+
 # Size/perf profile for the embedded binaries (mirrors the embassy templates).
 [profile.release]
 debug = 2

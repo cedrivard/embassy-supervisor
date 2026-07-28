@@ -41,7 +41,7 @@
 //!     gap** (executor bookkeeping + these hooks' own cost, dominated by the
 //!     O(N ≤ 256) id scan, not the two `Instant::now()` reads) — it grows with poll
 //!     rate. [`ExecutorStats`] owns the full busy/in-poll/overhead/unsupervised
-//!     decomposition and the measured figures.
+//!     decomposition.
 //!   * At most [`MAX_EXECUTORS`] executors are tracked (first come, first served);
 //!     hooks from further executors are dropped.
 //!   * Parked nodes (no `spawn:`) and verbatim-closure `spawn:` forms are not
@@ -278,15 +278,31 @@ fn now_ticks() -> u32 {
 /// Record a `poll_start` event: counts the scheduler pass — nothing else, by
 /// design. An open idle window is closed lazily by the first `exec_begin` of the
 /// pass (reusing the timestamp that hook takes anyway), so an **empty pass** —
-/// the executor woken by an interrupt with nothing runnable, which can happen
-/// hundreds of thousands of times per second — costs no timer read here and
+/// the executor woken with nothing runnable — costs no timer read here and
 /// merges into the surrounding idle window instead of inflating "overhead" with
-/// the instrument's own cost.
+/// the instrument's own cost. An empty pass is ~100 ns uninstrumented, so
+/// timestamping it would make this hook the dominant cost of a wakeup; that
+/// holds however rare empty passes are, and they are rare only when nothing in
+/// the idle loop defeats `WFE` (see below).
+///
+/// # Why this is a load/store and not a `fetch_add`
+///
+/// This hook runs on **every** scheduler pass, including empty ones, so it sits
+/// squarely in the executor's idle path. On RP2350 a read-modify-write compiles
+/// to `ldaex`/`stlex`, and any exclusive access posts a global-monitor event
+/// that acts as an effective `SEV`, making the `WFE` at the bottom of the idle
+/// loop return immediately; `ldr`/`str` leaves the monitor alone.
+///
+/// Sound because `passes` has exactly one writer: only the executor owning
+/// `executor_id` calls this hook for its own slot, and a preempting
+/// interrupt-priority tier has a different id and so a different slot. Readers
+/// only load. Do not "fix" this back into a `fetch_add`.
 pub fn on_poll_start(executor_id: u32) {
     let Some((_, slot)) = slot_for(executor_id) else {
         return;
     };
-    slot.passes.fetch_add(1, Ordering::Relaxed);
+    let passes = slot.passes.load(Ordering::Relaxed);
+    slot.passes.store(passes.wrapping_add(1), Ordering::Relaxed);
 }
 
 /// Record a task poll starting (`task_exec_begin`). Also closes an open idle
@@ -418,9 +434,12 @@ pub fn on_task_end(_executor_id: u32, task_id: u32) {
 ///                                        to no supervised node)
 /// ```
 ///
-/// Overhead is per-poll (~15–20 µs, dominated by the O(N ≤ 256) id scan in the
-/// hooks), so it scales with poll rate — measured ~13% of a 150 MHz core at ~8k
-/// polls/s under HTTP load.
+/// Overhead is charged per pass and per poll (dominated by the O(N ≤ 256) id scan
+/// in the hooks), so it scales with both rates. Measured on the demo firmware
+/// (RP2350, 8 nodes, `trace-hooks` + `trace-nested`, HTTP load): **0.7–1.0% of
+/// wall time run-to-run at ~1.9k polls/s and ~3.5k passes/s**, so under ~5 µs per
+/// poll, and that bound also absorbs the inter-poll ISR time folded into this
+/// term. Scale it by your own node count and rates rather than reusing the number.
 ///
 /// **Empty scheduler passes count as idle**, not overhead: the idle window stays
 /// open across a pass that polls nothing (see [`on_poll_start`]), because such a

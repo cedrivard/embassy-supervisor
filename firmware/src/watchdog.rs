@@ -34,8 +34,44 @@ pub(crate) async fn watchdog_task(
     //   Warn only on increase to avoid log spam (16 slots cover this graph).
     const STALL_TICKS: u32 = (embassy_time::TICK_HZ / 10) as u32; // 100 ms
     let mut warned = [0u32; 16];
+    // Per-executor (passes, polls) from the previous iteration, same slot order
+    // as `executors()` (slots are claim-once, so the order is stable). Sized off
+    // the returned array so it tracks `MAX_EXECUTORS` without naming it.
+    let mut prev = embassy_supervisor::trace::executors().map(|_| (0u32, 0u32));
+    let mut prev_at = embassy_time::Instant::now();
     loop {
         wd.feed(embassy_time::Duration::from_secs(8)); // `feed` also sets the timeout
+        // Idle-loop wakeup report, over RTT only. On the thread executor the run
+        // loop is literally `poll(); wfe`, so Δpasses IS the WFE-wakeup count —
+        // this prints the executor wake rate with zero network involvement
+        // (sampling /api/tasks would itself wake `net`, polluting a near-idle
+        // measurement). On RP2350 a residual exclusive access in the idle loop
+        // shows up here as ~10^5..10^6 passes per window instead of single digits
+        // (see the README's "Note on RP2350").
+        let win_ms = {
+            let now = embassy_time::Instant::now();
+            let ms = (now - prev_at).as_millis();
+            prev_at = now;
+            ms
+        };
+        for (id, pv) in embassy_supervisor::trace::executors()
+            .into_iter()
+            .zip(prev.iter_mut())
+        {
+            if id == 0 {
+                continue;
+            }
+            if let Some(s) = embassy_supervisor::trace::executor_stats(id) {
+                defmt::info!(
+                    "trace: exec {=u32:08x} +{=u32} passes +{=u32} polls in {=u64} ms",
+                    id,
+                    s.passes.wrapping_sub(pv.0),
+                    s.polls.wrapping_sub(pv.1),
+                    win_ms
+                );
+                *pv = (s.passes, s.polls);
+            }
+        }
         for id in embassy_supervisor::trace::executors() {
             if id == 0 {
                 continue;
