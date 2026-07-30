@@ -108,7 +108,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Patch embassy-executor to git main
         run: |
-          printf '\n[patch.crates-io]\nembassy-executor = { git = "https://github.com/embassy-rs/embassy" }\n' >> Cargo.toml
+          # Appending a second `[patch.crates-io]` is a duplicate-key error, so
+          # only add one when the checked-out manifest doesn't already patch.
+          if grep -q '^embassy-executor = { git' Cargo.toml; then
+            echo "manifest already patches embassy-executor to git; using it as is"
+          else
+            printf '\n[patch.crates-io]\nembassy-executor = { git = "https://github.com/embassy-rs/embassy" }\n' >> Cargo.toml
+          fi
           cargo update -p embassy-executor
       - run: cargo build -p embassy-supervisor --target $HOST --features trace-hooks,trace-names
 
