@@ -7,25 +7,25 @@ silicon quirk (reported across raspberrypi/pico-feedback
 [#1812](https://github.com/raspberrypi/pico-sdk/issues/1812)) keeps the idle `WFE`
 from ever blocking, so every WFE-idle embassy program on the chip silently burns a
 core. This repository holds the firmware and instrumentation used to measure that
-behaviour and the effect of the embassy-executor change on
-[`cedrivard/embassy:executor-skip-empty-dequeue`](https://github.com/cedrivard/embassy/tree/executor-skip-empty-dequeue),
-which makes `RunQueue::dequeue_all` return early instead of calling
-`TransferStack::take_all` (a `swap` on the queue head) when the run queue is empty.
+behaviour and the effect of the embassy-executor change in
+[embassy-rs/embassy#6659](https://github.com/embassy-rs/embassy/pull/6659), which makes
+`RunQueue::dequeue_all` return early instead of calling `TransferStack::take_all` (a
+`swap` on the queue head) when the run queue is empty.
 
 Two branches build the **same firmware source** against the two executors; the only
 difference between them is the `[patch.crates-io]` table in the root `Cargo.toml`:
 
 | branch | embassy-executor | idle behaviour |
 |---|---|---|
-| `pr-executor-skip-empty-dequeue-main` | `embassy-rs/embassy` `main` | storms at ~1 MHz |
-| `pr-executor-skip-empty-dequeue-fixed` | `cedrivard/embassy` `executor-skip-empty-dequeue` | sleeps |
+| `pr-executor-skip-empty-dequeue-main` | published crates (0.10, predates the fix) | storms at ~1 MHz |
+| `pr-executor-skip-empty-dequeue-fixed` | `embassy-rs/embassy` `main` (#6659 merged) | sleeps |
 
 ## The problem
 
 On RP2350, any exclusive access (`ldrex`/`strex`, `ldaex`/`stlex`) posts a monitor
 event that acts as an effective `SEV` on its own core, and the event flag is sticky.
 
-The thread executor's run loop is `poll(); wfe`. On `main`, every `poll()` calls
+The thread executor's run loop is `poll(); wfe`. Before the fix, every `poll()` calls
 `TransferStack::take_all`, a `swap`, even when the queue is empty, so the pass itself
 re-arms the event and the closing `WFE` returns immediately: the executor free-runs at
 ~1 MHz and never sleeps. Disassembly of this firmware confirms the loop: the `swap`'s
@@ -46,7 +46,7 @@ exactly. `polls` counts task polls. Identical firmware source, matched condition
 
 | | passes/s | polls/s | polls/pass | busy% | `net` mean poll |
 |---|---|---|---|---|---|
-| main (storm) | 962167 | 1853 | 0.00 | 14.8 | 59.3 µs |
+| baseline (storm) | 962167 | 1853 | 0.00 | 14.8 | 59.3 µs |
 | fixed | 3385 | 1886 | 0.56 | 14.6 | 57.9 µs |
 
 - **Near idle** (heartbeat off, no network traffic) the thread executor drops from
@@ -86,9 +86,9 @@ cargo run --release -p firmware        # flash + defmt over RTT
 ```
 
 - **Wake rate over RTT, zero network involvement:** the `watchdog` task prints
-  `trace: exec <id> +N passes +M polls in T ms` for every executor every 2 s. On this
-  branch expect ~2 M passes per window on both cores; on the fixed branch, single
-  digits once traffic stops. `POST /api/heartbeat?ms=0` turns the heartbeat off for a
+  `trace: exec <id> +N passes +M polls in T ms` for every executor every 2 s. On the
+  baseline branch expect ~2 M passes per window on both cores; on the fixed branch,
+  single digits once traffic stops. `POST /api/heartbeat?ms=0` turns the heartbeat off for a
   true idle floor. Executor ids are addresses: `2007ffe8` core 0 thread, `2000xxxx`
   low = core 1 thread, the remaining static = the `SWI_IRQ_0` interrupt tier.
 - **Load run:** `wrk -t1 -c2 -d10s --latency -s firmware/tools/wrk-tasks.lua

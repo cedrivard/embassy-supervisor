@@ -19,24 +19,15 @@ repository = "https://github.com/cedrivard/embassy-supervisor"
 rust-version = "1.85"
 
 # MEASUREMENT BASELINE (branch pr-executor-skip-empty-dequeue-main): builds the
-# firmware against upstream embassy main, whose `RunQueue::dequeue_all` calls
-# `TransferStack::take_all` (a `swap`) on every poll, empty or not. On RP2350
-# that exclusive posts a monitor event acting as an effective SEV, so the `WFE`
-# closing the thread executor's idle loop always returns immediately and it
-# never sleeps. See firmware/README.md for the measured behaviour; the sibling
-# branch pr-executor-skip-empty-dequeue-fixed builds the same source against the
-# fix. Cargo.lock pins the upstream revision this branch last built against; the
-# README numbers were measured at upstream 6534e02b4.
-#
-# The last three entries are the path-dep closure of embassy-executor's own
-# manifest; without them a second copy enters the graph alongside the crates.io
-# ones (embassy-time also reaches embassy-executor-timer-queue, where a
-# duplicate is a type mismatch).
-[patch.crates-io]
-embassy-executor = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
-embassy-executor-macros = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
-embassy-executor-timer-queue = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
-embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+# firmware against the published embassy crates, whose `RunQueue::dequeue_all`
+# calls `TransferStack::take_all` (a `swap`) on every poll, empty or not. On
+# RP2350 that exclusive posts a monitor event acting as an effective SEV, so the
+# `WFE` closing the thread executor's idle loop always returns immediately and it
+# never sleeps. There is deliberately no `[patch.crates-io]` here: the fix landed
+# after embassy-executor 0.10, so the registry release is the storming baseline.
+# See firmware/README.md for the measured behaviour; the sibling branch
+# pr-executor-skip-empty-dequeue-fixed builds the same source against upstream
+# main, which carries the fix (embassy-rs/embassy#6659).
 
 # Size/perf profile for the embedded binaries (mirrors the embassy templates).
 [profile.release]
