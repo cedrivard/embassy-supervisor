@@ -18,6 +18,14 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/cedrivard/embassy-supervisor"
 rust-version = "1.85"
 
+# Builds against upstream embassy main for the run-queue idle-path change.
+#
+[patch.crates-io]
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-executor-macros = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-executor-timer-queue = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+
 # Size/perf profile for the embedded binaries (mirrors the embassy templates).
 [profile.release]
 debug = 2

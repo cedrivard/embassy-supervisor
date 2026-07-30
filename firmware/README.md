@@ -343,26 +343,35 @@ Why these flags:
 
 ```
 ==== /api/tasks analysis (wrk thread 1) ====
-samples 424 | non-200 0 | malformed/truncated 0 | counter regressions 0
-body bytes  min 1655 / max 1656 (worker tx buffer must hold max + headers)
-heap_free   min 5284 / max 5284 B (min = headroom at peak load)
-window      9.9 s of device time (tick_hz 1000000)
-executor 200093b0: 0.0% busy = 0.0% in-poll + 0.0% overhead (scheduler + hooks + inter-poll ISRs)
-executor 200093b0: 2 polls/s, 2 passes/s, 1.00 polls/pass
-executor 2007ffe8: 23.6% busy = 21.6% in-poll + 2.0% overhead (scheduler + hooks + inter-poll ISRs)
-executor 2007ffe8: 1832 polls/s, 850993 passes/s, 0.00 polls/pass
-executor 20000360: 0.0% busy = 0.0% in-poll + 0.0% overhead (scheduler + hooks + inter-poll ISRs)
-executor 20000360: 0 polls/s, 869433 passes/s, 0.00 polls/pass
+samples 438 | non-200 0 | malformed/truncated 0 | counter regressions 0
+body bytes  min 1656 / max 1662 (worker tx buffer must hold max + headers)
+heap_free   min 6908 / max 6908 B (min = headroom at peak load)
+window      10.0 s of device time (tick_hz 1000000)
+executor 200093e0: 0.0% busy = 0.0% in-poll + 0.0% overhead (scheduler + hooks + inter-poll ISRs)
+executor 200093e0: 2 polls/s, 2 passes/s, 1.00 polls/pass
+executor 2007ffe8: 12.7% busy = 12.0% in-poll + 0.7% overhead (scheduler + hooks + inter-poll ISRs)
+executor 2007ffe8: 1923 polls/s, 3523 passes/s, 0.55 polls/pass
+executor 200003e0: 0.0% busy = 0.0% in-poll + 0.0% overhead (scheduler + hooks + inter-poll ISRs)
+executor 200003e0: 0 polls/s, 1878 passes/s, 0.00 polls/pass
 task            cpu%      polls  avg poll us  max poll us
-bench          0.00%          0          0.0          0.0
-heartbeat      0.01%         20         38.1         68.0
-http0          1.51%        213        705.8        748.0
-http1          1.53%        212        715.8        795.0
-net           18.57%      17783        103.8        696.0
+bench          0.00%          0          0.0       3818.0
+heartbeat      0.01%         20         51.0         66.0
+http0          1.50%        220        679.6        781.0
+http1          1.53%        219        693.9        762.0
+net            8.98%      18686         47.8        566.0
 ota            0.00%          0          0.0          0.0
-ota-confirm    0.00%          0          0.0         21.0
-watchdog       0.00%          5         36.2         62.0
+ota-confirm    0.00%          0          0.0         29.0
+watchdog       0.00%          5         43.8         56.0
 ```
+
+The executor ids are addresses, which is how you tell the three apart: `2007ffe8`
+is core 0's thread executor (net, http, watchdog), `200093e0` the `HIGH` interrupt
+tier (heartbeat), `200003e0` core 1's executor (bench, disabled here, hence 0
+polls). `polls/pass` below 1 is normal on RP2350: a productive pass leaves the
+monitor event set, so the next `WFE`
+falls through into one empty pass. Core 1's passes are the pender's `SEV`, which
+wakes *both* cores, so an otherwise idle core's passes/s tracks the other core's
+polls/s one-for-one. What matters is the order of magnitude, not the ratio.
 
 **Good looks like:** `non-200 0`, `malformed/truncated 0`, `counter regressions 0`;
 `body max` comfortably below the worker's 2560-byte TX buffer minus header bytes;
@@ -372,7 +381,7 @@ watchdog       0.00%          5         36.2         62.0
 **Bad looks like:**
 
 - **`malformed/truncated > 0`** — the JSON body no longer fits the worker's TX
-  buffer (1440 B, `tx` in `http_task`). Shrink the body or grow the buffer.
+  buffer (2560 B, `tx` in `http_task`). Shrink the body or grow the buffer.
 - **`heap_free min` approaching 0** — the pool grew but the heap can't sustain a
   fully-grown pool under load; an allocation is about to fail. This is the exact
   failure mode the TX/body sizing was chosen to avoid.
@@ -383,6 +392,11 @@ watchdog       0.00%          5         36.2         62.0
 - **`busy%` pinned near 100% with high `overhead%`** — the executor is saturated
   and spending a large share outside polls; a runaway max-poll on one task points
   at a specific culprit.
+- **`passes/s` orders of magnitude above `polls/s`** (`polls/pass` ≈ 0) — a wake
+  storm: the executor is woken constantly with nothing runnable, so it burns the
+  core instead of sleeping. `busy%` will not show it anywhere, since empty passes
+  are booked as idle — the rate gap and idle board draw are the only tells. See
+  [Note on RP2350](#note-on-rp2350).
 
 ## Interpreting the observability data
 
@@ -419,13 +433,20 @@ busy%        = in-poll% + overhead%
 - `passes` counts scheduler passes; `polls` counts completed task polls, so
   **`polls / passes` is the mean useful polls per pass**. Empty passes (woken but
   nothing runnable) are booked as **idle**, not overhead.
-- **The single most diagnostic comparison is `passes/s` vs `polls/s`:** near-equal
-  (ratio ≈ 1) is healthy — the executor wakes only for work. `passes/s` far above
-  `polls/s` is a **wake storm** (see [below](#note-on-rp2350)). Tick-based
-  idle% alone hides a storm completely, because empty passes count as idle.
-- **Overhead as a share of busy** grows with poll rate (~13% of a 150 MHz core
-  measured at ~8k polls/s under HTTP load); it ballooning means the hooks and
-  bookkeeping are eating the core — expected only at very high poll rates.
+- **The single most diagnostic comparison is `passes/s` vs `polls/s`,** read as an
+  order of magnitude, not a target ratio. Healthy on RP2350 is 0.5–1.0 polls/pass
+  (this firmware measures 0.47–0.54 near idle, 0.55–0.63 under HTTP load, and 1.00
+  when a task saturates its executor by waking itself). `passes/s` *orders of
+  magnitude* above `polls/s` is a **wake storm**: something keeps waking the
+  executor with nothing runnable (on RP2350, see [below](#note-on-rp2350)). Idle
+  board draw is the other tell. Tick-based idle% alone hides a storm completely,
+  because empty passes count as idle.
+- **Overhead as a share of busy** grows with both rates, since the hooks run per
+  pass and per poll. This firmware measures 0.7–1.0% of wall time run-to-run at
+  ~1.9k polls/s and ~3.5k passes/s over 8 nodes — under ~5 µs per poll, and that
+  bound also absorbs the inter-poll ISR time this term folds in. It ballooning
+  means the hooks and bookkeeping are eating the core; the id scan is O(nodes), so
+  scale the figure by your own node count and rates rather than reusing it.
 - **Unsupervised share** should be near zero (nearly all poll time maps to named
   nodes); a large share means significant work in tasks outside the graph.
 
@@ -462,20 +483,12 @@ yield.
 
 ### Note on RP2350
 
-⚠️ **On RP2350, the executor "idle %" is NOT sleep.** RP2350 has a silicon quirk where any
-exclusive-access atomic (`ldaex`/`strex`) raises a global-monitor event — an effective
-`SEV` — so every atomic in the executor's idle loop (the critical-section spinlock, task
-flags) makes the following `WFE` return immediately. The thread executor therefore
-free-runs at ~1 MHz (`polls/pass` in the wrk report is far below 1) and never actually
-sleeps, regardless of how little work there is. Read `idle %` as "WFE-spin", not power
-saving. This is not specific to this firmware or the supervisor — it affects any
-WFE-idle embassy/pico-SDK program on RP2350. For genuine low power use the `powman`
-peripheral (deep sleep), not WFE.
-
-
-- raspberrypi/pico-feedback [#482](https://github.com/raspberrypi/pico-feedback/issues/482)
-- embassy-rs/embassy [#4818](https://github.com/embassy-rs/embassy/issues/4818)
-- pico-sdk [#1812](https://github.com/raspberrypi/pico-sdk/issues/1812)
+On RP2350 any exclusive access posts a sticky monitor event that acts as an effective
+`SEV`, so a single exclusive per scheduler pass keeps the idle `WFE` from ever sleeping.
+The executor used to have one ([#4818](https://github.com/embassy-rs/embassy/issues/4818),
+fixed by [#6659](https://github.com/embassy-rs/embassy/pull/6659)): the root
+`[patch.crates-io]` builds against embassy `main` for it, and goes away once a release
+carries the fix.
 
 ## OTA update
 
