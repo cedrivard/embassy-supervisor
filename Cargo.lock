@@ -509,6 +509,7 @@ dependencies = [
 [[package]]
 name = "embassy-executor"
 version = "0.10.0"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#122901ea2bf85abcd588398de86cecbf5331fb76"
 dependencies = [
  "cordyceps",
  "cortex-m",
@@ -522,6 +523,7 @@ dependencies = [
 [[package]]
 name = "embassy-executor-macros"
 version = "0.8.0"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#122901ea2bf85abcd588398de86cecbf5331fb76"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -532,6 +534,7 @@ dependencies = [
 [[package]]
 name = "embassy-executor-timer-queue"
 version = "0.1.0"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#122901ea2bf85abcd588398de86cecbf5331fb76"
 
 [[package]]
 name = "embassy-futures"
@@ -703,6 +706,7 @@ dependencies = [
 [[package]]
 name = "embassy-time-driver"
 version = "0.2.2"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#122901ea2bf85abcd588398de86cecbf5331fb76"
 dependencies = [
  "document-features",
 ]

@@ -107,3 +107,8 @@ default = []
 # edit across three files — everything the switch touches is `cfg`'d on it:
 #   cargo build --release --features dns
 dns = ["embassy-net/dns"]
+# TEMPORARY measurement aids for the RP2350 idle-path investigation (see
+# src/bench.rs and the README's "Note on RP2350"): swap bench's slice body for a
+# cross-core interference generator. Mutually exclusive; pick one per build.
+bench-excl = [] # atomic fetch_add loop: ldrex/strex exclusive storm
+bench-mem = []  # atomic load+store loop: same SRAM traffic, no exclusives
