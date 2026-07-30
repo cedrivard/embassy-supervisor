@@ -19,23 +19,23 @@ repository = "https://github.com/cedrivard/embassy-supervisor"
 rust-version = "1.85"
 
 # MEASUREMENT FIX BUILD (branch pr-executor-skip-empty-dequeue-fixed): builds
-# the firmware against the run-queue idle-path change, where
-# `RunQueue::dequeue_all` returns early on an empty queue instead of running
-# `TransferStack::take_all`'s `swap`. On RP2350 that removes the exclusive that
-# kept the thread executor's idle `WFE` from ever sleeping. See
-# firmware/README.md for the measured behaviour; the sibling branch
-# pr-executor-skip-empty-dequeue-main builds the same source against upstream
-# main as the storming baseline.
+# the firmware against upstream embassy main, which since
+# embassy-rs/embassy#6659 returns early from `RunQueue::dequeue_all` on an empty
+# queue instead of running `TransferStack::take_all`'s `swap`. On RP2350 that
+# removes the exclusive that kept the thread executor's idle `WFE` from ever
+# sleeping. See firmware/README.md for the measured behaviour; the sibling
+# branch pr-executor-skip-empty-dequeue-main builds the same source against the
+# published crates, which predate the fix, as the storming baseline.
 #
 # The last three entries are the path-dep closure of embassy-executor's own
 # manifest; without them a second copy enters the graph alongside the crates.io
 # ones (embassy-time also reaches embassy-executor-timer-queue, where a
 # duplicate is a type mismatch).
 [patch.crates-io]
-embassy-executor = { git = "https://github.com/cedrivard/embassy", branch = "executor-skip-empty-dequeue" }
-embassy-executor-macros = { git = "https://github.com/cedrivard/embassy", branch = "executor-skip-empty-dequeue" }
-embassy-executor-timer-queue = { git = "https://github.com/cedrivard/embassy", branch = "executor-skip-empty-dequeue" }
-embassy-time-driver = { git = "https://github.com/cedrivard/embassy", branch = "executor-skip-empty-dequeue" }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-executor-macros = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-executor-timer-queue = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 
 # Size/perf profile for the embedded binaries (mirrors the embassy templates).
 [profile.release]

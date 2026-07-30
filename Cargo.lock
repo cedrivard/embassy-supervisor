@@ -509,7 +509,7 @@ dependencies = [
 [[package]]
 name = "embassy-executor"
 version = "0.10.0"
-source = "git+https://github.com/cedrivard/embassy?branch=executor-skip-empty-dequeue#b87d2dff06c4960ddfc7b15184dc716a624d9469"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#2a2eab8218457c97ed28fd18ee642c19cebc43ae"
 dependencies = [
  "cordyceps",
  "cortex-m",
@@ -523,7 +523,7 @@ dependencies = [
 [[package]]
 name = "embassy-executor-macros"
 version = "0.8.0"
-source = "git+https://github.com/cedrivard/embassy?branch=executor-skip-empty-dequeue#b87d2dff06c4960ddfc7b15184dc716a624d9469"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#2a2eab8218457c97ed28fd18ee642c19cebc43ae"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -534,7 +534,7 @@ dependencies = [
 [[package]]
 name = "embassy-executor-timer-queue"
 version = "0.1.0"
-source = "git+https://github.com/cedrivard/embassy?branch=executor-skip-empty-dequeue#b87d2dff06c4960ddfc7b15184dc716a624d9469"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#2a2eab8218457c97ed28fd18ee642c19cebc43ae"
 
 [[package]]
 name = "embassy-futures"
@@ -706,7 +706,7 @@ dependencies = [
 [[package]]
 name = "embassy-time-driver"
 version = "0.2.2"
-source = "git+https://github.com/cedrivard/embassy?branch=executor-skip-empty-dequeue#b87d2dff06c4960ddfc7b15184dc716a624d9469"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#2a2eab8218457c97ed28fd18ee642c19cebc43ae"
 dependencies = [
  "document-features",
 ]
