@@ -30,8 +30,9 @@ static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
 async fn worker(node: &'static TaskNode, probe: &mut Probe) {
     probe.runs += 1;
     OBSERVED_RUNS.store(probe.runs, Ordering::SeqCst);
-    node.wait_shutdown().await;
-    node.ack_dropped();
+    let _ = node
+        .run_cancellable_acked(core::future::pending::<()>())
+        .await;
     // Returning here is the restore point: the shell puts the Probe back into
     // PROBE for the next spawn.
 }
@@ -66,7 +67,7 @@ async fn driver(spawner: Spawner) {
 
     // teardown(): the worker acks and returns; the shell restores the Probe to
     // its slot. The restore happens on task exit, so wait for the running flag.
-    sup.teardown().await;
+    sup.teardown().await.expect("teardown");
     assert!(!METER.is_running(), "node torn down");
 
     // respawn_terminate(): the supervisor awaits the slot being restored, the

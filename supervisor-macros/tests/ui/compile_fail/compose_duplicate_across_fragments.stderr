@@ -1,0 +1,13 @@
+error: duplicate node/pool name `NET` (from fragment `FRAG_B`)
+  --> tests/ui/compile_fail/compose_duplicate_across_fragments.rs:15:10
+   |
+15 |       node NET = Terminate, deps: [], task: $crate::worker;
+   |            ^^^
+...
+18 | / compose_graph! {
+19 | |     fragments: [FRAG_A, FRAG_B],
+20 | |     graph: {}
+21 | | }
+   | |_- in this macro invocation
+   |
+   = note: this error originates in the macro `FRAG_B` which comes from the expansion of the macro `compose_graph` (in Nightly builds, run with -Z macro-backtrace for more info)

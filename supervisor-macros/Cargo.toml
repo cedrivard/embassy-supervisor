@@ -4,7 +4,7 @@ name = "embassy-supervisor-macros"
 # version (`=x.y.z`): the generated code references doc(hidden) supervisor internals,
 # so only the tested pair is guaranteed compatible. Bump only when the macro changes;
 # the supervisor updates its pin to match.
-version = "0.4.1"
+version = "0.5.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -34,6 +34,16 @@ pool = []
 # CONSUMER'S CRATE (this is why it is opt-in and off by default). Without it, a
 # `local` marker is a span-attached compile error naming the feature.
 local-resources = []
+# Forwarded from the supervisor's `heap-state` feature: permits the
+# `state: Type = init_expr` clause and emits the consumer-crate `__sv_try_box`
+# fallible-boxing helper (raw alloc + null check + Box::from_raw — after which
+# it is a normal Box, freed by drop on task exit).
+heap-state = []
+# Forwarded from the supervisor's `readiness` feature: permits the `ready` dep
+# marker (`deps: [NET ready]`) and emits the per-node ready-dep arrays plus
+# `.with_ready_deps` builder calls. Without it the marker is a span-attached
+# compile error naming the feature.
+readiness = []
 # Forwarded from the supervisor's `trace` feature: the generated spawn glue captures
 # each SpawnToken's task id into the node (`set_task_id`) before spawning it.
 trace = []
@@ -64,7 +74,11 @@ proc-macro2 = "1"
 # (embassy-supervisor depends back on this crate; a dev-dependency cycle is allowed.)
 [dev-dependencies]
 trybuild = "1"
-embassy-supervisor = { path = "../supervisor" }
+# `readiness` unconditionally: trybuild re-resolves this declaration verbatim in
+# its scratch project, so a feature forwarded from this crate's own features
+# would never reach it. Additive API only — the no-feature UI split tests the
+# MACRO-side rejection (expansion-time cfg!), which this does not affect.
+embassy-supervisor = { path = "../supervisor", features = ["readiness"] }
 # `platform-std` + `executor-thread` give embassy-executor a host Pender/executor so a
 # compile-pass case that uses real `#[embassy_executor::task]`s can link on the host.
 embassy-executor = { version = "0.10", features = ["platform-std", "executor-thread"] }

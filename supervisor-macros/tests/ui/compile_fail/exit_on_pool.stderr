@@ -1,0 +1,13 @@
+error: `exit:` is not supported on `pool` — the K members share one shell, so per-member exit values need per-member storage; use per-node `exit:` declarations, or have the worker provide() into an app-declared slot itself
+  --> tests/ui/compile_fail/exit_on_pool.rs:12:9
+   |
+12 |         exit: u32,
+   |         ^^^^
+
+warning: unused import: `DeferredShrink`
+ --> tests/ui/compile_fail/exit_on_pool.rs:4:26
+  |
+4 | use embassy_supervisor::{DeferredShrink, TaskNode, supervisor_graph};
+  |                          ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

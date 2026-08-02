@@ -11,7 +11,6 @@
 extern crate alloc;
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
 use embassy_rp::interrupt;
 use embassy_rp::interrupt::{InterruptExt, Priority};
 use {defmt_rtt as _, panic_probe as _};
@@ -24,26 +23,28 @@ mod net;
 mod ota;
 mod watchdog;
 
-// The supervised task graph — the single source of nodes, deps, pool, and order.
-embassy_supervisor::supervisor_graph! {
-    executor HIGH;  // Interrupt-priority tier (SWI_IRQ_0)
-    executor CORE1; // Core 1's thread executor (filled by core1_entry via spawn_core1)
-    node WATCHDOG = Terminate, deps: [], task: crate::watchdog::watchdog_task,
-        resources: [WD_DEV: embassy_rp::watchdog::Watchdog];
-    node NET = Terminate, deps: [], task: crate::net::net_task,
-        resources: [USB_DEV: embassy_rp::Peri<'static, embassy_rp::peripherals::USB>];
-    node HEARTBEAT = Pause, deps: [], executor: HIGH,
-        task: crate::heartbeat::heartbeat_task,
-        resources: [LED: embassy_rp::gpio::Output<'static>];
-    pool HTTP = [Terminate, OnDemand], deps: [NET],
-        task: crate::http::http_task,
-        policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(4)),
-        min: 1, max: 2;
-    node OTA = Terminate, deps: [NET], task: crate::ota::ota_task,
-        resources: [FLASH_DEV: embassy_rp::Peri<'static, embassy_rp::peripherals::FLASH>],
-        disabled;
-    node BENCH = Terminate, deps: [], executor: CORE1, task: crate::bench::bench_task, disabled;
-    node OTA_CONFIRM = Terminate, deps: [HTTP], task: crate::ota_confirm;
+// The supervised task graph, COMPOSED from module-owned fragments (net's node
+// lives in net.rs, the http pool in http.rs — each module declares its own
+// slice of the graph) plus the compose-site items below. Everything reaches
+// one supervisor_graph! expansion, so cross-fragment deps (`HTTP` -> `NET`),
+// the name map, u8 slots, topo order and the trace hooks are whole-graph.
+embassy_supervisor::compose_graph! {
+    fragments: [NET_FRAG, HTTP_FRAG],
+    graph: {
+        executor HIGH;  // Interrupt-priority tier (SWI_IRQ_0)
+        executor CORE1; // Core 1's thread executor (filled by core1_entry via spawn_core1)
+        node WATCHDOG = Terminate, deps: [], task: crate::watchdog::watchdog_task,
+            resources: [WD_DEV: embassy_rp::watchdog::Watchdog];
+        node HEARTBEAT = Pause, deps: [], executor: HIGH,
+            task: crate::heartbeat::heartbeat_task,
+            resources: [LED: embassy_rp::gpio::Output<'static>];
+        node OTA = Terminate, deps: [NET], task: crate::ota::ota_task,
+            resources: [FLASH_DEV: embassy_rp::Peri<'static, embassy_rp::peripherals::FLASH>],
+            state: crate::ota::OtaTransferBufs = crate::ota::OtaTransferBufs::new(),
+            disabled;
+        node BENCH = Terminate, deps: [], executor: CORE1, task: crate::bench::bench_task, exit: u32, disabled;
+        node OTA_CONFIRM = Terminate, deps: [HTTP], task: crate::ota_confirm;
+    }
 }
 
 // The interrupt-priority executor backing the graph's `HIGH` slot. Its poll loop
@@ -78,6 +79,12 @@ async fn main(spawner: Spawner) {
         p.PIN_25,
         embassy_rp::gpio::Level::Low,
     ));
+    // Per-member pool resources: every member's element, so the pool can grow
+    // to the ceiling. (Providing only the floor's would fail burst growth
+    // closed with Busy until the rest arrive.)
+    for s in HTTP_STATS.iter() {
+        s.provide(http::WorkerStats { served: 0 });
+    }
 
     // Bring up the HIGH tier and fill the graph's spawner slot BEFORE the
     // supervisor starts (an unfilled slot would fail heartbeat's spawn loudly).
@@ -119,16 +126,19 @@ async fn app_supervisor(spawner: Spawner) {
     // compile time, so a dependency cycle would have been a compile error. `GRAPH`
     // carries the nodes, dep table, order, and the elastic pools.
     let sup = embassy_supervisor::Supervisor::new(&GRAPH);
-    // `ota` is declared `disabled` (disabled-at-boot), so `start()` skips it; a
+    // `ota` is declared `disabled` (disabled-at-boot), so bring-up skips it; a
     // control `Activate` (POST /api/ota or the dashboard start button) starts it.
-    defmt::unwrap!(sup.start(spawner).await, "supervisor: initial spawn failed");
-
-    loop {
-        // Race pool scaling against runtime control requests. `run_pools` never
-        // returns; only a control command wakes the other arm.
-        match select(sup.run_pools(spawner), embassy_supervisor::wait_control()).await {
-            Either::First(()) => {}
-            Either::Second(cmd) => sup.apply_control(cmd, spawner).await,
+    // The canonical driver as one call: start + pool scaling + runtime control.
+    // Returns only on error; a missed ack anywhere is a wedged task — escalate
+    // by panicking into the 8 s hardware watchdog reset instead of running a
+    // half-torn-down graph. (Apps that select extra wake sources keep writing
+    // the run_pools/wait_control loop by hand.)
+    match sup.run(spawner).await {
+        embassy_supervisor::RunError::Spawn(_) => {
+            defmt::panic!("supervisor: bring-up spawn failed")
+        }
+        embassy_supervisor::RunError::Shutdown(err) => {
+            defmt::panic!("supervisor: {} missed shutdown ack", err.node.name)
         }
     }
 }

@@ -16,7 +16,7 @@
 
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_futures::select::{Either3, select3};
 use embassy_supervisor::TaskNode;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
@@ -68,6 +68,10 @@ pub async fn heartbeat_task<L: StatefulOutputPin>(node: &'static TaskNode, mut l
                 .await
                 {
                     Either3::First(()) => {
+                        // Liveness heartbeat: one beat per blink edge. The
+                        // watchdog's liveness sweep flags this node if beats
+                        // stop while it still reads as running.
+                        node.beat();
                         let _ = led.toggle();
                         // Live blocked-task observer: this task runs on the HIGH
                         // interrupt tier, so it still gets CPU while the thread
@@ -87,9 +91,19 @@ pub async fn heartbeat_task<L: StatefulOutputPin>(node: &'static TaskNode, mut l
                 } else {
                     let _ = led.set_high();
                 }
-                match select(CHANGED.wait(), node.wait_shutdown()).await {
-                    Either::First(()) => {}              // changed → re-read
-                    Either::Second(()) => break 'active, // pause requested
+                // Steady states have no blink edge, so wake every 5 s purely
+                // to beat — otherwise a parked-but-healthy "LED off" phase
+                // would read as stale to the liveness sweep.
+                match select3(
+                    Timer::after(Duration::from_secs(5)),
+                    CHANGED.wait(),
+                    node.wait_shutdown(),
+                )
+                .await
+                {
+                    Either3::First(()) => node.beat(),
+                    Either3::Second(()) => {} // changed → re-read
+                    Either3::Third(()) => break 'active, // pause requested
                 }
             }
         }

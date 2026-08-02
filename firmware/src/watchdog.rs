@@ -56,6 +56,22 @@ pub(crate) async fn watchdog_task(
                 defmt::warn!("trace: {} once held the executor {} ticks", n.name, max);
             }
         }
+        // Liveness sweep (feature `liveness` — works WITHOUT `trace`): flags a
+        // node that is running but stopped beating — alive-but-wedged, parked
+        // on an await that will never complete. The complement of the trace
+        // checks above (which catch a poll that never yields). Only nodes whose
+        // bodies actually beat() belong in this list: a node that never beats
+        // would read permanently stale.
+        const LIVENESS_CHECKED: &[&embassy_supervisor::TaskNode] = &[&crate::HEARTBEAT];
+        const MAX_BEAT_AGE: embassy_time::Duration = embassy_time::Duration::from_secs(30);
+        for n in LIVENESS_CHECKED {
+            if n.is_stale(MAX_BEAT_AGE) {
+                defmt::warn!(
+                    "liveness: {} stopped beating (still marked running)",
+                    n.name
+                );
+            }
+        }
         embassy_time::Timer::after(embassy_time::Duration::from_secs(2)).await;
     }
 }

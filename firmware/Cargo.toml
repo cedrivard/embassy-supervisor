@@ -16,6 +16,9 @@ embassy-supervisor = { path = "../supervisor", features = [
     "defmt",
     "trace-hooks",
     "trace-nested",
+    "readiness",
+    "liveness",
+    "heap-state",
 ] }
 
 # embassy core. These versions are the latest crates.io releases that resolve

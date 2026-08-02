@@ -1,0 +1,5 @@
+error: `exit:` requires `task:` — the generated shell is what captures the worker's return value; a `spawn:` task fn can provide() into a slot itself
+  --> tests/ui/compile_fail/exit_without_task.rs:10:58
+   |
+10 |     node PROBE = Terminate, deps: [], spawn: probe_task, exit: u32;
+   |                                                          ^^^^

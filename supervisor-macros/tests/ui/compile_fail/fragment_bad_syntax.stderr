@@ -1,0 +1,5 @@
+error: expected `,`
+ --> tests/ui/compile_fail/fragment_bad_syntax.rs:8:25
+  |
+8 |     node NET = Terminate; // missing the mandatory `, deps: [..]`
+  |                         ^

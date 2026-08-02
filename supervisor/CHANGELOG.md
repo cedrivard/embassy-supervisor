@@ -4,6 +4,132 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-02
+
+Defect fixes: the control mailbox can no
+longer drop a request silently, a task body that returns on its own is now observed,
+and a missed shutdown ack is an error the application escalates instead of a panic
+inside the supervisor. Macro pin moves to `embassy-supervisor-macros = "=0.5.0"`.
+
+### Changed (breaking)
+- `request_control` is now `async` and lossless: it awaits mailbox capacity instead
+  of silently dropping when the 4-deep channel is full. The old fire-and-forget
+  behavior is gone; for sync contexts (ISRs, callbacks) use the new
+  `try_request_control`, which returns `Err(ControlQueueFull)` instead of dropping.
+- The shutdown paths no longer panic on a missed ack. `stop_node`, `teardown` and
+  `apply_control` now return `Result<(), ShutdownTimeout>` naming the offending
+  node; `run_pools` returns `ShutdownTimeout` (it only completes on error, from a
+  shrink whose member missed its ack). `teardown` aborts the cascade at the first
+  timeout so a still-live dependent never has its dependencies stopped under it;
+  the previous behavior is one token away (`.unwrap()` / `defmt::unwrap!`).
+
+### Added
+- `TaskNode::mark_exited()` / `TaskNode::has_exited()`: a task body that returns is
+  now recorded as completed (and the teardown handshake acked). The generated
+  `task:` shell calls `mark_exited()` automatically after the worker returns and
+  resources are restored, so an autonomous exit no longer reads as running forever
+  and a control `Activate` can respawn it. Hand-written `spawn:` tasks call
+  `mark_exited()` where they previously called `ack_dropped()` on exit.
+  `has_exited() && !shutdown_requested()` distinguishes an autonomous completion
+  from an acked stop.
+- `Supervisor::teardown_continue()`: best-effort teardown for the
+  "hardware reset next" escalation — visits every node in reverse order past a
+  non-acking one and returns the first `ShutdownTimeout` at the end.
+- `ControlQueueFull` and `ShutdownTimeout` error types (`defmt::Format` under the
+  `defmt` feature).
+- **`readiness` feature** (off by default): task-asserted readiness. Providers call
+  `set_ready()` once actually serving (DHCP bound, registration done);
+  `deps: [NET ready]` then holds a dependent's spawn until the assertion (bounded by
+  the dependent's `slot_timeout`, then `SpawnError::Busy` with a log line naming the
+  not-ready dep — plain deps still order spawns only). Elastic-pool growth defers
+  while a ready-marked dep is un-ready. `clear_ready()` withdraws readiness as
+  status, not control (dependents are never stopped); the pre-spawn reset clears it
+  so a respawned provider re-asserts. Costs one AtomicBool + one Signal + one slice
+  per node.
+- **`liveness` feature** (off by default): per-node heartbeat. Bodies call `beat()`
+  per work loop; an app watchdog reads `is_stale(max_age)` to catch
+  alive-but-wedged tasks (parked on an await that will never complete) — the
+  complement of the `trace` stall watermark, and independent of `trace`.
+  `set_running` stamps a beat so a fresh spawn is never instantly stale;
+  not-running nodes are never stale. Costs one AtomicU32 per node.
+- `TaskNode::run_cancellable(fut)` / `run_cancellable_acked(fut)`: the select
+  against `wait_shutdown()` as a combinator — `Ok(output)` on completion,
+  `Err(Aborted)` when a stop wins; the `_acked` variant completes the handshake
+  before returning, for bodies with no cleanup between the select and the ack.
+- **Named multi-graphs**: `name: IDENT;` as a graph's first item (and
+  `compose_graph! { name: X, … }`) renames the emitted static and suffixes every
+  generated helper, so several supervisors coexist per binary — the shape a
+  subordinate sub-graph wants (a dedicated graph the app state machine cycles
+  with `start()`/`teardown()` per phase). The unnamed graph is the primary: only
+  it emits the `trace-hooks` symbols; the trace registry now tracks up to
+  `trace::MAX_GRAPHS` graphs. The control mailbox is shared — run ONE driver and
+  apply each command to every supervisor (foreign-node commands no-op safely).
+- `Supervisor::resume_node(node)`: resume ONE `Pause` node parked by an earlier
+  `stop_node`/`teardown` — the single-node partner of `resume_pausable` (same
+  sequence, same deliberate absence of dependency gating), completing the
+  node-level verb set: `stop_node` is the single-node pause for a `Pause` node,
+  `resume_node` the other half. No-op unless the node is `Pause`, actually
+  parked, and neither disabled nor detached.
+- `Supervisor::activate(node, spawner)` / `Supervisor::deactivate(node)` are now
+  public — the cascading, `disabled`-latching subsystem verbs, previously
+  reachable only by wrapping a `ControlCommand` for `apply_control` even when
+  holding the supervisor directly. `apply_control` remains the mailbox-dispatch
+  form. `activate` returns `()` (cascade spawn errors are deliberately
+  swallowed and re-driven); `deactivate` returns `Result<(), ShutdownTimeout>`.
+- `Supervisor::run(spawner) -> RunError`: the canonical driver as one call —
+  `start()` then drive pool scaling and runtime control forever, returning only
+  on error (`RunError::{Spawn, Shutdown}`). The manual
+  `select(run_pools, wait_control)` loop remains for apps with extra wake
+  sources.
+- `start()` is now the universal quiescent-to-running op, so
+  `start()`/`teardown()` cycles on a (sub-graph) supervisor handle every mode:
+  each node is reset before its spawn (as `start_node` always did), running and
+  detached nodes are skipped (idempotent; a detached instance survived the
+  teardown), and a `Pause` instance parked by an earlier teardown is resumed in
+  place instead of double-spawned — the completion flag (`mark_exited`) is what
+  makes "parked" (`acked && !completed`) distinguishable from "exited". The
+  resume path bypasses the gate waits like `resume_pausable` (a parked instance
+  retains its resources, so its slots are empty by design).
+- **`heap-state` feature** (off by default): the `state: Type = init_expr` clause
+  on `task:` nodes and pool members — reclaimable per-activation heap state. The
+  spawn glue fallibly boxes the init value (alloc failure = `SpawnError::Busy`,
+  nothing spawned or stranded, retryable), the shell lends the worker `&mut Type`
+  and drops the Box on task exit, before restores and the completion record —
+  every activation allocates fresh, every exit frees, net zero across respawns.
+  Task STORAGE stays static by design: embassy wakers are unrefcounted pointers
+  into it, so freeing it is unsound — heap only where it can be
+  reclaimed. The runtime crate stays no-alloc/`forbid(unsafe_code)`; the ~6-line
+  fallible-boxing helper (the feature's entire unsafe surface) is emitted into
+  the consumer crate, like `local-resources`. Consumer needs a
+  `#[global_allocator]`.
+- **Composable graphs**: `supervisor_fragment! { name: X; <items> }` lets a module
+  or a whole crate declare its slice of the graph; `compose_graph! { fragments:
+  [X, ::other::Y], graph: { .. } }` assembles them into ONE `supervisor_graph!`
+  expansion — cross-fragment deps resolve by name in either direction, and every
+  compile-time pass (name map, u8 slots, topo order, shared-slot dedup, 256 cap)
+  checks the whole composed graph. Errors are attributed to the owning fragment.
+  Fragment paths use `$crate::…`; `#[cfg]` inside a fragment evaluates against the
+  compose crate's features (documented).
+- **Per-member pool resources**: pools now accept take-kind `resources:`
+  entries (default lend and `consume`), emitted as per-member slot arrays
+  `[ResourceSlot<T>; K]` — member `I` takes/restores element `I` exclusively, the
+  floor comes up with floor-many elements provided, and a lend value survives
+  shrink/regrow on the same index. `shared` stays pool-wide — `shared local`
+  included, as in 0.3.x; only take-kind `local` on pools stays rejected (the
+  single-core slot contract + per-member restore is deferred). New
+  `ElasticPool::member_index(node)` lets a worker index per-member app state.
+- **Const-expression pool bounds**: `min:`/`max:` accept any const-evaluable
+  `usize` expression; non-literals make the emitted `_MIN`/`_MAX` consts the source
+  of truth, guarded by const asserts (min <= max <= members <= 255). The member
+  count (the mode list) stays a literal: it drives how many items are emitted,
+  which a proc macro cannot derive from a const.
+- `exit: Type` graph clause (`task:` nodes): the worker's return value is
+  `provide()`d into a generated `pub static <NODE>_EXIT: ResourceSlot<Type>` just
+  before the completion is recorded, so `has_exited()` implies the value is
+  readable. `ResourceSlot::wait_take()` awaits and takes it. Idiom: a worker
+  returning `Result<R, Aborted>` straight out of `run_cancellable` records
+  completed-vs-cancelled.
+
 ## [0.3.5] - 2026-07-27
 
 RAM saving for the `Supervisor` itself: the topological order is now borrowed from
@@ -224,6 +350,7 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
+[0.4.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.5...v0.4.0
 [0.3.5]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.2...v0.3.3

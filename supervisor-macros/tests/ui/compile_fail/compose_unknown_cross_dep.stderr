@@ -1,0 +1,13 @@
+error: unknown dependency `NET` — not a declared node or pool (from fragment `LONELY_FRAG`)
+  --> tests/ui/compile_fail/compose_unknown_cross_dep.rs:10:35
+   |
+10 |       node HTTP = Terminate, deps: [NET], task: $crate::worker;
+   |                                     ^^^
+...
+13 | / compose_graph! {
+14 | |     fragments: [LONELY_FRAG],
+15 | |     graph: {}
+16 | | }
+   | |_- in this macro invocation
+   |
+   = note: this error originates in the macro `LONELY_FRAG` which comes from the expansion of the macro `compose_graph` (in Nightly builds, run with -Z macro-backtrace for more info)
