@@ -49,8 +49,9 @@ static DONE: AtomicBool = AtomicBool::new(false);
 #[embassy_executor::task(pool_size = 2)]
 async fn normal_task(node: &'static TaskNode) {
     NORMAL_SPAWNS.fetch_add(1, Ordering::SeqCst);
-    node.wait_shutdown().await;
-    node.ack_dropped();
+    let _ = node
+        .run_cancellable_acked(core::future::pending::<()>())
+        .await;
 }
 
 /// A Pause node: counts its single spawn, then loops the pause protocol — ack a
@@ -129,7 +130,7 @@ async fn driver(spawner: Spawner) {
     PHASE.store(1, Ordering::SeqCst);
 
     // ── teardown(): tears down NORMAL + PAUSED, skips the detached DAEMON ─────
-    sup.teardown().await;
+    sup.teardown().await.expect("teardown");
     assert!(!NORMAL.is_running(), "normal torn down");
     assert!(
         !PAUSED.is_running(),
@@ -193,9 +194,11 @@ async fn driver(spawner: Spawner) {
     // ── control deactivate cascade (the exact on-device panic path): stop NORMAL;
     //    its dependent ONESHOT is `detached` — a one-shot that already exited — so the
     //    cascade's growth loop skips it, never awaiting an ack it can't give ──────────
-    request_control(&NORMAL, ControlOp::Deactivate);
+    request_control(&NORMAL, ControlOp::Deactivate).await;
     let cmd = wait_control().await;
-    sup.apply_control(cmd, spawner).await;
+    sup.apply_control(cmd, spawner)
+        .await
+        .expect("apply_control");
     assert!(!NORMAL.is_running(), "normal control-stopped");
     assert!(NORMAL.is_disabled(), "normal marked disabled by deactivate");
     assert!(
@@ -212,9 +215,11 @@ async fn driver(spawner: Spawner) {
     //    bypassing the growth-loop skip, so only the teardown loop's own detached guard
     //    prevents signalling a shutdown to the already-exited task. A no-op: it stays
     //    detached, is not even marked disabled, and the driver does not hang on an ack.
-    request_control(&ONESHOT, ControlOp::Deactivate);
+    request_control(&ONESHOT, ControlOp::Deactivate).await;
     let cmd = wait_control().await;
-    sup.apply_control(cmd, spawner).await;
+    sup.apply_control(cmd, spawner)
+        .await
+        .expect("apply_control");
     assert!(
         ONESHOT.is_detached(),
         "detached one-shot still detached after direct deactivate"
@@ -234,9 +239,11 @@ async fn driver(spawner: Spawner) {
     //    target — else NORMAL (independently control-stopped just above) would be
     //    un-disabled and force-started. Expected: a complete no-op — the detached
     //    target is skipped by the bring-up loop, and the disabled dep is left alone.
-    request_control(&ONESHOT, ControlOp::Activate);
+    request_control(&ONESHOT, ControlOp::Activate).await;
     let cmd = wait_control().await;
-    sup.apply_control(cmd, spawner).await;
+    sup.apply_control(cmd, spawner)
+        .await
+        .expect("apply_control");
     assert!(
         NORMAL.is_disabled(),
         "disabled dep NOT re-enabled by Activate(detached target)"

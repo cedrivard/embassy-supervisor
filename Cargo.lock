@@ -509,7 +509,8 @@ dependencies = [
 [[package]]
 name = "embassy-executor"
 version = "0.10.0"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#0a7dfc28ac7e410aac34cb7da77e006dc3b851d4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d0d3b15c9d7dc4fec1d8cb77112472fb008b3b28c51ad23838d83587a6d2f1e"
 dependencies = [
  "cordyceps",
  "cortex-m",
@@ -523,7 +524,8 @@ dependencies = [
 [[package]]
 name = "embassy-executor-macros"
 version = "0.8.0"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#0a7dfc28ac7e410aac34cb7da77e006dc3b851d4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d11a246f53de5f97a387f40ac24726817cd0b6f833e7603baac784f29d6ff276"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -534,7 +536,8 @@ dependencies = [
 [[package]]
 name = "embassy-executor-timer-queue"
 version = "0.1.0"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#0a7dfc28ac7e410aac34cb7da77e006dc3b851d4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fc328bf943af66b80b98755db9106bf7e7471b0cf47dc8559cd9a6be504cc9c"
 
 [[package]]
 name = "embassy-futures"
@@ -644,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "embassy-supervisor"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "critical-section",
  "defmt 1.1.0",
@@ -658,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "embassy-supervisor-macros"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "critical-section",
  "embassy-executor",
@@ -706,7 +709,8 @@ dependencies = [
 [[package]]
 name = "embassy-time-driver"
 version = "0.2.2"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#0a7dfc28ac7e410aac34cb7da77e006dc3b851d4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ee71af1b3a0deaa53eaf2d39252f83504c853646e472400b763060389b9fcc9"
 dependencies = [
  "document-features",
 ]

@@ -43,8 +43,9 @@ static DONE: AtomicBool = AtomicBool::new(false);
 /// `consume` worker: owns the Probe outright. Returning drops it — no restore.
 async fn cons_worker(node: &'static TaskNode, _probe: Probe) {
     CONS_RUNS.fetch_add(1, Ordering::SeqCst);
-    node.wait_shutdown().await;
-    node.ack_dropped();
+    let _ = node
+        .run_cancellable_acked(core::future::pending::<()>())
+        .await;
 }
 
 /// `local` worker: the `!Send` counter arrives `&mut` and is restored on exit,
@@ -52,8 +53,9 @@ async fn cons_worker(node: &'static TaskNode, _probe: Probe) {
 async fn loc_worker(node: &'static TaskNode, counter: &mut Rc<Cell<u32>>) {
     counter.set(counter.get() + 1);
     LOC_RUNS.store(counter.get(), Ordering::SeqCst);
-    node.wait_shutdown().await;
-    node.ack_dropped();
+    let _ = node
+        .run_cancellable_acked(core::future::pending::<()>())
+        .await;
 }
 
 supervisor_graph! {
@@ -87,7 +89,7 @@ async fn driver(spawner: Spawner) {
     sup.start(spawner).await.expect("start");
     settle(|| CONS_RUNS.load(Ordering::SeqCst) == 1 && LOC_RUNS.load(Ordering::SeqCst) == 1).await;
 
-    sup.teardown().await;
+    sup.teardown().await.expect("teardown");
     // consume: the worker dropped the Probe and the shell restored nothing.
     assert_eq!(
         DROPPED.load(Ordering::SeqCst),

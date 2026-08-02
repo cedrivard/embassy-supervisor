@@ -34,7 +34,6 @@ use core::fmt::Write as _;
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
-use alloc::vec;
 use embassy_boot_rp::{BlockingFirmwareUpdater, FirmwareUpdaterConfig};
 use embassy_net::Ipv4Address;
 #[cfg(feature = "dns")]
@@ -170,10 +169,38 @@ impl embedded_nal_async::Dns for IpDns {
 // never runs — irrelevant, the chip reboots. [`mark_booted`] (the OTA_CONFIRM path)
 // borrows the SAME slot manually with take()/restore(), so the two FLASH users
 // exclude each other at runtime.
-pub(crate) async fn ota_task(node: &'static TaskNode, flash: &mut Peri<'static, FLASH>) {
+/// Per-activation transfer buffers, `state:`-boxed by the graph: allocated by
+/// the spawn glue when OTA is Activated, lent here as `&mut`, and freed the
+/// moment the task exits — heap that exists only while an update runs (visible
+/// as a free_bytes dip that fully recovers, run after run).
+pub struct OtaTransferBufs {
+    hdr: [u8; 1024],
+    chunk: [u8; 1024],
+}
+
+impl OtaTransferBufs {
+    pub const fn new() -> Self {
+        Self {
+            hdr: [0; 1024],
+            chunk: [0; 1024],
+        }
+    }
+}
+
+impl Default for OtaTransferBufs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub(crate) async fn ota_task(
+    node: &'static TaskNode,
+    flash: &mut Peri<'static, FLASH>,
+    bufs: &mut OtaTransferBufs,
+) {
     node.set_detached(true);
     // http has been drained by now, so the heap has room for the ~16 KB window.
-    match run(flash).await {
+    match run(flash, bufs).await {
         Ok(()) => defmt::info!("ota: image staged to DFU, resetting to swap"),
         // No `mark_updated` on failure, so the reset just reboots the current
         // image (clean recovery).
@@ -191,7 +218,10 @@ pub(crate) async fn ota_task(node: &'static TaskNode, flash: &mut Peri<'static, 
 /// arena stays small. The task is already detached (first act of `ota_task`), so
 /// net's teardown here can't cascade back into it. The sync decode blocks the
 /// executor anyway, so net couldn't serve during it.
-async fn run(flash: &mut Peri<'static, FLASH>) -> Result<(), &'static str> {
+async fn run(
+    flash: &mut Peri<'static, FLASH>,
+    bufs: &mut OtaTransferBufs,
+) -> Result<(), &'static str> {
     // Fall back to the default target when started without one (e.g. the
     // dashboard's Activate button, which doesn't call set_target).
     let target = TARGET
@@ -203,16 +233,16 @@ async fn run(flash: &mut Peri<'static, FLASH>) -> Result<(), &'static str> {
     // Poll `is_running` (false only once teardown completes and the sockets are
     // freed), NOT `is_disabled` (set when the stop is merely *requested*, before the
     // workers actually exit). Deactivating the floor seeds the whole pool.
-    embassy_supervisor::request_control(&crate::HTTP[0], ControlOp::Deactivate);
+    embassy_supervisor::request_control(&crate::HTTP[0], ControlOp::Deactivate).await;
     while crate::HTTP.iter().any(|n| n.is_running()) {
         Timer::after(Duration::from_millis(20)).await;
     }
 
-    let len = download_to_scratch(&target, flash.reborrow()).await?;
+    let len = download_to_scratch(&target, flash.reborrow(), bufs).await?;
     defmt::info!("ota: downloaded {} B, draining net for the decode", len);
     // Already detached (ota_task's first act), so this net teardown won't cascade
     // back into us and no control op can interrupt the decode below.
-    embassy_supervisor::request_control(&crate::NET, ControlOp::Deactivate);
+    embassy_supervisor::request_control(&crate::NET, ControlOp::Deactivate).await;
     while crate::net::try_stack().is_some() {
         Timer::after(Duration::from_millis(20)).await;
     }
@@ -226,7 +256,11 @@ async fn run(flash: &mut Peri<'static, FLASH>) -> Result<(), &'static str> {
 /// HTTP client (reqwless): GET the image and stream the body into scratch flash.
 /// All transfer buffers are heap-allocated so they come from the drained budgeted
 /// heap, not this task's static future storage.
-async fn download_to_scratch(t: &Target, flash: Peri<'_, FLASH>) -> Result<usize, &'static str> {
+async fn download_to_scratch(
+    t: &Target,
+    flash: Peri<'_, FLASH>,
+    bufs: &mut OtaTransferBufs,
+) -> Result<usize, &'static str> {
     let stack = crate::net::try_stack().ok_or("net not up")?;
     let state: Box<TcpClientState<1, 512, 2048>> = Box::new(TcpClientState::new());
     let tcp = TcpClient::new(stack, &state);
@@ -239,7 +273,7 @@ async fn download_to_scratch(t: &Target, flash: Peri<'_, FLASH>) -> Result<usize
     let mut url = String::with_capacity(64);
     let _ = write!(url, "http://{}:{}{}", t.ip, t.port, t.path);
 
-    let mut hdr = vec![0u8; 1024];
+    let hdr = &mut bufs.hdr;
     let mut req = client
         .request(Method::GET, &url)
         .await
@@ -250,12 +284,12 @@ async fn download_to_scratch(t: &Target, flash: Peri<'_, FLASH>) -> Result<usize
         .map_err(|_| "http send")?;
 
     let mut reader = resp.body().reader();
-    let mut chunk = vec![0u8; 1024];
+    let chunk = &mut bufs.chunk;
     let mut scratch = Scratch::new(flash);
     let mut written: u32 = 0;
     loop {
         let n = reader
-            .read(&mut chunk)
+            .read(&mut chunk[..])
             .await
             .map_err(|_| "http body read")?;
         if n == 0 {

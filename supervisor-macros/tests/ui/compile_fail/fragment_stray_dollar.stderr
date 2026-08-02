@@ -1,0 +1,5 @@
+error: only `$crate` is permitted in a fragment — any other `$` would be read as a metavariable by the relay macro
+ --> tests/ui/compile_fail/fragment_stray_dollar.rs:8:43
+  |
+8 |     node NET = Terminate, deps: [], task: $worker;
+  |                                           ^

@@ -59,23 +59,26 @@ async fn provider_worker(node: &'static TaskNode) {
     let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     GADGET.provide(Gadget { generation });
     HANDLE.provide(Handle { generation });
-    node.wait_shutdown().await;
-    node.ack_dropped();
+    let _ = node
+        .run_cancellable_acked(core::future::pending::<()>())
+        .await;
 }
 
 /// `consume` consumer: owns the Gadget; returning after the ack drops it.
 async fn owner_worker(node: &'static TaskNode, gadget: Gadget) {
     OWNER_GEN.store(gadget.generation, Ordering::SeqCst);
-    node.wait_shutdown().await;
-    node.ack_dropped();
+    let _ = node
+        .run_cancellable_acked(core::future::pending::<()>())
+        .await;
 }
 
 /// `shared` consumer: its own copy of the fan-out handle (slot stays filled).
 async fn reader_worker(node: &'static TaskNode, handle: Handle) {
     READ_SUM.fetch_add(handle.generation, Ordering::SeqCst);
     READ_RUNS.fetch_add(1, Ordering::SeqCst);
-    node.wait_shutdown().await;
-    node.ack_dropped();
+    let _ = node
+        .run_cancellable_acked(core::future::pending::<()>())
+        .await;
 }
 
 supervisor_graph! {
@@ -130,7 +133,7 @@ async fn driver(spawner: Spawner) {
         "shared slot stays filled after both reads"
     );
 
-    sup.teardown().await;
+    sup.teardown().await.expect("teardown");
     assert_eq!(
         DROPPED.load(Ordering::SeqCst),
         1,

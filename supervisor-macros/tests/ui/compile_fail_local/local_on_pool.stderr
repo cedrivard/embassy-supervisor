@@ -1,0 +1,5 @@
+error: `local` is not supported on take-kind `pool` resources (the single-core slot contract + per-member restore is deferred); a `shared local` entry works (one pool-wide fan-out slot), or declare the take-kind `local` resource on a node
+  --> tests/ui/compile_fail_local/local_on_pool.rs:14:21
+   |
+14 |         resources: [H: local consume Handle],
+   |                     ^

@@ -45,8 +45,9 @@ static DONE: AtomicBool = AtomicBool::new(false);
 #[embassy_executor::task]
 async fn remote_task(node: &'static TaskNode) {
     REMOTE_STARTED.store(true, Ordering::Release);
-    node.wait_shutdown().await;
-    node.ack_dropped();
+    let _ = node
+        .run_cancellable_acked(core::future::pending::<()>())
+        .await;
 }
 
 /// Runs on executor A ("core 0"): rendezvous with B, start the graph (which
@@ -70,7 +71,7 @@ async fn driver_task(spawner: Spawner) {
     assert!(REMOTE.is_running());
 
     // (3) cross-thread shutdown/ack handshake.
-    sup.stop_node(&REMOTE).await;
+    sup.stop_node(&REMOTE).await.expect("stop_node");
     assert!(!REMOTE.is_running());
 
     DONE.store(true, Ordering::Release);

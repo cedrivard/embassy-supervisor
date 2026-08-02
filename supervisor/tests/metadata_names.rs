@@ -23,8 +23,9 @@ static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
 /// generated glue calls `stamp_name(&token)` before spawning under `metadata-names`.
 async fn worker(node: &'static TaskNode) {
     RUNS.fetch_add(1, Ordering::SeqCst);
-    node.wait_shutdown().await;
-    node.ack_dropped();
+    let _ = node
+        .run_cancellable_acked(core::future::pending::<()>())
+        .await;
 }
 
 supervisor_graph! {

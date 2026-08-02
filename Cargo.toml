@@ -18,13 +18,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/cedrivard/embassy-supervisor"
 rust-version = "1.85"
 
-# Builds against upstream embassy main for the run-queue idle-path change.
-#
-[patch.crates-io]
-embassy-executor = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
-embassy-executor-macros = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
-embassy-executor-timer-queue = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
-embassy-time-driver = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+# No `[patch.crates-io]`: a release is verified against exactly what consumers
+# resolve from the registry. The run-queue idle-path change (embassy-rs/embassy
+# #6659) is merged upstream but unreleased; patch embassy-executor to git main
+# locally when measuring the firmware's idle current, and drop the table again
+# before cutting a version.
 
 # Size/perf profile for the embedded binaries (mirrors the embassy templates).
 [profile.release]

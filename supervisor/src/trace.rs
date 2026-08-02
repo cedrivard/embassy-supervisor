@@ -68,30 +68,48 @@ use crate::TaskNode;
 // safe equivalent — each access is one short critical section, entered once per
 // poll on the recording path.
 
-static NODES: Mutex<CriticalSectionRawMutex, Cell<&'static [Option<&'static TaskNode>]>> =
-    Mutex::new(Cell::new(&[]));
+/// Up to this many graphs' node slices are tracked (named multi-graphs: each
+/// supervisor's `start()` registers its own). Registrations beyond the cap are
+/// silently dropped, like executor slots beyond `MAX_EXECUTORS`.
+pub const MAX_GRAPHS: usize = 4;
 
-/// Register the supervised node slots so the hook recorders can resolve task ids
-/// to nodes. Called automatically by [`Supervisor::start`](crate::Supervisor::start)
-/// with `GRAPH.nodes`; idempotent (last registration wins).
+static NODES: Mutex<
+    CriticalSectionRawMutex,
+    Cell<[&'static [Option<&'static TaskNode>]; MAX_GRAPHS]>,
+> = Mutex::new(Cell::new([&[]; MAX_GRAPHS]));
+
+/// Register a graph's node slots so the hook recorders can resolve task ids to
+/// nodes. Called automatically by [`Supervisor::start`](crate::Supervisor::start)
+/// with the graph's `nodes`; idempotent per slice (pointer-deduplicated), and
+/// with named multi-graphs each graph occupies one of the `MAX_GRAPHS` entries.
 pub fn register_graph(nodes: &'static [Option<&'static TaskNode>]) {
-    NODES.lock(|cell| cell.set(nodes));
+    NODES.lock(|cell| {
+        let mut slices = cell.get();
+        if slices.iter().any(|s| core::ptr::eq(*s, nodes)) {
+            return;
+        }
+        if let Some(slot) = slices.iter_mut().find(|s| s.is_empty()) {
+            *slot = nodes;
+            cell.set(slices);
+        }
+    });
 }
 
-/// The registered node slots (empty before `register_graph`).
-fn nodes() -> &'static [Option<&'static TaskNode>] {
+/// The registered graphs' node slots (all empty before any `register_graph`).
+fn graphs() -> [&'static [Option<&'static TaskNode>]; MAX_GRAPHS] {
     NODES.lock(Cell::get)
 }
 
-/// Resolve an executor task id to its node: a linear scan over the registered
-/// slots (id 0 = "unknown" is never matched). O(N) with N ≤ 256 — a handful of
-/// atomic loads per poll in practice.
+/// Resolve an executor task id to its node: a linear scan over every registered
+/// graph's slots (id 0 = "unknown" is never matched). O(total nodes) with the
+/// per-graph cap at 256 — a handful of atomic loads per poll in practice.
 fn node_for(task_id: u32) -> Option<&'static TaskNode> {
     if task_id == 0 {
         return None;
     }
-    nodes()
-        .iter()
+    graphs()
+        .into_iter()
+        .flatten()
         .flatten()
         .find(|n| n.task_id() == task_id)
         .copied()

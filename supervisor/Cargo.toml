@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.3.5"
+version = "0.4.0"
 description = "A generic, HAL-agnostic task-lifecycle supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, and runtime start/stop/pause/resume control."
 edition.workspace = true
 authors.workspace = true
@@ -25,7 +25,7 @@ embassy-futures = { version = "0.1" }
 portable-atomic = { version = "1", features = ["critical-section"] }
 defmt = { version = "1.1.0", optional = true }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.4.1", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.5.0", path = "../supervisor-macros", optional = true }
 
 [features]
 # Full-featured out of the box; a footprint-constrained consumer trims with
@@ -48,6 +48,33 @@ macros = ["dep:embassy-supervisor-macros"]
 # contract (all provide/take/restore of a slot on ONE core) the application
 # owns. Without this feature a `local` marker is a compile error.
 local-resources = ["embassy-supervisor-macros?/local-resources"]
+
+# Task-asserted readiness: set_ready/clear_ready/is_ready/wait_ready on TaskNode
+# and the `ready` dep marker (`deps: [NET ready]`) — bring-up then awaits the
+# dep's readiness (bounded by the node's slot_timeout), and pool growth defers
+# while a ready-marked dep is un-ready. Off by default: costs one AtomicBool +
+# one Signal + one slice per node.
+readiness = ["embassy-supervisor-macros?/readiness"]
+
+# Reclaimable per-activation heap state: the `state: Type = init_expr` clause
+# (task: nodes and pool members). The spawn glue fallibly boxes the init value
+# (alloc failure = SpawnError::Busy, retryable), the shell lends the worker
+# `&mut Type`, and the Box DROPS on task exit — every activation allocates
+# fresh, every exit frees, net zero across respawns. Pure forward: the runtime
+# crate stays no-alloc/forbid(unsafe); the ~6-line fallible-boxing helper (the
+# feature's entire unsafe surface) is emitted into the CONSUMER crate, like
+# `local-resources`. Task STORAGE stays static by design: embassy wakers are
+# unrefcounted pointers into it, so freeing it is unsound —
+# heap is used only where it can be reclaimed. Consumer needs a
+# #[global_allocator].
+heap-state = ["embassy-supervisor-macros?/heap-state"]
+
+# Per-node heartbeat/staleness: beat()/ticks_since_beat()/is_stale(max_age),
+# for an app watchdog task to detect alive-but-wedged nodes. Independent of
+# `trace` (pure atomics + embassy-time; detects a different failure class than
+# the trace stall watermark: not-making-progress vs hogging-the-executor).
+# Off by default: costs one AtomicU32 per node.
+liveness = []
 # Trace-hook observability: the `trace` module (task-id -> node registry,
 # per-node exec-tick/poll/max-poll accounting, per-executor idle accounting,
 # stall detection). Recorders only — the `_embassy_trace_*` hook SYMBOLS are
@@ -156,3 +183,88 @@ required-features = ["macros", "local-resources"]
 [[test]]
 name = "provider_node"
 required-features = ["macros"]
+
+# Lossless control mailbox: try_request_control reports a full channel,
+# the awaiting request_control parks until the driver drains a slot.
+[[test]]
+name = "control_errors"
+required-features = ["control", "macros"]
+
+# Node-completion observation (shell mark_exited) + non-panicking shutdown:
+# ShutdownTimeout from stop_node/teardown/teardown_continue, Activate respawns
+# a completed Terminate node.
+[[test]]
+name = "completion"
+required-features = ["macros", "control"]
+
+# run_cancellable / run_cancellable_acked: Ok on completion, Err(Aborted) on a
+# stop, the _acked variant satisfies the handshake alone.
+[[test]]
+name = "cancellable"
+required-features = ["macros"]
+
+# `exit: Type` slots: shell provides the worker's return value before
+# mark_exited; wait_take; overwrite-on-respawn; Result<R, Aborted> idiom.
+[[test]]
+name = "exit_result"
+required-features = ["macros"]
+
+# `readiness`: ready-marked deps hold spawns until set_ready, growth defers,
+# never-ready times out Busy, clear_ready is status-not-control.
+[[test]]
+name = "readiness"
+required-features = ["macros", "readiness", "pool"]
+
+# `liveness`: beat/staleness against the mock clock; spawn stamps a beat;
+# not-running is never stale.
+[[test]]
+name = "liveness"
+required-features = ["macros", "liveness"]
+
+# supervisor_fragment! + compose_graph!: cross-fragment deps, shared-slot dedup
+# across fragments, full lifecycle on the composed graph.
+[[test]]
+name = "compose"
+required-features = ["macros"]
+
+# Per-member pool resources: take-kind slot arrays, member I takes
+# element I, restore-to-same-index, member_index, const-expr min:/max:.
+[[test]]
+name = "pool_member_resources"
+required-features = ["macros", "pool"]
+
+# `shared local` on a pool: the !Send Copy fan-out handle (the Stack shape)
+# rides the pool-wide shared slot — gated bring-up, non-destructive get()
+# per member, no restore. (Take-kind `local` on pools stays rejected.)
+[[test]]
+name = "pool_shared_local"
+required-features = ["macros", "pool", "local-resources"]
+
+# `state:` (heap-state): one fresh Box per activation, freed on exit (net zero
+# via a counting global allocator), OOM -> SpawnError::Busy, retryable.
+[[test]]
+name = "heap_state"
+required-features = ["macros", "heap-state"]
+
+# Named multi-graphs: a name:d sub-graph supervisor start()/teardown()-cycled
+# per app phase (start resets), shared control channel with foreign no-op,
+# Activate-on-leaf/Deactivate-on-root subtree cascades.
+[[test]]
+name = "named_graphs"
+required-features = ["macros", "control"]
+
+# Supervisor::run(): start + pools + control in one call, returning
+# RunError::Shutdown on a missed ack.
+[[test]]
+name = "run_loop"
+required-features = ["macros", "control", "pool"]
+
+# The compile-time topological sort (const-evaluated adjacency tables).
+[[test]]
+name = "topo_sort"
+
+# DeferredShrink policy (pure decide/deferred_until) + ElasticPool::evaluate
+# member selection through real node state.
+[[test]]
+name = "pool_policy"
+required-features = ["macros", "pool"]

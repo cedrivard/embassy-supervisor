@@ -30,9 +30,19 @@
 //! Static IPv4 so no host DHCP server is needed: set your host's `usb0` to
 //! `10.42.0.1/24` and reach the device at `10.42.0.61`.
 
+// This module's slice of the task graph: the NET node and its USB peripheral
+// slot. Forwarded (verbatim) into main.rs's compose_graph! expansion — the
+// `USB_DEV` static and the node land at the compose site, so `crate::USB_DEV`
+// and `crate::NET` name them as before. `$crate` = this crate (the fragment's
+// defining crate), per the fragment path rule.
+embassy_supervisor::supervisor_fragment! {
+    name: NET_FRAG;
+    node NET = Terminate, deps: [], task: $crate::net::net_task,
+        resources: [USB_DEV: embassy_rp::Peri<'static, embassy_rp::peripherals::USB>];
+}
+
 use alloc::boxed::Box;
 use embassy_futures::join::{join, join3};
-use embassy_futures::select::select;
 use embassy_net::{Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::USB;
@@ -217,6 +227,10 @@ pub(crate) async fn net_task(node: &'static TaskNode, usb: &mut embassy_rp::Peri
     // `ready` just logs once the link is up. `select` against `wait_shutdown`. ──
     let ready = async {
         stack.wait_config_up().await;
+        // Task-asserted readiness: HTTP's pool and OTA_CONFIRM declare
+        // `deps: [NET ready]`, so their spawns wait for THIS, not merely for
+        // net's own spawn. A future link-loss handler would clear_ready here.
+        node.set_ready();
         if let Some(cfg) = stack.config_v4() {
             defmt::info!("net: up at {}", cfg.address);
         }
@@ -225,7 +239,9 @@ pub(crate) async fn net_task(node: &'static TaskNode, usb: &mut embassy_rp::Peri
         join3(usb_dev.run(), ncm_runner.run(), net_runner.run()),
         ready,
     );
-    let _ = select(serve, node.wait_shutdown()).await;
+    // run_cancellable (not _acked): unpublishing must precede the ack so no
+    // consumer grabs the stack between the ack and the drop.
+    let _ = node.run_cancellable(serve).await;
 
     // ── Teardown: stop publishing, ack, then drop everything. The `Box`es, USB
     // device, and runners all drop here — USB is disabled and net's heap budget

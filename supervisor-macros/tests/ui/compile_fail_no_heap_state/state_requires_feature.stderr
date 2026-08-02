@@ -1,0 +1,5 @@
+error: `state:` requires the `heap-state` feature (embassy-supervisor feature `heap-state`) — per-activation boxed state, reclaimed on task exit
+  --> tests/ui/compile_fail_no_heap_state/state_requires_feature.rs:11:54
+   |
+11 |     node CRUNCH = Terminate, deps: [], task: worker, state: Big = Big([0; 1024]);
+   |                                                      ^^^^^

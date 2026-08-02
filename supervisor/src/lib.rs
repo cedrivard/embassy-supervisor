@@ -86,12 +86,19 @@
 //! yourself. Either way the macro's glue passes the node, and extra arguments come
 //! from the partial-call spawn form. Four rules cover the task side of the protocol:
 //!
-//!   1. select long-lived work against [`TaskNode::wait_shutdown`] — that's how a
-//!      stop reaches you;
+//!   1. race long-lived work against the stop request — that's how a stop reaches
+//!      you. [`TaskNode::run_cancellable_acked`] is the everyday body (it owns the
+//!      `select` and acks for you; `Err(`[`Aborted`]`)` means a stop won),
+//!      [`TaskNode::run_cancellable`] the variant with cleanup between the two, and
+//!      [`TaskNode::wait_shutdown`] the raw signal when you write the `select`
+//!      yourself;
 //!   2. ack exactly once per stop with [`TaskNode::ack_dropped`]: on exit
 //!      (`Terminate`/`OnDemand`), or on each pause (`Pause`) *before* parking on
 //!      [`TaskNode::wait_resume`];
-//!   3. an autonomous exit acks too, so the supervisor sees the node as down;
+//!   3. an autonomous exit calls [`TaskNode::mark_exited`] instead — it acks *and*
+//!      records completion, so the supervisor sees the node as down and
+//!      [`TaskNode::has_exited`] tells a body that returned on its own from one
+//!      that was stopped (a `task:` shell does it for you);
 //!   4. resources follow the mode: a `Terminate` task re-acquires everything on
 //!      respawn (drop-on-exit is the cleanup), a `Pause` task keeps what it holds
 //!      across the park.
@@ -102,6 +109,29 @@
 //! [`TaskNode::set_detached`]. The README's *Writing supervised tasks* section has
 //! per-mode skeletons.
 //!
+//! ## Beyond bring-up
+//!
+//!   * [`Supervisor::run`] is bring-up plus the driver loop (pool scaling and the
+//!     control mailbox) in one call; it returns only on a [`RunError`], which the
+//!     application escalates. Drive the pieces yourself when the loop must watch
+//!     extra wake sources.
+//!   * Every shutdown path is fallible, never a library panic: [`Supervisor::teardown`]
+//!     aborts at the first node that misses its ack and returns a [`ShutdownTimeout`]
+//!     naming it, [`Supervisor::teardown_continue`] presses on through the rest and
+//!     reports the first failure at the end (the "hardware reset next anyway" path).
+//!   * `exit: Type` on a node adds a typed exit-value slot the application awaits
+//!     with [`ResourceSlot::wait_take`] — a run-once job hands its result back.
+//!     `state: Type = expr` (feature `heap-state`) boxes per-activation state that
+//!     is freed when the task exits, so a stopped subsystem costs no RAM.
+//!   * Feature `readiness` separates *spawned* from *serving*: a task asserts
+//!     `set_ready()` and a `deps: [NET ready]` edge makes bring-up (and pool growth)
+//!     wait for it. Feature `liveness` adds a per-node heartbeat (`beat()` /
+//!     `is_stale()`) for alive-but-wedged detection.
+//!   * A graph can span crates: `supervisor_fragment!` declares a module's nodes and
+//!     [`compose_graph!`] assembles the fragments into one graph. `name: IDENT;`
+//!     gives a second graph in the same binary its own statics and [`Supervisor`],
+//!     for a subordinate sub-graph an application starts and tears down as a unit.
+//!
 //! ## What the supervisor does *not* do
 //!
 //!   * It does not model any power-state transition (sleep/wake): it reacts to
@@ -109,8 +139,11 @@
 //!   * It does not allocate, and does no work at construction: the topological
 //!     sort runs at compile time (see the `supervisor_graph!` macro).
 //!   * It does not observe task internals. Tasks self-report their drop state via
-//!     `ack_dropped()`; a task that fails to ack within a timeout panics the
-//!     supervisor with the offending node's name.
+//!     `ack_dropped()` / `mark_exited()`; a task that misses the ack window comes
+//!     back as a [`ShutdownTimeout`] naming the node, for the application to act on.
+//!   * It does not catch panics: a panicking task is not captured or restarted.
+//!     Pair the supervisor with a hardware watchdog for crashes, and the `liveness`
+//!     heartbeat for tasks that are alive but wedged.
 //!
 //! ## Cargo features
 //!
@@ -118,9 +151,20 @@
 //!     [`request_control`], [`Supervisor::apply_control`].
 //!   * `pool` *(default)* — elastic worker pools: [`ElasticPool`],
 //!     [`Supervisor::run_pools`], and the `pools` field of [`Graph`].
+//!   * `macros` *(default)* — the [`supervisor_graph!`] graph-declaration macro (and
+//!     `supervisor_fragment!` / [`compose_graph!`]).
+//!   * `local-resources` — permit the `local` resource kind; ⚠ opting in to the macro
+//!     emitting a documented `unsafe impl Sync` into your crate.
+//!   * `readiness` — `set_ready`/`clear_ready`/`wait_ready` plus the `ready` dep
+//!     marker, gating bring-up and pool growth on *serving*, not merely spawned.
+//!   * `liveness` — a per-node heartbeat: `beat()`, `ticks_since_beat()`,
+//!     `is_stale(max_age)`. A fresh spawn counts as a beat.
+//!   * `heap-state` — the `state: Type = expr` clause: per-activation boxed state,
+//!     reclaimed on task exit; ⚠ emits a small `unsafe` fallible-boxing helper and
+//!     needs a `#[global_allocator]`.
 //!   * `defmt` — route the supervisor's logs through `defmt`; without it the log
 //!     macros are no-ops.
-//!   * `trace` family (all opt-in) — `trace`: the [`trace`] recorders consuming
+//!   * `trace` family (all opt-in) — `trace`: the `trace` module's recorders consuming
 //!     embassy-executor's `_embassy_trace_*` hooks; `trace-hooks`:
 //!     `supervisor_graph!` also *defines* the hook symbols; `metadata-names`: node
 //!     names stamped into task Metadata for external consumers (rtos-trace/
@@ -142,7 +186,7 @@
 //!
 //! ```ignore
 //! use embassy_executor::Spawner;
-//! use embassy_supervisor::{supervisor_graph, Supervisor, wait_control};
+//! use embassy_supervisor::{supervisor_graph, RunError, Supervisor, TaskNode};
 //!
 //! // `app` depends on `net`; `task:` names a plain async worker fn the macro wraps
 //! // in its `#[embassy_executor::task]` shell (`spawn:` takes one you wrote yourself).
@@ -151,17 +195,29 @@
 //!     node APP = Terminate, deps: [NET], task: app_task;
 //! }
 //!
+//! // Plain async fns taking the node first — no embassy attribute needed. The
+//! // combinator owns the shutdown `select` and the ack.
+//! async fn net_task(node: &'static TaskNode) {
+//!     let _ = node.run_cancellable_acked(async { /* serve forever */ }).await;
+//! }
+//! async fn app_task(node: &'static TaskNode) {
+//!     let _ = node.run_cancellable_acked(async { /* serve forever */ }).await;
+//! }
+//!
 //! #[embassy_executor::task]
 //! async fn supervisor_task(spawner: Spawner) {
+//!     // Infallible: the order is precomputed, so a dependency cycle is a compile error.
 //!     let sup = Supervisor::new(&GRAPH);
-//!     sup.start(spawner).await.expect("initial spawn"); // brings up `net`, then `app`
-//!     loop {
-//!         // Apply runtime start/stop/pause/resume requests in dependency order.
-//!         let cmd = wait_control().await;
-//!         sup.apply_control(cmd, spawner).await;
+//!     // Brings up `net`, then `app`, then drives pool scaling and runtime control
+//!     // requests (start/stop/pause/resume, applied in dependency order) forever;
+//!     // returns only on error, which the application escalates — typically a panic
+//!     // into a hardware-watchdog reset.
+//!     match sup.run(spawner).await {
+//!         RunError::Spawn(_) => panic!("bring-up failed"),
+//!         RunError::Shutdown(e) => panic!("{} missed its shutdown ack", e.node.name),
 //!     }
-//!     // With the `pool` feature you'd instead drive scaling and control together:
-//!     // `select(sup.run_pools(spawner), wait_control())` (see the `firmware` crate).
+//!     // Call the pieces yourself (`start`, then a `select(run_pools, wait_control)`
+//!     // loop) when the driver must watch extra wake sources.
 //! }
 //! ```
 //!
@@ -173,6 +229,7 @@
 mod fmt;
 
 use core::cell::Cell;
+use core::future::Future;
 use core::sync::atomic::Ordering;
 
 use embassy_executor::{SendSpawner, SpawnError, Spawner};
@@ -184,7 +241,7 @@ use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Timer, with_timeout};
 use portable_atomic::AtomicBool;
-#[cfg(feature = "trace")]
+#[cfg(any(feature = "trace", feature = "liveness"))]
 use portable_atomic::AtomicU32;
 
 // ─── Scale-request signal (task → supervisor) ──────────────────────────────
@@ -216,11 +273,14 @@ pub async fn wait_scale() {
 // An application's control surface (e.g. a network endpoint) usually can't drive
 // the supervisor directly: the `Supervisor` and the `Spawner` live on the
 // supervisor task's stack, not in a `static`. So control is decoupled via this
-// channel — the caller `request_control()`s a (node, op) pair and returns
-// immediately; the supervisor's driver loop `wait_control()`s it and runs the
-// dependency-honoring `apply_control`. A `Channel` (not a `Signal`) so
-// back-to-back requests aren't coalesced; capacity 4 is ample for hand-driven
-// control and a full channel simply drops the surplus (`try_send`).
+// channel — the caller `request_control()`s a (node, op) pair; the supervisor's
+// driver loop `wait_control()`s it and runs the dependency-honoring
+// `apply_control`. A `Channel` (not a `Signal`) so back-to-back requests aren't
+// coalesced; capacity 4 is ample for hand-driven control. Delivery is lossless:
+// `request_control` awaits free capacity, and the sync `try_request_control`
+// surfaces a full mailbox as an error instead of dropping the request — a
+// silently vanished emergency stop is the one failure mode this mailbox is not
+// allowed to have.
 
 /// Which way to drive a node. Higher-level verbs fold onto these two:
 /// `start`/`resume` → `Activate`, `stop`/`pause` → `Deactivate`. The concrete
@@ -251,12 +311,37 @@ pub struct ControlCommand {
 #[cfg(feature = "control")]
 static CONTROL_REQ: Channel<CriticalSectionRawMutex, ControlCommand, 4> = Channel::new();
 
-/// Enqueue a control request. Non-blocking; drops if the mailbox is full (4
-/// outstanding), which is harmless for low-frequency manual control. Called by
-/// the application's control surface.
+/// The control mailbox was full (4 outstanding requests) and the request was
+/// not enqueued. Returned by [`try_request_control`]; retry after the
+/// supervisor's driver loop has drained a command, or use the awaiting
+/// [`request_control`] from async contexts.
 #[cfg(feature = "control")]
-pub fn request_control(node: &'static TaskNode, op: ControlOp) {
-    let _ = CONTROL_REQ.try_send(ControlCommand { node, op });
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ControlQueueFull;
+
+#[cfg(all(feature = "control", feature = "defmt"))]
+impl defmt::Format for ControlQueueFull {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "control queue full");
+    }
+}
+
+/// Enqueue a control request, waiting for mailbox capacity if it is full.
+/// Lossless — the request is delivered once the supervisor's driver loop drains
+/// an earlier command. Called by the application's control surface.
+#[cfg(feature = "control")]
+pub async fn request_control(node: &'static TaskNode, op: ControlOp) {
+    CONTROL_REQ.send(ControlCommand { node, op }).await;
+}
+
+/// Non-blocking variant of [`request_control`] for sync contexts (ISRs,
+/// callbacks). Fails with [`ControlQueueFull`] instead of dropping the request
+/// when the mailbox is full — the caller decides whether to retry or surface it.
+#[cfg(feature = "control")]
+pub fn try_request_control(node: &'static TaskNode, op: ControlOp) -> Result<(), ControlQueueFull> {
+    CONTROL_REQ
+        .try_send(ControlCommand { node, op })
+        .map_err(|_| ControlQueueFull)
 }
 
 /// Await the next control request. Selected by the supervisor's driver loop
@@ -267,10 +352,66 @@ pub async fn wait_control() -> ControlCommand {
 }
 
 /// Per-node timeout for `wait_dropped`. A task that doesn't ack within this
-/// window is a bug (e.g. a missing `ack_dropped()` call) and panics the
-/// supervisor with the offending node's name. 2 s comfortably exceeds a typical
-/// task's poll period and peripheral settle time.
+/// window is a bug (e.g. a missing `ack_dropped()` call) or a wedge; the
+/// shutdown paths surface it as a [`ShutdownTimeout`] naming the node, and the
+/// application decides the escalation. 2 s comfortably exceeds a typical task's
+/// poll period and peripheral settle time.
 const SHUTDOWN_ACK_TIMEOUT_MS: u64 = 2_000;
+
+/// A node failed to ack a requested shutdown within `SHUTDOWN_ACK_TIMEOUT_MS`.
+/// Returned by [`Supervisor::stop_node`], [`Supervisor::teardown`],
+/// [`Supervisor::teardown_continue`] and (feature `control`)
+/// [`Supervisor::apply_control`]. The node is still marked running; the sane
+/// escalations are app-level — a hardware watchdog reset, `panic!`, or a retry.
+#[derive(Clone, Copy, Debug)]
+pub struct ShutdownTimeout {
+    /// The node that missed its ack window.
+    pub node: &'static TaskNode,
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for ShutdownTimeout {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "{} missed shutdown ack", self.node.name);
+    }
+}
+
+/// Why [`Supervisor::run`] stopped — it only returns on error, and every arm is
+/// an app-level escalation (typically `panic!` into a hardware-watchdog reset).
+#[cfg(any(feature = "pool", feature = "control"))]
+#[derive(Clone, Copy, Debug)]
+pub enum RunError {
+    /// Bring-up failed: a spawn error out of the initial [`Supervisor::start`]
+    /// (task-pool exhaustion, or a gate/slot wait that timed out as `Busy`).
+    Spawn(SpawnError),
+    /// A node missed its shutdown ack during a control cascade or pool shrink.
+    Shutdown(ShutdownTimeout),
+}
+
+#[cfg(all(any(feature = "pool", feature = "control"), feature = "defmt"))]
+impl defmt::Format for RunError {
+    fn format(&self, fmt: defmt::Formatter) {
+        match self {
+            RunError::Spawn(_) => defmt::write!(fmt, "bring-up spawn failed"),
+            RunError::Shutdown(e) => defmt::write!(fmt, "{}", e),
+        }
+    }
+}
+
+/// The shutdown side of [`TaskNode::run_cancellable`]'s result: the raced work
+/// future was cancelled at its await point because a stop/pause request won the
+/// select. Pairs naturally with the `exit:` slot — a worker returning
+/// `Result<R, Aborted>` records completed-vs-cancelled for whoever reads the
+/// exit value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Aborted;
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Aborted {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "aborted by shutdown");
+    }
+}
 
 /// How long the supervisor's bring-up waits for a node's `executor:`
 /// [`SpawnerSlot`] to be filled before failing the spawn with
@@ -355,9 +496,28 @@ pub struct TaskHandle {
     /// True while the task is actively serving (its active/idle status). Set by
     /// `mark_busy()` / `mark_idle()`; read by the scaling policy.
     busy: AtomicBool,
+    /// Set true by `mark_exited()` when the task body has returned — by the
+    /// generated `task:` shell automatically, or by a hand-written `spawn:` task
+    /// on its way out. Cleared by `reset()` before the next spawn. Together with
+    /// the lifecycle-spanning `shutdown` flag this distinguishes an autonomous
+    /// completion (`completed && !shutdown`) from an acked stop.
+    completed: AtomicBool,
     /// Wake source for `wait_resume()` on Pause-mode tasks. Fired by
     /// `signal_resume()`.
     resume_wake: Signal<CriticalSectionRawMutex, ()>,
+    /// Task-asserted readiness ("initialized and serving", e.g. DHCP bound) —
+    /// distinct from `running` (spawned). Set by `set_ready()`, cleared by
+    /// `clear_ready()` and by `reset()` so a respawned provider re-asserts.
+    #[cfg(feature = "readiness")]
+    ready: AtomicBool,
+    /// Wake source for `wait_ready()`. Latching; the supervisor's bring-up is
+    /// the only pre-fill waiter (single-waiter Signal semantics).
+    #[cfg(feature = "readiness")]
+    ready_wake: Signal<CriticalSectionRawMutex, ()>,
+    /// Instant ticks (truncated) of the last `beat()`; also stamped by
+    /// `set_running(true)` so a freshly spawned node is never instantly stale.
+    #[cfg(feature = "liveness")]
+    last_beat: AtomicU32,
     /// True while the node has been manually deactivated (stopped/paused) via the
     /// runtime control interface (`Supervisor::deactivate`). Unlike the other
     /// flags this one is **lifecycle-spanning**: it is *not* cleared by
@@ -402,7 +562,14 @@ impl TaskHandle {
             dropped_wake: Signal::new(),
             running: AtomicBool::new(false),
             busy: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
             resume_wake: Signal::new(),
+            #[cfg(feature = "readiness")]
+            ready: AtomicBool::new(false),
+            #[cfg(feature = "readiness")]
+            ready_wake: Signal::new(),
+            #[cfg(feature = "liveness")]
+            last_beat: AtomicU32::new(0),
             disabled: AtomicBool::new(disabled_at_boot),
             detached: AtomicBool::new(false),
             #[cfg(feature = "trace")]
@@ -597,6 +764,21 @@ impl<T> ResourceSlot<T> {
     pub fn restore(&self, value: T) {
         self.provide(value);
     }
+
+    /// Await the slot being filled, then take the value — how an application
+    /// reads a node's `exit:` slot (the shell `provide()`s the worker's return
+    /// value there just before recording the exit). Check-then-park, so a value
+    /// provided earlier is returned immediately; the latching signal carries
+    /// the same single-pre-fill-waiter caveat as [`SpawnerSlot::ready`] — for
+    /// N concurrent readers fan out through an app-owned `Watch` instead.
+    pub async fn wait_take(&self) -> T {
+        loop {
+            if let Some(v) = self.take() {
+                return v;
+            }
+            self.filled.wait().await;
+        }
+    }
 }
 
 // `T: Send` (not just any `T`): the gate is reachable from the supervisor task,
@@ -661,6 +843,11 @@ pub struct TaskNode {
     /// worker's shutdown ack). Empty for nodes without `resources:`. Set by the
     /// macro via [`with_resources`](Self::with_resources); `const`, zero-cost.
     resource_gates: &'static [&'static dyn ResourceGate],
+    /// Deps whose task-asserted readiness (`set_ready`) bring-up awaits before
+    /// spawning this node — the `ready`-marked subset of `deps:`. Spawn-order
+    /// deps stay in the graph's dep table; this is the readiness overlay.
+    #[cfg(feature = "readiness")]
+    ready_deps: &'static [&'static TaskNode],
     /// Bound on the pre-spawn waits for this node's `executor:` slot and
     /// `resources:` gates. Defaults to [`SLOT_READY_TIMEOUT`] (100 ms — sized
     /// for "main provided before start"); raise it (`slot_timeout:` in the
@@ -694,6 +881,8 @@ impl TaskNode {
             spawn,
             spawn_slot: None,
             resource_gates: &[],
+            #[cfg(feature = "readiness")]
+            ready_deps: &[],
             slot_timeout: SLOT_READY_TIMEOUT,
             handle: TaskHandle::new(disabled_at_boot),
         }
@@ -719,6 +908,15 @@ impl TaskNode {
         self
     }
 
+    /// Declare the deps whose task-asserted readiness bring-up awaits before
+    /// spawning this node (the `ready`-marked subset of `deps:`). `const` and
+    /// chainable in a `static` initializer; emitted by [`supervisor_graph!`].
+    #[cfg(feature = "readiness")]
+    pub const fn with_ready_deps(mut self, deps: &'static [&'static TaskNode]) -> Self {
+        self.ready_deps = deps;
+        self
+    }
+
     /// Override the pre-spawn slot/gate wait bound for this node (the
     /// `slot_timeout: <millis>` graph clause). The default
     /// (`SLOT_READY_TIMEOUT`, 100 ms) assumes slots are provided *before*
@@ -739,7 +937,8 @@ impl TaskNode {
     //   1. select long-lived work against `wait_shutdown()`;
     //   2. `ack_dropped()` exactly once per stop — on exit (Terminate/OnDemand)
     //      or on each pause (Pause), before parking on `wait_resume()`;
-    //   3. an autonomous exit acks too;
+    //   3. an autonomous exit calls `mark_exited()` (acks + records completion;
+    //      `task:` shells do it automatically);
     //   4. resources follow the mode: Terminate re-acquires on respawn, Pause
     //      retains across park.
 
@@ -774,11 +973,158 @@ impl TaskNode {
         self.handle.dropped_wake.signal(());
     }
 
+    /// Record that this node's task body has **returned**. Called automatically
+    /// by the generated `task:` shell after the worker returns (and after
+    /// resource restores); call it manually at the end of a hand-written
+    /// `spawn:` task that can exit, where you would previously have called
+    /// [`ack_dropped`](Self::ack_dropped) alone. Idempotent, and subsumes
+    /// `ack_dropped`: it acks the teardown handshake *and* records completion,
+    /// so a body that returns on its own — the case the supervisor previously
+    /// could not observe — reads as down ([`is_running`](Self::is_running) →
+    /// `false`, [`has_exited`](Self::has_exited) → `true`) instead of running
+    /// forever, and a control `Activate` can respawn it.
+    pub fn mark_exited(&self) {
+        self.handle.completed.store(true, Ordering::Release);
+        self.ack_dropped();
+    }
+
+    /// True once the last instance's body returned — set by
+    /// [`mark_exited`](Self::mark_exited), cleared by the pre-spawn reset.
+    /// `has_exited() && !shutdown_requested()` distinguishes an autonomous
+    /// completion from an acked stop (the shutdown flag persists until the next
+    /// reset).
+    pub fn has_exited(&self) -> bool {
+        self.handle.completed.load(Ordering::Acquire)
+    }
+
+    /// Assert readiness: "initialized and serving" (DHCP bound, registration
+    /// done, calibration finished) — the task-side half of a `ready`-marked
+    /// dependency edge. Distinct from *running* (spawned): `deps:` orders
+    /// spawns; a `deps: [THIS ready]` edge additionally awaits this call.
+    /// Latching until [`clear_ready`](Self::clear_ready) or the pre-spawn
+    /// reset (a respawned provider re-asserts).
+    #[cfg(feature = "readiness")]
+    pub fn set_ready(&self) {
+        self.handle.ready.store(true, Ordering::Release);
+        self.handle.ready_wake.signal(());
+    }
+
+    /// Withdraw readiness — **status, not control**: dependents are NOT stopped
+    /// or notified (pair with a control `Deactivate` for a cascade); it defers
+    /// future bring-up (a ready-marked dependent's spawn, pool growth) until
+    /// [`set_ready`](Self::set_ready) again. Use for "link lost, still
+    /// reconnecting" style states.
+    #[cfg(feature = "readiness")]
+    pub fn clear_ready(&self) {
+        self.handle.ready.store(false, Ordering::Release);
+    }
+
+    /// True while the node asserts readiness. Pool growth checks this for
+    /// `ready`-marked deps; also useful in app health views.
+    #[cfg(feature = "readiness")]
+    pub fn is_ready(&self) -> bool {
+        self.handle.ready.load(Ordering::Acquire)
+    }
+
+    /// Park until this node asserts readiness (immediately if it already has).
+    /// The supervisor's bring-up is the intended pre-fill waiter; the latching
+    /// signal has the same single-pre-fill-waiter caveat as
+    /// [`SpawnerSlot::ready`] — for N concurrent app-side waiters fan out
+    /// through an app-owned `embassy_sync::watch::Watch` fed by the ready task.
+    #[cfg(feature = "readiness")]
+    pub async fn wait_ready(&self) {
+        loop {
+            if self.is_ready() {
+                return;
+            }
+            self.handle.ready_wake.wait().await;
+        }
+    }
+
+    /// True when every `ready`-marked dep currently asserts readiness — the
+    /// sync form pool growth uses (no wait: a not-ready dep just defers the
+    /// grow to the next evaluation).
+    #[cfg(all(feature = "pool", feature = "readiness"))]
+    pub(crate) fn ready_deps_ok(&self) -> bool {
+        self.ready_deps.iter().all(|d| d.is_ready())
+    }
+    #[cfg(all(feature = "pool", not(feature = "readiness")))]
+    pub(crate) fn ready_deps_ok(&self) -> bool {
+        true
+    }
+
+    /// Record a liveness heartbeat. Call once per work loop (or per served
+    /// request); an app watchdog task reads [`is_stale`](Self::is_stale).
+    #[cfg(feature = "liveness")]
+    pub fn beat(&self) {
+        self.handle.last_beat.store(
+            embassy_time::Instant::now().as_ticks() as u32,
+            Ordering::Release,
+        );
+    }
+
+    /// Ticks since the last [`beat`](Self::beat) (wrapping arithmetic; correct
+    /// for gaps under the u32 tick wrap, ~71 min at 1 MHz — far above any sane
+    /// `max_age`).
+    #[cfg(feature = "liveness")]
+    pub fn ticks_since_beat(&self) -> u32 {
+        (embassy_time::Instant::now().as_ticks() as u32)
+            .wrapping_sub(self.handle.last_beat.load(Ordering::Acquire))
+    }
+
+    /// True when the node is running but hasn't beaten within `max_age` — the
+    /// alive-but-wedged detector (a task hogging nothing, parked on an await
+    /// that will never complete). Not-running nodes are never stale: a stopped
+    /// or completed node is *down*, which `is_running`/`has_exited` already
+    /// report. Complements the `trace` stall watermark, which catches the
+    /// opposite failure (a poll that never yields).
+    #[cfg(feature = "liveness")]
+    pub fn is_stale(&self, max_age: embassy_time::Duration) -> bool {
+        self.is_running() && u64::from(self.ticks_since_beat()) > max_age.as_ticks()
+    }
+
     /// Pause-mode only: park until the supervisor signals resume. Call *after*
     /// [`ack_dropped`](Self::ack_dropped) — ack the pause, then park; held
     /// resources stay owned across the park.
     pub async fn wait_resume(&self) {
         self.handle.resume_wake.wait().await;
+    }
+
+    /// Race `fut` against this node's shutdown: `Ok(output)` when the work
+    /// completes, `Err(Aborted)` when a stop/pause request wins. Owns the
+    /// `select` that rule 1 of the task protocol otherwise has you write by
+    /// hand. Does **not** ack — run your cleanup, then call
+    /// [`ack_dropped`](Self::ack_dropped) (or return through
+    /// [`run_cancellable_acked`](Self::run_cancellable_acked) when there is no
+    /// cleanup between the select and the ack).
+    ///
+    /// ```ignore
+    /// match node.run_cancellable(conn.serve()).await {
+    ///     Ok(done) => handle(done),
+    ///     Err(Aborted) => { flush().await; node.ack_dropped(); return; }
+    /// }
+    /// ```
+    pub async fn run_cancellable<F: Future>(&self, fut: F) -> Result<F::Output, Aborted> {
+        match select(fut, self.wait_shutdown()).await {
+            Either::First(out) => Ok(out),
+            Either::Second(()) => Err(Aborted),
+        }
+    }
+
+    /// [`run_cancellable`](Self::run_cancellable) that additionally calls
+    /// [`ack_dropped`](Self::ack_dropped) before returning `Err(Aborted)` — for
+    /// bodies with no teardown work between the select and the ack, e.g. a
+    /// runner whose drop *is* the cleanup:
+    ///
+    /// ```ignore
+    /// let _ = node.run_cancellable_acked(runner.run()).await; // drop releases the pins
+    /// ```
+    pub async fn run_cancellable_acked<F: Future>(&self, fut: F) -> Result<F::Output, Aborted> {
+        let out = self.run_cancellable(fut).await;
+        if out.is_err() {
+            self.ack_dropped();
+        }
+        out
     }
 
     /// Report that this task started serving a request (active). Fires the
@@ -932,6 +1278,15 @@ impl TaskNode {
 
     pub(crate) fn set_running(&self, running: bool) {
         self.handle.running.store(running, Ordering::Release);
+        // Stamp a beat at spawn so a freshly running node is never instantly
+        // stale (its body may not reach its first beat() for a while).
+        #[cfg(feature = "liveness")]
+        if running {
+            self.handle.last_beat.store(
+                embassy_time::Instant::now().as_ticks() as u32,
+                Ordering::Release,
+            );
+        }
     }
 
     /// Set/clear the manual-deactivation flag. Set by `Supervisor::deactivate`,
@@ -949,6 +1304,15 @@ impl TaskNode {
     /// Wait until the instance has called `ack_dropped()`. Single-instance, so
     /// one ack ends the wait. The fast-path flag check handles the ack landing
     /// before this await (the `dropped_wake` signal is edge-triggered).
+    /// True when an instance acked a stop WITHOUT exiting — for a `Pause` node
+    /// that is exactly "parked on `wait_resume()`" (the protocol acks, then
+    /// parks; a full exit would have set `completed` via `mark_exited`).
+    /// Readable only before the pre-spawn `reset()` clears both flags.
+    pub(crate) fn has_acked_stop(&self) -> bool {
+        self.handle.dropped.load(Ordering::Acquire)
+            && !self.handle.completed.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn wait_dropped(&self) {
         if self.handle.dropped.load(Ordering::Acquire) {
             return;
@@ -956,14 +1320,22 @@ impl TaskNode {
         self.handle.dropped_wake.wait().await;
     }
 
-    /// Clear the shutdown flag, dropped flag, busy flag, and the shutdown /
-    /// dropped wake-signals so the next cycle starts clean. Doesn't touch
-    /// `running` (managed around spawn/stop), `resume_wake` (`resume_pausable`
-    /// fires that for Pause nodes), or `disabled` (lifecycle-spanning).
+    /// Clear the shutdown flag, dropped flag, busy flag, completed flag, and the
+    /// shutdown / dropped wake-signals so the next cycle starts clean. Doesn't
+    /// touch `running` (managed around spawn/stop), `resume_wake`
+    /// (`resume_pausable` fires that for Pause nodes), or `disabled`
+    /// (lifecycle-spanning).
     pub(crate) fn reset(&self) {
         self.handle.shutdown.store(false, Ordering::Release);
         self.handle.dropped.store(false, Ordering::Release);
         self.handle.busy.store(false, Ordering::Release);
+        self.handle.completed.store(false, Ordering::Release);
+        // A respawned provider must re-assert readiness for its new instance.
+        #[cfg(feature = "readiness")]
+        {
+            self.handle.ready.store(false, Ordering::Release);
+            self.handle.ready_wake.reset();
+        }
         self.handle.shutdown_wake.reset();
         self.handle.dropped_wake.reset();
     }
@@ -1021,6 +1393,7 @@ pub struct Supervisor<const N: usize> {
     /// Per-node dependency indices into `nodes` (`deps[i]` lists the indices of
     /// the nodes that node `i` depends on). The single runtime source of graph
     /// topology, generated alongside `order` by the `supervisor_graph!` macro.
+    #[cfg(any(feature = "control", feature = "pool"))]
     deps: &'static [&'static [u8]],
     /// Topologically sorted indices into `nodes`: dependencies before their
     /// dependents; reverse iteration is the teardown order. Precomputed at
@@ -1084,6 +1457,34 @@ async fn await_resources(node: &'static TaskNode) -> Result<(), SpawnError> {
     Ok(())
 }
 
+/// Await every `ready`-marked dep's task-asserted readiness before spawning
+/// `node`, each bounded by the node's `slot_timeout` (same budget as its
+/// resource gates — both are "my inputs aren't there yet"). Timeout maps to
+/// `SpawnError::Busy` like the other pre-spawn gates; the log line names the
+/// dep so a readiness timeout is distinguishable from a slot timeout.
+#[cfg(feature = "readiness")]
+async fn await_ready_deps(node: &'static TaskNode) -> Result<(), SpawnError> {
+    for dep in node.ready_deps {
+        if with_timeout(node.slot_timeout, dep.wait_ready())
+            .await
+            .is_err()
+        {
+            warn!(
+                "supervisor: ready-dep {} not ready within {}ms (spawning {})",
+                dep.name,
+                node.slot_timeout.as_millis(),
+                node.name,
+            );
+            return Err(SpawnError::Busy);
+        }
+    }
+    Ok(())
+}
+#[cfg(not(feature = "readiness"))]
+async fn await_ready_deps(_node: &'static TaskNode) -> Result<(), SpawnError> {
+    Ok(())
+}
+
 impl<const N: usize> Supervisor<N> {
     /// Build a supervisor from a precomputed [`Graph`] — the `GRAPH` that
     /// `supervisor_graph!` emits (node slots, dependency-index table, compile-time
@@ -1093,6 +1494,7 @@ impl<const N: usize> Supervisor<N> {
     pub const fn new(graph: &'static Graph<N>) -> Self {
         Self {
             nodes: graph.nodes,
+            #[cfg(any(feature = "control", feature = "pool"))]
             deps: graph.deps,
             order: &graph.order,
             #[cfg(feature = "pool")]
@@ -1100,11 +1502,20 @@ impl<const N: usize> Supervisor<N> {
         }
     }
 
-    /// Spawn every boot node in dependency order. Called once at boot.
-    /// `Mode::OnDemand` nodes are skipped — they're brought up at runtime by
-    /// `start_node`. A **parked** node (no `spawn` fn) is spawned externally by
-    /// `main()` (with hardware handles main owns); it's still marked `running`
-    /// here. Disabled nodes, and `#[cfg]`-ed-out slots, are skipped.
+    /// Bring the graph from any quiescent state to running, in dependency
+    /// order — cold boot AND re-entry (a sub-graph supervisor is legitimately
+    /// `start()`/`teardown()`-cycled per app phase). Idempotent: running nodes
+    /// are skipped; detached nodes are skipped on re-entry (their instance
+    /// survived the teardown — the first start still spawns them, the flag is
+    /// app-set afterwards); a `Pause` instance parked by an earlier teardown is
+    /// **resumed in place** (never double-spawned; like
+    /// [`resume_pausable`](Self::resume_pausable) this bypasses the gate waits,
+    /// since the parked instance retains its resources and its slots are empty
+    /// by design). `Mode::OnDemand` nodes are skipped — they're brought up at
+    /// runtime by `start_node`. A **parked** node (no `spawn` fn) is spawned
+    /// externally by `main()` (with hardware handles main owns); it's still
+    /// marked `running` here. Disabled nodes, and `#[cfg]`-ed-out slots, are
+    /// skipped.
     ///
     /// Async because an `executor: NAME` node first awaits its [`SpawnerSlot::ready`]
     /// (bounded by `SLOT_READY_TIMEOUT` — the rendezvous with a tier or second core
@@ -1123,6 +1534,35 @@ impl<const N: usize> Supervisor<N> {
             if matches!(node.mode, Mode::OnDemand) || node.is_disabled() {
                 continue;
             }
+            // Re-entry guards, making start() the universal quiescent-to-running
+            // op (cold boot, post-teardown cycle, partial states) — all three
+            // are no-ops on a cold boot:
+            // * already running -> skip (idempotent; trustworthy because a
+            //   cleanly returned body clears `running` via mark_exited);
+            // * detached -> skip (its instance survived the teardown that
+            //   preceded this start; spawning again would double-spawn — the
+            //   flag is app-set at runtime, so first-start still spawns it);
+            // * a Pause instance parked by an earlier teardown -> resume it in
+            //   place below, never spawn a second one.
+            if node.is_running() || node.is_detached() {
+                continue;
+            }
+            if matches!(node.mode, Mode::Pause) && node.has_acked_stop() {
+                // Same sequence as resume_pausable, and like it deliberately
+                // WITHOUT the spawn path's gate waits: the parked instance
+                // retains its resources, so its slots are empty by design and
+                // await_resources would time out Busy.
+                node.reset();
+                info!("supervisor: resuming {} in place", node.name);
+                node.signal_resume();
+                node.set_running(true);
+                continue;
+            }
+            // Clean handle per cycle (like start_node): a sub-graph supervisor
+            // is legitimately start()/teardown()-cycled per app phase, and the
+            // teardown latches the shutdown flag — without this reset a second
+            // start()'s workers would observe it instantly. No-op at boot.
+            node.reset();
             info!("supervisor: spawning {} ({})", node.name, node.mode);
             if let Some(spawn) = node.spawn {
                 // For an `executor:` node, wait (bounded) for its slot to be filled
@@ -1132,11 +1572,54 @@ impl<const N: usize> Supervisor<N> {
                 // the value even if main provides late.
                 await_spawn_slot(node).await?;
                 await_resources(node).await?;
+                await_ready_deps(node).await?;
                 spawn(spawner)?;
             }
             node.set_running(true);
         }
         Ok(())
+    }
+
+    /// The canonical driver, as one call: [`start`](Self::start) the graph,
+    /// then drive elastic-pool scaling and/or runtime control forever. Returns
+    /// **only on error** — every arm is an app-level escalation (typically
+    /// `panic!` into a hardware-watchdog reset):
+    ///
+    /// ```ignore
+    /// match sup.run(spawner).await {
+    ///     RunError::Spawn(_) => defmt::panic!("supervisor: bring-up failed"),
+    ///     RunError::Shutdown(e) => defmt::panic!("supervisor: {} missed ack", e.node.name),
+    /// }
+    /// ```
+    ///
+    /// Apps that select extra wake sources into the driver loop (their own
+    /// signals, a wake timer) keep writing the loop by hand:
+    /// `select(sup.run_pools(spawner), wait_control())` + `apply_control`.
+    #[cfg(any(feature = "pool", feature = "control"))]
+    pub async fn run(&self, spawner: Spawner) -> RunError {
+        if let Err(e) = self.start(spawner).await {
+            return RunError::Spawn(e);
+        }
+        #[cfg(all(feature = "pool", feature = "control"))]
+        loop {
+            match select(self.run_pools(spawner), wait_control()).await {
+                Either::First(e) => return RunError::Shutdown(e),
+                Either::Second(cmd) => {
+                    if let Err(e) = self.apply_control(cmd, spawner).await {
+                        return RunError::Shutdown(e);
+                    }
+                }
+            }
+        }
+        #[cfg(all(feature = "pool", not(feature = "control")))]
+        return RunError::Shutdown(self.run_pools(spawner).await);
+        #[cfg(all(feature = "control", not(feature = "pool")))]
+        loop {
+            let cmd = wait_control().await;
+            if let Err(e) = self.apply_control(cmd, spawner).await {
+                return RunError::Shutdown(e);
+            }
+        }
     }
 
     /// Start a single node at runtime — e.g. growing an elastic pool. Resets the
@@ -1153,6 +1636,7 @@ impl<const N: usize> Supervisor<N> {
         if let Some(spawn) = node.spawn {
             await_spawn_slot(node).await?;
             await_resources(node).await?;
+            await_ready_deps(node).await?;
             spawn(spawner)?;
         }
         node.set_running(true);
@@ -1160,10 +1644,12 @@ impl<const N: usize> Supervisor<N> {
         Ok(())
     }
 
-    /// Signal `node` to shut down, wait for its ack (panicking on timeout — a
-    /// missing `ack_dropped()` somewhere), then clear `running`. Shared by
-    /// `stop_node` and `teardown`; the caller must have checked `is_running`.
-    async fn shutdown_and_wait(&self, node: &'static TaskNode) {
+    /// Signal `node` to shut down, wait for its ack, then clear `running`.
+    /// A missed ack (a missing `ack_dropped()`/`mark_exited()` somewhere, or a
+    /// wedged task) is returned as [`ShutdownTimeout`] — the node keeps running
+    /// and the caller decides the escalation. Shared by `stop_node` and
+    /// `teardown`; the caller must have checked `is_running`.
+    async fn shutdown_and_wait(&self, node: &'static TaskNode) -> Result<(), ShutdownTimeout> {
         node.signal_shutdown();
         if let Either::Second(()) = select(
             node.wait_dropped(),
@@ -1171,32 +1657,45 @@ impl<const N: usize> Supervisor<N> {
         )
         .await
         {
-            panic!(
+            warn!(
                 "supervisor: task {} did not ack shutdown within {}ms",
                 node.name, SHUTDOWN_ACK_TIMEOUT_MS,
             );
+            return Err(ShutdownTimeout { node });
         }
         node.set_running(false);
+        Ok(())
     }
 
     /// Stop a single running node at runtime — e.g. shrinking an elastic pool.
-    /// Signals shutdown, waits for the ack, clears `running`. No-op if the node
-    /// isn't running, or is [detached](TaskNode::set_detached) (self-managed — the
-    /// supervisor never stops it). Panics if it doesn't ack within the timeout.
-    pub async fn stop_node(&self, node: &'static TaskNode) {
+    /// For a `Pause` node this IS the single-node "pause": the worker acks and
+    /// parks on `wait_resume()`, and [`resume_node`](Self::resume_node) is the
+    /// symmetric other half. Signals shutdown, waits for the ack, clears
+    /// `running`. No-op `Ok` if the node isn't running, or is
+    /// [detached](TaskNode::set_detached) (self-managed — the supervisor never
+    /// stops it). A node that misses the ack window is returned as
+    /// [`ShutdownTimeout`] and stays marked running.
+    pub async fn stop_node(&self, node: &'static TaskNode) -> Result<(), ShutdownTimeout> {
         if !node.is_running() || node.is_detached() {
-            return;
+            return Ok(());
         }
-        self.shutdown_and_wait(node).await;
+        self.shutdown_and_wait(node).await?;
         info!("supervisor: stopped {}", node.name);
+        Ok(())
     }
 
     /// Signal every **running** node to shut down in **reverse** topological
     /// order, awaiting each node's ack before moving to its dependency. Down
     /// `OnDemand` nodes are skipped (no instance to ack). Pause-mode nodes ack
-    /// and park on `wait_resume()`; Terminate/OnDemand nodes exit. Panics if a
-    /// running node fails to ack within `SHUTDOWN_ACK_TIMEOUT_MS`.
-    pub async fn teardown(&self) {
+    /// and park on `wait_resume()`; Terminate/OnDemand nodes exit.
+    ///
+    /// **Aborts on the first missed ack**, returning the offending node as
+    /// [`ShutdownTimeout`]: continuing would stop dependencies out from under a
+    /// still-live dependent. After `Err` the graph is partially down — the sane
+    /// escalations are app-level (hardware watchdog reset, `panic!`, retry, or
+    /// [`teardown_continue`](Self::teardown_continue) when quiescing the rest
+    /// still matters before a reset).
+    pub async fn teardown(&self) -> Result<(), ShutdownTimeout> {
         for i in self.order.iter().rev() {
             let Some(node) = self.nodes[*i as usize] else {
                 continue;
@@ -1210,8 +1709,57 @@ impl<const N: usize> Supervisor<N> {
                 continue;
             }
             info!("supervisor: tearing down {}", node.name);
-            self.shutdown_and_wait(node).await;
+            self.shutdown_and_wait(node).await?;
         }
+        Ok(())
+    }
+
+    /// Best-effort variant of [`teardown`](Self::teardown) for the
+    /// "hardware reset next" escalation path: presses on past a non-acking node
+    /// (still in reverse topological order) so the remaining nodes get their
+    /// chance to flush and park, and returns the **first** timeout after
+    /// visiting every node. The wedged node's dependencies are stopped under it
+    /// — acceptable only because the caller is about to reset anyway.
+    pub async fn teardown_continue(&self) -> Result<(), ShutdownTimeout> {
+        let mut first_err = Ok(());
+        for i in self.order.iter().rev() {
+            let Some(node) = self.nodes[*i as usize] else {
+                continue;
+            };
+            if !node.is_running() || node.is_detached() {
+                continue;
+            }
+            info!("supervisor: tearing down {}", node.name);
+            if let Err(e) = self.shutdown_and_wait(node).await {
+                if first_err.is_ok() {
+                    first_err = Err(e);
+                }
+            }
+        }
+        first_err
+    }
+
+    /// Resume ONE `Pause` node parked by an earlier [`stop_node`](Self::stop_node)
+    /// or [`teardown`](Self::teardown) — the single-node partner of
+    /// [`resume_pausable`](Self::resume_pausable), same sequence and the same
+    /// deliberate absence of dependency gating (the parked instance retains its
+    /// resources). Cheap and synchronous. No-op unless the node is `Pause`
+    /// mode, actually parked (an instance acked without exiting), and neither
+    /// [disabled](TaskNode::is_disabled) (a control pause sticks — clear it
+    /// with [`activate`](Self::activate)) nor
+    /// [detached](TaskNode::set_detached).
+    pub fn resume_node(&self, node: &'static TaskNode) {
+        if !matches!(node.mode, Mode::Pause)
+            || node.is_disabled()
+            || node.is_detached()
+            || !node.has_acked_stop()
+        {
+            return;
+        }
+        node.reset();
+        info!("supervisor: resuming {}", node.name);
+        node.signal_resume();
+        node.set_running(true);
     }
 
     /// Signal every Pause-mode node to resume. Cheap and synchronous — the tasks
@@ -1255,6 +1803,7 @@ impl<const N: usize> Supervisor<N> {
                     // value only after the shutdown ack, so wait (bounded) for
                     // the restore before the glue's take().
                     await_resources(node).await?;
+                    await_ready_deps(node).await?;
                     spawn(spawner)?;
                 }
                 node.set_running(true);
@@ -1327,20 +1876,42 @@ impl<const N: usize> Supervisor<N> {
     }
 
     /// Apply one control command, honoring pool membership and the dependency
-    /// graph. Run from the supervisor's driver loop (never concurrently with
-    /// itself), so the cascade is atomic from the application's perspective.
-    pub async fn apply_control(&self, cmd: ControlCommand, spawner: Spawner) {
+    /// graph — the mailbox-dispatch form of [`activate`](Self::activate) /
+    /// [`deactivate`](Self::deactivate) (call those directly when you hold the
+    /// supervisor). Run from the supervisor's driver loop (never concurrently
+    /// with itself), so the cascade is atomic from the application's
+    /// perspective. A `Deactivate` cascade propagates a missed shutdown ack as
+    /// [`ShutdownTimeout`] (the cascade aborts at the offending node, dependents
+    /// already stopped); `Activate` cannot fail this way.
+    pub async fn apply_control(
+        &self,
+        cmd: ControlCommand,
+        spawner: Spawner,
+    ) -> Result<(), ShutdownTimeout> {
         match cmd.op {
             ControlOp::Deactivate => self.deactivate(cmd.node).await,
-            ControlOp::Activate => self.activate(cmd.node, spawner).await,
+            ControlOp::Activate => {
+                self.activate(cmd.node, spawner).await;
+                Ok(())
+            }
         }
     }
 
     /// Bring `target` (and its pool, and every transitive dependent) down, in
     /// reverse-topological order so each dependent stops before the dependency it
-    /// relies on. Marks the whole set `disabled` so the stop sticks against the
-    /// elastic policy and the wake respawn until a matching `activate`.
-    async fn deactivate(&self, target: &'static TaskNode) {
+    /// relies on — the cascading "turn this subsystem off" verb, and the exit
+    /// half of the subordinate sub-graph pattern's one-graph variant. Marks
+    /// the whole set `disabled` so the stop sticks against the elastic policy
+    /// and the wake respawn until a matching [`activate`](Self::activate).
+    /// Aborts with [`ShutdownTimeout`] on a missed ack (the offending node stays
+    /// running and disabled; dependents visited before it are already down).
+    ///
+    /// Contrast [`stop_node`](Self::stop_node): ONE node, no cascade, no
+    /// `disabled` latch (the pool-shrink primitive). Call this directly when
+    /// you hold the supervisor; [`request_control`] +
+    /// [`apply_control`](Self::apply_control) is the same operation routed
+    /// through the mailbox from code that doesn't.
+    pub async fn deactivate(&self, target: &'static TaskNode) -> Result<(), ShutdownTimeout> {
         let mut set = [false; N];
         self.seed(target, &mut set);
 
@@ -1378,24 +1949,33 @@ impl<const N: usize> Supervisor<N> {
             // keeps detached *dependents* out of the set; this also covers a detached
             // node that was seeded directly (or a detached pool member). Without it a
             // detached one-shot that already exited (stale `is_running`, no ack path)
-            // would be signalled a shutdown it can never acknowledge, panicking here.
+            // would be signalled a shutdown it can never acknowledge, failing here
+            // with a spurious `ShutdownTimeout`.
             if node.is_detached() {
                 continue;
             }
             node.set_disabled(true);
             if node.is_running() {
                 info!("supervisor: control-stop {}", node.name);
-                self.shutdown_and_wait(node).await;
+                self.shutdown_and_wait(node).await?;
             }
         }
+        Ok(())
     }
 
     /// Bring `target` (and its pool, and every transitive dependency) up, in
-    /// topological order so each dependency starts before its dependent. Clears
+    /// topological order so each dependency starts before its dependent — the
+    /// cascading "turn this subsystem on" verb, and the entry half of the
+    /// subordinate sub-graph pattern's one-graph variant: `activate` on a
+    /// subtree's LEAF pulls its whole dependency chain up, skipping
+    /// already-running nodes. Per-node spawn errors are deliberately swallowed
+    /// (a cascade is best-effort; a `Busy` member is re-driven by the pool
+    /// policy or a later activate), so this returns `()` — asymmetric with
+    /// [`deactivate`](Self::deactivate) on purpose. Clears
     /// `disabled` across the set. `OnDemand` (pool) members are only re-enabled,
     /// not force-spawned — the elastic policy re-grows them under load, which is
     /// the whole point of the pool.
-    async fn activate(&self, target: &'static TaskNode, spawner: Spawner) {
+    pub async fn activate(&self, target: &'static TaskNode, spawner: Spawner) {
         let mut set = [false; N];
         self.seed(target, &mut set);
 
@@ -1548,11 +2128,53 @@ pub use pool::*;
 #[cfg(feature = "trace")]
 pub mod trace;
 
+#[cfg(feature = "macros")]
+pub use embassy_supervisor_macros::supervisor_fragment;
 /// Declare a supervised task graph and compute its topological order at compile
 /// time (single source of nodes, deps, pool, and order). See the
 /// `embassy-supervisor-macros` crate for the surface syntax.
 #[cfg(feature = "macros")]
 pub use embassy_supervisor_macros::supervisor_graph;
+
+/// Assemble one graph from `supervisor_fragment!` relays plus compose-site
+/// items:
+///
+/// ```ignore
+/// embassy_supervisor::compose_graph! {
+///     fragments: [::net_stack::NET_FRAG, HTTP_FRAG],
+///     graph: {
+///         node APP = Terminate, deps: [NET], task: app_worker; // cross-fragment dep
+///     }
+/// }
+/// ```
+///
+/// Fragments expand in listed order, then the `graph:` items; everything
+/// reaches ONE `supervisor_graph!` expansion, so cross-fragment deps resolve by
+/// name (forward references included) and every compile-time pass — name map,
+/// u8 slot indices, topological order, shared-slot dedup, the 256-node cap —
+/// checks the whole composed graph. One compose site per binary (it emits the
+/// usual `GRAPH`/`NODES`/`DEPS` statics and, under `trace-hooks`, the hook
+/// symbols). Name collisions across fragments hit the ordinary duplicate-name
+/// errors, attributed to the owning fragment; prefix fragment-public names.
+#[cfg(feature = "macros")]
+#[macro_export]
+macro_rules! compose_graph {
+    // `name: X,` first renames the composed graph static (see
+    // `supervisor_graph!`'s `name:`) — seeded into the accumulator ahead of
+    // every fragment's items so it stays the expansion's first item.
+    (name: $n:ident, fragments: [$f:path $(, $r:path)* $(,)?], graph: {$($g:tt)*}) => {
+        $f! { @emit $crate::compose_graph, [$($r),*], {name: $n;}, {$($g)*} }
+    };
+    (fragments: [$f:path $(, $r:path)* $(,)?], graph: {$($g:tt)*}) => {
+        $f! { @emit $crate::compose_graph, [$($r),*], {}, {$($g)*} }
+    };
+    (@next [], {$($acc:tt)*}, {$($g:tt)*}) => {
+        $crate::supervisor_graph! { $($acc)* $($g)* }
+    };
+    (@next [$f:path $(, $r:path)*], {$($acc:tt)*}, $g:tt) => {
+        $f! { @emit $crate::compose_graph, [$($r),*], {$($acc)*}, $g }
+    };
+}
 
 /// Building blocks for `supervisor_graph!`-generated code — NOT public API.
 ///
@@ -1569,70 +2191,4 @@ pub mod _export {
     pub use embassy_sync::signal::Signal;
     // For the `slot_timeout:` clause's emitted `with_slot_timeout(..)` call.
     pub use embassy_time::Duration;
-}
-
-// ─── Tests (host-only) ─────────────────────────────────────────────────────
-//
-// Run on the host: `cargo test -p embassy-supervisor --target x86_64-unknown-linux-gnu`
-// (the workspace `.cargo/config.toml` pins the embedded target, so `--target` is
-// required to override it). These exercise the compile-time `topo_sort_const`
-// over index adjacency tables — exactly what `supervisor_graph!` generates.
-#[cfg(test)]
-mod tests {
-    use super::topo_sort_const;
-
-    /// Position of index `x` within `order`.
-    fn pos<const N: usize>(order: &[u8; N], x: u8) -> usize {
-        order.iter().position(|&y| y == x).expect("index present")
-    }
-
-    #[test]
-    fn linear_chain_orders_deps_before_dependents() {
-        // A=0, B=1 dep A, C=2 dep B.
-        const DEPS: [&[u8]; 3] = [&[], &[0], &[1]];
-        const ORDER: [u8; 3] = topo_sort_const(&DEPS);
-        assert_eq!(ORDER, [0, 1, 2]);
-    }
-
-    #[test]
-    fn diamond_puts_root_first_and_join_last() {
-        // A=0; B=1 dep A; C=2 dep A; D=3 dep B,C.
-        const DEPS: [&[u8]; 4] = [&[], &[0], &[0], &[1, 2]];
-        const ORDER: [u8; 4] = topo_sort_const(&DEPS);
-        assert_eq!(ORDER[0], 0, "root first");
-        assert_eq!(ORDER[3], 3, "join last");
-        assert!(pos(&ORDER, 1) < pos(&ORDER, 3), "B before D");
-        assert!(pos(&ORDER, 2) < pos(&ORDER, 3), "C before D");
-    }
-
-    #[test]
-    fn independent_nodes_all_present() {
-        const DEPS: [&[u8]; 2] = [&[], &[]];
-        const ORDER: [u8; 2] = topo_sort_const(&DEPS);
-        assert!(ORDER.contains(&0) && ORDER.contains(&1));
-    }
-
-    #[test]
-    fn unsorted_input_is_sorted() {
-        // Declared out of dependency order: node 0 depends on 1 and 2, node 2 on 1.
-        const DEPS: [&[u8]; 3] = [&[1, 2], &[], &[1]];
-        const ORDER: [u8; 3] = topo_sort_const(&DEPS);
-        assert!(pos(&ORDER, 1) < pos(&ORDER, 2), "1 before 2");
-        assert!(pos(&ORDER, 2) < pos(&ORDER, 0), "2 before 0");
-    }
-
-    #[test]
-    fn evaluates_at_compile_time() {
-        // The sort runs in a `const` context, proving it is const-evaluable.
-        // (A cyclic table here would be a *compile* error, not a test failure.)
-        const DEPS: [&[u8]; 3] = [&[], &[0], &[1]];
-        const _: () = {
-            let order = topo_sort_const(&DEPS);
-            assert!(order[0] == 0 && order[1] == 1 && order[2] == 2);
-        };
-    }
-
-    // Uncommenting this must fail to compile ("dependency cycle"):
-    //   const CYCLE: [&[u8]; 2] = [&[1], &[0]];
-    //   const _BAD: [u8; 2] = topo_sort_const(&CYCLE);
 }

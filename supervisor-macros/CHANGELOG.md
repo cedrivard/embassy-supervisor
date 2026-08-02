@@ -6,6 +6,55 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.5.0] - 2026-08-02
+
+Pairs with `embassy-supervisor` 0.4.0 (node-completion observation, exit values).
+
+### Added
+- `ready` dep marker (feature `readiness`, forwarded from the supervisor):
+  `deps: [NET ready, WATCHDOG]` emits a per-item ready-dep array wired via
+  `.with_ready_deps` — bring-up awaits each marked dep's `set_ready()`. A marker
+  naming a pool resolves to the floor member; markers on a `pool`'s `deps:` apply
+  to every member. Without the feature the marker is a span-attached error.
+- `exit: Type` node clause (`task:` only): emits
+  `pub static <NODE>_EXIT: ResourceSlot<Type>` and the shell binds the worker's
+  return value and `provide()`s it just before `mark_exited()`. Rejected with a
+  targeted error on `spawn:` nodes and on `pool` (K members share one shell).
+- `name: IDENT;` graph header: renames the emitted graph static (default
+  `GRAPH`) and suffixes the private tables and per-graph helpers
+  (`__SvLocalResourceSlot`, the heap-state boxing fn, the alloc alias) so
+  several graphs coexist, even in one module. Only the UNNAMED graph emits the
+  `trace-hooks` symbols (once-per-binary `no_mangle`).
+- `state: Type = init_expr` clause (feature `heap-state`; `task:` nodes and pool
+  members): the glue fallibly boxes the init BEFORE the resource takes (a failed
+  alloc strands nothing), the shell lends `&mut Type` and drops the Box first
+  thing after the worker returns. Emits the consumer-crate `__sv_try_box`
+  helper once per graph. Rejected without the feature, and on `spawn:` items.
+- `supervisor_fragment!` (new proc macro) + the `@fragment`/`@endfragment`
+  attribution markers `supervisor_graph!` now accepts: fragments forward their
+  items through a `#[macro_export]` relay into one compose-site expansion (the
+  supervisor crate's `compose_graph!` drives the chain). Fragment syntax is
+  validated at the fragment site; only `$crate` is permitted as a `$` token.
+- Pools accept take-kind `resources:` (per-member `[ResourceSlot<T>; K]` arrays,
+  member `I` takes/restores element `I`; shell restores through a slot-reference
+  parameter so the index cannot drift); `shared` entries stay one pool-wide
+  fan-out slot — including `shared local`, as in 0.4.x — while take-kind
+  `local` on pools remains rejected (the single-core slot contract +
+  per-member restore is deferred).
+- Pool `min:`/`max:` parse as expressions: literals validate at expansion,
+  otherwise the emitted consts + const asserts carry the checks.
+
+### Changed
+- The generated `task:` shell now calls `__node.mark_exited()` after the worker
+  returns and resources are restored, so a worker that exits on its own is recorded
+  as completed instead of reading as running forever. The
+  `#[allow(unreachable_code)]` on the shell body is now emitted unconditionally
+  (the completion record is an unconditional trailing statement; a `-> !` worker
+  makes it unreachable, which stays legitimate).
+
+### Fixed
+- Add missing doc strings.
+
 ## [0.4.1] - 2026-07-09
 
 Safety fix to 0.4.0: the `local` resource kind is the one graph form that makes
@@ -162,6 +211,7 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
+[0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.4.1...embassy-supervisor-macros-v0.5.0
 [0.4.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.4.0...embassy-supervisor-macros-v0.4.1
 [0.4.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.3.1...embassy-supervisor-macros-v0.4.0
 [0.3.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.3.0...embassy-supervisor-macros-v0.3.1

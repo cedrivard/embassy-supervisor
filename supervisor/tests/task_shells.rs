@@ -38,16 +38,18 @@ static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
 /// type, then behaves like a well-mannered Terminate task.
 async fn worker<P: Probe>(node: &'static TaskNode, bump: u32) {
     P::counter().fetch_add(bump, Ordering::SeqCst);
-    node.wait_shutdown().await;
-    node.ack_dropped();
+    let _ = node
+        .run_cancellable_acked(core::future::pending::<()>())
+        .await;
 }
 
 /// Pool-member worker (non-generic on purpose: proves `task:` is useful for the
 /// plain "spare me the #[task] boilerplate" case too).
 async fn pool_worker(node: &'static TaskNode) {
     POOL_RUNS.fetch_add(1, Ordering::SeqCst);
-    node.wait_shutdown().await;
-    node.ack_dropped();
+    let _ = node
+        .run_cancellable_acked(core::future::pending::<()>())
+        .await;
 }
 
 supervisor_graph! {
@@ -100,7 +102,7 @@ async fn driver(spawner: Spawner) {
     }
 
     // teardown(): shells select against wait_shutdown and ack like any task.
-    sup.teardown().await;
+    sup.teardown().await.expect("teardown");
     assert!(
         !FAST.is_running() && !SLOW.is_running(),
         "shell nodes torn down"

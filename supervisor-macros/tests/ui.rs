@@ -30,4 +30,26 @@ fn ui() {
     }
     #[cfg(not(feature = "local-resources"))]
     t.compile_fail("tests/ui/compile_fail_no_local/*.rs");
+    // The `ready` dep marker's pass/fail cases need the `readiness` feature.
+    // Unlike `local-resources` there is NO no-feature UI split: the dev-dep
+    // supervisor must carry `readiness` for the pass cases (trybuild copies the
+    // dev-dep declaration verbatim), and the scratch project's feature
+    // unification re-enables the macro feature through the supervisor's weak
+    // forward — so the rejection can't fire there. It is unit-tested inside the
+    // macros crate instead (`ready_marker_requires_feature`).
+    #[cfg(feature = "readiness")]
+    {
+        t.compile_fail("tests/ui/compile_fail_readiness/*.rs");
+        t.pass("tests/ui/compile_pass_readiness/*.rs");
+    }
+    // `state:` (heap-state): pass/fail with the feature; the "requires the
+    // feature" rejection fires without it (unlike `readiness`, nothing in the
+    // dev-dep re-enables this feature through unification).
+    #[cfg(feature = "heap-state")]
+    {
+        t.compile_fail("tests/ui/compile_fail_heap_state/*.rs");
+        t.pass("tests/ui/compile_pass_heap_state/*.rs");
+    }
+    #[cfg(not(feature = "heap-state"))]
+    t.compile_fail("tests/ui/compile_fail_no_heap_state/*.rs");
 }
