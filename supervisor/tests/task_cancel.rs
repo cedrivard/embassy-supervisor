@@ -50,10 +50,18 @@ async fn oneshot() -> u32 {
     7
 }
 
+/// A `cancel` worker declared with the partial-call form and NO `resources:`,
+/// so the shell's injected lead is empty and the extra argument is the only
+/// one. The regression: the generated call used to come out as `f(, 7)`.
+async fn with_extra(n: u32) -> u32 {
+    n
+}
+
 supervisor_graph! {
     node LOOPER = Terminate, deps: [], task: looper, cancel,
         resources: [PROBE: Probe];
     node ONESHOT = Terminate, deps: [], task: oneshot, cancel, exit: u32;
+    node EXTRA = Terminate, deps: [], task: with_extra(9), cancel, exit: u32;
 }
 
 async fn settle(mut f: impl FnMut() -> bool) {
@@ -79,6 +87,11 @@ async fn driver(spawner: Spawner) {
         "a cancel worker that returns still provides its exit value"
     );
     assert!(ONESHOT.has_exited(), "and still records the completion");
+    assert_eq!(
+        EXTRA_EXIT.wait_take().await,
+        9,
+        "the partial-call form reaches the worker with an empty injected lead"
+    );
     PHASE.store(1, Ordering::SeqCst);
 
     // ── the ack: the worker contains no handshake at all, so `stop_node`

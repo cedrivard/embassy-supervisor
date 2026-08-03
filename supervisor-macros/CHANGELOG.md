@@ -6,6 +6,16 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.6.1] - 2026-08-03
+
+### Fixed
+- `cancel` on a `task:` declared with the **partial-call form** and no
+  `resources:`/`state:` failed to compile: with the node lead suppressed and
+  nothing to take its place, the injected argument list emitted a leading comma
+  (`entry(, "arg")`), which rustc reported as `expected expression, found ','`
+  spanned on the whole `supervisor_graph!` item. The lead and the user's extras
+  are now one list.
+
 ## [0.6.0] - 2026-08-03
 
 Pairs with `embassy-supervisor` 0.4.1 (macro pin only; no runtime change).
@@ -248,6 +258,7 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
+[0.6.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.6.0...embassy-supervisor-macros-v0.6.1
 [0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.5.0...embassy-supervisor-macros-v0.6.0
 [0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.4.1...embassy-supervisor-macros-v0.5.0
 [0.4.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.4.0...embassy-supervisor-macros-v0.4.1

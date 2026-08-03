@@ -1141,13 +1141,19 @@ fn name_string(ident: &Ident) -> String {
 /// user-supplied extras — the node ref (`&NODE` / `&POOL[i]`) first, then the
 /// item's threaded `resources:` values: a bare path `f` => `f(lead..)`; a
 /// partial call `f(a, b)` => `f(lead.., a, b)`.
+///
+/// The lead may be EMPTY: a `cancel` shell suppresses the node ref, so a node
+/// with no `resources:`/`state:` leads with nothing at all. Both groups are
+/// therefore joined as ONE list — a separator hard-coded between them would
+/// emit `f(, a, b)`.
 fn inject_call_with(task: &Expr, lead: &[TokenStream2]) -> SynResult<TokenStream2> {
     match task {
         Expr::Path(_) => Ok(quote!(#task(#(#lead),*))),
         Expr::Call(c) => {
             let f = &c.func;
-            let args = c.args.iter();
-            Ok(quote!(#f(#(#lead),* #(, #args)*)))
+            let mut args: Vec<TokenStream2> = lead.to_vec();
+            args.extend(c.args.iter().map(|a| quote!(#a)));
+            Ok(quote!(#f(#(#args),*)))
         }
         other => Err(syn::Error::new_spanned(
             other,
