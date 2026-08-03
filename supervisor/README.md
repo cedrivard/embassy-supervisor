@@ -89,13 +89,15 @@ supervisor_graph! {
         , resources: [R: Type, ..]      //   owned values threaded from main (kinds: local/shared/consume)
         , exit: Type                    //   capture the worker's return value
         , state: Type = expr            //   per-activation boxed state, freed on exit
+        , cancel                        //   shell owns the shutdown race; worker takes no node
         , pool_size: N , executor: NAME , slot_timeout: MS , disabled;
 
     pool NAME = [Mode, ..],             // one Mode per member, floor first
         deps: [..], task: worker,
         resources: [..],                //   take kinds become per-member slot arrays
         policy: DeferredShrink::new(..),// scaling policy (required)
-        min: EXPR, max: EXPR;
+        min: EXPR, max: EXPR            //   trailing, in order: [, slot_timeout: MS][, cancel]
+        , cancel;                       //   same flag, applied to every member
 }
 ```
 
@@ -256,16 +258,20 @@ graphs.
 
 ## Writing supervised tasks (the TaskNode API)
 
-> **Anti-fit signal:** a worker typed `-> !` (or a service contract returning a `Never`
-> type) opts out of `Terminate`/restart *by type* — the body can never return, so stop
-> and respawn semantics are inert until it is rewritten to race its work against
-> `wait_shutdown()` (now one `run_cancellable` call) and return. If your codebase's
-> task idiom is `-> !`, budget for that rewrite before adopting lifecycle control;
+> **A worker typed `-> !`** (or a service contract returning a `Never` type) opts out
+> of `Terminate`/restart *by type* — the body can never return, so stop and respawn
+> semantics are inert on it as-is. Two ways in: add
+> [`cancel`](#cancel--supervisor-unaware-workers) to the node and the generated shell
+> races the body against shutdown for you (no signature change, the future is dropped
+> in place), or keep the node argument and race the work yourself (one
+> `run_cancellable` call) when teardown needs ordered post-cancel work.
 > `Pause`-parked and detached daemons are the forms that legitimately never return.
 
 A supervised task is an async fn whose first parameter is its node — the macro's glue
 passes it automatically; extra arguments come from the partial-call form
-(`task: my_task(EXTRA)`). The preferred style is a **plain worker fn** declared with
+(`task: my_task(EXTRA)`). (A [`cancel`](#cancel--supervisor-unaware-workers) node is
+the exception: its worker never sees the node — the shell holds it and uses this same
+API on the worker's behalf.) The preferred style is a **plain worker fn** declared with
 [`task:`](#task--generated-shells-for-plain-or-generic-workers) — the graph stamps the
 `#[embassy_executor::task]` shell for you:
 
@@ -428,7 +434,7 @@ executor NAME;                        // runtime-filled SendSpawner slot (tier /
 node NAME = Mode, deps: [A, B][, executor: EXEC], spawn: <spawn>[, disabled];
 node NAME = Mode, deps: [A, B][, executor: EXEC], task: <worker>[, pool_size: N]
     [, resources: [[#[cfg(..)]] RES: [local] [shared|consume] Type, ..]]
-    [, slot_timeout: MS][, disabled];
+    [, slot_timeout: MS][, cancel][, disabled];
 node NAME = Mode, deps: [A];          // neither => parked node the app spawns itself
 pool NAME = [Mode, ..], deps: [A][, executor: EXEC],
     spawn: <fn> | task: <worker>,
@@ -436,13 +442,14 @@ pool NAME = [Mode, ..], deps: [A][, executor: EXEC],
                                         // take kinds → per-member slot arrays;
                                         // shared (incl. shared local) one pool-wide slot
     policy: [<Type> =] <expr>,
-    min: N, max: M[, slot_timeout: MS];
+    min: N, max: M[, slot_timeout: MS][, cancel];
 ```
 
 ### Spawn forms
 
 A bare path `f` spawns `f(&NAME)`; a partial call `f(a, b)` spawns `f(&NAME, a, b)` (the node
-is always injected first); a closure is emitted verbatim (nodes only). These forms apply to
+is always injected first — except under [`cancel`](#cancel--supervisor-unaware-workers),
+which suppresses it); a closure is emitted verbatim (nodes only). These forms apply to
 both `spawn:` (a hand-written `#[embassy_executor::task]` fn) and `task:` (a plain worker fn
 the macro wraps) — **prefer `task:`**; see
 [`spawn:` vs `task:`](#spawn-vs-task--which-to-use) for the cases where `spawn:` is the
@@ -669,6 +676,76 @@ async fn serve_worker(node: &'static TaskNode) -> Result<Outcome, Aborted> {
 into an app-declared slot itself) and not available on `pool` (K members share one
 shell; per-member exit values would need per-member storage).
 
+**A worker that can never return rejects `exit:` at compile time.** A `-> !` worker
+has no output, so the slot could never be filled and a `wait_take()` on it would hang
+forever; the shell's `provide()` denies `unreachable_code` on itself to catch that.
+rustc reports it as `unreachable statement` (or `unreachable call` under
+[`cancel`](#cancel--supervisor-unaware-workers)) pointing **at the `exit:` clause** —
+drop the clause, or give the worker a return type it can actually reach. A diverging
+worker *without* `exit:` stays perfectly legal: that is the shape `cancel`, `Pause`,
+and detached daemons exist for.
+
+### `cancel` — supervisor-unaware workers
+
+Every worker so far takes the node as its first argument and answers the shutdown
+handshake itself (`run_cancellable*`, or just returning). `cancel` moves that whole
+job into the generated shell: the shell drives the worker under
+[`run_cancellable`] and does **not** pass it the node, so the worker is a plain
+`async fn` — the shape an existing firmware already has:
+
+```rust,ignore
+// No node, no handshake, no supervisor in sight. Loops forever.
+async fn telemetry(uart: &mut Uart<'static, Async>) -> ! {
+    loop { /* ... */ }
+}
+
+supervisor_graph! {
+    node TELEM = Terminate, deps: [NET], task: telemetry, cancel,
+        resources: [UART: Uart<'static, Async>];
+}
+```
+
+On `stop_node`/teardown the shell drops the worker's future in place and runs its
+usual tail: state freed, resources `restore()`d, exit recorded — so a `Terminate`
+respawn re-takes the same instances, exactly as if the worker had been node-aware.
+Resources still arrive, now as the *first* arguments (nothing leads them).
+
+With `exit:`, the value is provided only on a **real completion**; an aborted
+worker leaves `<NODE>_EXIT` empty (with `shutdown_requested()` set), which is how
+a waiter tells "finished" from "stopped". Combining `exit:` with a worker that can
+*never* complete is [a compile error](#exit--typed-exit-values). Drop-in-place is
+also the trade: the
+worker gets no post-cancel code, so a task that must flush or release something
+*ordered* at teardown should keep the node argument and race
+`run_cancellable_acked` itself.
+
+A `pool` takes the same flag, as its **last** clause (the pool grammar is
+positional: after `max:`, and after `slot_timeout:` if present). It applies to the
+one shell all members share, so it applies to every member:
+
+```rust,ignore
+async fn handler(conn: &mut Conn) -> ! { loop { /* serve */ } }
+
+supervisor_graph! {
+    pool WORKERS = [Terminate, OnDemand, OnDemand], deps: [NET], task: handler,
+        resources: [CONN: Conn],
+        policy: DeferredShrink::new(Duration::from_secs(5)),
+        min: 1, max: 3, cancel;
+}
+```
+
+An elastic **shrink** is a stop like any other, so this is what lets the policy
+retire a worker that would never have acked one: the member's future is dropped in
+place and the shell restores its per-member resource to *its own* slot index, ready
+for the regrow. The load signal is the one thing that has to move outside the
+worker — a `cancel` member holds no node, so `mark_busy()`/`mark_idle()` are called
+on `WORKERS[i]` by whatever hands it work (the member statics are app-visible), not
+by the worker itself.
+
+`task:`-only (a `spawn:` fn owns its body and can call `run_cancellable` itself),
+and rejected on `Mode::Pause` because a Pause worker must survive the stop and park on
+`wait_resume()`, which an exit record nothing ever resumes contradicts.
+
 ### `disabled`
 
 Declared but not started at boot; a control `Activate` starts it later (e.g. an OTA task).
@@ -792,6 +869,17 @@ offending token:
 - **`local` resources with `executor:`** — on a node or a pool: a local slot carries
   `!Send` values; a `SpawnerSlot`-routed spawn needs a `Send` future
 - **`slot_timeout: 0`** — would fail every gated spawn instantly
+- **[`cancel`](#cancel--supervisor-unaware-workers) without `task:`** — on a node or a
+  pool: the flag rewrites how the *generated* shell calls the worker; a hand-written
+  `spawn:` fn can call `node.run_cancellable(..)` itself
+- **`cancel` with `Pause`** — the node mode or any pool member: a Pause worker must
+  survive the stop and park on `wait_resume()`, but `cancel` drops its future and
+  records an exit; use `Terminate`/`OnDemand`, or drive the pause by hand
+- **[`exit:`](#exit--typed-exit-values) on a worker that can never return** — the shell's
+  `provide` would be dead code, so nothing could ever fill the slot and every waiter
+  would hang; rustc reports it as `unreachable statement` (or `unreachable call` under
+  `cancel`) spanned on the `exit:` clause rather than as a macro error. A diverging
+  worker *without* `exit:` stays legal
 - **pool bounds** — `min <= max <= K` (member count), values must fit `u8`
 - **pool without the `pool` feature** — a `pool` item requires enabling it
 - **more than 256 slots** — the `u8` index cap above
@@ -1434,6 +1522,68 @@ update — all driven by this supervisor.
 
 Condensed feature tours of past releases; the CHANGELOG is the authoritative history.
 
+### 0.4.0
+
+Ships with `embassy-supervisor-macros` 0.5.0 .
+
+The release where the graph stopped being one flat literal per binary — fragments
+compose it across crates, `name:` gives a binary several of them, and
+`start()`/`teardown()` became a repeatable cycle — on a lifecycle core that now
+**observes** what it supervises: a task's own completion is recorded, readiness is
+asserted rather than assumed, control delivery is guaranteed, and every shutdown
+outcome is a value the application can act on.
+
+- **Every outcome is a value** *(breaking)*. `stop_node`, `teardown` and
+  `apply_control` return `Result<(), ShutdownTimeout>` naming the offending node
+  (`run_pools` returns `ShutdownTimeout`), so a missed ack becomes an escalation the
+  application owns — retry, log, reset — instead of a decision made inside the
+  library; `teardown` stops the cascade at the first timeout so a still-live
+  dependent never has its dependencies pulled out from under it, and
+  `teardown_continue()` is the deliberate "hardware reset next" counterpart.
+  `request_control` is `async` and awaits mailbox capacity, with
+  `try_request_control` (`Err(ControlQueueFull)`) for ISRs and callbacks — a command
+  is now either delivered or refused, never silently lost. See
+  [Migration](#migration).
+- **Observed completion.** `mark_exited()` / `has_exited()`: a body that returns is
+  recorded as completed and its handshake acked, so a run-once task reads as
+  *finished* and a control `Activate` can respawn it. That flag is also what makes a
+  *parked* `Pause` instance distinguishable from an exited one, which is why
+  `start()` is now the universal quiescent-to-running op — reset each node, skip
+  running and detached ones, resume a parked one in place — making
+  `start()`/`teardown()` a repeatable cycle for a
+  [subordinate sub-graph](#subordinate-sub-graph-under-an-app-state-machine).
+- **Composable graphs.** `supervisor_fragment! { name: X; <items> }` lets a module or
+  a whole crate declare its slice of the graph and `compose_graph!` assembles them
+  into ONE expansion — cross-fragment deps resolve by name in either direction, every
+  compile-time pass runs over the whole composed graph, and errors are attributed to
+  the owning fragment. See [Composing graphs](#composing-graphs-across-crates).
+- **Named multi-graphs.** `name: IDENT;` as a graph's first item renames the emitted
+  static and suffixes every generated helper, so several supervisors coexist per
+  binary. The unnamed graph stays the primary (only it emits the `trace-hooks`
+  symbols) and the control mailbox is shared — run ONE driver and apply each command
+  to every supervisor. See [Multiple graphs per binary](#multiple-graphs-per-binary).
+- **`readiness` and `liveness`** *(both off by default)*. `deps: [NET ready]` holds a
+  dependent's spawn until the provider calls `set_ready()` — a real rendezvous on
+  "actually serving" (DHCP bound, registration done) rather than "spawned", bounded
+  by the dependent's `slot_timeout` and then a `SpawnError::Busy` naming the
+  not-ready dep. `beat()` + `is_stale(max_age)` catch the alive-but-wedged task an
+  ack-based check cannot see. One AtomicBool + Signal + slice, and one AtomicU32, per
+  node. See [Readiness rendezvous](#readiness-rendezvous-ready-dep-marker).
+- **`heap-state`** *(off by default)*. `state: Type = init_expr` on `task:` nodes and
+  pool members: fallibly boxed per activation (alloc failure = `SpawnError::Busy`,
+  retryable), lent to the worker as `&mut Type`, dropped on exit before restores —
+  every activation allocates fresh, net zero across respawns, while task STORAGE
+  stays static by soundness. See [Heap and the graph](#heap-and-the-graph).
+- **Pools grew up.** Take-kind `resources:` entries become per-member slot arrays
+  (member `I` owns element `I` exclusively; a lend value survives shrink and regrow
+  on the same index), `min:`/`max:` accept const-evaluable expressions guarded by
+  const asserts, and `ElasticPool::member_index(node)` indexes per-member app state.
+- Also: [`exit: Type`](#exit--typed-exit-values) — the worker's return value lands in
+  a generated `<NODE>_EXIT` slot just before the completion is recorded;
+  `run_cancellable` / `run_cancellable_acked` as combinators; `resume_node()`, and
+  `activate`/`deactivate` now public; and `Supervisor::run(spawner)`, which is
+  `start()` plus the pool-scaling and control loop in one call.
+
 ### 0.3.3
 
 Ships with `embassy-supervisor-macros` 0.4.0 .
@@ -1522,6 +1672,14 @@ Measured on the demo firmware (RP2350, release + fat LTO): the whole feature set
 steady-state stack — a threaded resource travels inside the task's future.
 
 ## Migration
+
+### 0.4.0 → 0.4.1
+
+Ships with `embassy-supervisor-macros` 0.6.0 (pinned by exact version — no action
+needed). Purely additive at run time, with one source-level catch: `exit:` declared on
+a worker that can never return is now [a compile error](#limits-and-compile-time-validation)
+instead of a slot nothing ever filled. If a graph hits it, drop the `exit:` clause —
+that worker never produced a value in the first place.
 
 ### 0.3 → 0.4
 

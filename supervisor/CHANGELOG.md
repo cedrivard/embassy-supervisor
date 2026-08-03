@@ -4,6 +4,27 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-08-03
+
+Ships the `cancel` graph flag by moving the macro pin to
+`embassy-supervisor-macros = "=0.6.0"`. No runtime code, API, or feature change on
+this crate.
+
+### Added
+- `cancel` flag in the graph DSL, on `task:` nodes and on `task:` pools (macros
+  side, feature `macros`; no runtime change and no new API): the generated shell
+  owns the shutdown race via `run_cancellable`, so a plain supervisor-unaware
+  `async fn` binds directly — no node argument, no handshake in the worker, and
+  the shell still frees state, restores resources and records the exit when the
+  future is dropped in place. On a pool it covers every member, so an elastic
+  shrink can retire such a worker. The flag requires `task:` and rejects `Pause`.
+  See the macros CHANGELOG and the README's "`cancel` — supervisor-unaware
+  workers" section.
+
+### Changed
+- `exit:` on a worker that can never return is now a compile error (macros side)
+  rather than a slot nothing could ever fill. See the macros CHANGELOG.
+
 ## [0.4.0] - 2026-08-02
 
 Defect fixes: the control mailbox can no
@@ -350,6 +371,7 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
+[0.4.1]: https://github.com/cedrivard/embassy-supervisor/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.5...v0.4.0
 [0.3.5]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/cedrivard/embassy-supervisor/compare/v0.3.3...v0.3.4

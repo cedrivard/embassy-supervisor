@@ -10,12 +10,12 @@
 //! node NAME = Mode, deps: [A, B], spawn: <spawn>[, executor: EXEC][, disabled];
 //! node NAME = Mode, deps: [A, B], task: <worker>[, pool_size: N][, executor: EXEC]
 //!     [, resources: [[#[cfg(..)]] RES: [local] [shared|consume] Type, ..]]
-//!     [, slot_timeout: MS][, disabled];
+//!     [, slot_timeout: MS][, cancel][, disabled];
 //! node NAME = Mode, deps: [A];                 // neither => a parked node the app spawns
 //! executor EXEC;                               // runtime-filled SendSpawner slot
 //! pool NAME = [Mode, ..], deps: [A][, executor: EXEC], spawn: <fn> | task: <worker>,
 //!     [resources: [RES: [local] shared Type, ..],]
-//!     policy: [<Ty> =] <expr>, min: N, max: M[, slot_timeout: MS];
+//!     policy: [<Ty> =] <expr>, min: N, max: M[, slot_timeout: MS][, cancel];
 //! ```
 //! `deps:` entries name a `node` or a `pool`; a `pool` dep resolves to that pool's floor
 //! member (member 0, the `min`-kept one), i.e. "start after the pool is up". A repeated
@@ -51,6 +51,20 @@
 //! poll, on the node's own executor — so cross-node data should go through awaited
 //! accessors, and a cross-core node builds its resources on its own core. `task:`
 //! and `spawn:` are mutually exclusive; `pool_size:` requires `task:`.
+//!
+//! `cancel` (a bare flag on `task:` items) makes the shell own the shutdown
+//! race: the worker is driven under `TaskNode::run_cancellable` and does NOT
+//! receive the node (resources become the first arguments), so a plain
+//! supervisor-unaware `async fn` — even a diverging one — binds directly. On
+//! stop/teardown its future is dropped in place and the shell still runs its
+//! full tail (state drop, resource restores, exit record). With `exit:` the
+//! value is provided only on a real completion — an aborted worker leaves the
+//! exit slot empty. Rejected on `spawn:` (that fn owns its body) and on
+//! `Mode::Pause` (a Pause worker must survive the stop and park on
+//! `wait_resume()`; `cancel` would record an exit nothing resumes). On a `pool`
+//! it is the trailing flag (after `max:`/`slot_timeout:`) and applies to the one
+//! shared shell, i.e. to every member: a shrink drops that member's future in
+//! place and its per-member resources are restored to its own slot index.
 //!
 //! **Prefer `task:`** — no attribute boilerplate, generic workers, auto-sized pool
 //! shells, and it is the only form supporting `resources:`; the shell inlines into
@@ -168,6 +182,7 @@ use quote::{format_ident, quote};
 use std::collections::{HashMap, HashSet};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
 use syn::{
     Attribute, Expr, Ident, LitInt, Meta, Path, Result as SynResult, Token, Type, bracketed,
 };
@@ -189,6 +204,7 @@ mod kw {
     syn::custom_keyword!(exit);
     syn::custom_keyword!(name);
     syn::custom_keyword!(state);
+    syn::custom_keyword!(cancel);
     syn::custom_keyword!(fragment);
     syn::custom_keyword!(endfragment);
 }
@@ -471,7 +487,10 @@ struct NodeItem {
     /// `provide()`d into a generated `pub static <NODE>_EXIT: ResourceSlot<Type>`
     /// just before the shell records the exit, so `<NODE>_EXIT.wait_take()`
     /// observes the completion value (idiomatically `Result<R, Aborted>` out of
-    /// `run_cancellable` for completed-vs-cancelled).
+    /// `run_cancellable` for completed-vs-cancelled). A worker that can never
+    /// return rejects the clause: the provide is dead code, and the shell denies
+    /// `unreachable_code` on it (spanned here) rather than emit a slot nothing
+    /// could ever fill.
     exit: Option<syn::Type>,
     /// `state: Type = init_expr` (feature `heap-state`) — per-activation heap
     /// state: the glue fallibly boxes `init_expr` (alloc failure =
@@ -479,6 +498,13 @@ struct NodeItem {
     /// and the Box drops on task exit — allocated fresh each activation,
     /// reclaimed on every exit.
     state: Option<(syn::Type, Expr)>,
+    /// `cancel` on a `task:` node — the shell drives the worker under
+    /// [`TaskNode::run_cancellable`] instead of awaiting it directly, and does
+    /// NOT pass the node to it. For the common shape the supervisor otherwise
+    /// can't take: a plain `async fn` that loops forever and knows nothing about
+    /// any supervisor. On shutdown its future is dropped in place and the shell
+    /// runs its usual restore/exit-provide/`mark_exited` tail.
+    cancel: bool,
     /// The `supervisor_fragment!` this item was forwarded from (via the
     /// `@fragment NAME;` marker), for error attribution across the relay.
     fragment: Option<String>,
@@ -539,6 +565,11 @@ struct PoolItem {
     /// `state: Type = init_expr` (feature `heap-state`) — per-activation heap
     /// state, one fresh Box per member per activation (see the node field).
     state: Option<(syn::Type, Expr)>,
+    /// `cancel` on a `task:` pool — the one shared shell drives each member's
+    /// worker under [`TaskNode::run_cancellable`] and does not lead its arguments
+    /// with `&POOL[I]`, so a plain worker is shrunk (and torn down) by having its
+    /// future dropped in place. See the node field of the same name.
+    cancel: bool,
     /// The `supervisor_fragment!` this item was forwarded from (via the
     /// `@fragment NAME;` marker), for error attribution across the relay.
     fragment: Option<String>,
@@ -666,6 +697,7 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
     let mut slot_timeout = None;
     let mut exit: Option<(kw::exit, syn::Type)> = None;
     let mut state: Option<(kw::state, syn::Type, Expr)> = None;
+    let mut cancel: Option<kw::cancel> = None;
     while input.peek(Token![,]) {
         input.parse::<Token![,]>()?;
         if input.peek(kw::spawn) {
@@ -683,6 +715,8 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
         } else if input.peek(kw::disabled) {
             input.parse::<kw::disabled>()?;
             disabled = true;
+        } else if input.peek(kw::cancel) {
+            cancel = Some(input.parse::<kw::cancel>()?);
         } else if input.peek(kw::executor) {
             input.parse::<kw::executor>()?;
             input.parse::<Token![:]>()?;
@@ -717,7 +751,7 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
         } else {
             return Err(input.error(
                 "expected `spawn:`, `task:`, `pool_size:`, `executor:`, `resources:`, \
-                 `slot_timeout:`, `exit:`, `state:`, or `disabled`",
+                 `slot_timeout:`, `exit:`, `state:`, `cancel`, or `disabled`",
             ));
         }
     }
@@ -815,6 +849,32 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
             ));
         }
     }
+    // `cancel` rewrites how the generated shell drives the worker; a `spawn:` fn
+    // (or a parked node) owns its own body and can call `run_cancellable` itself.
+    if let Some(k) = &cancel {
+        if task.is_none() {
+            return Err(syn::Error::new_spanned(
+                k,
+                "`cancel` requires `task:` — it wraps the generated shell's call \
+                 to the worker; a `spawn:` task fn can call \
+                 `node.run_cancellable(..)` itself",
+            ));
+        }
+        // A Pause worker is supposed to SURVIVE a stop (ack, park on
+        // `wait_resume()`, keep its resources); `cancel` drops its future and
+        // lets the shell record an exit, after which nothing resumes it. That is
+        // the opposite of the mode, so reject the pair rather than silently
+        // turning a Pause node into a one-shot.
+        if mode == "Pause" {
+            return Err(syn::Error::new_spanned(
+                k,
+                "`cancel` cannot be combined with `Mode::Pause` — a Pause worker \
+                 must survive the stop and park on `wait_resume()`, but `cancel` \
+                 drops its future and records an exit; use `Mode::Terminate` (or \
+                 `OnDemand`), or drive the pause by hand in the worker",
+            ));
+        }
+    }
     // A `local` resource makes the shell future hold a `!Send`-capable value, and
     // an `executor:`-routed node spawns through a `SendSpawner`, whose `spawn`
     // requires a `Send` future. Reject here with the reason instead of letting
@@ -851,6 +911,7 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
         slot_timeout,
         exit: exit.map(|(_, ty)| ty),
         state: state.map(|(_, ty, init)| (ty, init)),
+        cancel: cancel.is_some(),
         fragment: None,
     })
 }
@@ -1002,7 +1063,41 @@ fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
     } else {
         None
     };
+    // Optional trailing `, cancel` — the pool's one shared shell owns the
+    // shutdown race for every member (see the node clause of the same name).
+    // Shrink and teardown already signal each member; `cancel` is what makes a
+    // worker that never returns answer them.
+    let cancel = if input.peek(Token![,]) && input.peek2(kw::cancel) {
+        input.parse::<Token![,]>()?;
+        Some(input.parse::<kw::cancel>()?)
+    } else {
+        None
+    };
     input.parse::<Token![;]>()?;
+    if let Some(k) = &cancel {
+        // Same reason as the node: `cancel` rewrites how the GENERATED shell
+        // drives the worker, so there must be one.
+        if matches!(source, TaskSource::Spawn(_)) {
+            return Err(syn::Error::new_spanned(
+                k,
+                "`cancel` requires `task:` — it wraps the generated shell's call to \
+                 the member worker; a `spawn:` member fn can call \
+                 `node.run_cancellable(..)` itself",
+            ));
+        }
+        // A Pause member must survive its stop and park on `wait_resume()`;
+        // `cancel` drops its future and records an exit instead. Reject the pair
+        // per member rather than silently turning parked members into one-shots.
+        if let Some(m) = modes.iter().find(|m| *m == "Pause") {
+            return Err(syn::Error::new_spanned(
+                m,
+                "`cancel` cannot be combined with a `Pause` member — a Pause worker \
+                 must survive the stop and park on `wait_resume()`, but `cancel` \
+                 drops its future and records an exit; use `Terminate` (or \
+                 `OnDemand`) members, or drive the pause by hand in the worker",
+            ));
+        }
+    }
     // Same `Send` reasoning as the node-side check: a `local` (i.e. `!Send`able)
     // resource cannot ride members routed through a `SendSpawner`.
     if let Some(ex) = &executor {
@@ -1032,6 +1127,7 @@ fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
         min,
         max,
         state,
+        cancel: cancel.is_some(),
         fragment: None,
     })
 }
@@ -1418,6 +1514,10 @@ fn emit_shell(
     // member's own array element, passed by the wrapper) instead of a slot
     // named statically — restore-to-same-index by construction.
     pool_member: bool,
+    // `cancel`: drive the worker under `run_cancellable` and DON'T lead its
+    // arguments with the node — the worker is a plain future that never returns
+    // on its own, so the shell owns the shutdown race on its behalf.
+    cancel: bool,
     cr: &TokenStream2,
     helpers: &HelperIdents,
 ) -> SynResult<(TokenStream2, Expr)> {
@@ -1510,7 +1610,15 @@ fn emit_shell(
         ),
         None => (quote!(), vec![], quote!()),
     };
-    let mut lead: Vec<TokenStream2> = vec![quote!(__node)];
+    // `cancel` workers take no node: the shell holds it and races the worker's
+    // future against the shutdown signal itself, which is the whole point of the
+    // flag — the worker stays a plain async fn with no supervisor in its
+    // signature.
+    let mut lead: Vec<TokenStream2> = if cancel {
+        Vec::new()
+    } else {
+        vec![quote!(__node)]
+    };
     lead.extend(res_leases);
     lead.extend(state_lease);
     let call = inject_call_with(worker, &lead)?;
@@ -1526,19 +1634,56 @@ fn emit_shell(
     // node's exit slot BEFORE mark_exited, so has_exited() implies the value is
     // present. A worker whose return type mismatches the declared `exit:` fails
     // at this provide with a plain rustc type error on the shell.
-    let (bind_out, provide_exit) = match exit {
-        Some(_) => {
-            let exit_ident = format_ident!("{}_EXIT", owner);
-            (quote!(let __out =), quote!(#exit_ident.provide(__out);))
+    // Under `cancel` the worker may not have returned at all — the shell holds a
+    // `Result<Output, Aborted>` — so the exit value is provided only on a real
+    // completion. An aborted worker leaves `<NODE>_EXIT` empty (and
+    // `shutdown_requested()` set), which is how a waiter tells "it finished" from
+    // "it was stopped".
+    //
+    // A DIVERGING worker (`-> !`) makes that provide dead code: its future has
+    // no output, so the slot could never be filled and every `wait_take()` on
+    // it would hang forever. The blanket allow above would hide that, so the
+    // provide re-DENIES `unreachable_code` on itself — the one statement in the
+    // shell where unreachability is a declaration error rather than a
+    // legitimate parked/detached worker. Spanned on the declared `exit:` type,
+    // so rustc points at the clause the user has to remove (a bare diverging
+    // worker stays legal: that is what `cancel` is for).
+    let exit_ident = format_ident!("{}_EXIT", owner);
+    let provide = |exit: &syn::Type| {
+        // Every token of the statement carries the `exit:` type's span, so the
+        // lint's own label lands on that clause instead of the whole item.
+        let slot = Ident::new(&exit_ident.to_string(), exit.span());
+        quote::quote_spanned!(exit.span()=>
+            #[deny(unreachable_code)]
+            #slot.provide(__out);
+        )
+    };
+    let (drive, provide_exit) = match (cancel, exit) {
+        (false, Some(ty)) => {
+            let provide = provide(ty);
+            (quote!(let __out = #call.await;), provide)
         }
-        None => (quote!(), quote!()),
+        (false, None) => (quote!(#call.await;), quote!()),
+        (true, Some(ty)) => {
+            let provide = provide(ty);
+            (
+                quote!(let __res = __node.run_cancellable(#call).await;),
+                quote!(if let ::core::result::Result::Ok(__out) = __res {
+                    #provide
+                }),
+            )
+        }
+        (true, None) => (
+            quote!(let _ = __node.run_cancellable(#call).await;),
+            quote!(),
+        ),
     };
     let def = quote! {
         #(#cfg)*
         #[::embassy_executor::task(pool_size = #ps)]
         #allow_unreachable
         async fn #shell(__node: &'static #cr::TaskNode #(, #res_params)* #state_param) {
-            #bind_out #call.await;
+            #drive
             #state_drop
             #(#restores)*
             #provide_exit
@@ -1583,6 +1728,7 @@ fn emit_node(
                 n.exit.as_ref(),
                 n.state.as_ref(),
                 false,
+                n.cancel,
                 cr,
                 helpers,
             )?;
@@ -1831,6 +1977,7 @@ fn emit_pool(
             None,
             p.state.as_ref(),
             true,
+            p.cancel,
             cr,
             helpers,
         )?,

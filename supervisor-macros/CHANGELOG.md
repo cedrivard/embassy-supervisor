@@ -6,6 +6,43 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.6.0] - 2026-08-03
+
+Pairs with `embassy-supervisor` 0.4.1 (macro pin only; no runtime change).
+
+### Added
+- `cancel` flag on `task:` nodes: the generated shell drives the worker under
+  `TaskNode::run_cancellable` and does NOT inject the node, so a plain
+  supervisor-unaware `async fn` (even diverging) binds directly — `resources:`
+  become the worker's first arguments. On stop/teardown the worker's future is
+  dropped in place and the shell still runs its full tail (state drop, resource
+  restores, exit record, ack), so a `Terminate` respawn re-takes the same
+  instances. With `exit:` the value is provided only on a real completion; an
+  aborted worker leaves the exit slot empty, which is how a waiter tells
+  "finished" from "stopped". The trade is that the worker gets no post-cancel
+  code: a task that must flush or release something *ordered* at teardown keeps
+  the node argument and races `run_cancellable_acked` itself.
+- `cancel` on `task:` pools, as the trailing clause (`min: N, max: M[,
+  slot_timeout: MS], cancel;`). It applies to the one shell all members share, so
+  an elastic shrink can retire a member that would never have acked: its future
+  is dropped in place and its per-member resources are restored to its own slot
+  index, ready for the regrow. A `cancel` member holds no node, so its busy/idle
+  load signal has to be driven from the app on the member static.
+- Two spanned rejections for the flag, on nodes and pools alike: `cancel` without
+  `task:` (it rewrites how the *generated* shell calls the worker; a `spawn:` fn
+  can call `node.run_cancellable(..)` itself), and `cancel` with `Pause` (the
+  node mode or any pool member: a Pause worker must survive the stop and park on
+  `wait_resume()`, but `cancel` drops its future and records an exit).
+
+### Changed
+- `exit:` on a worker that can never return (`-> !`) is now a **compile error**
+  instead of a silently dead provide: the slot could never be filled and a
+  `wait_take()` on it would hang forever. The generated provide re-denies
+  `unreachable_code` on itself, so rustc reports `unreachable statement` (or
+  `unreachable call` under `cancel`) spanned on the `exit:` clause. Diverging
+  workers without `exit:` are unaffected — `cancel`, `Mode::Pause` and detached
+  daemons all rely on them.
+
 ## [0.5.0] - 2026-08-02
 
 Pairs with `embassy-supervisor` 0.4.0 (node-completion observation, exit values).
@@ -211,6 +248,7 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
+[0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.5.0...embassy-supervisor-macros-v0.6.0
 [0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.4.1...embassy-supervisor-macros-v0.5.0
 [0.4.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.4.0...embassy-supervisor-macros-v0.4.1
 [0.4.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.3.1...embassy-supervisor-macros-v0.4.0
