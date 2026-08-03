@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.4.0"
+version = "0.4.1"
 description = "A generic, HAL-agnostic task-lifecycle supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, and runtime start/stop/pause/resume control."
 edition.workspace = true
 authors.workspace = true
@@ -25,7 +25,7 @@ embassy-futures = { version = "0.1" }
 portable-atomic = { version = "1", features = ["critical-section"] }
 defmt = { version = "1.1.0", optional = true }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.5.0", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.6.0", path = "../supervisor-macros", optional = true }
 
 [features]
 # Full-featured out of the box; a footprint-constrained consumer trims with
@@ -258,6 +258,20 @@ required-features = ["macros", "control"]
 [[test]]
 name = "run_loop"
 required-features = ["macros", "control", "pool"]
+
+# `cancel`: the generated shell owns the shutdown race (run_cancellable) and the
+# worker takes no node — stop drops its future in place, the shell still runs its
+# tail (resource restores, exit record, ack).
+[[test]]
+name = "task_cancel"
+required-features = ["macros"]
+
+# `cancel` on a pool: the shared shell answers each member's shutdown, so an
+# elastic shrink can retire a plain diverging worker (and restore its
+# per-member resource to its own slot index).
+[[test]]
+name = "pool_cancel"
+required-features = ["macros", "pool"]
 
 # The compile-time topological sort (const-evaluated adjacency tables).
 [[test]]

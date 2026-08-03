@@ -70,47 +70,95 @@ Preemptive priority tiers *and* cooperative scheduling from one async codebase, 
 
 ## Architecture at a glance
 
-The general shape — a compile-time graph declaration, one supervisor task, and the executors,
-pools, and layers it orchestrates (the [demo firmware](firmware/README.md) is a concrete,
-flashable instantiation of exactly this):
+The shape, in three views: how a declaration becomes a running graph, what the supervisor does to
+it at run time, and what an individual node carries (the [demo firmware](firmware/README.md) is a
+concrete, flashable instantiation of all three).
+
+**1. From declaration to running tasks.**
 
 ```mermaid
-flowchart TD
-    subgraph CT["Compile time"]
-        DSL["supervisor_graph!<br/>nodes · deps · modes · pools · executor slots"]
-        GRAPH["static GRAPH<br/>node slots · dep table · pools · topological order<br/>(an invalid graph — cycle, unknown/duplicate dep, bad bounds — is a compile error)"]
-        DSL -- generates --> GRAPH
+flowchart LR
+    FRAG["supervisor_fragment!<br/>one per module or crate"]
+    DSL["supervisor_graph!<br/>or compose_graph!"]
+    GEN["static GRAPH<br/>node slots · deps · order · task shells"]
+    SUP["Supervisor task<br/>one per graph"]
+
+    FRAG -- composed into --> DSL
+    DSL -- generates --> GEN
+    GEN --> SUP
+
+    subgraph TIERS["Spawn targets — picked per node with executor:"]
+        T0["Thread executor<br/>cooperative tier, the default"]
+        IE["Interrupt executor<br/>preemptive tier"]
+        C1["Second core<br/>no migration"]
+        POOL["Elastic pool<br/>min..max workers"]
     end
 
-    subgraph RT["Run time"]
-        SUP["Supervisor task<br/>bring-up: start(spawner).await, dependency-ordered<br/>teardown: reverse order, stops cascade through dependents<br/>control: wait_control → apply_control<br/>pool scaling: run_pools — grow under load, shrink after cooldown"]
-
-        subgraph EXEC["Spawn targets"]
-            T0["Thread executor<br/>cooperative tier (default)"]
-            IE["Interrupt executor<br/>preemptive tier via executor: slot"]
-            C1["Second core's executor<br/>multi-core placement, no migration"]
-            POOL["Elastic pool<br/>min..max single-instance workers"]
-        end
-
-        CTRL["Control plane<br/>request_control from anywhere:<br/>start / stop / pause / resume a node or pool"]
-        TRACE["Trace layer (feature-gated)<br/>per-node ticks and polls · executor stats · stall detection"]
-    end
-
-    GRAPH --> SUP
     SUP --> T0
     SUP --> IE
     SUP --> C1
     SUP <--> POOL
-    CTRL --> SUP
-    T0 -.-> TRACE
-    IE -.-> TRACE
-    C1 -.-> TRACE
 ```
+
+The graph is validated where it is written: a cycle, an unknown or duplicate dep, bad pool bounds
+are all *compile errors*, and the topological order is computed at compile time. Fragments let a
+module or a whole crate declare its own slice; `name:` lets one binary hold several graphs, so a
+subsystem can be a sub-graph an app state machine brings up and drops per phase.
+
+**2. What the supervisor does with it.**
+
+```mermaid
+flowchart TD
+    APP["Anywhere in the app<br/>an HTTP handler, a button, an ISR"]
+    MBOX["Control mailbox<br/>request_control, or try_request_control"]
+    SUP["Supervisor"]
+    UP["start / run<br/>dependency order, every spawn gated"]
+    DOWN["stop_node / teardown<br/>reverse order, cascades to dependents"]
+    SCALE["run_pools<br/>grow under load, shrink after a cooldown"]
+    BUSY["Resource or readiness missing<br/>→ fail closed with Busy"]
+    TO["Ack missed<br/>→ ShutdownTimeout naming the node"]
+
+    APP --> MBOX --> SUP
+    SUP --> UP
+    SUP --> DOWN
+    SUP --> SCALE
+    UP -.-> BUSY
+    DOWN -.-> TO
+```
+
+Both failure edges are *returned values*, never a panic inside the library: bring-up refuses to
+spawn a task whose peripherals or dependencies are not ready yet, and a node that misses its
+shutdown ack is named to the application, which decides whether to retry, log, or reset.
+
+**3. What a node carries.**
+
+```mermaid
+flowchart LR
+    NODE["A node<br/>Terminate · Pause · OnDemand"]
+    RES["resources:<br/>moved in from main, restored on exit"]
+    STATE["state:<br/>heap per activation, freed on exit"]
+    DONE["completion<br/>a task that returns is observed; exit: keeps its value"]
+    READY["readiness<br/>dependents wait until it actually serves"]
+    LIVE["liveness<br/>a heartbeat a watchdog can read"]
+    TRACE["trace<br/>ticks · polls · stall detection"]
+
+    NODE --> RES
+    NODE --> STATE
+    NODE --> DONE
+    NODE --> READY
+    NODE --> LIVE
+    NODE -.-> TRACE
+```
+
+Everything below the mode is optional and mostly feature-gated — a minimal build is just the
+dependency-ordered core.
 
 App tasks are the graph *nodes* — each hangs off whichever executor slot its `executor:` annotation
 names (unannotated → the default thread executor). The supervisor never runs task code itself; it
-only spawns, parks, and tears down tasks onto the tiers, and scales the pool. A **detached** node
-is a self-managed daemon the supervisor starts once and then leaves alone.
+only spawns, parks, and tears down tasks onto the tiers, and scales the pool. A **detached** node is
+a self-managed daemon the supervisor starts once and then leaves alone; a **`cancel`** node is the
+other extreme — a plain worker that knows nothing of the supervisor, whose future the generated
+shell drops in place on stop.
 
 ## What the supervisor adds
 

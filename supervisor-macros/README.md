@@ -22,7 +22,8 @@ macro's surface syntax and examples, and this crate's
 [CHANGELOG](CHANGELOG.md) for what each release adds (0.2.0: `executor:` slots,
 pool-name deps, trace spawn glue, duplicate-dep/name rejection; 0.3.0: `task:` shells +
 `resources:`; 0.4.0: `local`/`consume` resource kinds; 0.5.0: fragments, named graphs,
-`exit:`/`state:` clauses, per-member pool resources, `ready` dep markers).
+`exit:`/`state:` clauses, per-member pool resources, `ready` dep markers; 0.6.0: the
+`cancel` flag for supervisor-unaware workers).
 
 ## License
 

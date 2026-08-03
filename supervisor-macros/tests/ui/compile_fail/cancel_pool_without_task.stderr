@@ -1,0 +1,5 @@
+error: `cancel` requires `task:` — it wraps the generated shell's call to the member worker; a `spawn:` member fn can call `node.run_cancellable(..)` itself
+  --> tests/ui/compile_fail/cancel_pool_without_task.rs:14:25
+   |
+14 |         min: 1, max: 2, cancel;
+   |                         ^^^^^^
