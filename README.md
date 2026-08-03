@@ -9,7 +9,7 @@ executors, with a governed heap and coordinated power and OTA — the structure 
 RTOS with none of its kernel, stacks, or overhead. The `no_std` **`embassy-supervisor`** crate is
 its drop-in core.
 
-[<img src="https://img.youtube.com/vi/rlLaaMKMPWo/maxresdefault.jpg" alt="Video: embassy-supervisor — RTOS-grade Lifecycle for Async Rust Firmware" width="640">](https://youtu.be/rlLaaMKMPWo)
+[<img src="https://i.ytimg.com/vi_webp/rlLaaMKMPWo/maxresdefault.webp" alt="Video: embassy-supervisor — RTOS-grade Lifecycle for Async Rust Firmware" width="640">](https://youtu.be/rlLaaMKMPWo)
 
 ▶ **[RTOS-grade Lifecycle for Async Rust Firmware](https://youtu.be/rlLaaMKMPWo)** — video walkthrough
 of the architecture: the graph declaration and its compile-time guarantees, executor tiers, the
