@@ -1803,10 +1803,10 @@ impl<const N: usize> Supervisor<N> {
                 continue;
             }
             info!("supervisor: tearing down {}", node.name);
-            if let Err(e) = self.shutdown_and_wait(node).await {
-                if first_err.is_ok() {
-                    first_err = Err(e);
-                }
+            if let Err(e) = self.shutdown_and_wait(node).await
+                && first_err.is_ok()
+            {
+                first_err = Err(e);
             }
         }
         first_err

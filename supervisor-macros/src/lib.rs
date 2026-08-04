@@ -760,13 +760,13 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
     // `slot_timeout: 0` would make every gated spawn fail instantly — reject it
     // as the declaration bug it is (`base10_parse::<u64>` also rejects suffixed
     // or oversized literals with a span-attached error).
-    if let Some(st) = &slot_timeout {
-        if st.base10_parse::<u64>()? == 0 {
-            return Err(syn::Error::new_spanned(
-                st,
-                "`slot_timeout:` must be at least 1 (milliseconds)",
-            ));
-        }
+    if let Some(st) = &slot_timeout
+        && st.base10_parse::<u64>()? == 0
+    {
+        return Err(syn::Error::new_spanned(
+            st,
+            "`slot_timeout:` must be at least 1 (milliseconds)",
+        ));
     }
 
     // Exactly one of `spawn:` / `task:` may pick the node's task.
@@ -816,13 +816,13 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
             }
         }
     }
-    if let Some(ps) = &pool_size {
-        if ps.base10_parse::<usize>()? == 0 {
-            return Err(syn::Error::new_spanned(
-                ps,
-                "`pool_size:` must be at least 1",
-            ));
-        }
+    if let Some(ps) = &pool_size
+        && ps.base10_parse::<usize>()? == 0
+    {
+        return Err(syn::Error::new_spanned(
+            ps,
+            "`pool_size:` must be at least 1",
+        ));
     }
     // `state:` lives in the generated shell (it owns the Box across the worker
     // call and drops it on exit); a `spawn:` fn can box its own state.
@@ -839,15 +839,15 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
     // `exit:` captures the worker's return value in the generated shell — only
     // `task:` has one. A `spawn:` fn (or a parked node) owns its body and can
     // `provide()` into any slot itself.
-    if let Some((k, _)) = &exit {
-        if task.is_none() {
-            return Err(syn::Error::new_spanned(
-                k,
-                "`exit:` requires `task:` — the generated shell is what captures \
+    if let Some((k, _)) = &exit
+        && task.is_none()
+    {
+        return Err(syn::Error::new_spanned(
+            k,
+            "`exit:` requires `task:` — the generated shell is what captures \
                  the worker's return value; a `spawn:` task fn can provide() into \
                  a slot itself",
-            ));
-        }
+        ));
     }
     // `cancel` rewrites how the generated shell drives the worker; a `spawn:` fn
     // (or a parked node) owns its own body and can call `run_cancellable` itself.
@@ -879,18 +879,18 @@ fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
     // an `executor:`-routed node spawns through a `SendSpawner`, whose `spawn`
     // requires a `Send` future. Reject here with the reason instead of letting
     // rustc surface it as an opaque `F: Send` bound failure deep in the glue.
-    if let (Some((_, decls)), Some(ex)) = (&resources, &executor) {
-        if let Some(l) = decls.iter().find_map(|d| d.local.as_ref()) {
-            return Err(syn::Error::new_spanned(
-                l,
-                format!(
-                    "`local` resources cannot be combined with `executor: {ex}` — a \
+    if let (Some((_, decls)), Some(ex)) = (&resources, &executor)
+        && let Some(l) = decls.iter().find_map(|d| d.local.as_ref())
+    {
+        return Err(syn::Error::new_spanned(
+            l,
+            format!(
+                "`local` resources cannot be combined with `executor: {ex}` — a \
                      local slot exists to carry `!Send` values, and a node routed \
                      through a `SpawnerSlot` (`SendSpawner`) must have a `Send` \
                      future; run the node on the supervisor's own executor"
-                ),
-            ));
-        }
+            ),
+        ));
     }
     let source = match (spawn, task) {
         (Some(e), _) => Some(TaskSource::Spawn(e)),
@@ -1100,18 +1100,18 @@ fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem> {
     }
     // Same `Send` reasoning as the node-side check: a `local` (i.e. `!Send`able)
     // resource cannot ride members routed through a `SendSpawner`.
-    if let Some(ex) = &executor {
-        if let Some(l) = resources.iter().find_map(|d| d.local.as_ref()) {
-            return Err(syn::Error::new_spanned(
-                l,
-                format!(
-                    "`local` resources cannot be combined with `executor: {ex}` — a \
+    if let Some(ex) = &executor
+        && let Some(l) = resources.iter().find_map(|d| d.local.as_ref())
+    {
+        return Err(syn::Error::new_spanned(
+            l,
+            format!(
+                "`local` resources cannot be combined with `executor: {ex}` — a \
                      local slot exists to carry `!Send` values, and a pool routed \
                      through a `SpawnerSlot` (`SendSpawner`) must have `Send` \
                      futures; run the pool on the supervisor's own executor"
-                ),
-            ));
-        }
+            ),
+        ));
     }
     Ok(PoolItem {
         cfg,
