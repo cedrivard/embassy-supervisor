@@ -4,6 +4,18 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-08-04
+
+Static-RAM fix for cancellable workers, on both sides: the runtime combinators and
+the generated `cancel` shells (macro pin moves to
+`embassy-supervisor-macros = "=0.6.2"`). No DSL, API or behavioural change —
+recompiling picks it up.
+
+### Changed
+- New dependency `pin-project-lite` (declarative-macro only, `no_std`) for the safe
+  pin projection the hand-written future needs.
+- **MSRV raised to 1.88** (from 1.85), for the let-chain in that future's `poll`.
+
 ## [0.4.2] - 2026-08-03
 
 Macro pin moves to `embassy-supervisor-macros = "=0.6.1"`. No runtime code, API,

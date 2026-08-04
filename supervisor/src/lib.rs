@@ -230,7 +230,9 @@ mod fmt;
 
 use core::cell::Cell;
 use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::Ordering;
+use core::task::{Context, Poll};
 
 use embassy_executor::{SendSpawner, SpawnError, Spawner};
 use embassy_futures::select::{Either, select};
@@ -410,6 +412,58 @@ pub struct Aborted;
 impl defmt::Format for Aborted {
     fn format(&self, fmt: defmt::Formatter) {
         defmt::write!(fmt, "aborted by shutdown");
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// The future behind [`TaskNode::run_cancellable`] and
+    /// [`run_cancellable_acked`](TaskNode::run_cancellable_acked): races the
+    /// worker against the node's shutdown signal, holding the worker's state
+    /// machine **once**.
+    ///
+    /// Written by hand rather than as `select(fut, wait_shutdown()).await` inside
+    /// an `async fn`, because that shape stores the worker both as the function's
+    /// argument and inside the select (rust-lang/rust#62958) — a doubling paid in
+    /// every caller's static task storage, which for a graph of `cancel` nodes is
+    /// the sum of every worker future in the binary.
+    ///
+    /// `fut` is an `Option` so the abort path can drop the worker in place, via
+    /// the safe `Pin::set`, *before* acking: the ack is what releases the
+    /// supervisor's teardown wait, and a runner whose `Drop` frees hardware must
+    /// have run by then.
+    struct RunCancellable<'a, F, S> {
+        #[pin]
+        fut: Option<F>,
+        #[pin]
+        shutdown: S,
+        // `Some` only for the `_acked` variant.
+        ack: Option<&'a TaskNode>,
+    }
+}
+
+impl<F: Future, S: Future<Output = ()>> Future for RunCancellable<'_, F, S> {
+    type Output = Result<F::Output, Aborted>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        // Worker first, shutdown second — the polling order `select` gave this
+        // before, so a worker that completes in the same wake as a stop request
+        // still reports completion rather than abort.
+        if let Some(fut) = this.fut.as_mut().as_pin_mut()
+            && let Poll::Ready(out) = fut.poll(cx)
+        {
+            return Poll::Ready(Ok(out));
+        }
+        match this.shutdown.poll(cx) {
+            Poll::Ready(()) => {
+                this.fut.set(None);
+                if let Some(node) = this.ack {
+                    node.ack_dropped();
+                }
+                Poll::Ready(Err(Aborted))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -1104,10 +1158,21 @@ impl TaskNode {
     ///     Err(Aborted) => { flush().await; node.ack_dropped(); return; }
     /// }
     /// ```
-    pub async fn run_cancellable<F: Future>(&self, fut: F) -> Result<F::Output, Aborted> {
-        match select(fut, self.wait_shutdown()).await {
-            Either::First(out) => Ok(out),
-            Either::Second(()) => Err(Aborted),
+    ///
+    /// Returns a future rather than being an `async fn` on purpose: an `async fn`
+    /// keeps `fut` in its own frame *and* in the `select` that lives across the
+    /// await, and rustc does not overlap the two slots
+    /// (rust-lang/rust#62958) — so the worker's state machine would be reserved
+    /// twice in the caller's static storage. The hand-written future below holds
+    /// it exactly once.
+    pub fn run_cancellable<F: Future>(
+        &self,
+        fut: F,
+    ) -> impl Future<Output = Result<F::Output, Aborted>> {
+        RunCancellable {
+            fut: Some(fut),
+            shutdown: self.wait_shutdown(),
+            ack: None,
         }
     }
 
@@ -1119,12 +1184,20 @@ impl TaskNode {
     /// ```ignore
     /// let _ = node.run_cancellable_acked(runner.run()).await; // drop releases the pins
     /// ```
-    pub async fn run_cancellable_acked<F: Future>(&self, fut: F) -> Result<F::Output, Aborted> {
-        let out = self.run_cancellable(fut).await;
-        if out.is_err() {
-            self.ack_dropped();
+    /// Single-copy for the same reason as
+    /// [`run_cancellable`](Self::run_cancellable), and it keeps that method's
+    /// ordering: on abort the worker future is dropped **before** the ack, so a
+    /// runner whose `Drop` is the cleanup has released everything by the time the
+    /// supervisor observes the handshake.
+    pub fn run_cancellable_acked<F: Future>(
+        &self,
+        fut: F,
+    ) -> impl Future<Output = Result<F::Output, Aborted>> {
+        RunCancellable {
+            fut: Some(fut),
+            shutdown: self.wait_shutdown(),
+            ack: Some(self),
         }
-        out
     }
 
     /// Report that this task started serving a request (active). Fires the
