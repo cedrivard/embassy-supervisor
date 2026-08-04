@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "embassy-supervisor"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "critical-section",
  "defmt 1.1.0",
@@ -656,12 +656,13 @@ dependencies = [
  "embassy-supervisor-macros",
  "embassy-sync",
  "embassy-time",
+ "pin-project-lite",
  "portable-atomic",
 ]
 
 [[package]]
 name = "embassy-supervisor-macros"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "critical-section",
  "embassy-executor",

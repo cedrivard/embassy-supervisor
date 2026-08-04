@@ -1664,6 +1664,14 @@ fn emit_shell(
             #slot.provide(__out);
         )
     };
+    // The `cancel` arms pin the worker into the shell's own frame and hand
+    // `run_cancellable` a `Pin<&mut _>`: the shell then stores the worker's state
+    // machine ONCE, whatever rustc decides to do with the callee's arguments
+    // (rust-lang/rust#62958 doubles a future passed by value into an `async fn`,
+    // and this is static task storage, so the doubling was per node, per binary).
+    // The `pin!` lives in its own block so the worker is dropped at the same point
+    // it always was — before the restores below, which move the lent resources
+    // back out.
     let (drive, provide_exit) = match (cancel, exit) {
         (false, Some(ty)) => {
             let provide = provide(ty);
@@ -1673,14 +1681,17 @@ fn emit_shell(
         (true, Some(ty)) => {
             let provide = provide(ty);
             (
-                quote!(let __res = __node.run_cancellable(#call).await;),
+                quote!(let __res = { let __fut = ::core::pin::pin!(#call); __node.run_cancellable(__fut).await };),
                 quote!(if let ::core::result::Result::Ok(__out) = __res {
                     #provide
                 }),
             )
         }
         (true, None) => (
-            quote!(let _ = __node.run_cancellable(#call).await;),
+            quote!({
+                let __fut = ::core::pin::pin!(#call);
+                let _ = __node.run_cancellable(__fut).await;
+            }),
             quote!(),
         ),
     };

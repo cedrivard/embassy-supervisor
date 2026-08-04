@@ -16,7 +16,7 @@ edition = "2024"
 authors = ["Cedric Rivard <cedric@rivard.info>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/cedrivard/embassy-supervisor"
-rust-version = "1.85"
+rust-version = "1.88"
 
 # No `[patch.crates-io]`: a release is verified against exactly what consumers
 # resolve from the registry. The run-queue idle-path change (embassy-rs/embassy

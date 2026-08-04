@@ -6,6 +6,24 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.6.2] - 2026-08-04
+
+### Fixed
+- A `cancel` node's generated shell reserved its worker's state machine **twice**
+  in static task storage. The shell drove the worker as
+  `node.run_cancellable(worker(..)).await`, passing the future by value into an
+  `async fn`, which rustc lays out both as that function's argument and inside the
+  select it lives across ([rust-lang/rust#62958]) — so every `cancel` node in a
+  graph cost an extra copy of its worker future in `.bss`. The shell now pins the
+  worker into its own frame and hands `run_cancellable` a `Pin<&mut _>`, which
+  stores it once whatever the callee does with its arguments. Applies to `task:`
+  pools too, per member. Drop order is unchanged: the worker is still dropped
+  before the shell's resource restores, state drop and exit record.
+
+### Changed
+- **MSRV raised to 1.88** (from 1.85), following the workspace; see the
+  supervisor's CHANGELOG. Nothing in the generated code requires it.
+
 ## [0.6.1] - 2026-08-03
 
 ### Fixed
