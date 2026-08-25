@@ -1,10 +1,3 @@
-//! Behavioral test for `task:` — macro-generated `#[embassy_executor::task]`
-//! shells around ONE generic async worker fn.
-//! A real executor drives two shell nodes instantiated at different
-//! types plus a shell-driven pool floor through `start -> teardown ->
-//! respawn_terminate`, proving each stamped shell spawns, acks, and respawns like
-//! a hand-written task, and that the per-declaration `TaskPool`s are independent.
-
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
@@ -43,8 +36,6 @@ async fn worker<P: Probe>(node: &'static TaskNode, bump: u32) {
         .await;
 }
 
-/// Pool-member worker (non-generic on purpose: proves `task:` is useful for the
-/// plain "spare me the #[task] boilerplate" case too).
 async fn pool_worker(node: &'static TaskNode) {
     POOL_RUNS.fetch_add(1, Ordering::SeqCst);
     let _ = node
@@ -76,7 +67,7 @@ async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
 
     // start(): both shell nodes + the pool floor (its shell is sized K=2) come up.
-    sup.start(spawner).await.expect("start");
+    sup.start(&spawner).await.expect("start");
     settle(|| {
         FAST_RUNS.load(Ordering::SeqCst) == 1
             && SLOW_RUNS.load(Ordering::SeqCst) == 1
@@ -101,16 +92,13 @@ async fn driver(spawner: Spawner) {
         assert_ne!(FAST.task_id(), 0, "shell spawn adopted into trace registry");
     }
 
-    // teardown(): shells select against wait_shutdown and ack like any task.
     sup.teardown().await.expect("teardown");
     assert!(
         !FAST.is_running() && !SLOW.is_running(),
         "shell nodes torn down"
     );
 
-    // respawn_terminate(): each shell's TaskPool slot was freed on exit, so the
-    // same shells respawn; per-type counters prove the right monomorphizations.
-    sup.respawn_terminate(spawner).await.expect("respawn");
+    sup.respawn_terminate(&spawner).await.expect("respawn");
     settle(|| FAST_RUNS.load(Ordering::SeqCst) == 2 && SLOW_RUNS.load(Ordering::SeqCst) == 2).await;
     assert_eq!(FAST_RUNS.load(Ordering::SeqCst), 2, "Fast shell respawned");
     assert_eq!(SLOW_RUNS.load(Ordering::SeqCst), 2, "Slow shell respawned");
@@ -120,8 +108,6 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn generated_shells_spawn_ack_and_respawn() {
-    // Frozen mock clock: the teardown ack-timeout Timer needs a registered driver
-    // but never fires (every shell acks immediately).
     let _clock = MockDriver::get();
 
     std::thread::spawn(|| {

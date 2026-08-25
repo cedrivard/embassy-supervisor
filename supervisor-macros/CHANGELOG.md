@@ -6,6 +6,165 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.7.0] - 2026-08-25
+
+### Added
+
+- `ack_timeout: MS` (node and pool) emits `.with_ack_timeout(Duration::from_millis(N))`
+  on the node config (every member's, for a pool): the per-node override of the 2 s
+  shutdown-ack window.
+- `state: zeroed Type`: emits a second helper, `__sv_try_box_zeroed`, that allocates
+  with `alloc_zeroed` under a `T: embassy_supervisor::Zeroable` bound; the init-form
+  helper is emitted only where an `= init_expr` clause exists.
+- `#[dataflow]` carries statement-level `#[cfg]` into the derived tables: a
+  verb call under a feature-gated statement emits an entry gated the same way
+  (per-entry cfg on the table element, cfg-aware table length, and call sites
+  indexing by the cfg-aware count of live entries ahead). A signal reached
+  both gated and ungated stays one unconditional entry; distinct gates
+  disjoin into `any(..)`.
+- `dataflow:` adoption entries take a per-entry `#[cfg(..)]`, like `deps:` and
+  `reads:` entries — a feature-gated accessor is ordinary. The bound table set,
+  its cfg-aware length, and the `discover` marker assertions all follow the
+  build.
+- `deps:` is optional, on nodes and pools alike: omitting it is `deps: []`, the
+  natural spelling for a graph whose ordering lives in the runtime coupling. It
+  is also order-free among the clauses now rather than positional; a duplicate
+  clause is a spanned error.
+- `provides: [SLOT, ..]` node clause (no feature — the clause is its own opt-in,
+  like `slot_timeout:`): names the resource slots
+  this node's task fills at runtime, resolved against the graph's `resources:`
+  entries (an unknown name is a span-attached expansion error, not rustc's
+  "cannot find value"). Emits a per-node `&dyn ResourceGate` array and the
+  `.with_provides` builder call, through which the node's shutdown ack clears the
+  slots. Duplicate names and an empty list are rejected at parse.
+- `beat_timeout: MS` / `beat_window: N` node clauses (feature `liveness-monitor`),
+  emitting `.with_beat_timeout(..)` / `.with_beat_window(..)`. Rejected with
+  span-attached errors: `beat_timeout: 0`, a `beat_window:` without a `beat_timeout:`,
+  and a `beat_window:` outside `1..=255` — the builder takes a `u8` and the sweep reads
+  the window as `max(1)`, so out of range would be a type mismatch inside the expansion
+  and zero a silent coercion.
+- `reads: [path, ..]` / `writes: [path, ..]` node clauses (feature `coupling`). Entries
+  are **paths, not expressions**: each is emitted as `&PATH` into a `[Coupling; N]`
+  table alongside the path rendered verbatim for diagnostics, so the compiler checks the
+  item exists and is `Sync`. An empty list and a repeated path are expansion-time
+  errors (duplicates compared as text — one-sided by design: it never rejects a
+  correct declaration, and cross-node matching is by address at runtime).
+- `bound` dep marker (feature `bound-deps`), emitting the per-node
+  `with_bound_deps` array.
+- Dep markers now compose in any order (`X ready bound` == `X bound ready`), each at
+  most once. `bound` without `ready` is rejected.
+- `observed` entry marker on `reads:`/`writes:` (feature `coupling-observe`), emitting
+  `.observed(Observer::new(|| ..))`. The accessor comes from a graph-level
+  `observe writes: <expr>;` / `observe reads: <expr>;` default with `it` bound to the
+  signal, or from a per-entry `observed via <expr>` override. An `observed` entry with
+  neither resolves through the supervisor's `Observable` facade (see Changed).
+- `it` is substituted into the accessor **at the token level**, rewriting the author's
+  own token rather than binding one the macro invents. A graph reaches this macro
+  through `macro_rules!` relays (`supervisor_fragment!`, `compose_graph!`), where an
+  invented `it` would land in a different hygiene context than the author's and the two
+  would never resolve to each other. The substituted signal is parenthesised, so
+  `it.load()` cannot reassociate into `&(PATH.load())`.
+- Per-entry `#[cfg(..)]` on `reads:`/`writes:` entries, matching `deps:`; the emitted
+  table's length is sized with the same `cfg_aware_len` machinery as the dep-marker
+  overlays.
+- `[idx]` on a signal entry (`reads: [crate::ARR[0]]`), selecting one element of an
+  array of signals. Declaring one path both bare and indexed is rejected: `&ARR` and
+  `&ARR[0]` are the same address, so nothing downstream could tell the element from
+  the whole.
+- `open` joins `get`/`reader` as a scanned read verb (feature `dataflow`), so a
+  gated access lands in the derived `reads:` table like any other read.
+- `#[dataflow]` attribute (feature `dataflow`): derives a task fn's coupling
+  tables from the verb calls in its body (receiver-keyed on the fn's `TaskNode`
+  parameter), emits them as flash `static`s beside the fn, and rewrites each call
+  site to carry its table entry. The arguments register the consumer's own verbs
+  (`#[dataflow(read(subscribe), write(publish))]`) and carry nothing else: the idents
+  join the table the walk keys on, additively and per fn, with the direction stated
+  because the scan is token-level. Span-attached errors for a computed argument, a
+  missing `TaskNode` parameter, a registration naming a built-in verb or repeating
+  itself, and arguments that are not registrations.
+- `discover` clause on nodes and pools (feature `dataflow`): binds the
+  `task:`/`spawn:` fn's `#[dataflow]` tables in place of declared lists.
+  Rejected on a parked node or on a closure spawn. A `reads:`/`writes:` list
+  beside it may only add markers (`observed`, `beat`) to a signal the scan
+  already found, checked by an emitted const assertion over the bound tables;
+  an unmarked entry is a spanned error.
+- `dataflow: [path::to::fn, ..]` clause on nodes and pools (feature
+  `dataflow`): adopts the named `#[dataflow]` fns' tables beside the item's
+  own sources. Emission builds one table-of-tables per direction (declared list
+  first, then `discover`'s, then each adopted fn's) bound via `.with_reads`/
+  `.with_writes`.
+- `beat` qualifier on an `observed` **write** entry, emitting `.beat()`. Only
+  `observed beat` entries feed the sweep-driven heartbeat; an `observed` entry
+  without it states a coupling and nothing more. `beat` on a `reads:` entry, or
+  without `observed`, is a spanned error — a body-side heartbeat is written at
+  the site that produces it (`beat_put`/`beat_writer`, or a `node.beat()` call).
+- `ready_on_write` node clause (features `coupling-observe` + `readiness`),
+  emitting `.with_ready_on_write()`. Requires an `observed beat` entry in
+  `writes:` and `beat_timeout:` — the monitor sweep's poll of that write is what
+  asserts the readiness; a body that beats through its verbs asserts its own
+  readiness, with `set_ready()` at the write. Missing either requirement is a
+  span-attached error.
+
+### Changed
+
+- A per-node `task:` shell calls `mark_exited()` through the node's static
+  instead of its `__node` parameter, so the parameter's last use is the worker
+  call and it stays out of the task arena (it was live across the worker await
+  only for that trailing call). Saves up to 8 B of RAM per node arena where
+  the reference crossed an alignment boundary. Pool shells are shared by their
+  members and keep the parameter.
+- **Breaking (emitted code):** `supervisor_graph!` computes the graph's
+  structural `shape` bits at expansion (any `ready`/`bound` marker, `executor:`,
+  `resources:`, `Pause`/`OnDemand` mode, `beat_timeout:`, `observed` entry,
+  `pool` — `#[cfg]`-gated items counted, conservatively) and emits the graph as
+  `Graph<N, GRAPH_TOPOLOGY>`, where the new `GRAPH_TOPOLOGY` alias (named-graph
+  form: `<NAME>_TOPOLOGY`) names `Ordered<N, SHAPE>` — or `Flat<SHAPE>` for a
+  graph with no `deps:` edge anywhere, in which case the `DEPS` backing table is
+  not emitted at all. The alias is what a `static` supervisor annotation names.
+- **Breaking (emitted code):** each node's immutable config is emitted as its own
+  flash-resident `static` (`__SV_CFG_<NODE>`, built with `NodeCfg::new` + the
+  `with_*` chain; one `[NodeCfg; K]` array per pool), and the node static becomes
+  `TaskNode::new(&__SV_CFG_<NODE>, disabled)` — so a node's RAM footprint is its
+  handle plus one pointer, not its whole declaration.
+- The graph grammar now lives in **`embassy-supervisor-syntax`**, a new dependency
+  pinned by exact version. A `proc-macro` crate can export nothing but its macros, so
+  the parser was unreachable to anything else; the tooling that reads a declaration
+  from source can now share it instead of keeping a second definition of the syntax.
+  Nothing about the accepted grammar, the diagnostics or the generated code changes.
+- Feature gating is a pass over the parsed graph rather than part of parsing. The
+  syntax crate accepts every construct and keeps the marker or clause keyword each
+  rejection points at; this crate decides which are permitted. Same messages, same
+  spans. One consequence: a graph with both a syntax error and a feature error now
+  reports the syntax error first.
+- The unknown-dep-marker error now lists every valid marker
+  (`expected `,`, `]`, or a dep marker (`ready`, `bound`)`), so its `.stderr`
+  snapshot changed.
+- A bare `observed` with no `via` and no graph-level default resolves through the
+  supervisor's `Observable` facade (`embassy-supervisor-observe`) instead of being a
+  "needs an accessor" expansion error; a type implementing nothing now gets the
+  compiler's trait-bound error at the graph site, which is the diagnostic the
+  `observed_without_accessor` fixture snapshots.
+- Fragments take plain `crate::…` paths: the macro normalizes them to `$crate`,
+  the spelling that survives the relay to a foreign compose site still meaning
+  the fragment's crate. At the definition site the two can only mean the same
+  thing, so fragment authors write ordinary Rust and stay portable
+  (`$crate::…` remains accepted).
+- `observe` is a graph-level item accepted **anywhere** in the item list, deliberately:
+  `compose_graph!` splices fragment items in front of the graph block, so requiring it
+  first would make the defaults unusable from a composed graph. The graph-item error
+  now reads `expected `node`, `pool`, `executor`, or `observe``, and the node clause
+  list names `ready_on_write`.
+
+### Fixed
+
+- `exit:` on a node declared at a `compose_graph!` site alongside
+  `supervisor_fragment!` fragments failed to compile: the shell's `let __out` binding
+  was emitted with the macro's call-site span while the exit slot's `provide(__out)`
+  used the `exit:` type's span, giving the two occurrences different hygiene contexts.
+  Both now use the `exit:` type's span — which fixes the resolution and keeps the
+  clause's `unreachable_code` diagnostic pointing at the clause rather than at the whole
+  graph declaration.
+
 ## [0.6.2] - 2026-08-04
 
 ### Fixed
@@ -276,6 +435,8 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
+[0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.6.2...embassy-supervisor-macros-v0.7.0
+[0.6.2]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.6.1...embassy-supervisor-macros-v0.6.2
 [0.6.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.6.0...embassy-supervisor-macros-v0.6.1
 [0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.5.0...embassy-supervisor-macros-v0.6.0
 [0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.4.1...embassy-supervisor-macros-v0.5.0

@@ -1,6 +1,3 @@
-//! `#[cfg(...)]` on a whole pool declaration. A cfg-ed-out pool keeps its member
-//! *slots* (the macro can't evaluate cfg), but its `ElasticPool` static and its
-//! `GRAPH.pools` entry are gated away, and its `GRAPH.nodes` slot becomes `None`.
 
 use embassy_supervisor::{DeferredShrink, TaskNode, supervisor_graph};
 

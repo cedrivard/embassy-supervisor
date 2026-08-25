@@ -1,6 +1,3 @@
-//! `state: Type = init_expr` on a node and on a pool: the glue fallibly boxes
-//! the init, the shell lends the worker `&mut Type` (after resources, before
-//! extras) and drops the Box on exit.
 
 use embassy_supervisor::{DeferredShrink, TaskNode, supervisor_graph};
 
@@ -23,6 +20,6 @@ supervisor_graph! {
 }
 
 fn main() {
-    assert_eq!(GRAPH.order, [0, 1, 2]);
+    assert!(GRAPH.order().eq([0, 1, 2]));
     assert_eq!(WORKERS_MEMBERS, 2);
 }

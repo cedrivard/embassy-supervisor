@@ -1,0 +1,8 @@
+error[E0080]: evaluation panicked: node `a`: `writes: [crate::ELSEWHERE ..]` marks a signal no bound `#[dataflow]` table carries. Beside `discover` an entry may only add a marker to a coupling the scan already found, so either the task fn does not access this signal, or it reaches it under a different final path segment
+  --> tests/ui/compile_fail_dataflow/discover_marker_not_derived.rs:12:1
+   |
+12 | / supervisor_graph! {
+13 | |     node A = Terminate, deps: [], task: w, discover,
+14 | |         writes: [crate::ELSEWHERE observed beat];
+15 | | }
+   | |_^ evaluation of `_` failed here

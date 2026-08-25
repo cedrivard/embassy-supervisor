@@ -1,5 +1,5 @@
 error: duplicate node/pool name `A`
- --> tests/ui/compile_fail/duplicate_name.rs:9:10
+ --> tests/ui/compile_fail/duplicate_name.rs:6:10
   |
-9 |     node A = Pause, deps: [];
+6 |     node A = Pause, deps: [];
   |          ^

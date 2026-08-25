@@ -1,5 +1,5 @@
 error: `cancel` requires `task:` — it wraps the generated shell's call to the worker; a `spawn:` task fn can call `node.run_cancellable(..)` itself
-  --> tests/ui/compile_fail/cancel_without_task.rs:11:58
-   |
-11 |     node PROBE = Terminate, deps: [], spawn: probe_task, cancel;
-   |                                                          ^^^^^^
+ --> tests/ui/compile_fail/cancel_without_task.rs:8:58
+  |
+8 |     node PROBE = Terminate, deps: [], spawn: probe_task, cancel;
+  |                                                          ^^^^^^

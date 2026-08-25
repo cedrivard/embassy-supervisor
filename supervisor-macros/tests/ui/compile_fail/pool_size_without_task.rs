@@ -1,6 +1,3 @@
-//! `pool_size:` sizes the generated shell's TaskPool, so it only makes sense
-//! with `task:` — a `spawn:` task fn declares its own
-//! `#[embassy_executor::task(pool_size = ...)]`.
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 

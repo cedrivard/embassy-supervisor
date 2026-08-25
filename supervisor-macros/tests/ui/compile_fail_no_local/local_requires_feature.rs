@@ -1,6 +1,3 @@
-//! Without the (non-default) `local-resources` feature the `local` kind is
-//! rejected: it is the one graph form that makes `supervisor_graph!` emit an
-//! `unsafe impl Sync` into the consumer's crate, so it is strictly opt-in.
 
 use std::cell::Cell;
 use std::rc::Rc;

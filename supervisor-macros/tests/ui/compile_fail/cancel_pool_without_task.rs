@@ -1,6 +1,3 @@
-//! `cancel` on a `pool` needs `task:` for the same reason a node does — it
-//! rewrites how the generated shell drives the member worker; a hand-written
-//! `spawn:` member fn can call `node.run_cancellable(..)` itself.
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 

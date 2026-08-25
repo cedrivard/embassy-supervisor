@@ -1,31 +1,3 @@
-//! HTTP control/observability plane — an **elastic pool** of HTTP/1.1 workers
-//! that also demonstrates the supervisor's **dynamic pool**, **socket budgeting**,
-//! and **heap budgeting** (stable Rust, no web framework).
-//!
-//! A floor worker (always-on `Terminate`) plus burst workers (`OnDemand`) all
-//! `accept` on port 80. Each worker owns one embassy-net socket and a set of
-//! heap-allocated I/O buffers, so the pool scales **within the fixed
-//! `StackResources` socket budget** and its heap footprint tracks the live pool
-//! size. `mark_busy`/`mark_idle` drive the supervisor's `ElasticPool`
-//! (`DeferredShrink`): it grows when every worker is serving a connection and
-//! shrinks a spare after a cooldown.
-//!
-//! Connections are **keep-alive**: a worker serves multiple requests on one TCP
-//! connection and only closes on the client's `Connection: close`, an idle
-//! timeout, or a supervisor teardown.
-//!
-//! Routes:
-//! - `GET /` — a page that polls the task list and offers stop/start
-//!   (pause/resume) buttons; the `http` workers are collapsed into one pool row
-//!   with a single control (the supervisor co-controls the whole pool anyway).
-//! - `GET /api/tasks` — JSON view of every supervised task.
-//! - `POST /api/control?node=<name>&op=<start|stop|pause|resume>` — drive a task
-//!   via the supervisor's dependency-honoring control (`request_control`).
-//! - `POST /api/heartbeat?ms=<n>` — set the heartbeat at runtime: `>0` blink
-//!   half-period, `0` LED off, `<0` LED on (`heartbeat::set_period_ms`).
-//!
-//! Depends on `net`.
-
 use core::fmt::Write as _;
 
 use alloc::string::String;
@@ -38,37 +10,30 @@ use embedded_io_async::Write as _;
 use crate::net;
 
 const HTTP_PORT: u16 = 80;
-/// Close a keep-alive connection after this long with no request, freeing the
-/// worker (and its socket) back to the pool.
 const KEEPALIVE_IDLE_SECS: u64 = 10;
 
-/// Scaling floor/ceiling as consts: referenced by the fragment's `min:`/`max:`
-/// (const-expr bounds — the emitted `HTTP_MIN`/`HTTP_MAX` become these) AND by
-/// any downstream sizing (the socket budget math in net.rs's StackResources).
+/// Minimum number of concurrent HTTP worker slots in the pool.
 pub const HTTP_FLOOR: usize = 1;
+/// Maximum number of concurrent HTTP worker slots in the pool.
 pub const HTTP_CEIL: usize = 2;
 
-/// Per-member state that OUTLIVES worker instances: a lend-kind pool resource,
-/// taken by member I from `HTTP_STATS[I]` at spawn and restored there on exit —
-/// so served-request counts survive a shrink/regrow cycle (the
-/// per-connection-worker shape).
+/// Counters tracked for each HTTP worker task.
 pub struct WorkerStats {
+    /// Number of requests served by this worker.
     pub served: u32,
 }
 
-// This module's slice of the task graph: the elastic HTTP pool. Forwarded into
-// main.rs's compose_graph! expansion; `NET` is a cross-fragment dep (declared
-// in net.rs's fragment) and `ready`-marked, so workers spawn only after net
-// asserts config-up. The `HTTP_STATS` per-member slot array and the
-// `HTTP`/`HTTP_POOL`/`HTTP_MIN`... statics land at the compose site (crate::).
 embassy_supervisor::supervisor_fragment! {
     name: HTTP_FRAG;
     pool HTTP = [Terminate, OnDemand], deps: [NET ready],
-        task: $crate::http::http_task,
-        resources: [HTTP_STATS: $crate::http::WorkerStats],
+        task: crate::http::http_task,
+        resources: [HTTP_STATS: crate::http::WorkerStats,
+                    NET_STACK: shared local embassy_net::Stack<'static>],
+        state: zeroed crate::http::HttpBufs,
+        dataflow: [crate::heartbeat::set_period_ms],
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(4)),
-        min: $crate::http::HTTP_FLOOR, max: $crate::http::HTTP_CEIL,
-        slot_timeout: 30000;
+        min: crate::http::HTTP_FLOOR, max: crate::http::HTTP_CEIL,
+        slot_timeout: 2000;
 }
 
 const INDEX_HTML: &str = "<!doctype html><meta charset=utf-8><title>task supervisor</title>\
@@ -103,21 +68,23 @@ document.getElementById('heap').textContent=hd;\
 const cpu=(n,tk)=>(!prev||prev.m[n]==null)?'-':\
 (100*sub(tk,prev.m[n])/sub(d.now_ticks,prev.now)).toFixed(1)+'%';\
 const us=t=>Math.round(t*1e6/d.tick_hz)+'us';\
-let h='<tr><th>task<th>mode<th>state<th>cpu<th>max poll<th>deps<th>';\
+let h='<tr><th>task<th>mode<th>state<th>gen<th>cpu<th>max poll<th>deps<th>';\
 let pool=null;\
 for(let t of d.tasks){\
 if(/^http[0-9]+$/.test(t.name)){\
 pool=pool||{n:0,r:0,b:0,dis:true,deps:t.deps,e:0,mp:0};\
 pool.n++;if(t.running)pool.r++;if(t.busy)pool.b++;if(!t.disabled)pool.dis=false;\
 pool.e=(pool.e+t.exec_ticks)>>>0;pool.mp=Math.max(pool.mp,t.max_poll_ticks);continue;}\
-let st=t.detached?'detached':t.disabled?'disabled':t.running?(t.busy?'busy':'running'):'stopped';\
+let st=t.detached?'detached':t.disabled?'disabled':t.bound_stopped?'link-stopped':\
+t.running?(t.ready===false?'up (not ready)':t.busy?'busy':'running'):'stopped';\
 let pause=t.mode=='pause';let act=t.disabled||!t.running;\
 let op=act?(pause?'resume':'start'):(pause?'pause':'stop');\
-h+='<tr><td>'+t.name+'<td>'+t.mode+'<td>'+st+'<td>'+cpu(t.name,t.exec_ticks)+\
+h+='<tr><td>'+t.name+'<td>'+t.mode+'<td>'+st+'<td>'+t.epoch+'<td>'+cpu(t.name,t.exec_ticks)+\
 '<td>'+us(t.max_poll_ticks)+'<td>'+t.deps.join(',')+\
-'<td>'+(t.detached?'':'<button onclick=\"ctl(\\''+t.name+'\\',\\''+op+'\\')\">'+op+'</button>');}\
+'<td>'+(t.detached?'':'<button onclick=\"ctl(\\''+t.name+'\\',\\''+op+'\\')\">'+op+'</button>'+\
+'<button onclick=\"ctl(\\''+t.name+'\\',\\'restart\\')\">restart</button>');}\
 if(pool){let op=pool.dis?'start':'stop';\
-h+='<tr><td>http (pool)<td>elastic<td>'+pool.r+'/'+pool.n+' up, '+pool.b+' busy<td>'+\
+h+='<tr><td>http (pool)<td>elastic<td>'+pool.r+'/'+pool.n+' up, '+pool.b+' busy<td>-<td>'+\
 cpu('_pool',pool.e)+'<td>'+us(pool.mp)+'<td>'+pool.deps.join(',')+\
 '<td><button onclick=\"ctl(\\'http0\\',\\''+op+'\\')\">'+op+'</button>';}\
 document.getElementById('t').innerHTML=h;\
@@ -127,16 +94,24 @@ prev={now:d.now_ticks,m:m,x:x};}\
 load();setInterval(load,2000);\
 </script>";
 
-pub(crate) async fn http_task(node: &'static TaskNode, stats: &mut WorkerStats) {
-    // Await net's stack — the executor may poll this worker before net's bring-up
-    // has published it (spawn batches poll last-spawned first).
-    let stack = net::stack_ready().await;
-    // Heap-allocated I/O buffers — held while this worker runs, freed when it
-    // exits (pool shrink or teardown). So the heap budget tracks the live pool
-    // size: every grow consumes a buffer set, every shrink returns one.
-    let mut rx = alloc::vec![0u8; 1024];
-    let mut tx = alloc::vec![0u8; 2560];
-    let mut req = alloc::vec![0u8; 1024];
+/// Preallocated buffers used by an HTTP worker.
+pub struct HttpBufs {
+    rx: [u8; 1024],
+    tx: [u8; 2560],
+    req: [u8; 1024],
+}
+unsafe impl embassy_supervisor::Zeroable for HttpBufs {}
+
+pub(crate) async fn http_task(
+    node: &'static TaskNode,
+    stats: &mut WorkerStats,
+    stack: embassy_net::Stack<'static>,
+    bufs: &mut HttpBufs,
+) {
+    let Some(_held) = net::hold() else {
+        return;
+    };
+    let HttpBufs { rx, tx, req } = bufs;
 
     loop {
         if node.shutdown_requested() {
@@ -144,29 +119,20 @@ pub(crate) async fn http_task(node: &'static TaskNode, stats: &mut WorkerStats) 
             return;
         }
 
-        let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
+        let mut socket = TcpSocket::new(stack, &mut rx[..], &mut tx[..]);
         socket.set_timeout(Some(Duration::from_secs(KEEPALIVE_IDLE_SECS)));
 
-        // Wait for a connection, but stay interruptible by a teardown. The
-        // manual ack stays (instead of run_cancellable_acked) because the
-        // busy/idle bracketing below must never run on the abort path.
         match node.run_cancellable(socket.accept(HTTP_PORT)).await {
             Err(Aborted) => {
                 node.ack_dropped();
                 return;
             }
-            Ok(Err(_)) => continue, // accept error/timeout — relisten
+            Ok(Err(_)) => continue,
             Ok(Ok(())) => {}
         }
 
-        // Holding a connection means holding a socket, so mark busy for the whole
-        // keep-alive session: the pool grows to keep spare capacity within the
-        // socket budget, and a shrink never targets a worker with a live
-        // connection (shrink only stops non-busy workers).
         node.mark_busy();
-        serve_connection(&mut socket, &mut req, node).await;
-        // Per-member lifetime stat: restored to HTTP_STATS[I] on exit, so the
-        // count survives this instance (visible across a shrink/regrow).
+        serve_connection(&mut socket, &mut req[..], node).await;
         stats.served = stats.served.wrapping_add(1);
         socket.close();
         let _ = socket.flush().await;
@@ -174,19 +140,14 @@ pub(crate) async fn http_task(node: &'static TaskNode, stats: &mut WorkerStats) 
     }
 }
 
-/// Serve requests on one keep-alive connection until the client closes, an idle
-/// read times out, the client asks to close, or the supervisor tears us down.
-async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &TaskNode) {
+async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &'static TaskNode) {
     loop {
         if node.shutdown_requested() {
             return;
         }
-        // One read per request. This assumes a small request arrives in a single
-        // segment (true for these routes over USB-net) — a general server would
-        // loop until the headers terminate.
         let n = match select(socket.read(req), node.wait_shutdown()).await {
-            Either::Second(()) => return,                           // teardown
-            Either::First(Ok(0)) | Either::First(Err(_)) => return, // closed / idle timeout
+            Either::Second(()) => return,
+            Either::First(Ok(0)) | Either::First(Err(_)) => return,
             Either::First(Ok(n)) => n,
         };
 
@@ -195,28 +156,16 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &Tas
         let mut parts = line.split_whitespace();
         let method = parts.next().unwrap_or("");
         let path = parts.next().unwrap_or("");
-        // Default to keep-alive (HTTP/1.1); honor an explicit `Connection: close`.
         let keep = !connection_close_requested(request);
 
         match (method, path) {
             ("GET", "/") => send(socket, "text/html", INDEX_HTML, keep).await,
             ("GET", "/api/tasks") => {
-                // Built on the heap (freed at the end of this match) so the worker
-                // future stays small — the JSON body is never inline in the future.
-                // Capacity: 8 node slots x ~200 B/row (keys + name + 4 bools + three u32
-                // counters + deps) + ~450 B heap/executors prefix + slack (measured
-                // 1783 B max on hardware with 9 slots). MUST exceed the real body: an
-                // undersized reserve doesn't just realloc (transient 2x footprint) — it
-                // grew 1408->2816 mid-serving and OOM-panicked the arena.
-                let mut body = String::with_capacity(2560);
+                let mut body = String::with_capacity(4096);
                 build_tasks_json(&mut body);
                 send(socket, "application/json", &body, keep).await;
             }
             ("GET", "/api/bench") => {
-                // The exit: slot demo. Non-blocking `take()` (not `wait_take`):
-                // an HTTP worker must not park until someone runs the bench.
-                // The slot is a mailbox — reading consumes the score, and the
-                // next completed bench run provides a fresh one.
                 let mut body = String::with_capacity(48);
                 match crate::BENCH_EXIT.take() {
                     Some(slices) => {
@@ -228,8 +177,6 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &Tas
             }
             ("POST", p) if p.starts_with("/api/control") => match handle_control(p) {
                 Ok(body) => send(socket, "application/json", &body, keep).await,
-                // Mailbox full: the request was NOT enqueued. 503 tells the
-                // caller to retry, instead of the pre-0.4.0 silent drop.
                 Err(body) => {
                     send_status(
                         socket,
@@ -242,12 +189,10 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &Tas
                 }
             },
             ("POST", p) if p.starts_with("/api/heartbeat") => {
-                let body = handle_heartbeat(p);
+                let body = handle_heartbeat(p, node);
                 send(socket, "application/json", &body, keep).await;
             }
             ("POST", p) if p.starts_with("/api/ota") => {
-                // Control-only: record the download target, ack, and start the
-                // (stopped-at-boot) OTA node, which orchestrates the rest itself.
                 match crate::ota::set_target(query(p, "ip="), query(p, "port="), query(p, "path="))
                 {
                     Ok(()) => {
@@ -284,8 +229,6 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &Tas
     }
 }
 
-/// Write a `200 OK` with `Content-Length` + the chosen `Connection` header, then
-/// the body. `Content-Length` is what makes keep-alive framing unambiguous.
 async fn send(socket: &mut TcpSocket<'_>, content_type: &str, body: &str, keep: bool) {
     send_status(socket, "200 OK", content_type, body, keep).await;
 }
@@ -300,7 +243,6 @@ async fn send_status(
     keep: bool,
 ) {
     // Heap-built so the header isn't held inline in the worker future across the
-    // write `.await` below.
     let mut header = String::with_capacity(128);
     let _ = write!(
         header,
@@ -314,7 +256,6 @@ async fn send_status(
     let _ = socket.write_all(body.as_bytes()).await;
 }
 
-/// True if the request carries a `Connection: close` header (ASCII case-insensitive).
 fn connection_close_requested(request: &str) -> bool {
     for l in request.lines() {
         let l = l.trim_start();
@@ -326,7 +267,6 @@ fn connection_close_requested(request: &str) -> bool {
     false
 }
 
-/// ASCII case-insensitive substring search (`needle` must already be lowercase).
 fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
     let (h, n) = (haystack.as_bytes(), needle_lower.as_bytes());
     if n.is_empty() {
@@ -338,11 +278,6 @@ fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
     (0..=h.len() - n.len()).any(|i| h[i..i + n.len()].eq_ignore_ascii_case(n))
 }
 
-/// Build the task-state JSON straight from the static graph + each node's atomics.
-///
-/// The trace counters are emitted RAW (wrapping tick counts + `tick_hz` +
-/// `now_ticks`): the dashboard keeps its previous sample and computes CPU% /
-/// idle% from the deltas, so the firmware holds no windowing state.
 fn build_tasks_json(json: &mut String) {
     let _ = write!(
         json,
@@ -355,7 +290,7 @@ fn build_tasks_json(json: &mut String) {
     let mut first = true;
     for id in embassy_supervisor::trace::executors() {
         if id == 0 {
-            continue; // free slot
+            continue;
         }
         let Some(st) = embassy_supervisor::trace::executor_stats(id) else {
             continue;
@@ -364,9 +299,6 @@ fn build_tasks_json(json: &mut String) {
             json.push(',');
         }
         first = false;
-        // idle/exec split the executor's time three ways for the dashboard:
-        // idle, in-poll (exec), and overhead = busy - exec (scheduler + hooks
-        // + ISRs between polls). polls/passes give the poll rate.
         let _ = write!(
             json,
             "{{\"id\":{},\"idle_ticks\":{},\"exec_ticks\":{},\"polls\":{},\"passes\":{}}}",
@@ -376,7 +308,6 @@ fn build_tasks_json(json: &mut String) {
     json.push_str("],\"tasks\":[");
     let mut first = true;
     for (i, slot) in crate::GRAPH.nodes.iter().enumerate() {
-        // Skip a `#[cfg]`-ed-out node slot (`None`).
         let Some(node) = slot else {
             continue;
         };
@@ -384,49 +315,60 @@ fn build_tasks_json(json: &mut String) {
             json.push(',');
         }
         first = false;
-        // Raw wrapping trace counters (see the fn doc): the dashboard diffs
-        // consecutive samples for CPU%, and converts max_poll to µs via tick_hz.
-        let _ = write!(
-            json,
-            "{{\"name\":\"{}\",\"mode\":\"{}\",\"running\":{},\"busy\":{},\"disabled\":{},\"detached\":{},\
-             \"exec_ticks\":{},\"polls\":{},\"max_poll_ticks\":{},\"deps\":[",
-            node.name,
-            node.mode.as_str(),
-            node.is_running(),
-            node.is_busy(),
-            node.is_disabled(),
-            node.is_detached(),
-            node.exec_ticks(),
-            node.poll_count(),
-            node.max_poll_ticks()
-        );
-        // `GRAPH.deps[i]` lists the indices of node `i`'s dependencies (the graph's
-        // edges, from `supervisor_graph!`); cfg-aware, so each resolves to a present node.
-        for (j, &di) in crate::GRAPH.deps[i].iter().enumerate() {
-            if j > 0 {
-                json.push(',');
-            }
-            if let Some(dep) = crate::GRAPH.nodes[di as usize] {
-                let _ = write!(json, "\"{}\"", dep.name);
-            }
+        write_task(json, node, crate::GRAPH.deps_of(i as u8));
+    }
+    if let Some(node) = crate::GRAPH.graph_ref.self_node() {
+        if !first {
+            json.push(',');
         }
-        json.push_str("]}");
+        write_task(json, node, &[]);
     }
     json.push_str("]}");
 }
 
-/// Parse `?node=&op=` and drive the supervisor; returns the JSON reply body —
-/// `Err` means the control mailbox was full and the request was not enqueued
-/// (the caller answers 503). The sync `try_` variant keeps this handler's
-/// latency bounded and demonstrates the error path; a full mailbox under
-/// hand-driven control means the driver loop is wedged, which the caller
-/// should hear about rather than wait out.
+fn write_task(json: &mut String, node: &'static TaskNode, deps: &'static [u8]) {
+    let _ = write!(
+        json,
+        "{{\"name\":\"{}\",\"mode\":\"{}\",\"running\":{},\"busy\":{},\"disabled\":{},\"detached\":{},\
+         \"ready\":{},\"bound_stopped\":{},\"epoch\":{},\
+         \"exec_ticks\":{},\"polls\":{},\"max_poll_ticks\":{},",
+        node.name(),
+        node.mode().as_str(),
+        node.is_running(),
+        node.is_busy(),
+        node.is_disabled(),
+        node.is_detached(),
+        node.is_ready(),
+        node.is_bound_stopped(),
+        node.epoch(),
+        node.exec_ticks(),
+        node.poll_count(),
+        node.max_poll_ticks()
+    );
+    match node.status() {
+        Some(s) => {
+            let _ = write!(json, "\"status\":\"{s}\",\"deps\":[");
+        }
+        None => json.push_str("\"status\":null,\"deps\":["),
+    }
+    for (j, &di) in deps.iter().enumerate() {
+        if j > 0 {
+            json.push(',');
+        }
+        if let Some(dep) = crate::GRAPH.nodes[di as usize] {
+            let _ = write!(json, "\"{}\"", dep.name());
+        }
+    }
+    json.push_str("]}");
+}
+
 fn handle_control(path: &str) -> Result<String, String> {
     let node_name = query(path, "node=");
     let op_str = query(path, "op=");
     let op = match op_str {
         "start" | "resume" => Some(ControlOp::Activate),
         "stop" | "pause" => Some(ControlOp::Deactivate),
+        "restart" => Some(ControlOp::Restart),
         _ => None,
     };
     let node = crate::GRAPH
@@ -434,7 +376,7 @@ fn handle_control(path: &str) -> Result<String, String> {
         .iter()
         .copied()
         .flatten()
-        .find(|n| n.name == node_name);
+        .find(|n| n.name() == node_name);
 
     let mut out = String::with_capacity(96);
     match (node, op) {
@@ -446,7 +388,8 @@ fn handle_control(path: &str) -> Result<String, String> {
             let _ = write!(
                 out,
                 "{{\"accepted\":true,\"node\":\"{}\",\"op\":\"{}\"}}",
-                node.name, op_str
+                node.name(),
+                op_str
             );
         }
         _ => {
@@ -456,13 +399,11 @@ fn handle_control(path: &str) -> Result<String, String> {
     Ok(out)
 }
 
-/// Parse `?ms=N` and set the heartbeat behavior (`>0` blink, `0` off, `<0` on);
-/// returns the JSON reply body.
-fn handle_heartbeat(path: &str) -> String {
+fn handle_heartbeat(path: &str, node: &'static TaskNode) -> String {
     let mut out = String::with_capacity(64);
     match query(path, "ms=").parse::<i32>() {
         Ok(ms) => {
-            crate::heartbeat::set_period_ms(ms);
+            crate::heartbeat::set_period_ms(node, ms);
             let mode = if ms > 0 {
                 "blink"
             } else if ms == 0 {

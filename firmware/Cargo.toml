@@ -1,23 +1,48 @@
 [package]
 name = "firmware"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# The generalized task supervisor. `defmt` on; `control` + `pool` + `macros`
-# come from the crate's defaults.
+# The generalized task supervisor. `defmt` on; the crate's only default is
+# `macros` — everything else is named below (`control` arrives via `restart`).
 # `trace-hooks` turns on the executor's trace instrumentation and generates the
 # hook symbols at the graph declaration; the dashboard renders per-node CPU% and
 # max-poll from the counters (see http.rs). `trace-nested` makes the accounting
 # preemption-exact (single core here): heartbeat's HIGH-tier polls are credited
 # back to whatever thread-executor window they preempt.
+# `liveness-monitor` replaces the hand-rolled staleness sweep watchdog.rs used
+# to run: the budget now lives on the node declaration and the supervisor
+# reports through `wait_health()`; the heartbeats themselves ride the verbs
+# (`beat_put`/`beat()`), so no `observed` entry and no `coupling-observe`.
+# `epochs` is pure status, shown on the dashboard. `restart` backs the
+# dashboard's restart button; `bound-deps` ties the compute load to the
+# heartbeat's active phase.
 embassy-supervisor = { path = "../supervisor", features = [
+    # `pool` for the HTTP worker pool; `control` arrives via `restart`.
+    "pool",
+    # The pool's `NET_STACK: shared local` slot — `Stack` is `!Send`, core-0
+    # only, which is that feature's documented contract.
+    "local-resources",
     "defmt",
     "trace-hooks",
     "trace-nested",
+    # The supervisor's own host task as a hidden auto-adopted node; /api/tasks
+    # appends it as a "supervisor" row (detached, no control buttons).
+    "trace-self",
     "readiness",
     "liveness",
+    "liveness-monitor",
+    "epochs",
+    "dataflow",
+    # `STACK` is a gated read: `stack_ready` opens it and the gate resolves the
+    # producer through the graph.
+    "data-deps",
+    "node-status",
+    "restart",
+    "bound-deps",
     "heap-state",
 ] }
 

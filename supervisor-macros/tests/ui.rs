@@ -1,23 +1,3 @@
-//! UI tests for `supervisor_graph!`, via `trybuild`.
-//!
-//! - `tests/ui/compile_fail/` — locks the macro's compile-error contracts (a
-//!   dependency cycle, an unknown dep, a closure in a pool `spawn:`, a malformed
-//!   entry). Each has a `.stderr` snapshot; regenerate them after an intentional
-//!   message change with `TRYBUILD=overwrite`. The cycle snapshots depend on the
-//!   `rust-src` component being installed (rustc renders the const-eval panic's
-//!   core frame differently without it) — CI installs it to match.
-//! - `tests/ui/compile_pass/` — exercises the generated code end-to-end. `trybuild`
-//!   compiles *and runs* these, so their `main` asserts the graph invariants
-//!   (`GRAPH.order` is a valid topological order, `#[cfg]`-ed-out nodes become `None`,
-//!   all `spawn:` forms compile).
-//! - `tests/ui/*_local/` — the `local` resource kind's cases, split out because the
-//!   kind is gated on the (non-default) `local-resources` feature: its pass/fail
-//!   cases only compile WITH the feature, and the "requires the feature" rejection
-//!   can only fire WITHOUT it. CI runs the suite in both states.
-//!
-//! Run on the host: `cargo test -p embassy-supervisor-macros --target x86_64-unknown-linux-gnu`
-//! (and once more with `--features local-resources`).
-
 #[test]
 fn ui() {
     let t = trybuild::TestCases::new();
@@ -30,25 +10,20 @@ fn ui() {
     }
     #[cfg(not(feature = "local-resources"))]
     t.compile_fail("tests/ui/compile_fail_no_local/*.rs");
-    // The `ready` dep marker's pass/fail cases need the `readiness` feature.
-    // Unlike `local-resources` there is NO no-feature UI split: the dev-dep
-    // supervisor must carry `readiness` for the pass cases (trybuild copies the
-    // dev-dep declaration verbatim), and the scratch project's feature
-    // unification re-enables the macro feature through the supervisor's weak
-    // forward — so the rejection can't fire there. It is unit-tested inside the
-    // macros crate instead (`ready_marker_requires_feature`).
     #[cfg(feature = "readiness")]
     {
         t.compile_fail("tests/ui/compile_fail_readiness/*.rs");
         t.pass("tests/ui/compile_pass_readiness/*.rs");
     }
-    // `state:` (heap-state): pass/fail with the feature; the "requires the
-    // feature" rejection fires without it (unlike `readiness`, nothing in the
-    // dev-dep re-enables this feature through unification).
     #[cfg(feature = "heap-state")]
     {
         t.compile_fail("tests/ui/compile_fail_heap_state/*.rs");
         t.pass("tests/ui/compile_pass_heap_state/*.rs");
+    }
+    #[cfg(feature = "dataflow")]
+    {
+        t.compile_fail("tests/ui/compile_fail_dataflow/*.rs");
+        t.pass("tests/ui/compile_pass_dataflow/*.rs");
     }
     #[cfg(not(feature = "heap-state"))]
     t.compile_fail("tests/ui/compile_fail_no_heap_state/*.rs");

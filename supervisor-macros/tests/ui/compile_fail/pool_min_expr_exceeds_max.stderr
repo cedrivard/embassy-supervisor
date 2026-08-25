@@ -1,10 +1,10 @@
 error[E0080]: evaluation panicked: pool `min:` must not exceed `max:`
-  --> tests/ui/compile_fail/pool_min_expr_exceeds_max.rs:11:1
+  --> tests/ui/compile_fail/pool_min_expr_exceeds_max.rs:8:1
    |
-11 | / supervisor_graph! {
-12 | |     pool CRUNCH = [Terminate, OnDemand], deps: [],
-13 | |         task: worker,
-14 | |         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(1)),
-15 | |         min: FLOOR, max: 2;
-16 | | }
+ 8 | / supervisor_graph! {
+ 9 | |     pool CRUNCH = [Terminate, OnDemand], deps: [],
+10 | |         task: worker,
+11 | |         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(1)),
+12 | |         min: FLOOR, max: 2;
+13 | | }
    | |_^ evaluation of `_` failed here

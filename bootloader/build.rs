@@ -1,4 +1,3 @@
-//! Places `memory.x` on the linker search path and passes the RP2350 link args.
 use std::env;
 use std::fs::File;
 use std::io::Write;
@@ -15,7 +14,5 @@ fn main() {
 
     println!("cargo:rustc-link-arg-bins=--nmagic");
     println!("cargo:rustc-link-arg-bins=-Tlink.x");
-    // defmt is linked in (workspace feature unification turns on embassy-rp/defmt),
-    // so the `.defmt` section is required or `probe-rs run` fails to parse defmt.
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
 }

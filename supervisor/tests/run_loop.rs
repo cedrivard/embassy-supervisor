@@ -1,21 +1,13 @@
-//! `Supervisor::run()`: the canonical driver as one call — start() the graph,
-//! then drive pool scaling and runtime control until an error. Verifies bring-up
-//! happens, a busy floor grows the pool, a Deactivate command cascades, and a
-//! wedged node's missed ack surfaces as `RunError::Shutdown` out of `run()`
-//! (mock clock advanced by the main thread for the ack timeout). Harness as
-//! teardown.rs.
-
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
-    ControlOp, DeferredShrink, RunError, Supervisor, TaskNode, request_control, supervisor_graph,
+    ControlOp, DeferredShrink, FaultKind, Supervisor, TaskNode, request_control, supervisor_graph,
 };
 
 supervisor_graph! {
     node MAIN = Terminate, deps: [], task: main_worker;
-    // Wedged on demand: started by control, never acks its stop.
     node WEDGE = Terminate, deps: [], task: wedge_worker, disabled;
     pool WORKERS = [Terminate, OnDemand], deps: [],
         task: pool_worker,
@@ -38,13 +30,12 @@ async fn main_worker(node: &'static TaskNode) {
 
 async fn pool_worker(node: &'static TaskNode) {
     POOL_SPAWNS.fetch_add(1, Ordering::SeqCst);
-    node.mark_busy(); // saturate: the policy wants to grow to the ceiling
+    node.mark_busy();
     let _ = node
         .run_cancellable_acked(core::future::pending::<()>())
         .await;
 }
 
-/// Never observes shutdown, never acks: stopping it times out.
 async fn wedge_worker(_node: &'static TaskNode) {
     WEDGE_SPAWNS.fetch_add(1, Ordering::SeqCst);
     core::future::pending::<()>().await;
@@ -63,31 +54,25 @@ async fn settle(mut f: impl FnMut() -> bool) {
 #[embassy_executor::task]
 async fn runner(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
-    match sup.run(spawner).await {
-        RunError::Shutdown(e) => {
-            assert_eq!(e.node.name, "wedge", "the wedged node is named");
-            DONE.store(true, Ordering::SeqCst);
-        }
-        RunError::Spawn(_) => panic!("bring-up failed"),
-    }
+    let fault = sup.run(&spawner).await;
+    assert!(
+        matches!(fault.kind, FaultKind::ShutdownTimeout),
+        "a wedged node surfaces as a missed ack, not a bring-up failure: {fault}"
+    );
+    assert_eq!(fault.node.name(), "wedge", "the wedged node is named");
+    DONE.store(true, Ordering::SeqCst);
 }
 
-/// Feeds control commands from "outside" (an app control surface).
 #[embassy_executor::task]
 async fn scenario() {
-    // run() brought the graph up (MAIN + the pool floor) and the busy floor
-    // grew the pool to its ceiling.
     settle(|| MAIN_SPAWNS.load(Ordering::SeqCst) == 1).await;
     settle(|| POOL_SPAWNS.load(Ordering::SeqCst) == 2).await;
     PHASE.store(1, Ordering::SeqCst);
 
-    // Control through run(): activate the wedge...
     request_control(&WEDGE, ControlOp::Activate).await;
     settle(|| WEDGE_SPAWNS.load(Ordering::SeqCst) == 1).await;
     PHASE.store(2, Ordering::SeqCst);
 
-    // ...then deactivate it: the cascade's shutdown_and_wait times out (the
-    // main thread advances the clock), and run() returns RunError::Shutdown.
     request_control(&WEDGE, ControlOp::Deactivate).await;
     PHASE.store(3, Ordering::SeqCst);
 }

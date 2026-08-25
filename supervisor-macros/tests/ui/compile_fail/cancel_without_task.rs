@@ -1,6 +1,3 @@
-//! `cancel` requires `task:` — it rewrites how the generated shell drives the
-//! worker; a hand-written `spawn:` task fn can call `node.run_cancellable(..)`
-//! itself.
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 

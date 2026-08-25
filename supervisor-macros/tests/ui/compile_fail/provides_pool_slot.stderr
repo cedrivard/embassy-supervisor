@@ -1,0 +1,5 @@
+error: `provides:` cannot name `BUF` — it is a pool's per-member slot array, filled and cleared by the pool's own scaling; the clause clears a single node's slot statics on its shutdown ack
+  --> tests/ui/compile_fail/provides_pool_slot.rs:15:69
+   |
+15 |     node PROVIDER = Terminate, deps: [], task: provider, provides: [BUF];
+   |                                                                     ^^^

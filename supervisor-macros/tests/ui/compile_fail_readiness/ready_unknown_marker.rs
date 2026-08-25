@@ -1,4 +1,3 @@
-//! A second ident after a dep name must be exactly `ready`.
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 

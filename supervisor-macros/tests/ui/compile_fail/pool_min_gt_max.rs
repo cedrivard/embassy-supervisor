@@ -1,6 +1,3 @@
-//! A pool's scaling bounds must satisfy `min <= max <= member count`; `min > max`
-//! makes the policy contradict itself (always above the floor and below the
-//! ceiling at once), so the macro rejects it at expansion time.
 
 use embassy_supervisor::supervisor_graph;
 

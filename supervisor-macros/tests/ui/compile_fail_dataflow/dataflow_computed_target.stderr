@@ -1,0 +1,13 @@
+error: the supervisor derives dataflow from the literal path: name the signal directly (`&path::TO_SIGNAL`, `&ARR[i]`)
+ --> tests/ui/compile_fail_dataflow/dataflow_computed_target.rs:9:17
+  |
+9 |     node.reader(hidden);
+  |                 ^^^^^^
+
+warning: unused import: `TaskNode`
+ --> tests/ui/compile_fail_dataflow/dataflow_computed_target.rs:2:26
+  |
+2 | use embassy_supervisor::{TaskNode, dataflow};
+  |                          ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

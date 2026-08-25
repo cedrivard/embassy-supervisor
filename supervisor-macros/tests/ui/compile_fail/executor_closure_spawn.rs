@@ -1,6 +1,3 @@
-//! `executor:` cannot combine with a verbatim spawn closure: the closure owns
-//! the spawn, so the macro has nowhere to inject the slot's spawner. The closure
-//! should use the named SpawnerSlot itself.
 
 use embassy_supervisor::supervisor_graph;
 

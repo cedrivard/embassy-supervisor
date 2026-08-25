@@ -1,5 +1,3 @@
-//! `exit: Type` on `task:` nodes: the macro emits `pub static <NODE>_EXIT:
-//! ResourceSlot<Type>` and the shell provides the worker's return value into it.
 
 use embassy_supervisor::{Aborted, TaskNode, supervisor_graph};
 
@@ -17,9 +15,7 @@ supervisor_graph! {
 }
 
 fn main() {
-    // The exit slots exist, typed, and start empty.
     assert!(SCORE_EXIT.take().is_none());
     assert!(SERVE_EXIT.take().is_none());
-    // Order respects deps.
-    assert_eq!(GRAPH.order, [0, 1]);
+    assert!(GRAPH.order().eq([0, 1]));
 }

@@ -1,7 +1,3 @@
-//! A node `spawn:` partial call with MULTIPLE extra args, one of them a fallible
-//! setup expression (`setup().expect(..)`), mirroring web-pico-clim's WIFI_CTRL.
-//! The macro injects `&NODE` first, then the provided args verbatim:
-//! `root_task(&ROOT, setup().expect(..), stack())`.
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 
@@ -23,6 +19,6 @@ supervisor_graph! {
 fn main() {
     assert_eq!(GRAPH.nodes.len(), 1);
     assert!(GRAPH.nodes[0].is_some());
-    assert_eq!(GRAPH.deps[0].len(), 0);
-    assert_eq!(GRAPH.order[0], 0);
+    assert_eq!(GRAPH.deps_of(0).len(), 0);
+    assert_eq!(GRAPH.order().next(), Some(0));
 }

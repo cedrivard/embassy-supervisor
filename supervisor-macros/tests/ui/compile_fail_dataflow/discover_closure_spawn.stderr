@@ -1,0 +1,5 @@
+error: `discover` derives its tables from the `task:`/`spawn:` fn — name it by path, not a closure
+ --> tests/ui/compile_fail_dataflow/discover_closure_spawn.rs:5:56
+  |
+5 |     node A = Terminate, deps: [], spawn: |_sp| Ok(()), discover;
+  |                                                        ^^^^^^^^

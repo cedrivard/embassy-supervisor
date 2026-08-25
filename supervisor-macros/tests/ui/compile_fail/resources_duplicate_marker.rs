@@ -1,4 +1,3 @@
-//! A repeated kind marker on one `resources:` entry is a declaration bug.
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 

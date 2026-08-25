@@ -1,6 +1,3 @@
-//! `compose_graph! { name: X, fragments: [...], graph: {...} }` forwards the
-//! name into the final expansion — a composed graph can be a named sub-graph
-//! next to an unnamed primary.
 
 use embassy_supervisor::{TaskNode, compose_graph, supervisor_fragment, supervisor_graph};
 
@@ -25,7 +22,7 @@ compose_graph! {
 }
 
 fn main() {
-    assert_eq!(GRAPH.order.len(), 1);
-    assert_eq!(NET_GRAPH.order, [0, 1]);
-    assert_eq!(NET.name, "net");
+    assert_eq!(GRAPH.order().len(), 1);
+    assert!(NET_GRAPH.order().eq([0, 1]));
+    assert_eq!(NET.name(), "net");
 }

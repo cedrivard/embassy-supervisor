@@ -4,6 +4,7 @@
 [package]
 name = "bootloader"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 license.workspace = true
 description = "embassy-boot-rp A/B OTA bootloader for the RP2350 firmware."

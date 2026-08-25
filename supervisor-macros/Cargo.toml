@@ -4,7 +4,7 @@ name = "embassy-supervisor-macros"
 # version (`=x.y.z`): the generated code references doc(hidden) supervisor internals,
 # so only the tested pair is guaranteed compatible. Bump only when the macro changes;
 # the supervisor updates its pin to match.
-version = "0.6.2"
+version = "0.7.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ repository.workspace = true
 rust-version.workspace = true
 readme = "README.md"
 documentation = "https://docs.rs/embassy-supervisor-macros"
-description = "Proc-macro for embassy-supervisor: declares a task graph and computes its topological order at compile time."
+description = "Proc-macros for embassy-supervisor: the task-graph declaration with its topological order computed at compile time, and the #[dataflow] attribute deriving a task's coupling tables from its body."
 keywords = ["embassy", "async", "embedded", "supervisor", "no-std"]
 categories = ["embedded", "asynchronous", "no-std"]
 
@@ -44,16 +44,60 @@ heap-state = []
 # `.with_ready_deps` builder calls. Without it the marker is a span-attached
 # compile error naming the feature.
 readiness = []
+# Forwarded from the supervisor's `bound-deps` feature: permits the `bound` dep
+# marker (`deps: [NET ready bound]`) and emits the per-node bound-dep arrays
+# plus `.with_bound_deps` builder calls. Without it the marker is a
+# span-attached compile error naming the feature.
+bound-deps = []
+# Forwarded from the supervisor's `coupling` feature: permits the `reads:` /
+# `writes:` node clauses, and emits the per-node
+# `Coupling` tables plus the `.with_reads(..)` / `.with_writes(..)` builder
+# calls. Without it either clause is a span-attached compile error naming the
+# feature.
+coupling = []
+# Forwarded from the supervisor's `coupling-observe` feature: permits the
+# `observed` entry marker on `reads:`/`writes:` and the graph-level
+# `observe writes:` / `observe reads:` accessor defaults, and emits the
+# `.observed(Observer::new(..))` thunks. Without it the marker is a
+# span-attached compile error naming the feature.
+coupling-observe = ["coupling"]
+# Forwarded from the supervisor's `dataflow` feature: permits the
+# `#[dataflow]` attribute and the `discover` / `dataflow:` clauses. Without it
+# each is a span-attached compile error naming the feature.
+dataflow = ["coupling"]
+# Forwarded from the supervisor's `graph-ref` feature: emits the per-graph
+# `GraphRef` static beside the node table, and the `graph_ref:` field of the
+# `GRAPH` value pointing at it. Purely additive; without it a graph is only its
+# tables, with nothing naming it as a whole.
+graph-ref = []
+# Forwarded from the supervisor's `data-deps` feature: emits the
+# `.with_graph(&GRAPH_REF)` builder call that points every node (and pool
+# member) at its own graph, whose node table is what a gated read resolves its
+# producer through. Purely additive; without it the nodes carry no back-pointer.
+data-deps = ["dataflow", "graph-ref"]
+# Forwarded from the supervisor's `liveness` feature: permits `beat_put` /
+# `beat_writer` in a `#[dataflow]` body. Those verbs do not exist without it
+# (they would be `put`/`writer` under a name claiming a heartbeat), so this
+# turns rustc's "no method named" into a span-attached error naming the
+# feature.
+liveness = []
+# Forwarded from the supervisor's `liveness-monitor` feature: permits the
+# `beat_timeout: <millis>` / `beat_window: <n>` node clauses and emits the
+# matching `.with_beat_timeout(..)` / `.with_beat_window(..)` builder calls.
+# Without it either clause is a span-attached compile error naming the feature.
+liveness-monitor = []
 # Forwarded from the supervisor's `trace` feature: the generated spawn glue captures
 # each SpawnToken's task id into the node (`set_task_id`) before spawning it.
-trace = []
+# Pulls `graph-ref` because the recorders resolve that id by walking the chain
+# of `GraphRef`s, which the graph site is what emits.
+trace = ["graph-ref"]
 # Forwarded from the supervisor's `metadata-names` feature: the generated spawn glue
 # stamps the node name into the task's Metadata (`stamp_name`). Read at expansion
 # time by `spawn_stmts`; independent of `trace`, so a graph built with names but not
 # `trace` emits the name-only spawn path (no `adopt`, no id capture).
 metadata-names = []
 # Forwarded from `trace-names`: the full trace layer with node names = trace + the
-# name stamp. Kept as an alias for back-compat; effective behavior unchanged.
+# name stamp.
 trace-names = ["trace", "metadata-names"]
 # Forwarded from the supervisor's `trace-hooks`: emit the seven `no_mangle`
 # `_embassy_trace_*` hook definitions at the graph declaration site (the supervisor
@@ -61,6 +105,9 @@ trace-names = ["trace", "metadata-names"]
 trace-hooks = ["trace"]
 
 [dependencies]
+# The graph grammar, shared with the diagram tool. Pinned by EXACT version: the
+# AST is an internal contract between the two crates and changes with the syntax.
+embassy-supervisor-syntax = { version = "=0.1.0", path = "../supervisor-syntax" }
 syn = { version = "2.0.118", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
@@ -78,7 +125,24 @@ trybuild = "1"
 # its scratch project, so a feature forwarded from this crate's own features
 # would never reach it. Additive API only — the no-feature UI split tests the
 # MACRO-side rejection (expansion-time cfg!), which this does not affect.
-embassy-supervisor = { path = "../supervisor", features = ["readiness"] }
+# `pool`/`control` named explicitly: the supervisor's defaults are `macros` only,
+# and the UI fixtures declare pools and control verbs. trybuild re-resolves this
+# declaration verbatim in its scratch project.
+embassy-supervisor = { path = "../supervisor", features = [
+    "pool",
+    "control",
+    "readiness",
+    "coupling-observe",
+    "dataflow",
+    # The macro emits `.with_graph(..)` when its own `data-deps` is on, so the
+    # scratch project's supervisor must carry the builder it calls.
+    "data-deps",
+    # `beat_put` / `beat_writer` only exist with `liveness`, and a pass fixture
+    # uses them. Feature unification then re-enables the macro's own `liveness`
+    # in the scratch project, so its rejection is unit-tested here instead (see
+    # `beat_verb_requires_feature`) — the same arrangement as `readiness`.
+    "liveness",
+] }
 # `platform-std` + `executor-thread` give embassy-executor a host Pender/executor so a
 # compile-pass case that uses real `#[embassy_executor::task]`s can link on the host.
 embassy-executor = { version = "0.10", features = ["platform-std", "executor-thread"] }

@@ -1,5 +1,3 @@
-//! A name collision across fragments hits the ordinary duplicate-name pass,
-//! attributed to the owning fragment.
 
 use embassy_supervisor::{TaskNode, compose_graph, supervisor_fragment};
 

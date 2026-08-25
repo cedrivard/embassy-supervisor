@@ -1,5 +1,5 @@
 error: `resources:` requires `task:` — resources are handed to the generated shell as owned arguments and restored by it; a `spawn:` task fn manages its own arguments
-  --> tests/ui/compile_fail/resources_without_task.rs:13:9
+  --> tests/ui/compile_fail/resources_without_task.rs:11:9
    |
-13 |         resources: [LED: FakeLed];
+11 |         resources: [LED: FakeLed];
    |         ^^^^^^^^^

@@ -1,0 +1,39 @@
+[package]
+name = "embassy-supervisor-tools"
+version = "0.1.0"
+description = "Host tools reading supervisor_graph!, supervisor_fragment! and compose_graph! declarations: Mermaid diagrams, and dataflow lints"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Two tools over one model: `supervisor-mermaid` draws it, `supervisor-lint`
+# reports what it says about the dataflow. Named explicitly (the file stems
+# would otherwise name the binaries `mermaid` and `lint`), so autodiscovery is
+# off and these are the only two.
+autobins = false
+
+[[bin]]
+name = "supervisor-mermaid"
+path = "src/bin/mermaid.rs"
+
+[[bin]]
+name = "supervisor-lint"
+path = "src/bin/lint.rs"
+
+[dependencies]
+# The graph grammar, shared with the proc-macro so the diagram cannot drift from
+# what the macro accepts. No features: the syntax crate always parses in full,
+# and which constructs a build permits is the macro's policy, not a diagram's.
+embassy-supervisor-syntax = { version = "=0.1.0", path = "../supervisor-syntax" }
+# `span-locations` is what puts a file:line on each declaration.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+syn = { version = "2.0.118", features = ["full"] }
+# `--live-url`: the mermaid.live link is the diagram JSON, zlib-deflated and
+# base64url'd (the editor's own "pako" share scheme).
+flate2 = "1"
+# Parsing `cargo metadata` (the `--deps` source discovery) and emitting the
+# `--json` model dump.
+serde_json = "1"

@@ -1,14 +1,6 @@
-//! `shared local` resources on a `pool`: the one pool kind combining a `!Send`
-//! payload with fan-out (the `embassy_net::Stack` shape — a `Copy` handle that
-//! is not `Send`). The pool rides the pool-wide shared-slot path exactly like
-//! nodes: ONE static (declared here by a node AND the pool), non-destructive
-//! `get()` per spawn, no restore. Take-kind `local` on pools stays rejected
-//! (see compile_fail_local/local_on_pool.rs).
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 
-/// A `Copy` fan-out handle that is also `!Send` (raw pointer) — the
-/// `embassy_net::Stack` shape, needing `shared local`.
 type LocalHandle = (u32, *const ());
 
 async fn provider(_node: &'static TaskNode) {}

@@ -1,18 +1,3 @@
-//! Behavioral tests for node-completion observation and the non-panicking
-//! shutdown paths (0.4.0). A `task:` worker that returns without any ack call is
-//! recorded by the generated shell's `mark_exited()` — it reads as down
-//! (`!is_running`, `has_exited`), `teardown` skips it, and a control `Activate`
-//! respawns it. A hand-written `spawn:` task follows the same contract by calling
-//! `mark_exited()` itself. A task that never acks turns a stop into
-//! `Err(ShutdownTimeout)` naming the node instead of a supervisor panic;
-//! `teardown_continue` visits every node past the wedge and reports it at the end.
-//!
-//! Same harness as `teardown.rs`: one real executor on a std thread, MockDriver
-//! for the frozen clock. The 2 s ack timeout only elapses when the main thread
-//! advances the mock clock, which it does in small repeated steps while the
-//! driver is in a wedge phase — repeated so the advance always lands after the
-//! timeout timer has been armed.
-
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
@@ -30,26 +15,19 @@ static ONESHOT_RUNS: AtomicU32 = AtomicU32::new(0);
 static PHASE: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
 
-/// The completion-observation subject: a plain `task:` worker that runs once and
-/// returns — no ack call anywhere in the body. The generated shell's
-/// `mark_exited()` is the only thing recording the exit. `pool_size: 2` leaves a
-/// slot free for the control-driven respawn.
 async fn oneshot_worker(_node: &'static TaskNode) {
     ONESHOT_RUNS.fetch_add(1, Ordering::SeqCst);
 }
 
-/// A hand-written `spawn:` task on the documented 0.4.0 contract: on shutdown it
-/// calls `mark_exited()` (instead of the old bare `ack_dropped()`) so its exit is
-/// recorded as a completion too.
+/// A hand-written `spawn:` task on the documented contract: on shutdown it calls
+/// `mark_exited()` rather than a bare `ack_dropped()`, so its exit is recorded as
+/// a completion too.
 #[embassy_executor::task]
 async fn acked_task(node: &'static TaskNode) {
     node.wait_shutdown().await;
     node.mark_exited();
 }
 
-/// The wedge: never observes shutdown, never acks. Every stop directed at it
-/// must come back as `Err(ShutdownTimeout)` once the mock clock passes the 2 s
-/// ack window.
 #[embassy_executor::task]
 async fn wedged_task(_node: &'static TaskNode) {
     core::future::pending::<()>().await;
@@ -69,7 +47,7 @@ async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
 
     // ── start: ONESHOT runs and returns; the shell records the completion ───
-    sup.start(spawner).await.expect("start");
+    sup.start(&spawner).await.expect("start");
     settle(|| ONESHOT_RUNS.load(Ordering::SeqCst) == 1).await;
     settle(|| !ONESHOT.is_running()).await;
     assert!(ONESHOT.has_exited(), "clean return recorded by the shell");
@@ -100,7 +78,7 @@ async fn driver(spawner: Spawner) {
             node: &ONESHOT,
             op: ControlOp::Activate,
         },
-        spawner,
+        &spawner,
     )
     .await
     .expect("activate cascade has nothing to stop");
@@ -119,7 +97,7 @@ async fn driver(spawner: Spawner) {
         .stop_node(&WEDGED)
         .await
         .expect_err("wedged task cannot ack");
-    assert_eq!(err.node.name, "wedged");
+    assert_eq!(err.node.name(), "wedged");
     assert!(
         WEDGED.is_running(),
         "a node that missed its ack stays marked running"
@@ -131,10 +109,10 @@ async fn driver(spawner: Spawner) {
         .teardown_continue()
         .await
         .expect_err("wedge reported after visiting all nodes");
-    assert_eq!(err.node.name, "wedged");
+    assert_eq!(err.node.name(), "wedged");
     // Plain teardown now also errors on the wedge (nothing else is running).
     let err = sup.teardown().await.expect_err("wedge still wedged");
-    assert_eq!(err.node.name, "wedged");
+    assert_eq!(err.node.name(), "wedged");
 
     DONE.store(true, Ordering::SeqCst);
 }
@@ -153,8 +131,6 @@ fn completion_observed_and_timeouts_are_errors() {
 
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
     while !DONE.load(Ordering::SeqCst) {
-        // Phases 3+ park on the 2 s ack timeout; advance the frozen clock in
-        // small repeated steps so an advance always lands after the timer arms.
         if PHASE.load(Ordering::SeqCst) >= 3 {
             clock.advance(embassy_time::Duration::from_millis(500));
         }

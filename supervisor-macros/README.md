@@ -3,28 +3,13 @@
 [![crates.io](https://img.shields.io/crates/v/embassy-supervisor-macros.svg)](https://crates.io/crates/embassy-supervisor-macros)
 [![docs.rs](https://docs.rs/embassy-supervisor-macros/badge.svg)](https://docs.rs/embassy-supervisor-macros)
 
-The `supervisor_graph!` proc-macro for
-[`embassy-supervisor`](https://crates.io/crates/embassy-supervisor): declare a supervised
-task graph once, and get the node `static`s plus a single `GRAPH` bundle whose
-**topological order is computed at compile time**. The whole graph is validated at compile
-time: dependency cycles, unknown or duplicate dependencies, duplicate node/pool names,
-unknown `executor:` slots, malformed spawn forms, and pool bounds (`min <= max <= member
-count`, 256-slot cap) are all spanned compile errors — see the
-[full list](../supervisor/README.md#limits-and-compile-time-validation).
+Proc-macro crate for [`embassy-supervisor`]: the `supervisor_graph!` graph declaration macro plus `compose_graph!` for fragment assembly. Do not depend on this crate directly — use `embassy_supervisor` with its default `macros` feature, which re-exports the macro and forwards features here.
 
-**Do not depend on this crate directly.** Use `embassy-supervisor` with its default
-`macros` feature, which re-exports the macro and forwards the `pool` feature here.
-The macro's output references `embassy-supervisor` internals, so the supervisor pins
-this crate by exact version — the pair it was tested with.
+**The macro's output references `embassy-supervisor` internals, so the supervisor pins this crate by exact version.** Use it only as a dependency of `embassy-supervisor`.
 
-See the [`embassy-supervisor` documentation](https://docs.rs/embassy-supervisor) for the
-macro's surface syntax and examples, and this crate's
-[CHANGELOG](CHANGELOG.md) for what each release adds (0.2.0: `executor:` slots,
-pool-name deps, trace spawn glue, duplicate-dep/name rejection; 0.3.0: `task:` shells +
-`resources:`; 0.4.0: `local`/`consume` resource kinds; 0.5.0: fragments, named graphs,
-`exit:`/`state:` clauses, per-member pool resources, `ready` dep markers; 0.6.0: the
-`cancel` flag for supervisor-unaware workers).
+## Documentation
 
-## License
-
-Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+What the macro emits and the runtime contract behind it:
+[The DSL](https://embassy-supervisor.github.io/concepts/dsl/) for the input
+syntax, [Task lifecycle](https://embassy-supervisor.github.io/concepts/lifecycle/)
+for the generated glue's semantics.

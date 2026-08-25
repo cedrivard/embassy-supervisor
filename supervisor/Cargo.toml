@@ -1,7 +1,7 @@
 [package]
 name = "embassy-supervisor"
-version = "0.4.3"
-description = "A generic, HAL-agnostic task-lifecycle supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, and runtime start/stop/pause/resume control."
+version = "0.5.0"
+description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -23,23 +23,36 @@ embassy-sync = { version = "0.8" }
 embassy-time = { version = "0.5" }
 embassy-futures = { version = "0.1" }
 portable-atomic = { version = "1", features = ["critical-section"] }
+# The observation facade (see the `coupling-observe` feature). Version range,
+# not `=`: it is a stable contract signal libraries also depend on.
+embassy-supervisor-observe = { version = "0.1", path = "../supervisor-observe", optional = true }
 pin-project-lite = "0.2"
 defmt = { version = "1.1.0", optional = true }
+# `default-features = false` keeps it no_std; only its macros are used.
+log = { version = "0.4", optional = true, default-features = false }
+# `state: zeroed Type` (heap-state): `Zeroable` is the all-zero-is-valid contract.
+bytemuck = { version = "1", optional = true, default-features = false }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.6.2", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.7.0", path = "../supervisor-macros", optional = true }
 
 [features]
-# Full-featured out of the box; a footprint-constrained consumer trims with
-# `default-features = false` and opts back into what it needs.
-default = ["control", "pool", "macros"]
+# Just the graph macro: everything the supervisor can DO is opt-in, matching the
+# rest of this table. `control` and `pool` are capabilities, not core, and both
+# cost driver-loop code that runs every iteration whether or not a graph uses
+# them. `restart` and `bound-deps` pull `control` back in on their own.
+default = ["macros"]
 # Runtime control plane: ControlOp, request_control/apply_control, activate/deactivate.
 control = []
 # Elastic worker pools: the `pool` module, run_pools, load scaling. Forwarded to
 # the proc-macro (weak `?`, so only when the optional `macros` dep is enabled) so
 # `supervisor_graph!` emits the `GRAPH.pools` field iff this feature is on.
 pool = ["embassy-supervisor-macros?/pool"]
-# Logging via defmt (otherwise the log macros are no-ops).
+# Logging backends. Only one can be live, so `defmt` TAKES PRECEDENCE when both
+# are on (`--all-features` does that, and it is what docs.rs builds).
 defmt = ["dep:defmt"]
+# For hosted and std consumers. With NEITHER backend the crate logs nothing at
+# all — no stale-node reports, no bring-up lines.
+log = ["dep:log"]
 # Re-export the `supervisor_graph!` proc-macro.
 macros = ["dep:embassy-supervisor-macros"]
 # Permit the `local` resource kind (`resources: [R: local Type]` — `!Send`
@@ -53,8 +66,9 @@ local-resources = ["embassy-supervisor-macros?/local-resources"]
 # Task-asserted readiness: set_ready/clear_ready/is_ready/wait_ready on TaskNode
 # and the `ready` dep marker (`deps: [NET ready]`) — bring-up then awaits the
 # dep's readiness (bounded by the node's slot_timeout), and pool growth defers
-# while a ready-marked dep is un-ready. Off by default: costs one AtomicBool +
-# one Signal + one slice per node.
+# while a ready-marked dep is un-ready. Off by default: costs one Signal of
+# RAM per node (the ready flag is a bit in the packed flags word), plus a
+# flash slice in the node's config.
 readiness = ["embassy-supervisor-macros?/readiness"]
 
 # Reclaimable per-activation heap state: the `state: Type = init_expr` clause
@@ -68,20 +82,271 @@ readiness = ["embassy-supervisor-macros?/readiness"]
 # unrefcounted pointers into it, so freeing it is unsound —
 # heap is used only where it can be reclaimed. Consumer needs a
 # #[global_allocator].
-heap-state = ["embassy-supervisor-macros?/heap-state"]
+heap-state = ["embassy-supervisor-macros?/heap-state", "dep:bytemuck"]
+
+# Bound readiness edges: `deps: [NET ready bound]` (`bound` implies `ready`).
+#
+# THIS CHANGES A DOCUMENTED CONTRACT, per edge and only where you opt in.
+# `clear_ready` is otherwise "status, not control": it defers future bring-up
+# and leaves running dependents alone. Across a `bound` edge it becomes
+# control — the driver loop stops the provider's still-running bound
+# dependents (transitively along bound edges, reverse topological order, no
+# `disabled` latch), and a later `set_ready` brings back every node it stopped
+# whose bound providers are all ready again, through the full gate sequence.
+# Edges without the marker behave exactly as before.
+#
+# This closes the gap where readiness is consumed once, at spawn: a provider
+# that comes up and later goes quiet is otherwise invisible to the graph.
+#
+# It is the WRONG tool for a chain that cannot tolerate a stop-restart window
+# — an in-flight control loop, anything holding physical state. There, pair
+# `liveness-monitor` (detect) with `epochs` (let the running dependent resync)
+# and leave the lifecycle alone. A manual `deactivate` always wins over a bound
+# cascade, and detached nodes are never pulled in.
+#
+# Costs a bit in the node's packed flags word plus a 4-slot mailbox, and a
+# flash slice in the node's config.
+bound-deps = ["readiness", "control", "embassy-supervisor-macros?/bound-deps"]
+
+# The rest_for_one restart verb (Erlang/OTP's name for the shape):
+# `Supervisor::restart(node)` stops the node's transitive dependents in reverse
+# topological order, respawns the node, then brings the dependents back in
+# topological order through the FULL gate sequence — executor slot, resource
+# gates, ready-deps. A `ready`-marked provider therefore has to re-assert
+# readiness before each dependent returns, which is the re-gate a bare
+# stop_node + start_node cannot give you.
+#
+# Distinct from `deactivate` + `activate`, which is the closest existing
+# composition but wrong for this: that pair also clears `disabled` on the
+# target's transitive *dependencies* (silently re-enabling nodes someone
+# deliberately stopped), swallows per-node spawn errors, and leaves `disabled`
+# latched across the two calls where concurrent observers and the pool policy
+# can see it.
+#
+# Adds `ControlOp::Restart`, so the verb is reachable from the control mailbox.
+#
+# A ground/bench verb on anything safety-critical: restarting a control loop in
+# flight is a very different proposition from restarting a stalled link. Pair
+# it with the application's failsafe logic; do not wire it blindly to a
+# `liveness-monitor` event.
+restart = ["control"]
+
+# Declared dataflow coupling: the `reads:` / `writes:` node clauses naming the
+# ACTUAL signal statics, plus the signal-indexed queries (`writers_of`,
+# `readers_of`).
+#
+# `deps:` orders SPAWNS, a one-shot startup relation; what governs a running
+# system is the continuous dataflow between tasks. These clauses state a node's
+# inputs and outputs by naming the statics: an unresolvable path is a compile
+# error, and renaming a signal breaks every declaration referring to it.
+#
+# The coupling table NEVER feeds the topological sort, so unlike `deps:` it may
+# contain cycles, which real signal coupling routinely does.
+#
+# On its own this is a description: who produces what, who consumes it, for a
+# status endpoint, the diagram tool, or a reader of the graph. The two tiers
+# below turn it into behaviour — a heartbeat and a readiness assertion.
+#
+# Flash-only cost (const slices, one `&str` + one thin ref per entry); no RAM
+# and no hot-path work.
+coupling = ["embassy-supervisor-macros?/coupling"]
+
+# Polled coupling: the `observed` entry marker on `reads:`/`writes:`, and a
+# heartbeat derived from a declared write.
+#
+# `observed` gives the supervisor a way to ask whether this signal moved;
+# `beat` is what currently asks. The marker supplies the accessor, a consumer
+# decides whether to call it, and today the heartbeat is the only consumer —
+# so an `observed` entry without `beat` (and every `observed` entry in a
+# `reads:` list, since a read can never be `beat`) is inert: declared, one word
+# of flash, waiting for something to ask.
+#
+# An `observed` entry resolves an accessor whose result changes when the signal
+# is written: `observed via <expr>` on the entry, else the graph-level
+# `observe writes:/reads:` default, else `Observable::change_token` from the
+# `embassy-supervisor-observe` facade — which a signal library implements
+# without depending on this crate. The supervisor calls the accessor and
+# compares readings for inequality; it never learns what a signal is.
+#
+# Two things follow from that one consumer. With `liveness-monitor`, an
+# `observed beat` write drives the node's heartbeat rather than `beat()` calls
+# in the body — so a declaration naming the wrong signal makes the node go
+# STALE instead of merely logging. And `ready_on_write` lets the first advance
+# assert readiness.
+#
+# What distinguishes this tier: it asks NOTHING of the task. No node in the
+# signature, no verb calls, no `beat()`, no `set_ready()`. It is the tier for a
+# body you cannot change — a vendor driver, a generated task, anything you do
+# not own. Where you can change the body, `dataflow` does both jobs
+# exactly rather than at sweep resolution, and with no probe.
+#
+# Cost: one `Option<fn() -> u32>` per entry (niche-packed to one word, and only
+# `observed` entries carry a non-null one) and one `AtomicU32` per node.
+coupling-observe = [
+    "coupling",
+    "dep:embassy-supervisor-observe",
+    "embassy-supervisor-macros?/coupling-observe",
+]
+
+# Explicit coupling: the node is the access path. The `#[dataflow]` attribute
+# derives a task fn's coupling tables at compile time from the verb calls in
+# its body — `put`/`get` perform the write or the snapshot read themselves
+# (via the facade's Sink/Source traits), `writer`/`reader` hand the signal
+# back for RMW and per-consumer-handle patterns — and rewrites each call to
+# carry its table entry, so the record cannot drift from the code.
+#
+# What the tables feed, by node shape. A `discover` node binds its task fn's
+# derived tables in place of `reads:`/`writes:` lists (a list beside it may
+# still add markers, never a coupling), and `dataflow: [..]`
+# additionally adopts accessor fns' tables (an accessor takes the caller's
+# node, so a fully private signal's accesses attribute to whoever calls):
+# flash-const, drawn by the diagram tool, answering the signal-indexed queries,
+# and impossible to drift from the code — there is no second place to update.
+# A derived table states couplings and nothing else. The sign of life is
+# carried by the verb — `beat_put` / `beat_writer` are `put`/`writer` that also
+# beat — or by a `TaskNode::beat` call. The graph says nothing about liveness at
+# this tier, because the write that proves it is the place that knows.
+#
+# The attribute's arguments register a CONSUMER'S OWN verbs, which are
+# otherwise invisible to the scan: `#[dataflow(read(subscribe),
+# write(publish))]` puts those idents in the table the walk keys on, so an
+# extension trait's methods record couplings exactly as the built-in verbs do.
+# Direction is stated because the scan is token-level and has no types to ask.
+# Compile-time only, so a registered verb costs nothing the built-in ones do
+# not; the diagram tool reads the same attribute, and so cannot disagree with
+# the build about what a verb is.
+#
+# The heartbeat self-silences: it is a flag that whoever next checks
+# staleness (the monitor's sweep, an app watchdog, a dashboard) converts to a
+# beat inside `ticks_since_beat`, so the checker pays the clock read it was
+# making anyway and the beating task never does. Steady state per write:
+# nothing at all for `put`/`writer`, and one relaxed store for the `beat_*`
+# pair. Reads are pure pass-throughs. RAM: one flag word per node; a
+# `discover` node's table (N slots x 3 words per direction) is flash-const.
+dataflow = [
+    "coupling",
+    "dep:embassy-supervisor-observe",
+    "embassy-supervisor-macros?/dataflow",
+]
+
+# A graph as one addressable `'static`: `supervisor_graph!` emits a `GraphRef`
+# beside the node table, and `GRAPH.graph_ref` names it. A graph is otherwise
+# only a set of statics, and two features need to refer to "the graph" itself,
+# in opposite directions — so this carries neither of them, only the handle:
+#
+#   * `data-deps` needs NODE -> GRAPH, to search a node's own peers;
+#   * `trace` needs BINARY -> GRAPHS, because a hook holds an opaque task id
+#     and no node at all. That list cannot be built at compile time (two
+#     `supervisor_graph!` invocations never see each other), so each `GraphRef`
+#     is linked into an intrusive chain at `Supervisor::start`. Intrusive
+#     because the link lives in the `GraphRef` the macro already emits, so the
+#     number of graphs is UNBOUNDED. A fixed-size table would have to drop the
+#     ones past its cap, and silently: a task id that resolves to nothing is
+#     indistinguishable from an unsupervised task.
+#
+# The chain costs RAM (one reference + one flag per graph) and only `trace`
+# reads it, so it is `trace`-gated: with this feature alone a `GraphRef` has no
+# interior mutability and the whole static lives in flash. Nothing here is per
+# node — that cost belongs to `data-deps`, below.
+graph-ref = ["embassy-supervisor-macros?/graph-ref"]
+
+# Data-driven dependencies: a coupling a reader cannot start without, resolved
+# through the graph instead of restated as a `deps: [X ready]` edge in every
+# consumer. Points each node at its own graph (`TaskNode::graph`), whose node
+# table `producer_of` searches for the node that declares a signal's write — by
+# address, so it sees `discover`-derived tables a declaration could not name.
+# On top of that: the `Gated` trait, `TaskNode::open`, and (with `readiness`)
+# the `Backed<T>` wrapper, which starts the producer on first open and holds
+# the reader until it is ready.
+#
+# And the same coupling's other edge, on the way down: `Leased<T>` with
+# `TaskNode::lease`. A producer that published a handle cannot free it while a
+# consumer still holds one, and no declaration answers that — `reads:` records
+# that a node touches a signal, never that it holds something derived from it
+# across an await. So the holders are counted: `lease` hands out a guard,
+# dropping it drops the count, and `Leased::drain` closes the signal to new
+# leases and waits for zero. Exact where a declaration is best-effort, which
+# is the point: an undeclared access, an unadopted helper and a `detached`
+# node the supervisor never tears down all hold a lease or they do not. Costs
+# one AtomicU32 + one Signal per leased signal, and nothing for the rest.
+#
+# Separate from `dataflow` because the back-pointer is a per-node cost a graph
+# that gates nothing should not carry: one reference in each node's flash
+# config. `producer_of` is non-generic, so it is codegen'd, but nothing
+# references it until a signal is wrapped and it links away.
+#
+# The field is a thin `&'static GraphRef` rather than the node slice it stands
+# for, but do not expect that back: `TaskNode` is 96 bytes at alignment 8
+# without the field and 104 with it, 4-byte reference or 8-byte slice alike,
+# because the padding eats the difference on a 32-bit target. The indirection
+# is there to share the handle with `trace`, not to save space.
+#
+# Resolution itself is const: no registry, no runtime registration, no bound on
+# the number of graphs, and a gate resolves as readily before
+# `Supervisor::start` as after.
+data-deps = ["graph-ref", "dataflow", "embassy-supervisor-macros?/data-deps"]
+
+# A per-node status line: report_status()/status() on TaskNode, in the mold of
+# sd_notify's STATUS=. Passive: shown when asked (a dashboard, a log line on
+# change), never an event, and cleared on activation so a fresh spawn does not
+# wear the previous run's last words. Costs one mutexed cell per node.
+node-status = []
+
+# Per-node activation generation: epoch() / wait_epoch_change() on TaskNode,
+# bumped on every transition into `running` (fresh spawn, pool grow,
+# respawn_terminate, Pause resume). Lets an ALREADY-RUNNING dependent notice
+# that a provider was restarted underneath it and resync its derived state —
+# the gap `deps:` cannot cover, because a dep edge is consumed once, at spawn.
+# Being per-node rather than per-edge, it also serves couplings the spawn DAG
+# cannot express (cyclic ones). Pure status: nothing is gated or stopped.
+# Off by default: costs one AtomicU32 + one Signal per node.
+epochs = []
 
 # Per-node heartbeat/staleness: beat()/ticks_since_beat()/is_stale(max_age),
 # for an app watchdog task to detect alive-but-wedged nodes. Independent of
 # `trace` (pure atomics + embassy-time; detects a different failure class than
 # the trace stall watermark: not-making-progress vs hogging-the-executor).
-# Off by default: costs one AtomicU32 per node.
-liveness = []
-# Trace-hook observability: the `trace` module (task-id -> node registry,
+# Off by default: costs 8 bytes per node (measured, thumbv8m: a `TaskNode` goes
+# from 96 to 104 with `dataflow`), and a beat is two instructions — `beat` is
+# `#[inline]`, so `beat_put` / `beat_writer` leave no call behind even without
+# LTO. Those two verbs are gated on this feature rather than degrading to plain
+# `put`/`writer` without it: a heartbeat verb that does not beat is a claim the
+# build silently does not make, and the node reads as live forever.
+liveness = ["embassy-supervisor-macros?/liveness"]
+
+# Supervisor-side liveness POLICING, on top of the `liveness` primitives: the
+# per-node `beat_timeout: <millis>` / `beat_window: <n>` graph clauses, plus
+# `Supervisor::monitor()` — a periodic sweep that emits a `HealthEvent`
+# (`wait_health()`) when a running node stops beating for `beat_window`
+# consecutive checks, and a `Recovered` event when it starts again.
+# `Supervisor::run` selects it in automatically.
+#
+# REPORT-ONLY, and deliberately so: the crate names the wedged node, the
+# application decides what that means. Escalation is a composition the app
+# writes (`Deactivate`, `restart`, `clear_ready`), because the right answer is
+# domain-specific — restarting a control loop mid-flight is a very different
+# proposition from restarting a stalled network link.
+#
+# Only nodes carrying `beat_timeout:` are policed; a node whose body doesn't
+# `beat()` would otherwise read permanently stale. Detached and not-running
+# nodes are skipped. With no node opting in the monitor parks forever and an
+# idle system never wakes. Costs one AtomicU8 per node + one 4-slot event
+# channel.
+liveness-monitor = ["liveness", "embassy-supervisor-macros?/liveness-monitor"]
+# Trace-hook observability: the `trace` module (task-id -> node resolution,
 # per-node exec-tick/poll/max-poll accounting, per-executor idle accounting,
 # stall detection). Recorders only — the `_embassy_trace_*` hook SYMBOLS are
 # gated separately (see `trace-hooks`) so an application with its own hooks can
 # forward to the recorders manually, and so the recorders stay host-testable.
-trace = ["embassy-executor/trace", "embassy-supervisor-macros?/trace"]
+#
+# Pulls `graph-ref` for the id -> node scan: a hook holds an opaque `u32` and
+# no node, so it walks every graph linked into the binary, of which there may
+# be any number.
+trace = [
+    "graph-ref",
+    "embassy-executor/trace",
+    "embassy-supervisor-macros?/trace",
+]
 # Stamp each node's name into its task Metadata at spawn, so external consumers
 # (rtos-trace/SystemView, debuggers) see node names instead of opaque ids —
 # WITHOUT the supervisor's own trace recorders/hooks. Independent of `trace`: it
@@ -99,8 +364,7 @@ metadata-names = [
 # forward to the `trace` recorders.
 trace-hooks = ["trace", "embassy-supervisor-macros?/trace-hooks"]
 # The supervisor's trace layer WITH node names: `trace` (recorders) plus the
-# `metadata-names` stamp. Effective behavior is unchanged from prior releases; it is
-# now expressed as a composition of the two independent capabilities.
+# `metadata-names` stamp, as a composition of the two independent capabilities.
 trace-names = ["trace", "metadata-names"]
 # Preemption-accurate (charge-splitting) accounting: a nested poll (an
 # InterruptExecutor preempting a lower tier mid-poll) credits its wall time back
@@ -109,6 +373,15 @@ trace-names = ["trace", "metadata-names"]
 # `trace::set_core_id_fn` (one per-core stack each); without it everything maps
 # to core 0's stack — correct on a single core.
 trace-nested = ["trace"]
+# The supervisor's own host task as a hidden, auto-adopted node: each GraphRef
+# carries one extra TaskNode ("supervisor", running + detached, outside the
+# node table so waves/monitor/respawn never see it), and start() stamps the
+# calling task's id into it — no declaration needed. The waves, driver loop,
+# monitor, and control application then show up in per-node poll accounting
+# instead of the unsupervised share. Attribution is task-granular: everything
+# else the host task polls is billed to it too. Costs one TaskNode of RAM per
+# graph.
+trace-self = ["trace"]
 
 [package.metadata.docs.rs]
 # Document every feature (control/pool/defmt) on docs.rs.
@@ -136,6 +409,18 @@ embassy-executor = { version = "0.10", features = ["platform-std", "executor-thr
 name = "trace"
 required-features = ["trace-hooks", "macros"]
 
+# The `trace-self` hidden node end to end (a real executor's hooks attribute the
+# host task's polls), plus `adopt_current` self-registration.
+[[test]]
+name = "trace_self"
+required-features = ["trace-self", "trace-hooks", "macros"]
+
+# Respawn vs embassy's two-phase task cleanup: a stale run-queue entry keeps the
+# storage Busy for one pass; both respawn paths must retry through it.
+[[test]]
+name = "spawn_reclaim"
+required-features = ["macros"]
+
 # Host tests for the `trace-nested` charge-splitting (preemption accounting).
 [[test]]
 name = "trace_nested"
@@ -156,7 +441,7 @@ required-features = ["macros", "control"]
 # generic worker (plus a shell-driven pool floor) through start/teardown/respawn.
 [[test]]
 name = "task_shells"
-required-features = ["macros"]
+required-features = ["macros", "pool"]
 
 # `metadata-names` WITHOUT `trace`: proves the name-only spawn glue (`stamp_name`,
 # no `adopt`) compiles, links with no `_embassy_trace_*` symbols, and runs.
@@ -183,6 +468,13 @@ required-features = ["macros", "local-resources"]
 # `slot_timeout:`-sized gate waits, across start -> teardown -> respawn.
 [[test]]
 name = "provider_node"
+required-features = ["macros"]
+
+# `provides:` — a provider's shutdown ack clears the slots its task fills, so
+# a respawned consumer's gate holds for the fresh value instead of taking the
+# previous activation's leftover; Pause parks are exempt.
+[[test]]
+name = "provides"
 required-features = ["macros"]
 
 # Lossless control mailbox: try_request_control reports a full channel,
@@ -228,11 +520,198 @@ required-features = ["macros", "readiness", "pool"]
 name = "liveness"
 required-features = ["macros", "liveness"]
 
+# `restart`: rest_for_one cycles the target and its transitive dependents,
+# re-gating them on the way back up, while leaving upstream dependencies and
+# deliberately-disabled nodes alone.
+[[test]]
+name = "restart"
+required-features = ["macros", "restart", "readiness"]
+
+# `bound-deps`: clear_ready stops bound dependents and set_ready brings them
+# back, while unmarked `ready` edges keep the status-not-control behaviour.
+[[test]]
+name = "bound_deps"
+required-features = ["macros", "bound-deps"]
+
+# `log`: that the crate's log macros reach the facade at all.
+[[test]]
+name = "log_backend"
+required-features = ["macros", "coupling", "log", "node-status"]
+
+# `liveness-monitor`: the supervisor-side sweep. Only `beat_timeout:` nodes are
+# policed, a stall reports once (not per sweep), `beat_window:` requires
+# consecutive misses, recovery is reported, and nothing is ever stopped.
+[[test]]
+name = "liveness_monitor"
+required-features = ["macros", "liveness-monitor", "control"]
+
+# `coupling-observe`: liveness and readiness asked of nothing. An observed
+# `beat` write drives the node's heartbeat, so a declaration naming a signal
+# the task does not write makes it go STALE rather than merely logging, and
+# `ready_on_write` follows the first advance (`readiness` is what it asserts).
+# Paired with `liveness-monitor` because the sweep is what polls the accessors.
+[[test]]
+name = "coupling_observe"
+required-features = ["macros", "coupling-observe", "liveness-monitor", "readiness"]
+
+# `dataflow`: the explicit tier. `#[dataflow]` derives a fn's tables
+# from its verb calls, `discover` binds them in place of lists and
+# `dataflow: [..]` adopts an accessor's; `beat_put`/`beat_writer` carry the
+# node's heartbeat at the write that proves it.
+[[test]]
+name = "dataflow_bundle"
+required-features = [
+    "macros",
+    "dataflow",
+]
+
+[[test]]
+name = "dataflow"
+required-features = ["macros", "dataflow", "node-status", "liveness", "pool"]
+
+# Consumer-registered verbs: `#[dataflow(read(..), write(..))]` puts a
+# consumer's own idents in the table the walk keys on, so their accesses reach
+# the derived tables like the built-in verbs' do.
+[[test]]
+name = "custom_verbs"
+required-features = ["macros", "dataflow", "readiness"]
+
+# The stop wave's unordered half: a producer whose shutdown waits on a
+# consumer it has no edge to is signalled up front. Sequential signalling
+# deadlocks here, so this is the regression guard for that shape.
+[[test]]
+name = "teardown_concurrent"
+required-features = ["macros", "data-deps"]
+
+# The stop wave's dependency-ordered half: a `deps:` dependency is signalled
+# only once its stopping dependents have acked, so a dependent may drive one
+# final request through it during shutdown (the cyw43 leave-ioctl shape) —
+# and an unordered watcher waiting on that dependency is released by an ack
+# the parked wave observes.
+[[test]]
+name = "stop_wave"
+required-features = ["macros"]
+
+# The wave's fault behaviors around a held dependency: an aborting teardown
+# leaves the wedge's dependency unsignalled and serving; teardown_continue
+# gives up on the wedge after its window, which releases the dependency.
+[[test]]
+name = "stop_wave_faults"
+required-features = ["macros"]
+
+# `ack_timeout:` bounds the shutdown-ack wait per node on both stop paths:
+# a shortened window faults early, a raised one collects an ack the default
+# would have missed.
+[[test]]
+name = "ack_timeout"
+required-features = ["macros"]
+
+# Activate on a down-but-not-parked Pause node (stopped at boot) spawns a
+# real instance through the gates; a genuinely parked one resumes in place.
+[[test]]
+name = "activate_pause"
+required-features = ["macros", "control"]
+
+# The same shape through the cascading verbs: `deactivate` and `restart`'s
+# down half stay routed through the shared two-phase stop, so a draining
+# producer chosen by a cascade is not waited on before its consumer is told.
+[[test]]
+name = "lifecycle_concurrent"
+required-features = ["macros", "data-deps", "restart"]
+
+# The bring-up wave's own capability: a consumer gated on a slot filled by a
+# provider declared after it, with no dep edge — a sequential walk parks on
+# the gate before the provider is spawned and times out.
+[[test]]
+name = "bringup_concurrent"
+required-features = ["macros"]
+
+# `Leased`: the teardown side of a data dependency. The producer counts its
+# consumers' live claims rather than deriving them from a declaration, and
+# waits for zero before it may free what it published.
+[[test]]
+name = "leases"
+required-features = ["macros", "data-deps"]
+
+# The coupling layer on embassy-sync's `Channel` and `Mutex`: a coupling names
+# any `Sync` static, so the tables, the verbs, the gate and the queries carry
+# primitives that behave nothing like a shared cell. Also pins that a queue's
+# `len()` is not a change token, where `Counted` is.
+[[test]]
+name = "sync_primitives"
+required-features = [
+    "macros",
+    "dataflow",
+    "data-deps",
+    "coupling-observe",
+    "liveness-monitor",
+    "readiness",
+    "liveness",
+]
+
+# How many graphs the trace recorders resolve through: all of them, with no
+# cap. Six here, so the chain is exercised well past a plausible fixed table.
+[[test]]
+name = "trace_graphs"
+required-features = ["macros", "trace"]
+
+# Data-driven dependencies: `open` runs the signal's own `Gated::ensure` before
+# handing it back, so a `Backed` signal starts the node that fills it on first
+# read and holds the reader until that node is ready. The producer is found by
+# searching the caller's own graph, so nothing names it.
+[[test]]
+name = "gated_signal"
+required-features = ["macros", "data-deps", "readiness", "control"]
+
+# Two openers racing one gate during the producer's bring-up: both must pass
+# on one wake, with one control request between them.
+[[test]]
+name = "gated_signal_concurrent"
+required-features = ["macros", "data-deps", "readiness", "control"]
+
+# A node's view of its own graph: two graphs answer separately, pool members
+# carry the table, an unwritten signal resolves to nothing, and the heartbeat
+# pass-through verb claims what the plain one does not.
+[[test]]
+name = "data_deps"
+required-features = ["macros", "data-deps", "readiness", "liveness", "pool"]
+
+# The same gate on a signal a module keeps private: the derived tables are
+# public, the signal is not, and the graph binds by fn path without naming it.
+[[test]]
+name = "gated_private"
+required-features = ["macros", "data-deps", "readiness", "control"]
+
+# The write-rate decimation: under `liveness-monitor` a verb write sets a flag
+# the sweep converts into a beat, so the per-message cost is a relaxed store.
+# Separate from `dataflow` because `beat_timeout:` only compiles with
+# the monitor feature, and the base test's no-monitor build is itself a row
+# worth keeping (it exercises the stamp-at-the-access fallback).
+[[test]]
+name = "dataflow_monitor"
+required-features = ["macros", "dataflow", "liveness-monitor"]
+
+# `epochs`: the activation generation bumps on every path into `running`
+# (spawn, stop/start, respawn_terminate, Pause resume), so an already-running
+# dependent can see a provider restart that nothing re-gates it for.
+[[test]]
+name = "epochs"
+required-features = ["macros", "epochs", "control"]
+
+# `Pause` nodes under `restart` and `bound-deps`: restart resumes (not
+# respawns) a Pause target; a bound dependent of a Pause provider stops when
+# the provider is paused and restarts when it is resumed.
+[[test]]
+name = "pause_bound_restart"
+required-features = ["macros", "restart", "bound-deps"]
+
 # supervisor_fragment! + compose_graph!: cross-fragment deps, shared-slot dedup
 # across fragments, full lifecycle on the composed graph.
 [[test]]
 name = "compose"
 required-features = ["macros"]
+# `data-deps` is checked inside, behind a cfg, so the row that has it proves a
+# composed node carries the whole composed graph.
 
 # Per-member pool resources: take-kind slot arrays, member I takes
 # element I, restore-to-same-index, member_index, const-expr min:/max:.
@@ -289,3 +768,11 @@ name = "topo_sort"
 [[test]]
 name = "pool_policy"
 required-features = ["macros", "pool"]
+
+# Topology selection and shape bits: `Flat` for an edge-free graph (identity
+# order, empty dep rows, zero SHAPE), `Ordered` with exactly the declared bits
+# otherwise, a hand-built NodeCfg/TaskNode pair, and a full lifecycle over
+# `Flat` (the waves fold to plain index loops on it).
+[[test]]
+name = "flat_topology"
+required-features = ["macros"]

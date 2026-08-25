@@ -1,6 +1,3 @@
-//! Const-expr `min:`/`max:` are validated by const asserts (parse-time spans
-//! only exist for the literal path): a floor above the ceiling fails
-//! const-eval.
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 

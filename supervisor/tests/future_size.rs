@@ -1,16 +1,3 @@
-//! Layout regression: the `run_cancellable` combinators must store the worker's
-//! state machine **once**.
-//!
-//! Written as `select(fut, wait_shutdown()).await` inside an `async fn`, they
-//! stored it twice — once in the function's own frame (the by-value argument) and
-//! once inside the select, because rustc does not overlap those slots
-//! (rust-lang/rust#62958). That is invisible in a unit test of behaviour and very
-//! visible in a binary: task storage is static, so a graph of `cancel` nodes paid
-//! an extra copy of every worker future in `.bss`. A real graph measured +38 KB.
-//!
-//! The bound is deliberately generous (1.5x, against a doubling) so this fails on
-//! the regression and not on a few bytes of bookkeeping drifting.
-
 use core::future::Future;
 use core::mem::size_of_val;
 
@@ -28,6 +15,14 @@ const PAYLOAD: usize = 4096;
 
 /// A worker holding a large buffer **across** an await, so the buffer lands in
 /// its state machine rather than on the stack.
+///
+/// Deliberately `-> impl Future` wrapping an `async` block rather than an
+/// `async fn`: this test measures future *layout*, and the two forms are only
+/// interchangeable as long as rustc lays them out identically — which is
+/// exactly the kind of assumption a layout regression test must not bake in.
+/// (`clippy::manual_async_fn` cannot know that, and CI lints with
+/// `--all-targets`, so this `#[allow]` is load-bearing.)
+#[allow(clippy::manual_async_fn)]
 fn worker() -> impl Future<Output = usize> {
     async {
         let buf = [0u8; PAYLOAD];
@@ -51,5 +46,19 @@ fn run_cancellable_stores_the_worker_once() {
     assert!(
         acked < base + base / 2,
         "run_cancellable_acked holds the worker more than once: {acked} vs {base}"
+    );
+
+    let paused = size_of_val(&SIZED.run_pausable(worker()));
+    assert!(
+        paused < base + base / 2,
+        "run_pausable holds the worker more than once: {paused} vs {base}"
+    );
+
+    let looped = size_of_val(&SIZED.run_pausable_loop(async || {
+        let _ = worker().await;
+    }));
+    assert!(
+        looped < base + base / 2,
+        "run_pausable_loop holds the cycle future more than once: {looped} vs {base}"
     );
 }

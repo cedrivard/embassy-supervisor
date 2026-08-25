@@ -1,7 +1,3 @@
-//! `local` resources cannot combine with `executor:` — a local slot carries
-//! `!Send` values, and an `executor:`-routed node spawns through a `SendSpawner`
-//! whose `spawn` requires a `Send` future. The macro rejects the combination
-//! with the reason, instead of rustc's opaque `F: Send` bound failure.
 
 use std::cell::Cell;
 use std::rc::Rc;

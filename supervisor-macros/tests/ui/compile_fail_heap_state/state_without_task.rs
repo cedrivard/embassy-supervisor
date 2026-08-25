@@ -1,5 +1,3 @@
-//! `state:` requires `task:` — the generated shell owns the Box across the
-//! worker call and drops it on exit; a `spawn:` fn boxes its own state.
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 

@@ -1,0 +1,108 @@
+name: tools release
+
+# Prebuilt binaries for the host tools (`supervisor-mermaid` and
+# `supervisor-lint`), built when an `embassy-supervisor-tools-v*` tag is pushed
+# and attached to that tag's GitHub release. `workflow_dispatch` runs the build
+# matrix alone (artifacts only, no release), as a dry run for the packaging.
+on:
+  push:
+    tags: ["embassy-supervisor-tools-v*"]
+  workflow_dispatch:
+
+# The release job creates the release for the tag and uploads the archives.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl on Linux: the dependency tree is pure Rust (miniz_oxide backs
+          # flate2), so static linking is free and the binaries run on any
+          # distro regardless of its glibc. The arm64 runner is the hosted
+          # `ubuntu-24.04-arm` (free for public repositories).
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, runner: macos-13 }
+          - { target: aarch64-apple-darwin, runner: macos-latest }
+          - { target: x86_64-pc-windows-msvc, runner: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl linker
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # The workspace `.cargo/config.toml` pins the embedded target, so the
+      # explicit `--target` is load-bearing on every row, not just the cross
+      # ones. The workspace release profile keeps `debug = 2` for probe-rs on
+      # the firmware; the env override strips it here (16 MB -> 1.6 MB) without
+      # touching the shared profile.
+      - run: cargo build --release -p embassy-supervisor-tools --target ${{ matrix.target }}
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+      - name: Package
+        shell: bash
+        run: |
+          case "$GITHUB_REF_NAME" in
+            embassy-supervisor-tools-*) version="${GITHUB_REF_NAME#embassy-supervisor-tools-}" ;;
+            *) version="dev" ;;  # workflow_dispatch from a branch
+          esac
+          name="embassy-supervisor-tools-${version}-${{ matrix.target }}"
+          bindir="target/${{ matrix.target }}/release"
+          mkdir "$name"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "$bindir"/supervisor-mermaid.exe "$bindir"/supervisor-lint.exe "$name/"
+          else
+            cp "$bindir"/supervisor-mermaid "$bindir"/supervisor-lint "$name/"
+          fi
+          cp supervisor-tools/README.md LICENSE-MIT LICENSE-APACHE "$name/"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a "$name.zip" "$name"
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            embassy-supervisor-tools-*.tar.gz
+            embassy-supervisor-tools-*.zip
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/embassy-supervisor-tools-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The tag must name the version the manifest actually carries; a mismatch
+      # means the tag was cut before (or after) the bump landed.
+      - name: Check the tag against the manifest
+        run: |
+          manifest=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "embassy-supervisor-tools") | .version')
+          tag="${GITHUB_REF_NAME#embassy-supervisor-tools-v}"
+          if [ "$manifest" != "$tag" ]; then
+            echo "tag says $tag, Cargo.toml says $manifest" >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

@@ -2,14 +2,21 @@
 #
 # - `supervisor` : the generalized, HAL-agnostic task-lifecycle supervisor (the
 #   publishable `embassy-supervisor` crate). Pure embassy, no board specifics.
+# - `supervisor-syntax` : the graph DSL's parser and AST, shared by the proc-macro
+#   crate and any tooling that reads a declaration from source.
 # - `supervisor-macros` : the proc-macro crate providing `supervisor_graph!`
 #   (re-exported by `supervisor`; receives the forwarded `pool` feature).
+# - `supervisor-tools` : host tools over a graph declaration read from source:
+#   `supervisor-mermaid` (Mermaid diagrams) and `supervisor-lint` (dataflow lints).
+# - `supervisor-observe` : the observation facade (`Observable`, `Counted`) a
+#   signal library implements without depending on the supervisor.
 # - `firmware`   : the RP2350 application that drives the supervisor over a
 #   USB-CDC-NCM network with an HTTP control plane, an elastic worker pool, and OTA.
 # - `bootloader` : the embassy-boot-rp A/B bootloader.
 [workspace]
 resolver = "2"
-members = ["supervisor", "supervisor-macros", "firmware", "bootloader"]
+members = ["supervisor", "supervisor-syntax", "supervisor-macros", "supervisor-tools", "supervisor-observe", "firmware", "bootloader"]
+default-members = ["supervisor", "supervisor-macros", "firmware", "bootloader"]
 
 [workspace.package]
 edition = "2024"

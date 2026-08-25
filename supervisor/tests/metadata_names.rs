@@ -1,14 +1,3 @@
-//! Behavioral test for the `metadata-names` feature WITHOUT `trace`.
-//!
-//! This is the regression guard for the name-stamping/trace decoupling: with only
-//! `metadata-names` (not `trace`) the macro must emit the name-only spawn path
-//! (`stamp_name`, no `adopt`, no id capture), and the crate must link with **no**
-//! `_embassy_trace_*` hook symbols — because `metadata-names` pulls in
-//! `embassy-executor/metadata-name`, not `embassy-executor/trace`. A real executor
-//! drives one `task:` node through `start`, proving the generated `stamp_name` glue
-//! compiles and runs. (If this test is ever built with `trace` also on, the glue
-//! takes the `adopt` path instead; the assertions below hold either way.)
-
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
@@ -19,8 +8,6 @@ use embassy_time::MockDriver;
 static RUNS: AtomicU32 = AtomicU32::new(0);
 static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Plain worker; the graph stamps its `#[embassy_executor::task]` shell. The shell's
-/// generated glue calls `stamp_name(&token)` before spawning under `metadata-names`.
 async fn worker(node: &'static TaskNode) {
     RUNS.fetch_add(1, Ordering::SeqCst);
     let _ = node
@@ -46,7 +33,7 @@ async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
     // start() spawns NAMED through the name-only glue path; if this links and runs,
     // the decoupling holds (no trace recorders, no `_embassy_trace_*` symbols).
-    sup.start(spawner).await.expect("start");
+    sup.start(&spawner).await.expect("start");
     settle(|| RUNS.load(Ordering::SeqCst) == 1).await;
     assert_eq!(RUNS.load(Ordering::SeqCst), 1, "named shell ran");
     assert!(NAMED.is_running(), "named node up after start");

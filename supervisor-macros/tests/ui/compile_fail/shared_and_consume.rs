@@ -1,5 +1,3 @@
-//! `shared` and `consume` contradict each other: `consume` takes the single
-//! value out for one owner, `shared` copies it out to any number of consumers.
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 

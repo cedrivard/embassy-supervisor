@@ -1,5 +1,3 @@
-//! Every declaration of a `shared` slot is the SAME static, so re-declaring it
-//! with different kind markers or a different type is a contradiction.
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 
@@ -15,7 +13,7 @@ supervisor_graph! {
     node A = Terminate, deps: [], task: worker,
         resources: [H: shared Handle];
     node B = Terminate, deps: [], task: other_worker,
-        resources: [H: shared OtherHandle]; // type differs from A's declaration
+        resources: [H: shared OtherHandle]; 
 }
 
 fn main() {}

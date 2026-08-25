@@ -1,11 +1,3 @@
-//! The optional `policy: <Type> = <expr>` form: state the policy type explicitly so
-//! the value can be any (const-evaluable) expression of that type — here a `const fn`
-//! factory call, which the default `Ty::new(..)` derivation (`policy_type`) cannot
-//! handle (a single-segment call has no type to strip). Proves the annotated type is
-//! used verbatim for the emitted `ElasticPool<P>` and the value shape is unconstrained.
-//!
-//! The value must still be const-evaluable, since it initializes the pool `static` —
-//! hence a `const fn` rather than a plain fn.
 
 use embassy_supervisor::{DeferredShrink, TaskNode, supervisor_graph};
 
@@ -27,10 +19,9 @@ supervisor_graph! {
 }
 
 fn main() {
-    // A(0) + two pool members P0(1), P1(2).
     assert_eq!(GRAPH.nodes.len(), 3);
     assert_eq!(GRAPH.pools.len(), 1);
-    assert_eq!(GRAPH.deps[0].len(), 0);
-    assert_eq!(GRAPH.deps[1], [0u8].as_slice());
-    assert_eq!(GRAPH.deps[2], [0u8].as_slice());
+    assert_eq!(GRAPH.deps_of(0).len(), 0);
+    assert_eq!(GRAPH.deps_of(1), [0u8].as_slice());
+    assert_eq!(GRAPH.deps_of(2), [0u8].as_slice());
 }

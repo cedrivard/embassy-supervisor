@@ -1,14 +1,14 @@
 error: unreachable statement
-  --> tests/ui/compile_fail/exit_on_diverging_worker.rs:15:58
+  --> tests/ui/compile_fail/exit_on_diverging_worker.rs:11:58
    |
-14 | / supervisor_graph! {
-15 | |     node D = Terminate, deps: [], task: diverging, exit: u32;
+10 | / supervisor_graph! {
+11 | |     node D = Terminate, deps: [], task: diverging, exit: u32;
    | |                                                          ^^^ unreachable statement
-16 | | }
+12 | | }
    | |_- any code following this expression is unreachable
    |
 note: the lint level is defined here
-  --> tests/ui/compile_fail/exit_on_diverging_worker.rs:15:58
+  --> tests/ui/compile_fail/exit_on_diverging_worker.rs:11:58
    |
-15 |     node D = Terminate, deps: [], task: diverging, exit: u32;
+11 |     node D = Terminate, deps: [], task: diverging, exit: u32;
    |                                                          ^^^
