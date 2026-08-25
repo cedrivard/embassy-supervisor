@@ -88,9 +88,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # The tag must name the version the manifest actually carries; a mismatch
-      # means the tag was cut before (or after) the bump landed.
       - name: Check the tag against the manifest
+        id: version
         run: |
           manifest=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "embassy-supervisor-tools") | .version')
@@ -99,6 +98,7 @@ jobs:
             echo "tag says $tag, Cargo.toml says $manifest" >&2
             exit 1
           fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -107,4 +107,5 @@ jobs:
         run: cd dist && sha256sum * > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
+          name: embassy-supervisor-tools ${{ steps.version.outputs.version }}
           files: dist/*
