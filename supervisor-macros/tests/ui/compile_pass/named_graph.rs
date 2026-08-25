@@ -1,6 +1,3 @@
-//! `name: X;` renames the emitted graph static and suffixes the private
-//! backing tables, so two graphs coexist in ONE module (each with its own
-//! name map, order, and 256 cap).
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 
@@ -18,8 +15,8 @@ supervisor_graph! {
 }
 
 fn main() {
-    assert_eq!(GRAPH.order.len(), 1);
-    assert_eq!(SUB_GRAPH.order, [0, 1]);
-    assert_eq!(MAIN.name, "main");
-    assert_eq!(SENSOR.name, "sensor");
+    assert_eq!(GRAPH.order().len(), 1);
+    assert!(SUB_GRAPH.order().eq([0, 1]));
+    assert_eq!(MAIN.name(), "main");
+    assert_eq!(SENSOR.name(), "sensor");
 }

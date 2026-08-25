@@ -1,6 +1,3 @@
-//! Take-kind `local` resources stay rejected on `pool`: the single-core slot
-//! contract + per-member restore is deferred. (`shared local` IS accepted —
-//! one pool-wide fan-out slot; see compile_pass_local/pool_shared_local.rs.)
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 

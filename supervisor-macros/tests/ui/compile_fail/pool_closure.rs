@@ -1,5 +1,3 @@
-//! A pool member can't be a closure (members are instantiated per index), so a pool
-//! `spawn:` must be a task-fn path or a partial call — a closure is a compile error.
 
 use embassy_supervisor::supervisor_graph;
 

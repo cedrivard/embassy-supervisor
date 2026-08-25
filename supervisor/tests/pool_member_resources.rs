@@ -1,22 +1,11 @@
-//! Per-member pool resources: take-kind entries become per-member slot
-//! arrays — member `I` takes/restores element `I` exclusively, so the floor
-//! comes up with only floor-many elements provided, growth waits for the burst
-//! member's own element, restore lands back on the same index across a
-//! stop/regrow, and `member_index` gives a worker its position. Also covers
-//! const-expr `min:`/`max:` (the emitted `_MIN`/`_MAX` consts are the source of
-//! truth). Harness as teardown.rs.
-
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{DeferredShrink, Supervisor, TaskNode, supervisor_graph};
 
-/// Const-driven bounds: the macro can't parse-time-validate these, so the
-/// emitted consts + const asserts carry the checks.
 const FLOOR: usize = 1;
 
-/// A per-member connection resource: distinct per member, non-Copy.
 struct Conn {
     id: u32,
     uses: u32,
@@ -34,9 +23,6 @@ static SPAWNS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static SEEN_ID: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static DONE: AtomicBool = AtomicBool::new(false);
 
-/// Lend-kind worker: receives its member's own `Conn` as `&mut`, records which
-/// instance it got, and parks; the shell restores to the same array element on
-/// exit.
 async fn worker(node: &'static TaskNode, conn: &mut Conn) {
     let i = WORKERS_POOL.member_index(node).expect("a member");
     SPAWNS[i].fetch_add(1, Ordering::SeqCst);
@@ -62,8 +48,8 @@ async fn settle(mut f: impl FnMut() -> bool) {
 /// re-driven), and keeping ALL pool driving inside the one driver task is the
 /// production shape — a concurrent pool task would race the manual
 /// stop/start below on the member's handshake flags.
-async fn drive_until<const N: usize>(
-    sup: &Supervisor<N>,
+async fn drive_until<const N: usize, T: embassy_supervisor::Topology<N>>(
+    sup: &Supervisor<N, T>,
     spawner: Spawner,
     mut until: impl FnMut() -> bool,
 ) {
@@ -76,31 +62,25 @@ async fn drive_until<const N: usize>(
             embassy_futures::yield_now().await;
         }
     };
-    match select(sup.run_pools(spawner), watch).await {
-        Either::First(err) => panic!("pool shrink timed out: {:?}", err.node.name),
+    match select(sup.run_pools(&spawner), watch).await {
+        Either::First(err) => panic!("pool shrink timed out: {:?}", err.node.name()),
         Either::Second(()) => {}
     }
 }
 
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
-    // Const-expr bounds landed in the emitted consts.
     assert_eq!(WORKERS_MIN, 1);
     assert_eq!(WORKERS_MAX, 2);
     assert_eq!(WORKERS_MEMBERS, 2);
 
     let sup = Supervisor::new(&GRAPH);
 
-    // Floor comes up with ONLY the floor member's element provided.
     CONN[0].provide(Conn { id: 10, uses: 0 });
-    sup.start(spawner).await.expect("start with floor element");
+    sup.start(&spawner).await.expect("start with floor element");
     settle(|| SPAWNS[0].load(Ordering::SeqCst) == 1).await;
     assert_eq!(SEEN_ID[0].load(Ordering::SeqCst), 10);
 
-    // Growth wants member 1 (floor is busy) but its element is empty: the
-    // spawn fail-closes (Busy, once the mock clock passes the gate timeout)
-    // and is simply re-driven, so the member stays down until ITS element is
-    // provided.
     let mut budget = 0;
     drive_until(&sup, spawner, || {
         budget += 1;
@@ -119,11 +99,6 @@ async fn driver(spawner: Spawner) {
     assert_eq!(SEEN_ID[1].load(Ordering::SeqCst), 20, "member 1 got id 20");
     assert_eq!(SEEN_ID[0].load(Ordering::SeqCst), 10, "member 0 kept id 10");
 
-    // Restore-to-same-index: stop member 1 (run_pools is NOT running here, so
-    // nothing races the handshake); the shell restores its element (use count
-    // bumped by the first run). Peek it, put it back, then drive the pool
-    // again — floor still busy, so the regrow re-takes the SAME instance from
-    // the same index.
     sup.stop_node(&WORKERS[1]).await.expect("member 1 acks");
     let back = CONN[1].take().expect("restored to element 1");
     assert_eq!((back.id, back.uses), (20, 1), "same instance, one use");

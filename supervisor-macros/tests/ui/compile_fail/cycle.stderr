@@ -1,12 +1,17 @@
 error[E0080]: evaluation panicked: supervisor_graph!: dependency cycle
- --> tests/ui/compile_fail/cycle.rs:5:1
+ --> tests/ui/compile_fail/cycle.rs:4:1
   |
-5 | / supervisor_graph! {
-6 | |     node A = Terminate, deps: [B];
-7 | |     node B = Terminate, deps: [A];
-8 | | }
+4 | / supervisor_graph! {
+5 | |     node A = Terminate, deps: [B];
+6 | |     node B = Terminate, deps: [A];
+7 | | }
   | |_^ evaluation of `GRAPH` failed inside this call
   |
+note: inside `Ordered::<2, 0>::new`
+ --> $WORKSPACE/supervisor/src/lib.rs
+  |
+  |             order: topo_sort_const(deps),
+  |                    ^^^^^^^^^^^^^^^^^^^^^
 note: inside `embassy_supervisor::topo_sort_const::<2>`
  --> $RUST/core/src/panic.rs
   |

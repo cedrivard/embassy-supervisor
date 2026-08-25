@@ -1,5 +1,5 @@
-error: expected `,`, `]`, or the `ready` marker, found `rdy`
-  --> tests/ui/compile_fail_readiness/ready_unknown_marker.rs:10:39
-   |
-10 |     node HTTP = Terminate, deps: [NET rdy], task: http_worker;
-   |                                       ^^^
+error: expected `,`, `]`, or a dep marker (`ready`, `bound`), found `rdy`
+ --> tests/ui/compile_fail_readiness/ready_unknown_marker.rs:9:39
+  |
+9 |     node HTTP = Terminate, deps: [NET rdy], task: http_worker;
+  |                                       ^^^

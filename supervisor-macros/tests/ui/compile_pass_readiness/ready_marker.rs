@@ -1,5 +1,3 @@
-//! `ready`-marked deps: node dep, pool-as-dep (floor member), pool deps, and a
-//! cfg'd ready dep all expand; spawn ordering (DEPS/order) is unchanged.
 
 use embassy_supervisor::{DeferredShrink, TaskNode, supervisor_graph};
 
@@ -20,7 +18,7 @@ supervisor_graph! {
 
 fn main() {
     // Readiness is an overlay: the spawn-order table is what it always was.
-    assert_eq!(GRAPH.order.len(), 4);
+    assert_eq!(GRAPH.order().len(), 4);
     assert!(!NET.is_ready());
     NET.set_ready();
     assert!(NET.is_ready());

@@ -1,4 +1,3 @@
-//! `slot_timeout: 0` would make every gated spawn fail instantly.
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 

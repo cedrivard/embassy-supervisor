@@ -1,5 +1,5 @@
 error: expected `:`
- --> tests/ui/compile_fail/missing_deps_colon.rs:6:30
+ --> tests/ui/compile_fail/missing_deps_colon.rs:5:30
   |
-6 |     node A = Terminate, deps [];
+5 |     node A = Terminate, deps [];
   |                              ^

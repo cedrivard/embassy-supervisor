@@ -1,0 +1,5 @@
+error: expected `read(..)` or `write(..)`, found `beat`. The walker has no type information, so which way a registered verb points is stated here
+ --> tests/ui/compile_fail_dataflow/dataflow_verb_args.rs:6:12
+  |
+6 | #[dataflow(beat = crate::OUT)]
+  |            ^^^^

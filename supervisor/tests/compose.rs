@@ -1,11 +1,3 @@
-//! End-to-end test of graph composition: two `supervisor_fragment!` relays plus
-//! compose-site items assemble into ONE `supervisor_graph!` expansion via
-//! `compose_graph!` — cross-fragment deps resolve by name (both directions:
-//! the compose site depends on a fragment node, one fragment depends on the
-//! other's node), a `shared` slot declared in a fragment and at the compose
-//! site dedups into one static, and the composed graph runs a full
-//! start -> stop -> respawn lifecycle. Harness as teardown.rs.
-
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
@@ -15,7 +7,12 @@ use embassy_supervisor::{Supervisor, TaskNode, compose_graph, supervisor_fragmen
 static NET_SPAWNS: AtomicU32 = AtomicU32::new(0);
 static HTTP_SPAWNS: AtomicU32 = AtomicU32::new(0);
 static APP_SPAWNS: AtomicU32 = AtomicU32::new(0);
+static ONESHOT_RUNS: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
+
+pub async fn oneshot_worker(_node: &'static TaskNode) {
+    ONESHOT_RUNS.fetch_add(1, Ordering::SeqCst);
+}
 
 pub async fn net_worker(node: &'static TaskNode) {
     NET_SPAWNS.fetch_add(1, Ordering::SeqCst);
@@ -40,20 +37,14 @@ async fn app_worker(node: &'static TaskNode, port: u16) {
         .await;
 }
 
-// In-crate fragments: `$crate` here resolves to this test crate itself — the
-// same mechanism a foreign crate's `$crate::…` would use. (True cross-crate
-// composition is exercised by the demo firmware; a single-crate test can't
-// model two crates.)
 supervisor_fragment! {
     name: NET_FRAG;
     node NET = Terminate, deps: [], task: $crate::net_worker;
+    node ONESHOT = Terminate, deps: [], task: $crate::oneshot_worker, pool_size: 2;
 }
 
 supervisor_fragment! {
     name: HTTP_FRAG;
-    // Cross-fragment dep (NET lives in NET_FRAG) + a shared slot this fragment
-    // declares; the compose-site item re-declares it (kinds + type verbatim),
-    // deduping into one static.
     node HTTP = Terminate, deps: [NET], task: $crate::http_worker,
         resources: [PORT: shared u16];
 }
@@ -79,27 +70,35 @@ async fn settle(mut f: impl FnMut() -> bool) {
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
     PORT.provide(80);
-    sup.start(spawner).await.expect("start");
+    sup.start(&spawner).await.expect("start");
     settle(|| APP_SPAWNS.load(Ordering::SeqCst) == 1).await;
     assert!(NET.is_running() && HTTP.is_running() && APP.is_running());
 
-    // The composed order is dependency-first across fragment boundaries.
+    settle(|| ONESHOT_RUNS.load(Ordering::SeqCst) == 1).await;
+    settle(|| !ONESHOT.is_running()).await;
+    assert!(
+        ONESHOT.has_exited(),
+        "composed shell recorded the clean return"
+    );
+
     let pos = |name: &str| {
         GRAPH
-            .order
-            .iter()
-            .position(|&i| GRAPH.nodes[i as usize].is_some_and(|n| n.name == name))
+            .order()
+            .position(|i| GRAPH.nodes[i as usize].is_some_and(|n| n.name() == name))
             .unwrap()
     };
     assert!(pos("net") < pos("http") && pos("http") < pos("app"));
 
-    // Full lifecycle across the composed graph.
     sup.teardown().await.expect("teardown");
     assert!(!NET.is_running() && !HTTP.is_running() && !APP.is_running());
-    sup.respawn_terminate(spawner).await.expect("respawn");
+    sup.respawn_terminate(&spawner).await.expect("respawn");
     settle(|| APP_SPAWNS.load(Ordering::SeqCst) == 2).await;
     assert_eq!(NET_SPAWNS.load(Ordering::SeqCst), 2);
     assert_eq!(HTTP_SPAWNS.load(Ordering::SeqCst), 2);
+
+    settle(|| ONESHOT_RUNS.load(Ordering::SeqCst) == 2).await;
+    settle(|| !ONESHOT.is_running()).await;
+    assert!(ONESHOT.has_exited());
 
     DONE.store(true, Ordering::SeqCst);
 }
@@ -107,6 +106,13 @@ async fn driver(spawner: Spawner) {
 #[test]
 fn fragments_compose_into_one_graph() {
     let _clock = embassy_time::MockDriver::get();
+
+    #[cfg(feature = "data-deps")]
+    {
+        let seen: Vec<&str> = APP.graph().iter().flatten().map(|n| n.name()).collect();
+        assert_eq!(seen.len(), GRAPH.nodes.len(), "{seen:?}");
+        assert!(seen.contains(&"app") && seen.contains(&"net"), "{seen:?}");
+    }
 
     std::thread::spawn(|| {
         let executor: &'static mut embassy_executor::Executor =

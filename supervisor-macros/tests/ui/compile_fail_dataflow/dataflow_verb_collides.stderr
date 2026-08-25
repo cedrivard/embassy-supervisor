@@ -1,0 +1,7 @@
+error: the supervisor derives dataflow from the literal path: name the signal directly (`&path::TO_SIGNAL`, `&ARR[i]`)
+ --> tests/ui/compile_fail_dataflow/dataflow_verb_collides.rs:6:1
+  |
+6 | #[dataflow(read(is_running))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `dataflow` (in Nightly builds, run with -Z macro-backtrace for more info)

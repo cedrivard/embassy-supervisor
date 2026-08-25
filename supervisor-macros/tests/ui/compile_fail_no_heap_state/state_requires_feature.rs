@@ -1,5 +1,3 @@
-//! The `state:` clause requires the `heap-state` feature (it emits the
-//! consumer-crate fallible-boxing helper and an alloc dependency).
 
 use embassy_supervisor::{TaskNode, supervisor_graph};
 

@@ -1,0 +1,5 @@
+error: `#[dataflow_bundle]` found no `#[dataflow]` fn at the module's top level — nothing to bundle
+ --> tests/ui/compile_fail_dataflow/bundle_nothing_to_bundle.rs:3:9
+  |
+3 | pub mod api {
+  |         ^^^

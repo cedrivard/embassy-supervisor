@@ -1,0 +1,95 @@
+:root {
+  color-scheme: light;
+  --page-bg: #f5f7f8;
+  --surface: #ffffff;
+  --text: #17212b;
+  --muted: #5d6a73;
+  --border: #d6dde1;
+  --accent: #0f766e;
+  --accent-ink: #ffffff;
+  --focus: #0f766e;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page-bg: #151a1c;
+  --surface: #1e2528;
+  --text: #e8f0f2;
+  --muted: #b6c4c9;
+  --border: #3a474b;
+  --accent: #4fd1c5;
+  --accent-ink: #102023;
+  --focus: #8ce5db;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+    --page-bg: #151a1c;
+    --surface: #1e2528;
+    --text: #e8f0f2;
+    --muted: #b6c4c9;
+    --border: #3a474b;
+    --accent: #4fd1c5;
+    --accent-ink: #102023;
+    --focus: #8ce5db;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  min-height: 100vh;
+  margin: 0;
+  background: var(--page-bg);
+  color: var(--text);
+  font-family: "IBM Plex Sans", "Aptos", "Segoe UI", sans-serif;
+  line-height: 1.45;
+}
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  min-height: 3.5rem;
+  padding: 0.65rem clamp(1rem, 3vw, 2.5rem);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+h1, h2 { margin: 0; font-weight: 650; letter-spacing: 0; }
+h1 { font-size: 1.1rem; overflow-wrap: anywhere; }
+h2 { color: var(--muted); font-size: 0.85rem; }
+.appearance {
+  display: inline-flex;
+  flex: 0 0 auto;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--page-bg);
+}
+.appearance button {
+  min-width: 4.4rem;
+  border: 0;
+  border-radius: 4px;
+  padding: 0.35rem 0.6rem;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.8rem;
+}
+.appearance button[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+.appearance button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+main { max-width: 100rem; margin: 0 auto; padding: clamp(1rem, 3vw, 2.5rem); }
+.diagram { padding: 1.1rem 0 1.75rem; }
+.diagram + .diagram { border-top: 1px solid var(--border); }
+.diagram h2 { margin-bottom: 0.75rem; }
+.diagram-canvas { min-height: 2rem; overflow-x: auto; }
+.diagram-canvas svg { display: block; max-width: 100%; height: auto; }
+@media (max-width: 34rem) {
+  .page-header { align-items: flex-start; flex-direction: column; }
+  .appearance { width: 100%; }
+  .appearance button { flex: 1 1 0; }
+}

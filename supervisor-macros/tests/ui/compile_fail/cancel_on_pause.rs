@@ -1,6 +1,3 @@
-//! `cancel` + `Mode::Pause` is contradictory: a Pause worker must survive the
-//! stop and park on `wait_resume()`, but `cancel` drops its future and records
-//! an exit — nothing would ever resume it.
 
 use embassy_supervisor::supervisor_graph;
 

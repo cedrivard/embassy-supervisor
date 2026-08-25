@@ -38,19 +38,36 @@ jobs:
       # link a binary, so it cannot run in a host test. Its compilation is covered
       # by the `embedded` (build --all-features) and `lint` (clippy --all-features,
       # check-only) jobs; here we run the functional matrix (control + pool) without it.
+      # The default set is just `macros`, so this row is deliberately narrow;
+      # every row below names `control`/`pool` explicitly rather than inheriting
+      # them, so a change to the defaults cannot silently shrink coverage.
       - run: cargo test -p embassy-supervisor --target $HOST
       - run: cargo test -p embassy-supervisor --target $HOST --no-default-features
-      - run: cargo test -p embassy-supervisor --target $HOST --features trace-hooks
+      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,trace-hooks
       # Charge-splitting (preemption-exact) accounting + the base trace tests again
       # under the extra feature. `local-resources` rides along so the gated
-      # `resource_kinds` suite (a `!Send` value through a local slot) runs too.
-      - run: cargo test -p embassy-supervisor --target $HOST --features trace-nested,trace-hooks,local-resources
+      # `resource_kinds` suite (a `!Send` value through a local slot) runs too,
+      # and `trace-self` so the hidden-node adoption suite runs.
+      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,trace-nested,trace-hooks,local-resources,trace-self
       # Readiness rendezvous (ready-marked deps; needs pool for the growth gate)
       # + the liveness heartbeat. `required-features` silently skips otherwise.
-      - run: cargo test -p embassy-supervisor --target $HOST --features readiness,liveness
+      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,readiness,liveness
+      # The runtime-coupling features, together: the activation generation
+      # (epochs), the liveness sweep (liveness-monitor), the declared and derived
+      # dataflow (coupling), rest_for_one (restart), and readiness
+      # propagation across `bound` edges (bound-deps). Run as one set because
+      # several of their suites need `readiness` and/or `control` alongside.
+      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,coupling-observe,dataflow,data-deps,node-status,restart,bound-deps,epochs,liveness-monitor,readiness,liveness
+      # The explicit tier without the polled one: the two are independent, and
+      # the items they share sit behind `any(..)` cfgs this row keeps honest.
+      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,dataflow,data-deps,node-status,readiness,liveness
+      # `log` backend: that the crate's log macros emit at all. Separate run
+      # because `log` and `defmt` are mutually exclusive, so it cannot ride
+      # along with any set that might pull `defmt` in.
+      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,log,coupling,node-status
       # Reclaimable per-activation heap state (state: clause): counting-allocator
       # net-zero + OOM->Busy behavior.
-      - run: cargo test -p embassy-supervisor --target $HOST --features heap-state
+      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,heap-state
       # `supervisor_graph!` UI tests (trybuild): compile-fail cases lock the macro's
       # error contracts (cycle, unknown dep, ...); compile-pass cases run the generated
       # graph. Host-only — trybuild compiles real graphs — so `--target $HOST`.
@@ -64,6 +81,29 @@ jobs:
       # The `state:` clause's UI split (its no-feature rejection runs in the
       # plain macros invocation above).
       - run: cargo test -p embassy-supervisor-macros --target $HOST --features heap-state
+      # The new clauses and dep markers. Their no-feature rejections are
+      # unit-tested inside the crate (same trybuild caveat as `readiness`), so
+      # this run is about the accepting side and the marker-composition rules.
+      - run: cargo test -p embassy-supervisor-macros --target $HOST --features coupling-observe,dataflow,data-deps,liveness-monitor,bound-deps,readiness
+
+      # The graph grammar itself, which both the proc-macro and the diagram tool
+      # parse with. It has no features: it always accepts the full syntax.
+      - run: cargo test -p embassy-supervisor-syntax --target $HOST
+      # The observation facade: no features either, by design.
+      - run: cargo test -p embassy-supervisor-observe --target $HOST
+      # The host tools over that grammar: `supervisor-mermaid` and `supervisor-lint`.
+      - run: cargo test -p embassy-supervisor-tools --target $HOST
+      # They must also still understand the graph the firmware actually
+      # declares, in both views and with the legend on.
+      - run: cargo run -q -p embassy-supervisor-tools --target $HOST --bin supervisor-mermaid -- --signals firmware/src/*.rs > /dev/null
+      - run: cargo run -q -p embassy-supervisor-tools --target $HOST --bin supervisor-mermaid -- --runtime --legend firmware/src/*.rs > /dev/null
+      # And the firmware's graph and its `#[dataflow]` fns must agree: any
+      # coverage warning (a bound fn no file defines, a fn nothing binds) is a
+      # failure here, not a line on stderr someone has to notice.
+      - run: cargo run -q -p embassy-supervisor-tools --target $HOST --bin supervisor-mermaid -- --check firmware/src/*.rs
+      # The dataflow itself: a one-sided signal in the firmware's graph fails
+      # here. Accepted absences would be named with `--allow`, in this line.
+      - run: cargo run -q -p embassy-supervisor-tools --target $HOST --bin supervisor-lint -- firmware/src/*.rs
 
   # `no_std` guard: the crate must still cross-compile for the MCU target (the
   # pinned default) across the feature matrix.
@@ -101,9 +141,19 @@ jobs:
           for f in "" control pool macros pool,macros control,pool \
                    control,pool,macros defmt trace trace,trace-hooks \
                    trace,trace-hooks,trace-nested trace,trace-names \
+                   trace-self trace-self,data-deps \
                    macros,local-resources readiness liveness readiness,pool \
                    control,pool,macros,readiness,liveness heap-state \
-                   macros,heap-state; do
+                   macros,heap-state epochs liveness-monitor coupling \
+                   macros,coupling macros,coupling-observe restart bound-deps macros,bound-deps \
+                   log log,macros,coupling \
+                   epochs,liveness-monitor,coupling,restart,bound-deps \
+                   coupling-observe,liveness-monitor,macros,control \
+                   dataflow macros,dataflow node-status \
+                   dataflow,readiness,liveness macros,coupling-observe,dataflow \
+                   graph-ref macros,graph-ref graph-ref,trace \
+                   data-deps macros,data-deps data-deps,readiness \
+                   control,pool,macros,readiness,liveness,epochs,liveness-monitor,coupling,restart,bound-deps; do
             echo "::group::features=[${f:-none}]"
             cargo check -p embassy-supervisor --no-default-features ${f:+--features "$f"}
             echo "::endgroup::"
@@ -140,11 +190,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          # The workspace default target applies to any clippy line without a
+          # `--target` override (the observe crate's embedded-view lint below).
+          targets: thumbv8m.main-none-eabihf
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy -p embassy-supervisor --target $HOST --all-features -- -D warnings
+      # `--all-targets` so the tests are linted too, not just the lib: the test
+      # suite is where the graph DSL is actually exercised, and lint debt there
+      # went unseen while this checked the lib alone.
+      - run: cargo clippy -p embassy-supervisor --target $HOST --all-features --all-targets -- -D warnings
       # The `supervisor_graph!` proc-macro crate (host-only build).
       - run: cargo clippy -p embassy-supervisor-macros -- -D warnings
+      # Host crates, so they need the same `--target $HOST` override as the tests.
+      - run: cargo clippy -p embassy-supervisor-syntax --target $HOST --all-targets -- -D warnings
+      - run: cargo clippy -p embassy-supervisor-tools --target $HOST --all-targets -- -D warnings
+      # The observation facade builds for both worlds; lint it as its consumers see it.
+      - run: cargo clippy -p embassy-supervisor-observe --target $HOST --all-targets -- -D warnings
+      - run: cargo clippy -p embassy-supervisor-observe -- -D warnings
 
   docs:
     name: doc

@@ -1,0 +1,22 @@
+[package]
+name = "embassy-supervisor-observe"
+# A facade in the `log` mold: signal libraries implement `Observable` (or wrap
+# a primitive in `Counted`) against this crate alone, so it must stay small,
+# dependency-light, and semver-stable. Depend on it by version range; it is
+# never `=`-pinned by anything.
+version = "0.1.0"
+description = "Observation facade for embassy-supervisor: implement it where your signals live, without depending on the supervisor"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/embassy-supervisor-observe"
+
+# No `[features]`. A facade earns adoption by having nothing to configure.
+
+[dependencies]
+# The one dependency, for targets without native atomics (thumbv6 needs the
+# critical-section fallback, which the final binary enables).
+portable-atomic = "1"

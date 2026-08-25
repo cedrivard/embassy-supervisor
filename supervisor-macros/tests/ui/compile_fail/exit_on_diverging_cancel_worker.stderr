@@ -1,14 +1,14 @@
 error: unreachable call
-  --> tests/ui/compile_fail/exit_on_diverging_cancel_worker.rs:16:66
+  --> tests/ui/compile_fail/exit_on_diverging_cancel_worker.rs:11:66
    |
-16 |     node D = Terminate, deps: [], task: diverging, cancel, exit: u32;
+11 |     node D = Terminate, deps: [], task: diverging, cancel, exit: u32;
    |                                                                  ^^^
    |                                                                  |
    |                                                                  unreachable call
    |                                                                  any code following this expression is unreachable
    |
 note: the lint level is defined here
-  --> tests/ui/compile_fail/exit_on_diverging_cancel_worker.rs:16:66
+  --> tests/ui/compile_fail/exit_on_diverging_cancel_worker.rs:11:66
    |
-16 |     node D = Terminate, deps: [], task: diverging, cancel, exit: u32;
+11 |     node D = Terminate, deps: [], task: diverging, cancel, exit: u32;
    |                                                                  ^^^

@@ -1,0 +1,5 @@
+error: `ready_on_write` requires an `observed beat` entry in `writes:` — the sweep's own poll of that write is what asserts the readiness. A body that beats through its verbs asserts readiness itself, with `set_ready()` at the same write
+  --> tests/ui/compile_fail_dataflow/discover_ready_on_write_no_beat.rs:12:44
+   |
+12 |     node A = Terminate, deps: [], task: w, ready_on_write, discover;
+   |                                            ^^^^^^^^^^^^^^

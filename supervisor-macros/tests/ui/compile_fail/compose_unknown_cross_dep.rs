@@ -1,5 +1,3 @@
-//! An unresolved cross-fragment dep fails at the compose site, attributed to
-//! the fragment that declared it.
 
 use embassy_supervisor::{TaskNode, compose_graph, supervisor_fragment};
 

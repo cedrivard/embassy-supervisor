@@ -1,0 +1,5 @@
+error: `put` is a built-in verb and is always recognised: registering it would either repeat what the crate already says or contradict it. Give the new verb its own name
+ --> tests/ui/compile_fail_dataflow/dataflow_verb_shadows_builtin.rs:6:17
+  |
+6 | #[dataflow(read(put))]
+  |                 ^^^

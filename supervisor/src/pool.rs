@@ -1,80 +1,57 @@
-//! Reusable elastic-pool scaling.
-//!
-//! A pool is a floor node (always-on `Terminate`) plus on-demand workers of the
-//! same task fn, scaled by a swappable [`ScalingPolicy`]. The policy is a generic
-//! type parameter (static dispatch, zero-cost), and may be stateful via interior
-//! mutability since the pool lives in a `static`.
-//!
-//! Heterogeneous pools are driven uniformly through the object-safe [`Pool`]
-//! trait. Its methods are **synchronous** — the policy only *decides* (returns a
-//! [`PoolAction`]); the supervisor performs the actual async `start_node` /
-//! `stop_node`. That keeps `&dyn Pool` object-safe with **no boxed futures and no
-//! heap**, while policies stay generic and zero-cost.
-
 use super::*;
 
 use core::cell::Cell;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::{Duration, Instant};
 
-/// Aggregate state of a pool, handed to the policy.
 #[derive(Clone, Copy)]
+/// Snapshot of an elastic pool's current load.
 pub struct PoolStats {
-    /// Instances currently up (spawned and not exited).
+    /// Number of currently running members.
     pub running: u8,
-    /// Of the running instances, how many are serving (marked busy).
+    /// Number of running members marked busy.
     pub busy: u8,
-    /// Floor — the pool never shrinks below this.
+    /// Minimum member count.
     pub min: u8,
-    /// Ceiling — the pool never grows above this.
+    /// Maximum member count.
     pub max: u8,
 }
 impl PoolStats {
-    /// Instances that are up but not serving (the spares).
+    /// Number of running members that are not busy.
     pub fn idle(&self) -> u8 {
         self.running.saturating_sub(self.busy)
     }
 }
 
-/// What a policy wants done this evaluation.
 #[derive(Clone, Copy, PartialEq, Eq)]
+/// Decision an elastic scaling policy can return.
 pub enum ScaleAction {
-    /// Leave the pool at its current size.
+    /// No change.
     None,
-    /// Start one more instance (if below `max`).
+    /// Start another member.
     Grow,
-    /// Stop one idle instance (if above `min`).
+    /// Stop an idle member.
     Shrink,
 }
 
-/// Swappable scaling decision. `decide` is synchronous; stateful policies use
-/// interior mutability (the pool is a `static`, so `&self`).
+/// Policy that decides when an elastic pool should grow or shrink.
 pub trait ScalingPolicy {
-    /// Decide what to do given the current pool `stats` at time `now`.
+    /// Decide the next scaling action given current pool statistics.
     fn decide(&self, stats: PoolStats, now: Instant) -> ScaleAction;
 
-    /// The next instant at which the pool must be re-evaluated even without a
-    /// status signal (e.g. a deferred shrink's cooldown). `None` = nothing
-    /// pending. The supervisor arms a one-shot timer for it.
+    /// Optional future instant at which the policy should be re-evaluated.
     fn deferred_until(&self) -> Option<Instant> {
         None
     }
 }
 
-/// Grow immediately (stay responsive), but shrink only after the idle surplus has
-/// persisted for `cooldown` — damps grow→shrink→grow flapping. Holds its pending
-/// shrink **deadline** in a `Cell<Option<Instant>>` (interior mutability under
-/// `&self`, since the pool is a `static`); `None` = no shrink pending.
+/// A scaling policy that grows immediately but shrinks only after a cooldown.
 pub struct DeferredShrink {
     cooldown: Duration,
-    /// Pending shrink deadline, or `None`. A critical-section mutex over a `Cell`
-    /// (not an `AtomicU64`) so it's Sync + const-constructible without pulling in
-    /// `portable_atomic`'s 64-bit lock-table fallback on Cortex-M.
     pending: Mutex<CriticalSectionRawMutex, Cell<Option<Instant>>>,
 }
 impl DeferredShrink {
-    /// Create a policy that defers each shrink by `cooldown` after the pool first
-    /// becomes over-provisioned.
+    /// Create a policy with the given shrink cooldown.
     pub const fn new(cooldown: Duration) -> Self {
         Self {
             cooldown,
@@ -84,33 +61,24 @@ impl DeferredShrink {
 }
 impl ScalingPolicy for DeferredShrink {
     fn decide(&self, s: PoolStats, now: Instant) -> ScaleAction {
-        // Grow immediately, cancelling any pending shrink (we need this one).
         if s.idle() == 0 && s.running < s.max {
             self.pending.lock(|p| p.set(None));
             return ScaleAction::Grow;
         }
-        // Shrink only after the surplus has persisted the whole cooldown.
-        // idle == 1 is the stable dead-band (grow at 0, shrink at >= 2) so a
-        // single spare never flaps; at most one spare is released per cooldown.
         if s.idle() >= 2 && s.running > s.min {
             match self.pending.lock(|p| p.get()) {
                 None => {
-                    // First sight of surplus — arm the cooldown.
                     self.pending.lock(|p| p.set(Some(now + self.cooldown)));
                     ScaleAction::None
                 }
                 Some(deadline) if now >= deadline => {
-                    // Surplus held for the full cooldown — shrink one spare.
-                    // Re-arm only if a surplus will remain afterwards (idle-1 >=
-                    // 2), else clear (avoids a trailing no-op wake).
                     let next = (s.idle() >= 3).then(|| now + self.cooldown);
                     self.pending.lock(|p| p.set(next));
                     ScaleAction::Shrink
                 }
-                Some(_) => ScaleAction::None, // still within the window
+                Some(_) => ScaleAction::None,
             }
         } else {
-            // No surplus (or at the floor) — cancel any pending shrink.
             self.pending.lock(|p| p.set(None));
             ScaleAction::None
         }
@@ -121,39 +89,30 @@ impl ScalingPolicy for DeferredShrink {
     }
 }
 
-/// What the supervisor should do for a pool this tick. The async part (start /
-/// stop) is applied by the caller, keeping `Pool` object-safe without futures.
+/// Action the supervisor should take for a pool member.
 pub enum PoolAction {
-    /// Nothing to do this tick.
+    /// No action.
     None,
-    /// Start this (currently down) pool member.
+    /// Start this member.
     Start(&'static TaskNode),
     /// Stop this (running, idle) pool member.
     Stop(&'static TaskNode),
 }
 
-/// An elastic pool of single-instance nodes scaled by policy `P`.
+/// An elastic pool backed by a [`ScalingPolicy`].
 pub struct ElasticPool<P: ScalingPolicy> {
-    /// The pool's member nodes (each a single-instance `OnDemand`/`Terminate` node).
+    /// Pool member nodes.
     pub nodes: &'static [&'static TaskNode],
-    /// Floor — keep at least this many members running.
+    /// Minimum number of members.
     pub min: u8,
-    /// Ceiling — never run more than this many members.
+    /// Maximum number of members.
     pub max: u8,
-    /// The scaling policy driving grow/shrink decisions.
+    /// Scaling policy instance.
     pub policy: P,
 }
 
 impl<P: ScalingPolicy> ElasticPool<P> {
-    /// This node's position in the pool's member array, or `None` if it isn't a
-    /// member. Lets a worker derive its member index from its `&'static
-    /// TaskNode` first argument and index per-member application state
-    /// (configs, buffers) without any per-member spawn arguments:
-    ///
-    /// ```ignore
-    /// let i = HTTP_POOL.member_index(node).unwrap();
-    /// let cfg = &MEMBER_CONFIG[i];
-    /// ```
+    /// Return the pool index of `node`, if it belongs to this pool.
     pub fn member_index(&self, node: &'static TaskNode) -> Option<usize> {
         self.nodes.iter().position(|m| core::ptr::eq(*m, node))
     }
@@ -178,35 +137,29 @@ impl<P: ScalingPolicy> ElasticPool<P> {
 
 /// Object-safe, **synchronous** pool interface so `&dyn Pool` needs no heap: the
 /// policy decides here; the supervisor performs the async start/stop.
+/// Object-safe, synchronous pool interface used by the supervisor.
 pub trait Pool: Sync {
     /// Run the policy against the current snapshot and report the action to
     /// apply. Does not itself start/stop (that's async — the caller does it).
     fn evaluate(&self, now: Instant) -> PoolAction;
-    /// Earliest instant this pool must be re-evaluated without a signal.
+    /// Optional future instant at which the pool should be re-evaluated.
     fn deferred_until(&self) -> Option<Instant>;
-    /// The pool's member nodes (floor first). Used by the supervisor's control
-    /// interface to co-control a whole pool from any member, and by a task-state
-    /// view to group members. This is the single source of pool membership — the
-    /// same slice the scaling policy iterates.
+    /// Return the pool's member nodes.
     fn members(&self) -> &'static [&'static TaskNode];
 }
 
 impl<P: ScalingPolicy + Sync> Pool for ElasticPool<P> {
     fn evaluate(&self, now: Instant) -> PoolAction {
         match self.policy.decide(self.stats(), now) {
-            // Grow a candidate that is OnDemand, down, and **not manually
-            // disabled** (the disabled check keeps a manually-stopped pool from
-            // being re-grown by the policy). Dependency-readiness is checked in
-            // `drive_pools` via `Supervisor::deps_running`.
             ScaleAction::Grow => self
                 .nodes
                 .iter()
-                .find(|n| matches!(n.mode, Mode::OnDemand) && !n.is_running() && !n.is_disabled())
+                .find(|n| matches!(n.mode(), Mode::OnDemand) && !n.is_running() && !n.is_disabled())
                 .map_or(PoolAction::None, |n| PoolAction::Start(n)),
             ScaleAction::Shrink => self
                 .nodes
                 .iter()
-                .find(|n| matches!(n.mode, Mode::OnDemand) && n.is_running() && !n.is_busy())
+                .find(|n| matches!(n.mode(), Mode::OnDemand) && n.is_running() && !n.is_busy())
                 .map_or(PoolAction::None, |n| PoolAction::Stop(n)),
             ScaleAction::None => PoolAction::None,
         }
@@ -221,27 +174,16 @@ impl<P: ScalingPolicy + Sync> Pool for ElasticPool<P> {
     }
 }
 
-/// Run every pool's policy and apply its chosen scaling action (evaluate is
-/// sync; the async start/stop happens here), returning the earliest deferred
-/// re-evaluation deadline across all pools, or `None`. A shrink whose member
-/// misses its shutdown ack aborts the pass with [`ShutdownTimeout`].
-async fn drive_pools<const N: usize>(
+async fn drive_pools<const N: usize, T: Topology<N>>(
     pools: &[&dyn Pool],
-    sup: &Supervisor<N>,
-    spawner: Spawner,
-) -> Result<Option<Instant>, crate::ShutdownTimeout> {
+    sup: &Supervisor<N, T>,
+    spawner: &Spawner,
+) -> Result<Option<Instant>, crate::NodeFault> {
     let now = Instant::now();
     let mut next: Option<Instant> = None;
     for pool in pools {
         match pool.evaluate(now) {
             PoolAction::Start(n) => {
-                // Only grow when the candidate's dependencies are up — and,
-                // with `readiness`, when every ready-marked dep asserts ready
-                // (sync check: a not-ready dep just defers the grow to the
-                // next evaluation, no wait). Spawn errors ignored: a lost
-                // start (e.g. SpawnError::Busy from embassy task-pool
-                // exhaustion — the policy itself enforces the pool ceiling)
-                // is simply re-driven on the next pass.
                 if sup.deps_running(n) && n.ready_deps_ok() {
                     let _ = sup.start_node(n, spawner).await;
                 }
@@ -256,9 +198,6 @@ async fn drive_pools<const N: usize>(
     Ok(next)
 }
 
-/// Future that fires at `deadline` if `Some`, else never — a pool's deferred
-/// re-evaluation wake (e.g. a shrink cooldown). Only armed while a deferral is
-/// outstanding, so an idle system never polls.
 async fn deadline_timer(deadline: Option<Instant>) {
     match deadline {
         Some(t) => Timer::at(t).await,
@@ -266,17 +205,13 @@ async fn deadline_timer(deadline: Option<Instant>) {
     }
 }
 
-impl<const N: usize> Supervisor<N> {
-    /// Drive the registered elastic pools (from `GRAPH.pools`): run their
-    /// policies, then park until the next status signal (`SCALE_REQ`) or a pool's
-    /// deferred deadline. Runs forever in the success case — meant to be
-    /// `select`ed against the application's control / teardown futures in the
-    /// supervisor task; when another arm wins this future is dropped, which is
-    /// safe: a half-applied stop is re-driven on the next pass. **Returns only
-    /// on error**: a pool member that missed its shutdown ack during a shrink,
-    /// as [`ShutdownTimeout`] — the app escalates (its select arm typically
-    /// panics or triggers a watchdog reset).
-    pub async fn run_pools(&self, spawner: Spawner) -> crate::ShutdownTimeout {
+impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
+    /// Drive all elastic pools forever, returning only on a fault.
+    pub async fn run_pools(&self, spawner: &Spawner) -> crate::NodeFault {
+        if !Self::has(crate::shape::POOLS) {
+            let never: core::convert::Infallible = core::future::pending().await;
+            match never {}
+        }
         loop {
             let next = match drive_pools(self.pools, self, spawner).await {
                 Ok(next) => next,

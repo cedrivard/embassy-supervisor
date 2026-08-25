@@ -2,21 +2,30 @@
 
 [![crates.io](https://img.shields.io/crates/v/embassy-supervisor.svg)](https://crates.io/crates/embassy-supervisor)
 [![docs.rs](https://docs.rs/embassy-supervisor/badge.svg)](https://docs.rs/embassy-supervisor)
+[![docs](https://img.shields.io/badge/docs-embassy--supervisor.github.io-blue)](https://embassy-supervisor.github.io/)
 
-A generic, **HAL-agnostic** task-lifecycle supervisor for the [embassy](https://embassy.dev)
-async embedded framework. `no_std`, no allocator, no board crates — it compiles for any embassy
-target. The only third-party deps are pure-embassy crates (`embassy-executor`/`-sync`/`-time`/
+
+**Run-time supervision for embassy firmware**: a dependency-ordered task-lifecycle
+supervisor and a declared-and-verified dataflow layer, for the
+[embassy](https://embassy.dev) async embedded framework. The graph declares *when
+each task runs* (bring-up order, modes, pools, executor placement) and *what data
+flows between them* (reads/writes declared, polled, or derived straight from the
+code) — the first checked at compile time. **HAL-agnostic**,
+`no_std`, no allocator, no board crates — it compiles for any embassy target. The only
+third-party deps are pure-embassy crates (`embassy-executor`/`-sync`/`-time`/
 `-futures`) and `portable-atomic`.
 
 ## Table of contents
 
 - [What it is](#what-it-is)
+- [The two tiers](#the-two-tiers)
 - [The grammar, at a glance](#the-grammar-at-a-glance)
 - [Quickstart](#quickstart)
 - [The model](#the-model)
 - [Lifecycle reference](#lifecycle-reference)
 - [Writing supervised tasks (the TaskNode API)](#writing-supervised-tasks-the-tasknode-api)
 - [The `supervisor_graph!` DSL](#the-supervisor_graph-dsl)
+- [Dataflow supervision](#dataflow-supervision)
 - [Recipes by use case](#recipes-by-use-case)
 - [Elastic pools](#elastic-pools)
 - [Multi-executor tiers and multi-core](#multi-executor-tiers-and-multi-core)
@@ -43,26 +52,98 @@ target. The only third-party deps are pure-embassy crates (`embassy-executor`/`-
   capacity; the sync `try_request_control` reports a full queue instead of dropping) and a
   dependency- and pool-aware `apply_control`.
 - **Whole-graph lifecycle ops** — `teardown()` / `teardown_continue()` (reverse-dependency
-  shutdown with acked handshakes), `respawn_terminate()` (dependency-ordered re-spawn after a
-  wake), `resume_pausable()` (thaw parked nodes); a missed shutdown ack comes back as a
-  `ShutdownTimeout` error naming the node, never a hang or a library panic.
+  shutdown with acked handshakes, running as a dep-ordered wave — a dependency
+  keeps serving until its stopping dependents have acked, unordered nodes stop
+  concurrently), `respawn_terminate()`
+  (dependency-ordered re-spawn after a wake), `resume_pausable()` (thaw parked nodes); a
+  missed shutdown ack comes back as a `NodeFault` naming the node and what went wrong,
+  never a hang or a library panic.
 - **Multi-executor placement** — `executor:` annotations route nodes onto interrupt-priority
   tiers; the graph is the single source of *where each task runs*.
 - **Multi-core placement.** The same mechanism spans the second core: `start()` rendezvouses
   with the other core's asynchronous executor bring-up as part of the bring-up loop, and a whole
   elastic pool can live on core 1, scaled by core 0's supervisor.
-- **Safe resource threading** — `resources:` annotations move owned peripherals from `main`
-  into workers through `ResourceSlot`s (compile-time exclusive ownership — no `steal()`),
-  restored on task exit so a respawn re-takes the same instance.
+- **Safe resource threading** — `resources:` annotations hand owned values to workers
+  through `ResourceSlot`s: peripherals moved in from `main` (compile-time exclusive
+  ownership — no `steal()`), or values another node builds at runtime and `provides:`.
+  The consumer's spawn waits for the value; a lent value is restored on exit so a
+  respawn re-takes the same instance.
+- **Dataflow declaration** *(feature family `coupling`)* — `reads:`/`writes:`
+  entries name the actual signal statics tasks exchange data through, so the graph can
+  answer who produces a signal and who consumes it, and the diagram tool can draw it.
+- **Dataflow-driven liveness** *(features `coupling-observe`, `dataflow`)* — a
+  declared write can be the node's *sign of life*: polled from outside (`observed beat`,
+  with no change to the task) or carried by the access (`beat`, via node verbs).
+  `#[dataflow]` goes further and **derives** a task's read/write tables from its body at
+  compile time, so the declaration cannot drift from the code.
+- **Health surface** *(features `liveness`, `readiness`, `node-status`)* — per-node
+  heartbeat + staleness, task-asserted readiness that gates dependents, and a one-line
+  self-description; all cheap atomic reads for an app-owned monitor.
 - **Observability** *(feature family `trace`)* — per-node CPU time, poll counts and stall
   detection by consuming embassy-executor's trace hooks, with node *names* attached.
 
 The supervisor deliberately does **not** allocate, own a HAL, manage power states, or know what your
-tasks do — it orchestrates their *lifecycle* and leaves the rest to you. It also does **not**
+tasks do — it orchestrates their *lifecycle* and checks their *dataflow*, and leaves the rest to
+you. It also does **not**
 catch panics: a panicking task is not captured or restarted (panic capture is off the table in a
 `forbid(unsafe_code)` no_std library — it would need unwinding or the app-global panic handler).
 Pair the supervisor with a hardware watchdog for crashes, and the `liveness` heartbeat for
 alive-but-wedged tasks.
+
+## The two tiers
+
+Every capability above is reachable from one of two positions; mixing them freely,
+per task and even per signal, is the normal case.
+
+**The supervisor tier — code that holds its node.** A task declared in the graph
+receives its `TaskNode` as the first parameter, and the node is the whole protocol:
+lifecycle (`run_cancellable_acked`, `ack_dropped`), health (`beat()`, `set_ready()`,
+`report_status()`), and dataflow (`node.put`/`node.get` under `#[dataflow]`). The
+more a body routes through its node, the more the graph can check — up to
+`discover`, where the body *is* the declaration:
+
+```rust,ignore
+#[embassy_supervisor::dataflow]
+async fn eskf_task(node: &'static TaskNode) {
+    loop {
+        let est = fuse(node.get(&crate::signals::IMU_DATA));
+        node.put(&crate::signals::ESTIMATE, est);
+        node.beat();
+    }
+}
+// node ESKF = Terminate, deps: [IMU ready], task: eskf_task, discover;
+```
+
+**The agnostic tier — code that never learns the supervisor exists.** Adopt
+supervision without touching the code being supervised:
+
+- a [**`cancel` node**](#cancel--supervisor-unaware-workers) runs a plain
+  `async fn` — no node parameter, no handshake; the generated shell owns the
+  shutdown race and drops the worker's future in place on stop:
+
+  ```rust,ignore
+  async fn telemetry(uart: &mut Uart<'static, Async>) -> ! { loop { /* ... */ } }
+  // node TELEM = Terminate, deps: [NET], task: telemetry, cancel,
+  //     resources: [UART: Uart<'static, Async>];
+  ```
+
+- a node is also a **free-standing health handle**: any code that can see the
+  static — an ISR, a callback, a driver — can call `NODE.beat()` or
+  `NODE.report_status(..)`, and the same monitor and status endpoint see it like
+  any task's;
+- [**observed coupling**](#liveness-and-readiness-by-polling-feature-coupling-observe):
+  `writes: [SIG observed beat]` is polled from outside — neither the signal
+  crate nor the task body sees the supervisor;
+- the **observe facade** ([`embassy-supervisor-observe`](https://crates.io/crates/embassy-supervisor-observe)):
+  a signal library implements `Observable`/`Sink`/`Source` in a line each,
+  without depending on the supervisor.
+
+Rules of thumb: existing or third-party code goes in as-is through the agnostic
+tier (`cancel` + `observed`); code written for this graph takes the node and gets
+the exact forms (`beat`, `discover`, `ready_on_write`); a private signal
+behind a setter stays private — the setter takes the caller's node and callers
+[adopt it](#the-node-as-the-access-path-feature-dataflow) with
+`dataflow: [..]`.
 
 ## The grammar, at a glance
 
@@ -71,7 +152,7 @@ separated clauses, `;`-terminated. A useful graph is often just nodes, deps and 
 
 ```text
 supervisor_graph! {
-    node NET  = Terminate, deps: [], task: net_task;
+    node NET  = Terminate, task: net_task;
     node HTTP = Terminate, deps: [NET], task: http_worker;
 }
 ```
@@ -86,23 +167,32 @@ supervisor_graph! {
     node NAME = Mode,                   // Mode: Terminate | Pause | OnDemand
         deps: [A, POOL, NET ready]      // bring-up order; `ready` also waits for set_ready()
         , task: worker                  //   or `spawn: task_fn`; omit both = app-spawned
-        , resources: [R: Type, ..]      //   owned values threaded from main (kinds: local/shared/consume)
+        , resources: [R: Type, ..]      //   owned values handed over at spawn (kinds: local/shared/consume)
+        , provides: [R, ..]             //   slots this task fills at runtime, cleared at its shutdown ack
         , exit: Type                    //   capture the worker's return value
         , state: Type = expr            //   per-activation boxed state, freed on exit
+        , state: zeroed Type            //   same, allocated zero-filled (Type: Zeroable)
         , cancel                        //   shell owns the shutdown race; worker takes no node
-        , pool_size: N , executor: NAME , slot_timeout: MS , disabled;
+        , reads: [crate::SIG, ..]       //   declared dataflow; entry marker: observed
+        , writes: [crate::SIG beat]     //     `beat` marks the heartbeat write
+        , discover                      //   or: bind the tables the task fn's #[dataflow] derived
+                                        //     (a list beside it may only add markers)
+        , dataflow: [crate::setter]     //   adopt an accessor fn's #[dataflow] tables
+        , beat_timeout: MS , ready_on_write
+        , pool_size: N , executor: NAME , slot_timeout: MS , ack_timeout: MS , disabled;
 
     pool NAME = [Mode, ..],             // one Mode per member, floor first
         deps: [..], task: worker,
         resources: [..],                //   take kinds become per-member slot arrays
         policy: DeferredShrink::new(..),// scaling policy (required)
-        min: EXPR, max: EXPR            //   trailing, in order: [, slot_timeout: MS][, cancel]
+        min: EXPR, max: EXPR            //   required; any order, like every clause
         , cancel;                       //   same flag, applied to every member
 }
 ```
 
-Reading rules, all regular: node clauses after `deps:` may appear **in any order**
-(only `pool` fields are positional); the mode sits **after `=`**; every clause is **inline on
+Reading rules, all regular: node and pool clauses may appear **in any order**
+(only the mode after `=` is positional — for a pool, the mode list); a repeated
+clause is a compile error; every clause is **inline on
 its item** (there are no block forms and no top-level `resources { }` section); a
 pool always names its `policy:`; take-kind resource names are **globally unique**
 (each is one static — only `shared` names repeat, by design); and `detached` is not a
@@ -114,14 +204,14 @@ never a runtime surprise.
 
 ```rust,ignore
 use embassy_executor::Spawner;
-use embassy_supervisor::{RunError, Supervisor, supervisor_graph};
+use embassy_supervisor::{Supervisor, supervisor_graph};
 
 // Declare the graph once: `supervisor_graph!` generates the node `static`s and a
 // single `GRAPH` bundling the node slots, dep table, compile-time order, and pools.
 // Each `task:` names a plain async worker fn (the macro stamps its
 // `#[embassy_executor::task]` shell); `app` depends on `net`.
 supervisor_graph! {
-    node NET = Terminate, deps: [], task: net_task;
+    node NET = Terminate, task: net_task;
     node APP = Terminate, deps: [NET], task: app_task;
 }
 
@@ -135,11 +225,9 @@ async fn supervisor_task(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
     // Bring-up in dependency order, then drive pools + runtime control forever;
     // returns only on error, which the app escalates (typically a panic into a
-    // hardware-watchdog reset).
-    match sup.run(spawner).await {
-        RunError::Spawn(_) => panic!("bring-up failed"),
-        RunError::Shutdown(e) => panic!("{} missed its shutdown ack", e.node.name),
-    }
+    // hardware-watchdog reset). One fault type with a `Display` that names the
+    // node and the cause.
+    panic!("supervisor: {}", sup.run(&spawner).await);
 }
 ```
 
@@ -152,16 +240,25 @@ single-executor graph resolves immediately — the `.await` costs nothing.
 
 Three pieces, all `static`:
 
-- **`TaskNode`** — one per managed task: a name, a `Mode`, an optional spawn fn, and a
-  private handle of atomic flags + signals. The *task side* of the protocol is a handful of
+- **`TaskNode`** — one per managed task: a private handle of atomic flags + signals,
+  plus a reference to its `NodeCfg` — the immutable half (name, mode, spawn fn, gates,
+  budgets, coupling tables), a separate flash-resident `static` the macro emits beside
+  the node, so the atomics don't drag the constant data into RAM. Read the declared
+  side through methods (`name()`, `mode()`, `slot_timeout()`, ...). The *task side* of
+  the protocol is a handful of
   node methods — see [Writing supervised tasks](#writing-supervised-tasks-the-tasknode-api).
-- **`Graph<N>`** — the macro-emitted `GRAPH`: `nodes` (fixed `[Option<&TaskNode>; N]` — a
-  `#[cfg]`-ed-out node keeps its slot as `None`), `deps` (per-node dependency indices),
-  `order` (the compile-time topological order), and `pools` (with the `pool` feature). The
-  fields are public: a status endpoint can iterate them directly.
-- **`Supervisor<N>`** — construction-free orchestration over `&GRAPH` (`new` is
-  `const`, so `static SUP: Supervisor<5> = Supervisor::new(&GRAPH);` works; `N` =
-  total graph slots, pool members included — the same `N` as `Graph<N>`), in three
+- **`Graph<N, T>`** — the macro-emitted `GRAPH`: `nodes` (fixed `[Option<&TaskNode>; N]` — a
+  `#[cfg]`-ed-out node keeps its slot as `None`), `topo` (the `Topology`: per-node
+  dependency indices + the compile-time topological order, or the zero-sized `Flat`
+  when the graph declares no `deps:` at all), and `pools` (with the `pool` feature).
+  Read the edges through `deps_of(i)` / `dependents_of(i, ..)` / `order()`. The
+  topology also carries the graph's structural **shape** bits (which modes, gates,
+  markers and pools the graph contains, decided at expansion), so the lifecycle code
+  serving a structure the graph lacks is compiled out rather than branched over.
+- **`Supervisor<N, T>`** — construction-free orchestration over `&GRAPH` (`new` is
+  `const`; the macro emits a `GRAPH_TOPOLOGY` alias for `T`, so
+  `static SUP: Supervisor<5, GRAPH_TOPOLOGY> = Supervisor::new(&GRAPH);` works; `N` =
+  total graph slots, pool members included — the same `N` as `Graph<N, T>`), in three
   tiers: whole-graph, single-node, and cascading subsystem verbs.
 
 The full verb surface, with signatures (every error type is `Debug` — `.unwrap()` /
@@ -169,32 +266,37 @@ The full verb surface, with signatures (every error type is `Debug` — `.unwrap
 
 | verb | signature |
 |---|---|
-| `start` | `async fn(&self, Spawner) -> Result<(), SpawnError>` — quiescent → running, any state |
-| `run` | `async fn(&self, Spawner) -> RunError` — `start` + drive pools/control; returns only on error |
-| `teardown` / `teardown_continue` | `async fn(&self) -> Result<(), ShutdownTimeout>` |
-| `respawn_terminate` | `async fn(&self, Spawner) -> Result<(), SpawnError>` — wake pair, with... |
+| `start` | `async fn(&self, &Spawner) -> Result<(), NodeFault>` — quiescent → running, any state |
+| `run` | `async fn(&self, &Spawner) -> NodeFault` — `start` + drive pools/control; returns only on error |
+| `teardown` / `teardown_continue` | `async fn(&self) -> Result<(), NodeFault>` |
+| `respawn_terminate` | `async fn(&self, &Spawner) -> Result<(), NodeFault>` — wake pair, with... |
 | `resume_pausable` | `fn(&self)` — ...this (sync: parked tasks pick up immediately) |
-| `start_node` | `async fn(&self, &'static TaskNode, Spawner) -> Result<(), SpawnError>` |
-| `stop_node` | `async fn(&self, &'static TaskNode) -> Result<(), ShutdownTimeout>` — awaits the ack |
+| `start_node` | `async fn(&self, &'static TaskNode, &Spawner) -> Result<(), NodeFault>` |
+| `stop_node` | `async fn(&self, &'static TaskNode) -> Result<(), NodeFault>` — awaits the ack |
 | `resume_node` | `fn(&self, &'static TaskNode)` — sync, `Pause` nodes only |
-| `activate` | `async fn(&self, &'static TaskNode, Spawner)` — cascade; spawn errors deliberately swallowed |
-| `deactivate` | `async fn(&self, &'static TaskNode) -> Result<(), ShutdownTimeout>` — cascade |
-| `apply_control` | `async fn(&self, ControlCommand, Spawner) -> Result<(), ShutdownTimeout>` |
-| `run_pools` | `async fn(&self, Spawner) -> ShutdownTimeout` — completes only on error |
+| `activate` | `async fn(&self, &'static TaskNode, &Spawner)` — cascade; spawn errors deliberately swallowed |
+| `deactivate` | `async fn(&self, &'static TaskNode) -> Result<(), NodeFault>` — cascade |
+| `apply_control` | `async fn(&self, ControlCommand, &Spawner) -> Result<(), NodeFault>` |
+| `run_pools` | `async fn(&self, &Spawner) -> NodeFault` — completes only on error |
 
-Error provenance: `RunError`, `ShutdownTimeout`, `Aborted`, `ControlQueueFull` are
-crate types; `SpawnError` is re-used from `embassy_executor`. All the guarantees here
+Error provenance: every lifecycle failure is one `NodeFault { node, kind: FaultKind }`
+— `ExecutorSlotEmpty`, `ResourceMissing`, `ReadyDepTimeout { dep }`, `Spawn(SpawnError)`
+or `ShutdownTimeout` — with an unconditional `Display` that names the node and the
+cause, so `{fault}` is enough for an escalation message. `Aborted` and
+`ControlQueueFull` are the other crate types; `SpawnError` is re-used from
+`embassy_executor` and appears only inside `FaultKind::Spawn`. All the guarantees here
 are cross-thread (release/acquire atomics) — a host test's main thread reads them as
 safely as another task.
 
 The control mailbox (feature `control`) is two free functions and two small types:
 `async fn request_control(&'static TaskNode, ControlOp)` (lossless — awaits mailbox
 capacity), `fn try_request_control(..) -> Result<(), ControlQueueFull>` (sync
-contexts), and `enum ControlOp { Activate, Deactivate }` — just those two variants;
-higher-level verbs (start/stop/pause/resume) fold onto them per the node's `Mode`.
+contexts), and `enum ControlOp` — `Activate`, `Deactivate`, and (feature `restart`) `Restart`;
+the enum is `#[non_exhaustive]`. Higher-level verbs (start/stop/pause/resume) fold
+onto the first two per the node's `Mode`.
 All of these are importable from the crate root (`embassy_supervisor::try_request_control`,
-`embassy_supervisor::ControlOp`, …); `ShutdownTimeout`'s one field is
-`pub node: &'static TaskNode` (hence `e.node.name` in escalation messages).
+`embassy_supervisor::ControlOp`, …); a `NodeFault`'s fields are
+`pub node: &'static TaskNode` and `pub kind: FaultKind`.
 
 One cascade asymmetry worth knowing: `activate` expands *dependencies* (up) and
 `deactivate` expands *dependents* (down) — so a pool taken down as a **dependent** of
@@ -220,7 +322,9 @@ The canonical per-operation matrix — what each supervisor operation does to a 
 and by the two lifecycle-spanning flags (`disabled`, `detached`). Other docs link here.
 
 **Missed acks are errors, not panics.** Every stop path awaits the target's ack with a
-2 s timeout; a node that misses it is returned as `ShutdownTimeout` naming the node —
+2 s timeout (per-node override: `ack_timeout:`); a node that misses it is returned as a
+`NodeFault`
+(`FaultKind::ShutdownTimeout`) naming the node —
 from `stop_node`, `teardown`, and (feature `control`) `apply_control`; `run_pools`
 completes (only) with it when a shrink hits a wedged member. `teardown` **aborts at the
 first timeout** so a still-live dependent never has its dependencies stopped under it;
@@ -249,12 +353,17 @@ Two flags cut across the modes:
   lifecycle and the supervisor never drives it again. Its `deps:` still order its *first*
   spawn — after that, the graph only remembers where it was declared.
 
-**Defaults in one place:** shutdown-ack timeout **2 s** (a missed ack returns
-`ShutdownTimeout`); pre-spawn slot/gate/ready-dep wait **100 ms** per gate
-(override per node with `slot_timeout:`; timeout = `SpawnError::Busy`); control
-mailbox depth **4** (`request_control` awaits capacity, `try_request_control`
-reports `ControlQueueFull`); trace registries track up to **4** executors and **4**
-graphs.
+**Defaults in one place:** shutdown-ack timeout **2 s** (override with `ack_timeout:`
+for a node whose cleanup legitimately takes longer; a missed ack returns
+`FaultKind::ShutdownTimeout`, from the moment that node is signalled on either stop
+path); pre-spawn gate budget **100 ms** per node — the
+`start()` wave covers all of a node's gates (executor slot, resources, ready
+deps) with one budget from when its in-pass deps resolve, while the single-node
+verbs bound each gate separately (override with `slot_timeout:`; timeout = a
+`NodeFault` naming the gate); control mailbox depth **4** (`request_control`
+awaits capacity, `try_request_control` reports `ControlQueueFull`); trace
+registries track up to **4** executors and any number of graphs (an intrusive
+chain through each graph's `GraphRef`).
 
 ## Writing supervised tasks (the TaskNode API)
 
@@ -290,7 +399,7 @@ The node is the task's half of the lifecycle protocol. Four rules cover all of i
    indefinitely — that's how a teardown/stop reaches you.
 2. **Ack exactly once per stop** with `ack_dropped()`: on exit (`Terminate`/`OnDemand`),
    or on each pause (`Pause`) *before* parking. A task that never acks surfaces as a
-   `ShutdownTimeout` error naming the node — a loud bug report, not a hang, and the
+   `FaultKind::ShutdownTimeout` fault naming the node — a loud bug report, not a hang, and the
    application chooses the escalation.
 3. **An autonomous exit calls `mark_exited()`** — it acks like `ack_dropped()` *and*
    records the completion, so a worker that returns on its own reads as down
@@ -307,6 +416,8 @@ Task-side methods:
 |---|---|
 | `run_cancellable_acked(fut).await` | the everyday body: race `fut` against shutdown AND complete the handshake on `Err(Aborted)` — discarding the result (`let _ =`) is fine, the ack already happened |
 | `run_cancellable(fut).await` | same race, no ack — run cleanup between the cancellation and your own `ack_dropped()` |
+| `run_pausable(fut).await` | `Pause` bodies: same race, and on a pause it acks, parks, and returns `Err(Resumed)` only after the resume — the loop body is the fresh cycle |
+| `run_pausable_loop(body).await` | the whole `Pause` protocol in one call: rebuilds `body` (an async closure) every cycle, never returns |
 | `wait_shutdown().await` | the underlying primitive: park until a stop/pause is requested (immediate if already requested) |
 | `ack_dropped()` | complete the handshake: clears `running`, wakes the supervisor's ack wait |
 | `mark_exited()` | `ack_dropped()` + record the completion (`has_exited()`) — call on an autonomous exit; `task:` shells emit it automatically |
@@ -317,8 +428,9 @@ Task-side methods:
 | `set_detached(true)` | opt out of supervision from now on (self-managed daemon or run-once — see the [lifecycle reference](#lifecycle-reference)) |
 | `adopt(&token)` | parked nodes: register a hand-spawned task's id so trace accounting sees it |
 
-The combinators return `Result<F::Output, Aborted>`; `Aborted` is a crate type —
-`use embassy_supervisor::{Aborted, TaskNode};` covers the canonical loops.
+The cancellable combinators return `Result<F::Output, Aborted>` and the pausable
+one `Result<F::Output, Resumed>`; both markers are crate types —
+`use embassy_supervisor::{Aborted, Resumed, TaskNode};` covers the canonical loops.
 
 **Status methods** — readable from anywhere (a status endpoint iterates `GRAPH.nodes`
 and reads these; all are cheap atomic loads):
@@ -336,7 +448,7 @@ and reads these; all are cheap atomic loads):
 
 Useful compositions: **down** = `!is_running()`; **parked `Pause`** = mode `Pause` +
 `!is_running()` + `shutdown_requested()`; **autonomous completion** = `has_exited() &&
-!shutdown_requested()`. A spawn that fail-closed (`SpawnError::Busy` from a gate)
+!shutdown_requested()`. A spawn that fail-closed (a `NodeFault` from a gate)
 leaves the node `!is_running()` — nothing was taken or spawned. Ordering guarantees: when `stop_node`/`teardown`/`deactivate`
 return `Ok`, the ack has happened and `is_running()` is already `false`; for bodies
 that ack by returning (the `run_cancellable_acked` idiom), `has_exited()` is also
@@ -362,21 +474,25 @@ cleanup must run between the cancellation and the ack (flush, unpublish, busy/id
 bracketing); keep a hand-written `select3` when the loop races more than work vs
 shutdown — nesting combinators there buys nothing.
 
-**`Pause` node** — ack, then park; held resources survive:
+**`Pause` node** — ack, then park; held resources survive. `run_pausable_loop`
+owns the whole protocol:
 
 ```rust,ignore
 #[embassy_executor::task]
 async fn sensor_task(node: &'static TaskNode) {
     let mut bus = acquire_once();                // kept across pause/resume
-    loop {
-        while let Ok(v) = node.run_cancellable(sample(&mut bus)).await {
-            publish(v);
-        }
-        node.ack_dropped();                      // ack the pause...
-        node.wait_resume().await;                // ...then park, still owning `bus`
-    }
+    node.run_pausable_loop(async || {
+        let v = sample(&mut bus).await;          // raced against the pause
+        publish(v);
+    })
+    .await                                       // acks, parks and resumes inside; never returns
 }
 ```
+
+Per-cycle `run_pausable` is the same minus the loop, for a body with its own
+control flow between cycles. When cleanup must run between the cancellation and
+the ack, spell the tail out: `run_cancellable`, the cleanup, `ack_dropped()`,
+`wait_resume().await`.
 
 **Pool worker** — same as `Terminate`, plus load reporting around the busy section:
 
@@ -434,7 +550,7 @@ executor NAME;                        // runtime-filled SendSpawner slot (tier /
 node NAME = Mode, deps: [A, B][, executor: EXEC], spawn: <spawn>[, disabled];
 node NAME = Mode, deps: [A, B][, executor: EXEC], task: <worker>[, pool_size: N]
     [, resources: [[#[cfg(..)]] RES: [local] [shared|consume] Type, ..]]
-    [, slot_timeout: MS][, cancel][, disabled];
+    [, slot_timeout: MS][, ack_timeout: MS][, cancel][, disabled];
 node NAME = Mode, deps: [A];          // neither => parked node the app spawns itself
 pool NAME = [Mode, ..], deps: [A][, executor: EXEC],
     spawn: <fn> | task: <worker>,
@@ -442,7 +558,7 @@ pool NAME = [Mode, ..], deps: [A][, executor: EXEC],
                                         // take kinds → per-member slot arrays;
                                         // shared (incl. shared local) one pool-wide slot
     policy: [<Type> =] <expr>,
-    min: N, max: M[, slot_timeout: MS][, cancel];
+    min: N, max: M[, slot_timeout: MS][, ack_timeout: MS][, cancel];
 ```
 
 ### Spawn forms
@@ -483,7 +599,7 @@ Semantics:
   accessors (a spawn batch polls last-first). Corollary: an extra that can be **missing** at
   first poll is a task-side panic, not a failed spawn — extras are for infallible accessors.
   A value that might not exist yet belongs in `resources:` (a `shared` entry for a fan-out
-  handle): the pre-spawn gate turns "missing" into a clean `SpawnError::Busy`.
+  handle): the pre-spawn gate turns "missing" into a clean `FaultKind::ResourceMissing`.
 - `pool_size: N` (default 1) sizes the shell's `TaskPool` — headroom for a respawn issued
   while the previous instance is still draining.
 - On a `pool`, `task:` emits ONE shell sized to the member count.
@@ -508,7 +624,7 @@ have emitted.
 
    ```rust,ignore
    // other_crate exports: #[embassy_executor::task] pub async fn modem_task(..) { .. }
-   node MODEM = Terminate, deps: [], spawn: other_crate::modem_task(&NODES[0]);
+   node MODEM = Terminate, spawn: other_crate::modem_task(&NODES[0]);
    ```
 
 2. **The same task is also spawned outside the graph.** `spawn:` reuses the one existing
@@ -520,7 +636,7 @@ have emitted.
    async fn logger(node: &'static TaskNode, sink: Sink) { /* ... */ }
 
    // One instance supervised ...
-   node LOG = Pause, deps: [], spawn: logger(uart_sink());
+   node LOG = Pause, spawn: logger(uart_sink());
    // ... and one spawned by hand elsewhere, sharing logger's pool:
    spawner.spawn(logger(&NODES[log_idx], usb_sink()).unwrap());
    ```
@@ -552,81 +668,105 @@ have emitted.
    ```rust,ignore
    // Snapshot the respawn count at the moment of this spawn, not at first poll
    // (an interrupt-tier node's first poll can preempt and land arbitrarily later):
-   node REPORT = Terminate, deps: [], executor: HIGH, spawn: report_task(boot_epoch());
+   node REPORT = Terminate, executor: HIGH, spawn: report_task(boot_epoch());
    ```
 
 Omitting both keeps the node **parked** (see [Spawn forms](#spawn-forms)) — that's a third
 option, not a tie-breaker between the two.
 
-### `resources:` — safe resource threading
+### `resources:` — owned values handed over at spawn
 
-`ResourceSlot<T>`'s full hand-usable API, for reference (the macro's glue uses the
-same calls): `provide(T)` / `restore(T)` fill the slot (restore is provide, named for
-the give-it-back half), `take() -> Option<T>` empties it, `get() -> Option<T>`
-(`T: Copy` only) copies without emptying, and `async wait_take() -> T` awaits a fill
-then takes — how an `exit:` slot is read. `provide` on an already-filled slot
-overwrites (the old value is dropped): every slot is a mailbox, not a log.
+A resource is a value **one party builds and one worker owns while it runs**: a
+peripheral split out of `Peripherals`, a driver object, a stream endpoint, a handle an
+async bring-up produced. The graph threads it into the worker at spawn instead of
+having the body re-acquire it (`Peripherals::steal()`, a global registry looked up by
+name), which keeps embassy's compile-time exclusive ownership and turns "not there
+yet" into a gate the supervisor waits on rather than a panic inside the task.
 
-By default a supervised task that needs a peripheral re-acquires it inside its body
-(`Peripherals::steal()`), giving up embassy's compile-time ownership guarantee.
-`resources: [NAME: Type, ..]` (requires `task:`; node-only) restores it: each entry emits a
-`pub static NAME: ResourceSlot<Type>` at the declaration site, and `main` **moves** the
-resource in:
+`resources: [NAME: Type, ..]` (requires `task:`) emits a `pub static NAME:
+ResourceSlot<Type>` at the declaration site. Whoever owns the value fills the slot:
+
+- **`main`**, before `start()`, for anything that exists from boot:
 
 ```rust,ignore
 async fn blink(node: &'static TaskNode, led: &mut Output<'static>) { /* ... */ }
 
 supervisor_graph! {
-    node BLINK = Terminate, deps: [], task: blink,
+    node BLINK = Terminate, task: blink,
         resources: [LED: Output<'static>];
 }
 
 // main, after the Peripherals split:
 LED.provide(Output::new(p.PIN_25, Level::Low)); // consumes p.PIN_25 — no steal, no 2nd owner
-sup.start(spawner).await?;
+sup.start(&spawner).await?;
 ```
+
+- **a provider node**, for anything another task builds at runtime (a radio stack
+  after its firmware load, a serial stream once its UART is pumping). It names the
+  slots it fills with [`provides:`](#provides--slots-that-die-with-their-producer) and the consumers order after it with
+  `deps:`; the [provider-node recipe](#provider-node--async-multi-output-construction-in-the-graph)
+  shows the whole shape.
 
 The protocol, per (re)spawn:
 
-1. `main` `provide()`s the value once. Consuming the `Peripherals` field is the
+1. The value is `provide()`d once. Consuming the `Peripherals` field is the
    **compile-time exclusive-ownership guarantee** — a second owner cannot exist.
-2. The generated glue `take()`s it just before the spawn. An unprovided slot fails
-   `Supervisor::start` with `SpawnError::Busy` after a bounded wait (the supervisor logs the
-   node name) — fail-closed at bring-up, not a panic inside a running task. Provisioning is
-   the runtime-checked half of the contract.
-3. The generated shell hands the worker `&mut Type` — after the node arg, in declared order,
-   before any partial-call extras — and `restore()`s the value after the worker returns
-   (i.e. after its shutdown ack). A Terminate respawn therefore re-takes the **same
-   instance**; a Pause worker never returns, so it simply retains its resources.
+2. The generated glue probes the slot just before the spawn. An unprovided slot fails
+   `Supervisor::start` with `FaultKind::ResourceMissing` after a bounded wait (the
+   node's `slot_timeout`, 100 ms by default; the supervisor logs the node name) —
+   fail-closed at bring-up, not a panic inside a running task. Provisioning is the
+   runtime-checked half of the contract.
+3. The generated shell `take()`s the value at its first poll — never through the task-fn
+   call, where a `Busy` storage claim would drop it, unrecoverable — hands the worker
+   `&mut Type` (after the node arg, in declared order, before any partial-call extras) and
+   `restore()`s it after the worker returns (i.e. after its shutdown ack). A Terminate
+   respawn therefore re-takes the **same instance**; a Pause worker never returns, so it
+   simply retains its resources.
 
 The supervisor awaits a node's slots being filled before each (re)spawn (same bounded wait
 as `executor` slots), so late provisioning and the respawn-vs-restore window on another core
 are both covered. Caveats: a panic in the worker skips the restore (embedded panic = reboot);
-`pool_size > 1` on a `resources:` node buys nothing (the slot holds ONE value — a second
-concurrent spawn fails at `take()`); pools reject `resources:` (members would contend for a
-single instance).
+`pool_size > 1` cannot combine with lend/consume entries — the slot holds ONE value, so the
+macro rejects it (use `shared`, or an `ElasticPool`, whose members get per-member slot
+arrays).
+
+`ResourceSlot<T>`'s hand-usable API, for providers and app code (the macro's glue uses
+the same calls): `provide(T)` / `restore(T)` fill the slot (restore is provide, named for
+the give-it-back half), `take() -> Option<T>` empties it, `get() -> Option<T>`
+(`T: Copy` only) copies without emptying, `clear()` empties it and resets the filled
+latch, and `async wait_take() -> T` awaits a fill then takes — how an `exit:` slot is
+read. `provide` on an already-filled slot overwrites (the old value is dropped): every
+slot is a mailbox, not a log.
 
 #### Resource kinds: `local`, `consume`, and `shared`
 
 Per-entry markers (order-free; `local` composes with either of the mutually exclusive
-`consume`/`shared`) refine the default lend-and-restore protocol for the resources it
-cannot express:
+`consume`/`shared`) refine the default lend-and-restore protocol. The kind follows from
+what the worker does with the value:
+
+- it only **borrows** it, and the same instance should serve the next activation →
+  the default;
+- it **moves it into a constructor** (`Uart::new(periph, ..)`), drops it at teardown,
+  or the node is one-shot by construction (its setup claims `StaticCell`s a second run
+  would re-initialise) → `consume`: the slot stays empty afterwards, so a respawn fails
+  at the supervisor with `ResourceMissing` instead of panicking inside the worker;
+- several nodes need the **same `Copy` handle** → `shared`.
 
 | kind | worker receives | on worker exit | use for |
 |---|---|---|---|
 | *(default)* | `&mut Type` | `restore()`d — respawn re-takes the same instance | long-lived singletons (`Output`, a reborrowable `Peri`) |
-| `consume` | `Type` **by value** (glue `take()`s) | nothing — the slot stays **empty** | resources the worker must *drop* at teardown (a driver whose `Drop` releases pins/DMA) or that go stale across a power cycle and are rebuilt each run |
-| `shared` | `Type` **by value** (glue **copies** via `get()`, `T: Copy`) | nothing — the slot **stays filled** | one handle fanned out to many consumers (`embassy_net::Stack`, a `&'static` shared-bus ref); several nodes — and whole `task:` pools — declare the SAME slot name |
+| `consume` | `Type` **by value** (shell `take()`s) | nothing — the slot stays **empty** | resources the worker must *drop* at teardown (a driver whose `Drop` releases pins/DMA) or that go stale across a power cycle and are rebuilt each run |
+| `shared` | `Type` **by value** (shell **copies** via `get()`, `T: Copy`) | nothing — the slot **stays filled** | one handle fanned out to many consumers (`embassy_net::Stack`, a `&'static` shared-bus ref); several nodes — and whole `task:` pools — declare the SAME slot name |
 | `local` | as the kind it composes with | as the kind it composes with | `!Send` values (`RefCell`-/`NoopRawMutex`-based driver handles) on a **single core** |
 
 `consume` makes teardown-drop explicit and turns the wake path into "build fresh, `provide()`,
-respawn": until the application re-provides, a respawn fail-closes with `SpawnError::Busy`
+respawn": until the application re-provides, a respawn fail-closes with `FaultKind::ResourceMissing`
 instead of reusing a stale instance.
 
 `shared` replaces the panicking-accessor pattern for fan-out handles: instead of a
 `task:` extra like `stack()` that panics at first poll when the value is missing, a
 `shared` resource is gate-awaited before the spawn and a missing value is a clean
-`SpawnError::Busy`. The slot static is emitted once per unique name (with the union of
+`FaultKind::ResourceMissing`. The slot static is emitted once per unique name (with the union of
 the declaring sites' `#[cfg]` predicates); every re-declaration must repeat the same
 kind markers and type. Entries may also carry per-entry `#[cfg(...)]` — gate the worker
 fn's matching parameter with the same attribute.
@@ -648,13 +788,71 @@ async fn radio(node: &'static TaskNode, runner: Cyw43Runner) {
 }
 
 supervisor_graph! {
-    node RADIO = Terminate, deps: [], task: radio,
+    node RADIO = Terminate, task: radio,
         resources: [RUNNER: local consume Cyw43Runner];
 }
 
 // bring-up (and again on every wake cycle, BEFORE the respawn):
 RUNNER.provide(build_radio_runner().await);
 ```
+
+#### `provides:` — slots that die with their producer
+
+`provides: [RES, ..]` on a node names the slots its task fills at runtime, resolved
+against the graph's `resources:` entries (an unknown name is a compile error). The
+node's shutdown ack clears them — the value drops, the filled latch resets; `Pause`
+parks excepted, since a parked task still backs what it published — so a consumer's
+gate waits for the next activation's value instead of taking a leftover.
+
+**The `shared` slot is why the clause exists.** A `consume` slot is empty from teardown
+until the rebuild, so its gate is fresh by construction — but a `shared` slot is never
+emptied by its consumers, and "filled" cannot say *whose activation* filled it: after
+the provider stops, a gate wait would hand out the previous cycle's handle. Resources
+are not couplings, so nothing else links a slot to the task that fills it; the clause
+is that link. Emptiness is then the freshness signal the gate waits already
+understand. The declared form also covers providers whose ack happens inside
+`run_cancellable_acked` or a `cancel` shell, and autonomous exits through
+`mark_exited`; the manual form — `ResourceSlot::clear()` before the ack — needs no
+feature.
+
+The graph hands the producer nothing: its task names the static itself (`&STREAM` as a
+`task:` extra when the body lives in another crate, the bare name when it does not) and
+calls `provide()` once the value exists. A runner whose output nobody consumes has no
+consumer to declare a slot for it; a hand-written `static X: ResourceSlot<T> =
+ResourceSlot::new()` gives it somewhere to provide into, outside the graph's view.
+
+#### Resource or signal?
+
+Both are `pub static`s that two nodes touch, and the graph has a clause for each. They
+record different relations:
+
+| | resource (`resources:` / `provides:`) | signal (`reads:` / `writes:` / `#[dataflow]`) |
+|---|---|---|
+| what it is | a value one party builds and one worker owns | a `'static` that exists from boot and any number of tasks touch |
+| lifetime | its provider's; cleared when the provider stops | the program's |
+| relation | ownership hand-over, once per activation | runtime coupling, for the whole run, may be cyclic |
+| gating | the consumer's spawn waits for the value (`slot_timeout`) | none, unless the signal is wrapped in a gate (`Backed`, `node.open`) |
+| examples | a `Peri`, a driver, a `Stack` handle, a stream endpoint | a `Watch`, `Signal`, `Channel`, `Mutex` |
+
+The test is **whether the thing exists before its producer runs**. A `static W:
+Watch<..>` does; a UART stream does not. So a signal is never a resource merely because
+a consumer must not read it before its writer is up — that is readiness (`deps: [X
+ready]`, `ready_on_write`, or a [gated read](#gated-reads-feature-data-deps)), and the
+signal stays a coupling. Conversely, a handle a task builds and another task must not
+start without is a resource even when it is a channel endpoint or a `&'static Signal`
+living inside the provider's state: what crosses the edge is the producer's lifetime,
+which is exactly what a `provides:` slot encodes.
+
+Two consequences:
+
+- A `'static` primitive both nodes can already name is a coupling. Threading a reference
+  to it through a slot adds a gate that fires at once and a clear-on-shutdown that
+  clears nothing; declare it in `reads:`/`writes:` instead.
+- When a consumer needs a **value** and a **state** from one provider (a stream, and
+  "the link is up"), the value goes through the slot and the state through `ready`.
+  Where the value *is* the state — the provider has nothing to say beyond "here it is"
+  — the slot gate alone is the rendezvous, and a `ready` marker beside it states the
+  same fact twice.
 
 ### `exit:` — typed exit values
 
@@ -755,7 +953,7 @@ Declared but not started at boot; a control `Activate` starts it later (e.g. an 
 `executor NAME;` emits a `SpawnerSlot` static; the app fills it with a `SendSpawner`
 (`InterruptExecutor::start()`, `Spawner::make_send()`), and annotated nodes spawn through it.
 `start()` awaits the slot (bounded) as part of bring-up; a slot still empty at the deadline
-fails the spawn with `SpawnError::Busy` — loud, not silent. Constraints: `executor:` requires
+fails the spawn with `FaultKind::ExecutorSlotEmpty` — loud, not silent. Constraints: `executor:` requires
 a `spawn:` fn (it cannot combine with a verbatim closure), and the routed task's future must
 be `Send`.
 
@@ -766,24 +964,33 @@ be `Send`.
 
 **A plain dep orders *spawns*, not *readiness*.** `start()` spawns a node and immediately
 marks it running, so a dependent with no gates can race its provider's body. Bring-up
-walks the topological order sequentially: a node's gate wait (slot, resource, ready
-dep) blocks every node after it in the order until it resolves or times out. Two
-rendezvous exist, both opt-in:
+is a wave: a node spawns once its deps are up and its gates (executor slot, resource
+slots, ready deps) are satisfied, bounded by its own `slot_timeout`; unrelated nodes do
+not wait on each other's gates. Two rendezvous exist, both opt-in, and they carry
+different things across the edge:
 
-- a `resources:` slot wait — the provider-node pattern (`provide()` after DHCP etc.);
-- a **`ready` dep marker** *(feature `readiness`)*: `deps: [NET ready]` additionally
+- a `resources:` slot wait — the provider hands over a **value**; the gate is the
+  value's presence ([`provides:`](#provides--slots-that-die-with-their-producer));
+- a **`ready` dep marker** *(feature `readiness`)* — the provider asserts a **state**
+  with nothing to hand over: `deps: [NET ready]` additionally
   awaits the dep's task-asserted `set_ready()` before spawning this node, bounded by
-  this node's `slot_timeout` (then `SpawnError::Busy`, with a log line naming the
-  not-ready dep). Elastic-pool growth also defers while a ready-marked dep is
+  this node's `slot_timeout` (then `FaultKind::ReadyDepTimeout { dep }`, which names
+  the dep that never asserted). Elastic-pool growth also defers while a ready-marked dep is
   un-ready (a sync check per evaluation — no wait). `ready` on a pool name means the
   floor member's readiness; markers on a `pool`'s own `deps:` apply to every member.
 
 The provider side is three calls: `set_ready()` once serving, `clear_ready()` on a
 lost link (**status, not control** — dependents are not stopped; pair with a control
-`Deactivate` for a cascade), and the pre-spawn reset clears it so a respawned provider
-re-asserts. `wait_ready()` exists for app code too, with the same
-single-pre-fill-waiter caveat as the other latching gates — fan N waiters out through
-an app-owned `embassy_sync::watch::Watch` instead.
+`Deactivate` for a cascade, or opt an individual edge into `bound` below), and the
+pre-spawn reset clears it so a respawned provider re-asserts. `wait_ready()` exists for
+app code too, with the same single-pre-fill-waiter caveat as the other latching gates —
+fan N waiters out through an app-owned `embassy_sync::watch::Watch` instead.
+
+Pick by what crosses the edge: a value wants a slot, a state wants `ready`. Both on one
+edge for one fact is redundant ([Resource or signal?](#resource-or-signal)).
+
+What a dep edge does *not* say — the continuous flow of data between running
+tasks — has its own part: [Dataflow supervision](#dataflow-supervision).
 
 ### `#[cfg(...)]`
 
@@ -869,6 +1076,7 @@ offending token:
 - **`local` resources with `executor:`** — on a node or a pool: a local slot carries
   `!Send` values; a `SpawnerSlot`-routed spawn needs a `Send` future
 - **`slot_timeout: 0`** — would fail every gated spawn instantly
+- **`ack_timeout: 0`** — would fault every stop before the task's first poll
 - **[`cancel`](#cancel--supervisor-unaware-workers) without `task:`** — on a node or a
   pool: the flag rewrites how the *generated* shell calls the worker; a hand-written
   `spawn:` fn can call `node.run_cancellable(..)` itself
@@ -891,6 +1099,567 @@ Generated surface at the call site: one `pub static` per node, the pool array + 
 one `SpawnerSlot` static per `executor NAME;`, one slot static per `resources:` entry (plus,
 iff any entry is `local`, the local slot type), and `pub static GRAPH` — nothing else.
 
+## Dataflow supervision
+
+Everything above orders *when tasks run*. This part is about the other half of the
+graph: *what data flows between them* while they run — declared, turned into a
+heartbeat and a readiness assertion, and (at the top tier) derived straight from the
+code. It is layered: each feature below builds on the previous one, and stopping at
+any layer is fine.
+
+### Spawn ordering is not runtime coupling
+
+A `deps:` edge orders **spawns** — consumed once, at bring-up, never again.
+Dataflow — who writes and who reads each signal, for the whole run — is a
+different relation, and conflating them cuts both ways: an ordering edge read as
+"A feeds B", a real coupling left undeclared because "the deps already say it".
+One declaration per meaning:
+
+| declaration | relates | applies |
+| --- | --- | --- |
+| `deps: [X]` | spawn order | one instant, at bring-up |
+| `deps: [X ready]` | spawn order + a startup rendezvous | one instant |
+| `resources:` / `provides:` | ownership of a value | once per activation, gated on the value |
+| `reads:` / `writes:` / derived tables | dataflow | whole run, **may be cyclic** |
+| `deps: [X ready bound]` | runtime state propagation | continuous, opt-in |
+
+- Dataflow may be cyclic; a spawn DAG cannot — which is why the coupling tables
+  never feed the topological sort.
+- A `deps:` edge is never re-evaluated: nothing re-gates a running node when a
+  provider cycles underneath it (`epochs` lets it notice; `restart` re-gates it).
+- Readiness is a rendezvous, not a persistent guarantee: without `bound-deps`, a
+  provider that comes up and later goes quiet is invisible.
+- A resource is not a coupling either: it is a value handed over, bound to its
+  provider's lifetime. [Resource or signal?](#resource-or-signal) draws the line.
+
+### The pieces, in plain terms
+
+The record dataflow supervision keeps: **for each signal, which node writes it,
+which nodes read it.** What each side gets from being on it:
+
+- **Writer**: found by `GRAPH.writers_of(&SIG)`, drawn by the diagram tool; with
+  the features below, the write can become the node's heartbeat and its
+  readiness ("ready" = actually producing). Readers' gates resolve against it.
+- **Reader**: `readers_of(&SIG)` answers "who is affected if this producer
+  cycles?"; the diagram tool warns on one-sided signals. Reads carry no
+  bookkeeping — the record is the whole product.
+
+Two ways onto the record, differing in who keeps it true:
+
+- **Declared** — `reads:` / `writes:` lists on the node
+  ([below](#declaring-the-dataflow-feature-coupling)). Works for any body;
+  nothing checks the list against the code.
+- **Derived** — `#[embassy_supervisor::dataflow]` on a fn that accesses signals
+  through its node: `node.put(&SIG, v)` / `node.get(&SIG)` perform the access,
+  `node.writer(&SIG)` / `node.reader(&SIG)` hand the signal back. The attribute
+  scans for those calls and emits the fn's tables beside it — the call site *is*
+  the declaration, so it cannot drift.
+
+The graph binds derived tables with two keywords:
+
+- **`discover`** — use the `task:` fn's own table as the node's declaration.
+- **`dataflow: [path]`** — adopt annotated helper fns. The scan sees one body at
+  a time, so helpers must be annotated and adopted by their callers; a module of
+  them adopts as one `#[dataflow_bundle]` entry (`dataflow: [crate::api::BUNDLE]`).
+
+Use cases:
+
+| you are a… | use |
+| --- | --- |
+| writer or reader in your own task fn | the verbs + `#[dataflow]` + `discover` |
+| writer through a setter other nodes call | annotate the setter; each caller adopts it — the write attributes to the caller, and the static stays private to its module |
+| reader through an accessor | same: annotate it, callers adopt it |
+| writer or reader in a body that cannot see the supervisor (third-party, [`cancel`](#cancel--supervisor-unaware-workers)) | `writes:` / `reads:` lists (`observed beat` adds liveness) |
+| writer the scan cannot follow (runtime-computed index) | keep that entry in the list |
+| reader of a value meaningless until its writer runs | gate it: `deps: [X ready]` (the spawn waits) or a [gated read](#gated-reads-feature-data-deps) `node.open(&SIG)` (each use waits, resolved via the declared writer) |
+
+All of it composes per node — one table per source (list, task fn, each
+adoption). An access on no bound table still works; the graph just doesn't see
+it.
+
+### Declaring the dataflow (feature `coupling`)
+
+The hand-written tier, for bodies that cannot carry a node. Entries name the
+**actual signal statics**: checked to exist and be `Sync`, so a rename breaks
+every referring declaration — and that is the whole check; the list is never
+verified against the body.
+
+```rust,ignore
+node CONTROLLER = Terminate, deps: [ESKF ready],
+    reads:  [crate::signals::ESKF_ESTIMATE],
+    writes: [crate::signals::MOTOR_SETPOINT],
+    task: crate::controller::entry;
+```
+
+The couplings beside a node's deps also say which edges carry data and which
+merely sequence: a `deps:` edge with no coupling beside it is pure ordering
+("run me last"), and now says so.
+
+The next two sections build on declared entries without touching the body
+(`observed` liveness, `ready_on_write`); the sections after them cover the
+derived tier in detail.
+
+### Liveness and readiness by polling (feature `coupling-observe`)
+
+**`observed` gives the supervisor a way to ask whether this signal moved; `beat` is
+what currently asks.** The marker names an accessor whose result changes when the
+signal is written; a consumer decides whether to call it. Nothing is asked of the
+task — no node in its signature, no `beat()`, no `set_ready()` — which makes this
+the tier for a body you do not own.
+
+Today the heartbeat is the only consumer, so an `observed` entry without `beat` is
+inert: declared, one word of flash, and never called. The same is true of every
+`observed` entry in a `reads:` list, since `beat` on a read is a compile error. They
+are not errors — a second consumer (an input that went quiet, a rate readout) would
+give them meaning without a syntax change — but nothing asks about them today.
+
+```rust,ignore
+observe writes: it.load(Ordering::Relaxed);   // graph-level default; `it` is the signal
+
+node ESTIMATOR = Terminate, beat_timeout: 1000,
+    writes: [crate::signals::ESTIMATE observed],
+    task: crate::estimator_task;
+```
+
+The accessor resolves from three places, most specific first: `observed via <expr>` on
+the entry, the graph-level `observe writes:/reads:` default for its direction, and —
+with neither — the `Observable` trait from `embassy-supervisor-observe`. That last one
+is a leaf facade in the `log` mold: a signal library implements it (or wraps a primitive
+in the facade's `Counted`) without ever depending on the supervisor, which is what a
+trait defined *here* could never offer. The atomics implement it out of the box, value
+as token. The expression forms remain what reach an accessor no trait method could — a
+different accessor per entry, or one element of an array (`ARR[1] observed`).
+
+Two things follow, and they are the point of the feature:
+
+- **With `liveness-monitor`, a `beat`-qualified write drives the node's heartbeat.** The
+  sweep treats an advancing counter as a beat, so the node above calls `beat()` only on
+  its steady path where it produces no output. Name the wrong signal and the node goes
+  **stale** — the declaration stops being a comment.
+
+  `beat` is a separate qualifier because the two questions are different: `observed`
+  says the signal can be asked, `beat` says the answer is this node's sign of life. A
+  node with four outputs usually wants only one treated that way — without the split,
+  marking a second write would quietly weaken the heartbeat from "the output that
+  matters moved" to "any output moved". `beat` on a `reads:` entry is a compile
+  error — a heartbeat is something a node produces.
+- **`ready_on_write`** turns that same advance into the node's readiness assertion,
+  described below.
+
+### `ready_on_write`
+
+A node clause: the sweep calls `set_ready()` the first time one of the node's `observed`
+writes advances, so "ready" means *actually producing* rather than *reached the line that
+says so*. It replaces the common shape of awaiting a first publication and then asserting
+readiness by hand.
+
+```rust,ignore
+node ESKF = Terminate, beat_timeout: 1000, ready_on_write,
+    writes: [crate::signals::ESKF_ESTIMATE observed beat];
+```
+
+Requires an `observed beat` entry in `writes:` — the sweep's poll of that write is
+what asserts the readiness — and `beat_timeout:`, because the sweep only visits nodes
+with a budget. Both are compile errors otherwise, because either alone would be a
+silent no-op. A body that carries its own heartbeat through the verbs asserts its own
+readiness too, with `set_ready()` at the same write. (A `discover` node reaches the
+polled form with a marker-only entry beside it, below.)
+
+**Monotone: it never withdraws readiness.** A node that later goes quiet is reported
+through `wait_health()`, and what that means is the application's decision, exactly as
+with `liveness-monitor`. Withdrawing readiness here would leave a node permanently unready
+with nothing able to restore it — if you want that coupling, the composition already
+exists: `wait_health()` → `Stale` → your own `clear_ready()`.
+
+**The boundary, stated plainly.** Polling can only ever watch a signal the
+declaration names; it can never see what a body actually touched, and its resolution
+is the sweep interval. That is the price of asking nothing of the task. The tier
+below crosses both limits at the price polling exists to avoid: the body must see
+the supervisor.
+
+### The node as the access path (feature `dataflow`)
+
+`observed` is the implicit tier: the supervisor asks the signal, and neither the
+signal crate nor the task body ever learns it exists. The explicit tier is for a body that holds its
+`TaskNode` — the split AUTOSAR ships as `Rte_IWrite` beside `Rte_Write`: the access goes
+*through* the node, and is thereby the record.
+
+```rust,ignore
+#[embassy_supervisor::dataflow]
+async fn eskf_task(node: &'static TaskNode) {
+    let mut imu = node.reader(&IMU_DATA).receiver().unwrap();  // pass-through: handles
+    loop {
+        let est = fuse(imu.changed().await);
+        node.put(&crate::signals::ESTIMATE, est);              // Sink: the verb writes
+        node.beat();                                           // the sign of life
+    }
+}
+
+// graph: node ESKF = Terminate, deps: [IMU ready], task: eskf_task, discover;
+```
+
+`#[dataflow]` scans the fn for calls through its `TaskNode` parameter, emits the fn's
+read/write coupling tables as flash `static`s beside it, and rewrites each call site to
+carry its table entry — nothing is registered, nothing is declared, and the record
+cannot drift from the code. `put`/`get` perform the operation themselves through the
+facade's `Sink`/`Source` traits (the atomics implement both; a signal library adds
+one-line impls); the pass-through pair exists for the two patterns no value verb can
+express — read-modify-write has no value to hand over without racing
+(`node.writer(&COUNT).fetch_add(1, ..)`), and a consuming read needs per-consumer
+handle state a shared static cannot carry. A derived table states couplings and
+nothing else: the sign of life is carried by the verb, `node.beat_put(&SIG, v)` /
+`node.beat_writer(&SIG)`, or by a `node.beat()` call. The scan is receiver-keyed on the
+node parameter, so a
+`map.get(&key)` elsewhere is never touched; an aliased receiver or a helper fn's
+accesses are outside it, so annotate helpers too and adopt their tables — an access
+no bound table carries still performs, it simply leaves the graph unaware of it.
+
+### Verbs of your own
+
+The verbs are inherent methods on `TaskNode`, so an extension trait can add more; what
+the scan needs is to know the ident and which way it points. The attribute's arguments
+say so, and say nothing else:
+
+```rust
+pub trait Signals {
+    fn subscribe<T: Sync + ?Sized>(&'static self, s: Sig<T>) -> &'static T;
+    fn publish<T: Sink + Sync>(&'static self, s: Sig<T>, v: T::Item);
+}
+impl Signals for TaskNode { /* `s.target` is the signal, `s.entry` its table row */ }
+
+#[dataflow(read(subscribe), write(publish))]
+async fn entry(node: &'static TaskNode) {
+    let rx = node.subscribe(&crate::ESTIMATE);   // lands in reads:
+    node.publish(&crate::ARMED, true);           // lands in writes:
+}
+```
+
+A registered verb takes `Sig<T>`, which is where the rewrite puts the table entry; hand
+the signal back with `s.target`, as `reader` does. Registrations are **additive** — the
+built-in verbs are always recognised, and naming one of them is an error rather than a
+silent redefinition — and **per fn**, so the same method is an ordinary call in a fn
+that does not register it, with its coupling simply absent from that fn's tables.
+
+Direction is stated rather than inferred because the scan is token-level and has no
+type information, and direction is not cosmetic: `writers_of`/`readers_of`, the
+heartbeat and the gate's producer lookup all partition on it. The diagram tool reads
+the same attribute, so a registered verb reaches the diagrams with no configuration of
+its own, drawn under its own name.
+
+A crate with a house verb set will want its own attribute wrapping `#[dataflow(..)]`,
+since the registration otherwise repeats on every annotated fn — that needs a
+proc-macro crate on your side, and is the main ergonomic cost of adopting this.
+
+What the record feeds depends on the node's shape:
+
+- **`discover` (the body is the declaration).** The node binds the tables its `task:` fn's
+  `#[dataflow]` attribute derived, in place of `reads:`/`writes:` lists — flash-const,
+  and true by construction: the entry exists because the call does, so there is no
+  second place to keep in sync. The signal queries and the diagram tool see those
+  edges.
+
+  A derived table states couplings and marks none, so a list may sit beside
+  `discover` **to add markers only**: every entry must carry `observed` and/or
+  `beat`, and must name a signal the scan already found. An unmarked entry is a
+  spanned error (it would declare a coupling the scan missed), and a marked one
+  that no bound table carries fails a const assertion at expansion. That buys a
+  heartbeat and `ready_on_write` without a second authority over the relation:
+
+  ```rust,ignore
+  node ESKF = Terminate, deps: [IMU ready], task: eskf_task,
+      beat_timeout: 1000, discover,
+      writes: [crate::signals::ESKF_ESTIMATE observed beat];
+  ```
+
+  The check matches the path's **last segment**, because a const context cannot
+  compare addresses. A signal reached through a renaming re-export fails it
+  although it is legitimate, and two signals sharing a final segment pass it —
+  in which case the marker simply never matches a write at runtime and the node
+  reads as stale. Otherwise the node beats with `node.beat()` and asserts
+  readiness with `node.set_ready()`.
+- **Declared lists.** Where derivation cannot follow the code — a runtime index, a
+  `#[cfg]`-gated access, a table walked at runtime — keep the lists and route the
+  accesses through the node anyway, and let `beat_put`/`beat_writer` carry the
+  heartbeat at the write that proves it — no marker, no sweep, no clock read.
+
+**Encapsulated signals keep their privacy.** A signal accessed only through a
+getter/setter stays fully private: the accessor takes the caller's node, carries
+`#[dataflow]`, and callers adopt it —
+
+```rust,ignore
+// heartbeat.rs — the static never leaves the module
+static PERIOD_MS: AtomicI32 = AtomicI32::new(500);
+
+#[embassy_supervisor::dataflow]
+pub fn set_period_ms(node: &'static TaskNode, ms: i32) {
+    node.put(&PERIOD_MS, ms);
+}
+
+// the caller's declaration adopts the accessor's table; the write is now the
+// caller's coupling, queried and drawn like any other
+pool HTTP = [Terminate, OnDemand], deps: [NET ready], task: http_worker,
+    dataflow: [crate::heartbeat::set_period_ms], ...;
+```
+
+`dataflow: [..]` composes with declared lists and with `discover` alike; a node binds
+one table per source (list, task fn, each adopted accessor). A caller that does *not*
+adopt the accessor performs the same write, and the graph simply does not attribute it.
+
+A module of accessors adopts as one entry through `#[dataflow_bundle]`:
+
+```rust,ignore
+#[embassy_supervisor::dataflow_bundle]     // or #[dataflow_bundle(NAME)]
+pub mod api {
+    #[embassy_supervisor::dataflow]
+    pub fn request_threshold(node: &'static TaskNode, v: u16) { /* node.put(..) */ }
+    #[embassy_supervisor::dataflow]
+    pub fn signal_config_update(node: &'static TaskNode) { /* node.writer(..) */ }
+}
+
+// dataflow: [crate::api::BUNDLE]   — exactly the members' tables, concatenated
+```
+
+A member fn's own `#[cfg]` gates every entry it contributes, and the graph cannot
+tell a bundle from a fn — the emitted statics share the naming.
+
+The tiers compose per node. Keep `observed` where signals and bodies stay foreign to
+the supervisor; go through the node where it is already in hand.
+
+**Teardown is a wave.** Every stop path — `teardown`, `teardown_continue`,
+`deactivate`, `restart`'s down half, the `bound-deps` cascade — signals a node the
+moment every dependent stopping with it has acked, signals nodes with no such
+dependents up front, and re-runs the scan on each ack. That is what lets a producer's
+shutdown *wait on* an unordered consumer: a `drain()` reached before the consumer has
+acked is released by a consumer that has already been told to go, where signalling one
+node at a time would deadlock — the producer holding its ack for the consumer, the
+supervisor holding the consumer for the producer. And because a `deps:` dependency is
+not even signalled until its dependents are gone, it keeps *serving* through their
+cleanup — a dependent may flush over a link, or drive one last ioctl through a runner
+it depends on, inside its own shutdown.
+
+The unordered side is the contract to write for. A node with no `deps:` path to
+another may be told to stop while that other node is still running, and it frees what
+it owns as soon as it acks. So a node that publishes a handle to consumers it has *no
+edge from* must hold its own shutdown until they let go — that is what `Leased` is —
+and what a node uses while shutting down must be one of its `deps:`; an unordered
+service cannot be assumed to still work. A node that only acks and exits is
+unaffected, which is most of them.
+
+**Bring-up is a wave too.** `start`, `respawn_terminate`, `activate`
+and `restart`'s up half spawn every node whose in-pass deps are up and whose gates test
+satisfied on each round, parking between rounds on a gate-event signal fired by
+`provide`/`restore`, `SpawnerSlot::set` and `set_ready` — so independent slow bring-ups
+overlap instead of queueing, and a provider may even be declared after its consumers
+with no dep edge (`tests/bringup_concurrent.rs`). Spawn
+ordering is strict: a dependent never spawns before its in-pass deps. The
+non-blocking gate test this needs is *emptiness*, which means "valid" for every slot
+kind — provided a provider whose values die with it clears its `shared` slots on the
+way down ([`provides:`](#provides--slots-that-die-with-their-producer), or `ResourceSlot::clear()` before the ack). A node's
+`slot_timeout` covers all its gates together, from when its deps resolve.
+
+**The heartbeat only says something when someone asks**, so high-rate writers stay
+cheap. A plain `put`/`writer` costs nothing beyond the write itself; a `beat_put`/
+`beat_writer` adds one relaxed store. Reads are pure pass-throughs. The
+heartbeat is a flag that whoever next asks about staleness — the monitor's sweep, an
+app watchdog, a dashboard — converts into a beat inside `ticks_since_beat`, using the
+clock read that call makes anyway. A 1 MHz writer therefore pays a relaxed store per
+message, never a timer read, and a beat materializes exactly when someone looks —
+which is all `beat_timeout:`/`beat_window:` can resolve anyway. (Readiness is the
+exception, asserted at the access: it is once per activation and other nodes'
+bring-up waits on it.) One ordering caveat for hot paths: `put` writes
+`Relaxed` through the facade, so a flag that publishes other memory keeps its own
+ordering via `node.writer(&FLAG).store(v, Release)`.
+
+The diagram tool reads the same source the graph came from with the same scanner the
+attribute uses, so `supervisor-mermaid --runtime` draws the derived edges too — by
+construction the build's view.
+
+### Gated reads (feature `data-deps`)
+
+Some couplings are not merely observed but *depended on*: an estimate has no meaning
+until the node producing it is up. Stating that as `deps: [ESKF ready]` in every
+consumer says it once per consumer, by hand, in a place that has no idea which signal
+motivated it.
+
+A gate moves the obligation onto the signal. Its **type** carries what reading it
+implies, `node.open(&SIG).await` is the verb that discharges it, and consumers say only
+that they read:
+
+```rust,ignore
+// The declaration says what reading it implies. `Backed` is the gate this crate
+// ships: start the producer on first open, then wait for its readiness.
+pub static ESTIMATE: Backed<Watch<Estimate>> = Backed::new(Watch::new());
+
+// The consumer states a read. `Deref` gives the wrapped signal's own API back, so
+// every existing consumer of ESTIMATE keeps compiling unchanged.
+let mut rx = node.open(&crate::ESTIMATE).await.receiver();
+```
+
+**Nothing names the producer.** The graph already knows who writes a signal, so
+`producer_of` looks it up by address over the caller's own graph — which covers
+`discover`-derived tables no declaration site could name. It is all const: nothing to
+register, nothing to size, and a gate resolves before `Supervisor::start` as readily as
+after. Two graphs in one binary never answer for each other.
+
+Write your own by implementing `Gated` for your wrapper: `ensure` receives the reading
+node and the coupling entry, so it can log the caller, wait on a mode, throttle a first
+access — anything, including awaiting. There is deliberately **no blanket impl**:
+`open` on an ungated signal is a compile error, not a no-op the reader would mistake
+for a guarantee. Starting the producer needs `control` (the mailbox the request goes
+through); without it the gate is the readiness wait alone, which is right for a
+boot-started producer and reported for any other.
+
+`open` is the only awaiting verb — a gate fires once per consumer at setup, so the
+future belongs there and not on every access — and it grants no exclusive access.
+A signal with no gate carries no wrapper, no state and no code.
+
+### Leases: the teardown side (feature `data-deps`)
+
+A gate orders bring-up. The same coupling has an edge on the way down, and it is
+the one that bites: a task that published a handle into a `static` — a network
+stack, a DMA buffer, a peripheral view — cannot free it while a consumer is
+still holding it.
+
+No declaration answers that. `reads:` records that a node *touches* a signal,
+never that it is holding something derived from it across an await, and a
+coupling table is best-effort by construction: an unadopted helper, a computed
+target or a forgotten list entry is simply absent. Ordering a lifetime
+invariant on "not mentioned" is not sound. So the holders are counted instead:
+
+```rust,ignore
+pub static NET_STACK: Leased<StackCell> = Leased::new(StackCell::new());
+
+// The consumer holds the guard for exactly as long as it uses the value.
+let Some(stack) = node.lease(&crate::NET_STACK) else { return };
+serve(*stack).await;
+
+// The producer, on its way down, before it frees the backing.
+crate::NET_STACK.drain().await;
+```
+
+`drain` closes the signal to new leases, then waits for the live ones to drop.
+Closing is what makes the count trustworthy: afterwards a consumer that asks
+gets `None` — the honest answer, and one it can act on — rather than a handle
+about to dangle, so the producer is not racing an asker. A producer that comes
+back up calls `reopen`.
+
+`lease` is sync, unlike `open`: there is nothing to wait for, since either the
+value is available or its producer is going away. It records a read like
+`reader` does, and the diagram draws it as its own kind of edge.
+
+What this buys over a `deps:` edge is exactness. The count covers **every**
+holder — including a consumer whose access no table carries, and a `detached`
+node, which teardown skips entirely and which therefore escapes any
+ordering-based scheme. The failure mode is a leaked guard: `drain` never
+returns and the producer misses its shutdown ack, which surfaces as the
+ordinary ack timeout naming the producer rather than as a use-after-free.
+
+Costs one `AtomicU32` and one `Signal` per leased signal, and nothing at all
+for signals that do not opt in. `Deref` keeps the wrapped signal's own API
+reachable, which also means reaching the static directly is uncounted — the
+same advisory property a gate has.
+
+### Channels, mutexes, and anything else `Sync`
+
+None of this is about signals. `CouplingPoint` is a blanket impl over every `Sync`
+type and identity is the static's address, so a coupling names **any `'static` two
+nodes both touch** — a `Channel`, a `Mutex`, a driver handle, whatever the application
+shares. embassy-sync's primitives behave nothing like a shared cell (a channel is a
+bounded queue with backpressure, a mutex hands out a guard, both acquire
+asynchronously) and the layer carries them unchanged:
+
+```rust,ignore
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex as Cs;
+
+pub static CHAN: Channel<Cs, u32, 4> = Channel::new();
+pub static MUX:  Mutex<Cs, u32> = Mutex::new(0);
+pub static GATED: Backed<Channel<Cs, u32, 4>> = Backed::new(Channel::new());
+
+#[dataflow]
+async fn producer(node: &'static TaskNode) {
+    node.beat_writer(&crate::CHAN).send(1).await;   // heartbeat on a send
+    *node.writer(&crate::MUX).lock().await = 7;     // and on a lock
+}
+
+#[dataflow]
+async fn consumer(node: &'static TaskNode) {
+    let _ = node.reader(&crate::CHAN).receive().await;
+    let _ = node.open(&crate::GATED).await.receive().await;  // gated receive
+}
+```
+
+Derived and declared tables, the pass-through verbs, `open` on a
+`Backed<Channel<..>>` (whose `Deref` hands the channel's own API back), the
+signal-indexed queries and the gate's `producer_of` lookup all work as they do on a
+signal. `tests/sync_primitives.rs` pins the lot.
+
+Three things to know:
+
+- **The value verbs do not fit, by design.** `put`/`get` go through `Sink`/`Source`,
+  which are **sync and infallible** — last-value-wins over a cell. A bounded `send` is
+  async and a `try_send` can fail, so neither primitive implements them and
+  `node.put(&CHAN, v)` is a compile error rather than a silent block-or-drop. Use the
+  pass-through verbs, or register your own: `fn offer(&self, s: Sig<Channel<..>>, v: u32)
+  -> bool` over `try_send` is exactly the shape the built-in verbs have no room for.
+  Do not implement `Sink` for a queue to make `put` compile.
+- **A queue's `len()` is not a change token.** The `observed` sweep compares successive
+  readings **for inequality only**, so a channel that fills and drains between two
+  sweeps reads identical and looks silent — which under `liveness-monitor` reports the
+  node stale. Wrap it in `Counted` (whose token is the write *count*, and so never goes
+  backwards) before pairing `observed` with `beat`. `observed via it.len()` is fine as
+  a description; it is wrong as a heartbeat.
+- **Direction means less on shared mutable state.** `reads:`/`writes:` records a
+  producer→consumer relation; every holder of a mutex does both. Declaring it on both
+  sides is honest as "these nodes are coupled through this lock" and misleading as
+  "this one produces it". Gating a mutex is a category error outright: `Backed` asks
+  "has the node that fills this started producing yet", which is apt for a channel and
+  meaningless for a lock that exists from `static` initialisation.
+
+The layer records who touches what, not in what order. Two nodes taking two mutexes in
+opposite orders is a coupling the graph will draw and never object to — the `deps:` DAG
+is checked for cycles, the coupling table deliberately is not. And a `'static` both
+nodes can name is always a coupling, never a resource ([Resource or signal?](#resource-or-signal)).
+
+### A status line (feature `node-status`)
+
+`sd_notify`'s third verb, `STATUS=`. A node describes what it is doing in one line —
+`node.report_status("receiving image")` — and `node.status()` hands it to whoever asks:
+a dashboard, a shell command, a log line on change. Purely descriptive: never an event,
+never acted on, cleared when the node (re)starts so a fresh activation does not wear the
+previous one's last words.
+
+### The app-owned health monitor
+
+The supervisor reports; the application decides. Every input is a cheap atomic load:
+
+```rust,ignore
+for (i, node) in GRAPH.iter_nodes() {
+    let down    = !node.is_running();
+    let wedged  = node.is_stale(Duration::from_secs(1)); // `liveness`
+    let unready = !node.is_ready();                      // `readiness`
+    let gen     = node.epoch();                          // `epochs`
+    // GRAPH.deps_of(i) / GRAPH.dependents_of(i, &mut |d| ..) for the topology
+}
+```
+
+With `liveness-monitor` the polling is done for you: declare `beat_timeout:` on the
+nodes whose bodies beat, and consume `wait_health()`.
+
+**What to do about a report is deliberately yours.** Where a subsystem can be cycled
+safely, feeding a `Stale` event to `Supervisor::restart` (feature `restart`) or to
+`clear_ready()` across a `bound` edge is reasonable. Where it cannot be —
+a flight control loop, a motor commutation task, anything holding physical state —
+restarting is the wrong reflex and degrading to a safe mode is the right one. The
+supervisor cannot tell those apart, so it does not try, and `liveness-monitor` stays
+report-only by design.
+
+### Testing a coupling claim
+
+Whether a coupling actually carries data is an app-side test pattern, because only the
+app can build a valid sample: with the mock clock, bring the graph up, inject into a
+producer's signal, and assert the consumer's `beat()` advances (`ticks_since_beat`) or
+its own output changes, within a bounded mock interval.
+
 ## Recipes by use case
 
 ### Heap and the graph
@@ -905,7 +1674,7 @@ force-cancels — after the shutdown select, the future runs to completion). The
 supervisor therefore uses heap only where it comes back:
 
 - **`state: Type = init_expr`** *(feature `heap-state`)* — per-activation boxed state.
-  The spawn glue fallibly boxes the init value (**alloc failure = `SpawnError::Busy`**,
+  The spawn glue fallibly boxes the init value (**alloc failure = `FaultKind::Spawn`**,
   nothing spawned or stranded, retry when heap frees up), the shell lends the worker
   `&mut Type` (after resources, before extras — e.g. a node with
   `resources: [STACK: shared u32], state: Buf = Buf::new()` has a worker
@@ -917,6 +1686,14 @@ supervisor therefore uses heap only where it comes back:
   shell; the bulk is paid only while the phase runs. The ~6-line fallible-boxing
   helper is the feature's entire `unsafe` surface and is emitted into YOUR crate
   (the `local-resources` precedent); you need a `#[global_allocator]`.
+- **`state: zeroed Type`** — the same lifecycle with no init value: the glue calls
+  `alloc_zeroed` and hands the worker the block as a live `&mut Type`. With
+  `= init_expr` the value is built in the spawner's frame and copied into the Box
+  unless the optimizer elides it, so a large buffer set briefly costs its size in
+  stack; the zeroed form never does, at any size or opt-level. `Type` must implement
+  [`Zeroable`](https://docs.rs/bytemuck/latest/bytemuck/trait.Zeroable.html)
+  (re-exported as `embassy_supervisor::Zeroable`): `unsafe impl Zeroable for Bufs {}`
+  for a struct of byte arrays, or bytemuck's derive.
 - **`consume Box<T>` slots** — the app-provided variant, zero crate support needed:
   provide a fresh `Box` before each activation, the worker owns it, drop-on-exit
   frees it, the slot stays empty until re-provided (fail-closed respawn). Use it when
@@ -938,7 +1715,7 @@ state entry/exit, dependency-ordered both ways automatically:
 ```rust,ignore
 supervisor_graph! {
     name: UPLOAD_GRAPH;
-    node WIFI   = Terminate, deps: [],     task: wifi_ctrl,
+    node WIFI   = Terminate, task: wifi_ctrl,
         resources: [WIFI_HW: consume WifiController<'static>];
     node NET    = Terminate, deps: [WIFI], task: net_runner;
     node UPLOAD = Terminate, deps: [NET],  task: upload_worker;
@@ -950,7 +1727,7 @@ loop {
         State::Menu => menu(&mut ctx).await,
         State::Upload => {
             WIFI_HW.provide(build_wifi(&mut ctx));   // rebuilt per entry
-            sub.start(spawner).await?;               // WIFI -> NET -> UPLOAD, in order
+            sub.start(&spawner).await?;               // WIFI -> NET -> UPLOAD, in order
             let next = upload_screen(&mut ctx).await; // state machine stays in charge
             sub.teardown().await?;                   // UPLOAD -> NET -> WIFI, reverse
             next
@@ -985,7 +1762,7 @@ phase must be drivable from anywhere via `request_control` through the shared ma
 ```rust,ignore
 State::Upload => {
     WIFI_HW.provide(build_wifi(&mut ctx));
-    sup.activate(&UPLOAD, spawner).await;            // WIFI -> NET -> UPLOAD
+    sup.activate(&UPLOAD, &spawner).await;            // WIFI -> NET -> UPLOAD
     let next = upload_screen(&mut ctx).await;
     sup.deactivate(&WIFI).await?;                    // UPLOAD -> NET -> WIFI
     next
@@ -1010,7 +1787,7 @@ attribute.
 
 ```rust,ignore
 supervisor_graph! {
-    node SENSOR   = Terminate, deps: [], task: sensor_worker;
+    node SENSOR   = Terminate, task: sensor_worker;
     node REPORTER = Terminate, deps: [SENSOR], task: reporter_worker;
 }
 ```
@@ -1029,7 +1806,7 @@ async fn poll_sensor<D: Sensor>(node: &'static TaskNode, dev: D) {
 }
 
 supervisor_graph! {
-    node BUS = Terminate, deps: [], task: bus_worker;
+    node BUS = Terminate, task: bus_worker;
     // One node per concrete driver; the macro stamps a monomorphized shell each:
     node BME = Terminate, deps: [BUS], task: poll_sensor::<Bme280>(bme());
     node SHT = Terminate, deps: [BUS], task: poll_sensor(sht());  // inferred
@@ -1059,7 +1836,11 @@ async fn radio_hw(node: &'static TaskNode) {
 }
 
 supervisor_graph! {
-    node RADIO_HW = Terminate, deps: [], task: radio_hw;
+    // `provides:`: these slots die with this node — its
+    // shutdown ack clears them, so a respawned consumer's gate waits for the
+    // rebuilt value instead of taking the previous cycle's leftover.
+    node RADIO_HW = Terminate, task: radio_hw,
+        provides: [RUNNER, CONTROL, STACK];
     // Consumers: deps order them after the provider, and slot_timeout covers
     // its build time (the 100 ms default assumes provided-before-start).
     node LINK = Terminate, deps: [RADIO_HW], task: link_worker, slot_timeout: 5000,
@@ -1074,8 +1855,12 @@ The lifecycle falls out of the existing rules: `start()` spawns `RADIO_HW` first
 consumers first (reverse topo — `consume` values are dropped, `shared` handles just
 die with their copies) and the provider last; `respawn_terminate` re-runs the
 provider FIRST, so the consumers' gate waits rendezvous with the freshly built
-values. A provider that dies before providing surfaces as `SpawnError::Busy` on its
+values. A provider that dies before providing surfaces as `FaultKind::ResourceMissing` on its
 consumers after their `slot_timeout` — fail-closed, never a stale reuse.
+
+What the clause clears, and why the `shared` slot needs it, is under
+[`provides:`](#provides--slots-that-die-with-their-producer). The consumers declare
+no `ready` dep on the provider: the value is the rendezvous.
 
 ### Readiness rendezvous (`ready` dep marker)
 
@@ -1084,7 +1869,7 @@ holds the dependent until the dep's task says it is actually serving:
 
 ```rust,ignore
 supervisor_graph! {
-    node NET  = Terminate, deps: [], task: net_worker;
+    node NET  = Terminate, task: net_worker;
     node HTTP = Terminate, deps: [NET ready], task: http_worker,
         slot_timeout: 10000;   // how long HTTP's spawn waits for NET's set_ready()
 }
@@ -1100,14 +1885,19 @@ async fn net_worker(node: &'static TaskNode) {
 
 `set_ready()` latches until `clear_ready()` or the pre-spawn reset (a respawned
 provider re-asserts for its new instance). The wait is bounded by the DEPENDENT's
-`slot_timeout:` and fails the spawn with `SpawnError::Busy`, so a provider that never
+`slot_timeout:` and fails the spawn with `FaultKind::ReadyDepTimeout`, so a provider that never
 becomes ready is a loud, retryable error — never a hang.
+
+`ready` carries a state, not a value. When what the dependent waits for *is* something
+the provider hands over (a stream, a stack handle), a `resources:` slot filled under
+`provides:` is the rendezvous and `ready` adds nothing; see the provider-node recipe
+above and [Resource or signal?](#resource-or-signal).
 
 ### Elastic worker pool with `DeferredShrink`
 
 ```rust,ignore
 supervisor_graph! {
-    node BROKER = Terminate, deps: [], task: broker_worker;
+    node BROKER = Terminate, task: broker_worker;
     pool WORKERS = [Terminate, OnDemand, OnDemand, OnDemand], deps: [BROKER],
         task: worker,
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(4)),
@@ -1124,7 +1914,7 @@ so there is no `pool_size = 4` constant to keep in sync with `max:`.
 
 ```rust,ignore
 supervisor_graph! {
-    node SENSOR = Pause, deps: [];   // neither `task:` nor `spawn:` => parked node
+    node SENSOR = Pause;   // neither `task:` nor `spawn:` => parked node
     node READER = Terminate, deps: [SENSOR], task: reader_worker;
 }
 
@@ -1139,7 +1929,7 @@ never dropped. `resume_pausable()` thaws it in place after a wake.
 
 ```rust,ignore
 supervisor_graph! {
-    node NET     = Terminate, deps: [], task: net_worker;
+    node NET     = Terminate, task: net_worker;
     node UPDATER = Terminate, deps: [NET], task: updater_worker, disabled;
 }
 ```
@@ -1152,7 +1942,7 @@ updater, a debug server) that shouldn't run until explicitly asked for.
 
 ```rust,ignore
 supervisor_graph! {
-    node LOG_DRAIN = Terminate, deps: [], task: log_drain_worker;
+    node LOG_DRAIN = Terminate, task: log_drain_worker;
 }
 
 // Plain async fn — `task:` stamps the #[embassy_executor::task] shell:
@@ -1171,7 +1961,7 @@ it's declared and ordered; management stops after the first spawn.
 ```rust,ignore
 supervisor_graph! {
     executor HIGH;   // runtime-filled SendSpawner slot (an interrupt-priority tier)
-    node SAMPLER = Terminate, deps: [], executor: HIGH, task: sampler_worker;
+    node SAMPLER = Terminate, executor: HIGH, task: sampler_worker;
     node LOGGER  = Terminate, deps: [SAMPLER], task: logger_worker;
 }
 
@@ -1183,7 +1973,7 @@ HIGH.set(EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0));
 
 `SAMPLER` runs at raised priority while `LOGGER` stays on the thread executor — yet the
 dependency between them is still honored. `sampler_worker`'s future must be `Send`; if the
-slot is never filled, `start()` fails with `SpawnError::Busy` after a bounded wait. A
+slot is never filled, `start()` fails with `FaultKind::ExecutorSlotEmpty` after a bounded wait. A
 `task:` extra is evaluated inside the shell, i.e. on the raised-priority tier at its first
 poll — switch that node to `spawn:` when an argument must instead be snapshotted on the
 supervisor's executor at the moment of the spawn (case 4 of
@@ -1194,7 +1984,7 @@ supervisor's executor at the moment of the spawn (case 4 of
 ```rust,ignore
 supervisor_graph! {
     executor CORE1;
-    pool CRUNCHERS = [OnDemand, OnDemand], deps: [], executor: CORE1,
+    pool CRUNCHERS = [OnDemand, OnDemand], executor: CORE1,
         task: cruncher_worker,
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(2)),
         min: 0, max: 2;
@@ -1210,7 +2000,7 @@ and `start_node` await the slot, so a late-booting core is a rendezvous, not a r
 
 ```rust,ignore
 supervisor_graph! {
-    pool WORKERS = [Terminate, OnDemand], deps: [],
+    pool WORKERS = [Terminate, OnDemand], 
         task: worker,
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(3)),
         min: 1, max: 2;
@@ -1225,7 +2015,7 @@ A dep on a pool name resolves to the pool's **floor member**, so `deps: [WORKERS
 
 ```rust,ignore
 supervisor_graph! {
-    node NET = Terminate, deps: [], task: net_worker;
+    node NET = Terminate, task: net_worker;
     pool WORKERS = [Terminate, OnDemand], deps: [NET],
         task: worker,
         policy: embassy_supervisor::DeferredShrink::new(embassy_time::Duration::from_secs(3)),
@@ -1250,11 +2040,11 @@ the next wake cycle would re-run the completed node.
 supervisor_graph! {
     executor HIGH;                    // interrupt-priority tier
 
-    node SENSOR   = Terminate, deps: [], executor: HIGH, task: sensor_worker;
-    node NET      = Terminate, deps: [], task: net_worker;
+    node SENSOR   = Terminate, executor: HIGH, task: sensor_worker;
+    node NET      = Terminate, task: net_worker;
     node UPLOADER = Terminate, deps: [NET, SENSOR], task: uploader_worker;
-    node STATS    = Pause, deps: [], task: stats_worker;   // parked through sleep
-    node POWER    = Terminate, deps: [];  // parked: main spawns it with the Spawner
+    node STATS    = Pause, task: stats_worker;   // parked through sleep
+    node POWER    = Terminate;  // parked: main spawns it with the Spawner
 }
 
 static SUP: Supervisor<5> = Supervisor::new(&GRAPH);
@@ -1270,7 +2060,7 @@ async fn power_task(node: &'static embassy_supervisor::TaskNode, spawner: Spawne
         SUP.teardown().await;                       // quiesce the graph; POWER is skipped
         enter_low_power().await;                    // Pause nodes stay parked
         SUP.resume_pausable();                      // thaw the parked diagnostics
-        SUP.respawn_terminate(spawner).await.ok();  // respawn the stateless services
+        SUP.respawn_terminate(&spawner).await.ok();  // respawn the stateless services
     }
 }
 ```
@@ -1284,17 +2074,17 @@ drives the whole sleep/wake cycle itself — because it's detached, its own `tea
 
 `ElasticPool` scales single-instance members between `min` and `max` running instances.
 Workers report load (`mark_busy`/`mark_idle` + `request_scale`); the supervisor's
-`run_pools(spawner)` future — `select`ed against `wait_control()` in the driver loop — wakes
+`run_pools(&spawner)` future — `select`ed against `wait_control()` in the driver loop — wakes
 on each scale request (it never polls), asks each pool's `ScalingPolicy` for a `PoolAction`,
 and starts/stops one member accordingly. A member is never grown while one of its declared
 dependencies is down (or, with `readiness`, while a `ready`-marked dep is un-ready).
 
 **The whole driver is one call** when you don't need extra select arms:
-`sup.run(spawner).await` = `start()` + drive pools and control forever, returning a
-`RunError` only on error (bring-up spawn failure, or a missed shutdown ack) — every arm
+`sup.run(&spawner).await` = `start()` + drive pools and control forever, returning a
+`NodeFault` only on error (bring-up spawn failure, or a missed shutdown ack) — every arm
 an app-level escalation, typically `panic!` into a hardware-watchdog reset. Apps that
 select their own wake sources into the loop keep writing
-`select(sup.run_pools(spawner), wait_control())` + `apply_control` by hand.
+`select(sup.run_pools(&spawner), wait_control())` + `apply_control` by hand.
 
 The built-in `DeferredShrink` policy grows immediately when saturated (no idle member, below
 `max`) and shrinks only after an idle surplus has persisted for a configurable cooldown —
@@ -1311,7 +2101,7 @@ graph is the single source of *placement*.
 ```rust,ignore
 supervisor_graph! {
     executor CORE1;
-    node BENCH = Terminate, deps: [], executor: CORE1, task: bench_worker, disabled;
+    node BENCH = Terminate, executor: CORE1, task: bench_worker, disabled;
 }
 
 // core 1 publishes its spawner as it boots (embassy-rp shown; any HAL works):
@@ -1320,8 +2110,8 @@ spawn_core1(p.CORE1, &mut CORE1_STACK, || {
 });
 
 // bring-up rendezvouses with that asynchronous publish as part of `start` itself
-// (bounded wait per `executor:` node, then `SpawnError::Busy`):
-sup.start(spawner).await?;
+// (bounded wait per `executor:` node, then `FaultKind::ExecutorSlotEmpty`):
+sup.start(&spawner).await?;
 ```
 
 Everything the supervisor does is already cross-core sound (atomics + critical-section
@@ -1343,7 +2133,7 @@ and one compose site assembles them:
 // net.rs (or a separate crate)
 embassy_supervisor::supervisor_fragment! {
     name: NET_FRAG;
-    node NET = Terminate, deps: [], task: $crate::net::net_task,
+    node NET = Terminate, task: crate::net::net_task,
         resources: [USB_DEV: Peri<'static, USB>];
 }
 
@@ -1366,10 +2156,11 @@ site.
 
 Rules and caveats:
 
-- **Paths**: a fragment references its own workers/types via `$crate::…` (resolves to
-  the fragment's crate at any compose site) or fully-qualified `::crate_name::…`. A bare
-  `crate::…` resolves at the *compose* crate — a bug unless they are the same crate. No
-  `$` other than `$crate` is permitted (validated).
+- **Paths**: a fragment references its own workers/types with plain `crate::…`, as
+  anywhere else in its crate — the macro normalizes it to `$crate`, which is what
+  resolves to the fragment's crate at any compose site (`$crate::…` may also be
+  written directly). Another crate's items take a fully-qualified `::crate_name::…`.
+  No `$` other than `$crate` is permitted (validated).
 - **`#[cfg(...)]` inside a fragment is evaluated against the COMPOSE crate's features**
   (the tokens expand there). A fragment crate that wants feature-dependent shapes
   exports differently-named fragment variants instead.
@@ -1387,8 +2178,8 @@ the emitted static and suffixes every generated helper, so several supervisors c
 
 - **The unnamed graph is the primary**: under `trace-hooks` only it emits the
   once-per-binary `_embassy_trace_*` symbols; named graphs are secondary (their nodes
-  still resolve in the trace recorders — each `start()` registers its graph, up to
-  `trace::MAX_GRAPHS`).
+  still resolve in the trace recorders — each `start()` links its graph into the chain
+  the recorders walk, and there is no cap on how many).
 - **The control mailbox and scale signal are shared.** Run ONE driver (one `run()` or
   one `run_pools`/`wait_control` loop) and apply each command to every supervisor in
   turn — a command naming a node outside a supervisor's graph is a safe no-op. Two
@@ -1440,7 +2231,11 @@ brings the recorders back and, as ever, requires the hook symbols (`trace-hooks`
 Limitations: accounting is preemption-naive without `trace-nested`; hardware-ISR time is
 invisible either way; executor busy% exceeds the per-node sum by a per-poll accounting gap
 (`ExecutorStats` measures it as `busy − in-poll`); at most 4 executors are tracked. Parked /
-closure-spawned nodes register with one call: `TaskNode::adopt(&token)`. The hook API is an
+closure-spawned nodes register with one call: `TaskNode::adopt(&token)` — or
+`node.adopt_current().await` from inside the task body, when nobody holds the token. The
+supervisor's own host task is part of the unsupervised share unless `trace-self` is on:
+each graph then carries a hidden `"supervisor"` node that `start()` adopts as its calling
+task, attribution being task-granular (everything else that task polls is billed to it). The hook API is an
 executor implementation detail — this feature tracks the executor minor version the crate
 already pins.
 
@@ -1448,22 +2243,41 @@ already pins.
 
 | feature   | default | what it adds |
 |-----------|:-------:|--------------|
-| `control` |    ✓    | runtime control plane (`ControlOp`, `request_control`, `apply_control`) |
-| `pool`    |    ✓    | elastic worker pools (`ElasticPool`, `run_pools`, `GRAPH.pools`) |
 | `macros`  |    ✓    | the `supervisor_graph!` graph-declaration macro |
+| `control` |         | runtime control plane (`ControlOp`, `request_control`, `apply_control`) |
+| `pool`    |         | elastic worker pools (`ElasticPool`, `run_pools`, `GRAPH.pools`) |
 | `local-resources` | | permit the `local` resource kind — ⚠ opt-in to the macro emitting a documented `unsafe impl Sync` (single-core contract) |
 | `readiness` | | task-asserted readiness: `set_ready`/`wait_ready`/`clear_ready` + the `ready` dep marker (bring-up + pool-growth gating) |
-| `liveness` | | per-node heartbeat: `beat()` stamps the embassy-time clock, `ticks_since_beat() -> u32` (embassy-time ticks), `is_stale(max_age)` — alive-but-wedged detection without `trace`. A fresh spawn counts as a beat, so a node is never instantly stale |
-| `heap-state` | | `state: Type = expr` per-activation boxed state, reclaimed on task exit — ⚠ opt-in: emits the ~6-line fallible-boxing `unsafe` helper into your crate; needs a `#[global_allocator]` |
-| `defmt`   |         | route the supervisor's logs through `defmt` (otherwise the log macros are no-ops) |
+| `liveness` | | per-node heartbeat: `beat()` raises a flag that `ticks_since_beat() -> u32` converts using the clock read it already makes, plus `is_stale(max_age)` — alive-but-wedged detection without `trace`. A fresh spawn counts as a beat, so a node is never instantly stale. The `beat_put`/`beat_writer` verbs exist only with this on |
+| `liveness-monitor` | | the sweep over those heartbeats: `beat_timeout:` / `beat_window:` clauses, `Supervisor::monitor`, `HealthEvent` on `wait_health()`. **Report-only** — escalation is the application's call (implies `liveness`) |
+| `epochs` | | per-node activation generation (`epoch()`, `wait_epoch_change()`), so an *already-running* dependent can notice that a provider was restarted underneath it. Pure status |
+| `coupling` | | declared dataflow: `reads:` / `writes:` naming real signal statics, and the signal-indexed queries |
+| `coupling-observe` | `coupling` | the `observed` entry marker and its accessor (`via`, graph default, or the `Observable` facade): a way to ask whether a signal moved. `beat` is what currently asks — with `liveness-monitor` it drives the heartbeat and `ready_on_write` by polling, nothing asked of the task |
+| `dataflow` | `coupling` | the node as the access path: `#[dataflow]` derives a fn's coupling tables from its `put`/`get`/`writer`/`reader` calls, `discover` binds the task fn's and `dataflow: [..]` adopts accessors' (flash-const, no second place to update); `beat_put`/`beat_writer` carry the node's heartbeat at the write that proves it, and `#[dataflow(read(..), write(..))]` registers verbs of your own |
+| `graph-ref` | | a graph as one addressable `'static`: `supervisor_graph!` emits a `GraphRef` beside the node table and `GRAPH.graph_ref` names it. Carries no behaviour of its own — it is the handle `data-deps` and `trace` both need, in opposite directions |
+| `data-deps` | `graph-ref` + `dataflow` | data-driven dependencies, both directions. Bring-up: `node.open(&SIG).await` runs the signal's own `Gated::ensure` first, `Backed<T>` (with `readiness`) starts the producer on first open and holds the reader until it is ready, and `producer_of` finds that producer through the graph by address. Teardown: `Leased<T>` + `node.lease(&SIG)` count the live holders so a producer's `drain()` waits for zero before it frees what it published. Nothing names anything; a signal that uses neither costs nothing |
+| `node-status` | | `report_status()`/`status()` — a one-line self-description per node, `sd_notify(STATUS=..)` style; shown when asked, cleared on activation, never an event |
+| `restart` | | `Supervisor::restart` — rest_for_one: cycle a node and its transitive dependents, re-gating them on the way back up (implies `control`) |
+| `bound-deps` | | the `bound` dep marker — ⚠ **the one feature that changes a documented contract**, per edge and only where you opt in: `clear_ready()` stops a `bound` dependent instead of merely deferring its next spawn (implies `readiness` + `control`) |
+| `heap-state` | | `state: Type = expr` / `state: zeroed Type` per-activation boxed state, reclaimed on task exit — ⚠ opt-in: emits the ~6-line fallible-boxing `unsafe` helper into your crate; needs a `#[global_allocator]`; pulls `bytemuck` for `Zeroable` |
+| `defmt`   |         | route the supervisor's logs through `defmt`; takes precedence over `log` if both are on |
+| `log`     |         | route them through the `log` facade instead, for hosted and std consumers. With **neither** backend the log macros are no-ops, so the `liveness-monitor` stale reports and every bring-up line print nothing |
 | `trace`   |         | trace-hook observability: per-node CPU time / poll counts / max-poll watermark, executor idle time, stall detection |
 | `trace-hooks` |     | batteries-included: the graph declaration also defines the `_embassy_trace_*` hook symbols (implies `trace`) |
 | `metadata-names` |  | stamp node names into task Metadata for external tooling (rtos-trace/SystemView); independent of `trace` — no hook symbols |
 | `trace-names` |     | shorthand for `trace` + `metadata-names` |
 | `trace-nested` |    | preemption-exact accounting: nested higher-tier polls are credited back to the window they interrupt (implies `trace`) |
+| `trace-self` |      | the supervisor's own host task as a hidden auto-adopted node: `start()` stamps its calling task into a per-graph `"supervisor"` node (`GRAPH.graph_ref.self_node()`), so waves/driver/monitor poll time is attributed instead of landing in the unsupervised share. No declaration needed; the node is outside the node table, so lifecycle never touches it (implies `trace`) |
 
-`default-features = false` gives a minimal core that only does dependency-ordered
-bring-up/teardown — dropping the control plane and pools trims flash and a couple of statics.
+**Only `macros` is on by default.** Everything the supervisor can *do* is opt-in,
+including `control` and `pool`: both add code to the driver loop that runs every
+iteration whether or not a graph uses it, so a graph with no pool and no control ops
+should not carry either. `restart` and `bound-deps` enable `control` on their own, so
+you rarely name it directly.
+
+If you declare a `pool` without the feature, or call a control verb without it, the
+macro and the compiler say so by name — the failure mode is a spanned error, not a
+silent behaviour change.
 
 ## Testing on the host
 
@@ -1476,7 +2290,7 @@ and `embassy-time`'s `mock-driver` provides the clock (also enable
 #[embassy_executor::task]
 async fn driver(spawner: embassy_executor::Spawner) {
     let sup = Supervisor::new(&GRAPH);
-    sup.start(spawner).await.expect("bring-up");
+    sup.start(&spawner).await.expect("bring-up");
     // ... assertions, teardown/start cycles ...
     DONE.store(true, Ordering::Release);
 }
@@ -1489,8 +2303,8 @@ fn main() {
         ex.run(|spawner| spawner.spawn(driver(spawner).unwrap()));
     });
     while !DONE.load(Ordering::Acquire) {
-        // Advance ONLY to observe a timeout (ShutdownTimeout / gate Busy) or
-        // liveness staleness — cross-thread advance is sound.
+        // Advance ONLY to observe a timeout (a shutdown-ack or gate
+        // NodeFault) or liveness staleness — cross-thread advance is sound.
         // clock.advance(embassy_time::Duration::from_millis(500));
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
@@ -1500,7 +2314,7 @@ fn main() {
 A frozen mock clock is fine on the happy paths — every wait resolves by signal (acks,
 slot fills, readiness), and the internal timeouts exist only to convert a *failure*
 into an error, so advance the clock only when a test wants to observe
-`ShutdownTimeout`, a gate `Busy`, or `is_stale` flipping (the liveness clock IS
+a `NodeFault` (a missed ack, an empty gate), or `is_stale` flipping (the liveness clock IS
 embassy-time, so the mock drives it too). `heap-state` needs no `#[global_allocator]`
 on the host — std provides one. The crate's own integration tests are all built this
 way.
@@ -1567,13 +2381,13 @@ outcome is a value the application can act on.
   "actually serving" (DHCP bound, registration done) rather than "spawned", bounded
   by the dependent's `slot_timeout` and then a `SpawnError::Busy` naming the
   not-ready dep. `beat()` + `is_stale(max_age)` catch the alive-but-wedged task an
-  ack-based check cannot see. One AtomicBool + Signal + slice, and one AtomicU32, per
-  node. See [Readiness rendezvous](#readiness-rendezvous-ready-dep-marker).
-- **`heap-state`** *(off by default)*. `state: Type = init_expr` on `task:` nodes and
-  pool members: fallibly boxed per activation (alloc failure = `SpawnError::Busy`,
-  retryable), lent to the worker as `&mut Type`, dropped on exit before restores —
-  every activation allocates fresh, net zero across respawns, while task STORAGE
-  stays static by soundness. See [Heap and the graph](#heap-and-the-graph).
+  ack-based check cannot see. One Signal + slice, one AtomicU32 and a beat-flag
+  byte per node (the ready flag is a bit in the packed flags word). See [Readiness rendezvous](#readiness-rendezvous-ready-dep-marker).
+- **`heap-state`** *(off by default)*. `state: Type = init_expr` or `state: zeroed
+  Type` on `task:` nodes and pool members: fallibly boxed per activation (alloc
+  failure = `SpawnError::Busy`, retryable), lent to the worker as `&mut Type`, dropped
+  on exit before restores — every activation allocates fresh, net zero across
+  respawns, while task STORAGE stays static by soundness. See [Heap and the graph](#heap-and-the-graph).
 - **Pools grew up.** Take-kind `resources:` entries become per-member slot arrays
   (member `I` owns element `I` exclusively; a lend value survives shrink and regrow
   on the same index), `min:`/`max:` accept const-evaluable expressions guarded by
@@ -1581,7 +2395,7 @@ outcome is a value the application can act on.
 - Also: [`exit: Type`](#exit--typed-exit-values) — the worker's return value lands in
   a generated `<NODE>_EXIT` slot just before the completion is recorded;
   `run_cancellable` / `run_cancellable_acked` as combinators; `resume_node()`, and
-  `activate`/`deactivate` now public; and `Supervisor::run(spawner)`, which is
+  `activate`/`deactivate` now public; and `Supervisor::run(&spawner)`, which is
   `start()` plus the pool-scaling and control loop in one call.
 
 ### 0.3.3
@@ -1654,10 +2468,10 @@ Ships with `embassy-supervisor-macros` 0.3.0 .
 - **Safe resource threading.** `resources: [NAME: Type, ..]` on a `task:` node emits a
   `ResourceSlot<Type>` static: `main` **moves** the peripheral in with `provide()`
   (consuming the `Peripherals` field — compile-time exclusive ownership, no `steal()`
-  inside tasks), the glue `take()`s it before each (re)spawn (unprovided → `SpawnError::Busy`
+  inside tasks), each (re)spawn probes-then-`take()`s it (unprovided → `SpawnError::Busy`
   out of `start()`, fail-closed), the worker receives `&mut Type`, and the shell
   `restore()`s it on exit so a respawn re-takes the *same instance*. See
-  [`resources:`](#resources--safe-resource-threading).
+  [`resources:`](#resources--owned-values-handed-over-at-spawn).
 - **`ResourceSlot` / `ResourceGate` API.** The slot type behind `resources:` is public and
   usable by hand — e.g. share one slot between the generated glue and a manual
   `take()`/`restore()` borrower elsewhere in the app; `TaskNode::with_resources` makes
@@ -1672,6 +2486,28 @@ Measured on the demo firmware (RP2350, release + fat LTO): the whole feature set
 steady-state stack — a threaded resource travels inside the task's future.
 
 ## Migration
+
+### 0.4 → 0.5
+
+Ships with `embassy-supervisor-macros` 0.7.0 (pinned by exact version — no action
+needed). The largest breaking surface so far; the compiler finds every item:
+
+| 0.4.x | 0.5.0 |
+|---|---|
+| every spawning verb (`start`, `run`, `run_pools`, `start_node`, `respawn_terminate`, `activate`, `apply_control`) took `Spawner` by value | they take `&Spawner` — `sup.run(&spawner)`. The `NodeCfg` spawn fn type still takes `Spawner` by value |
+| lifecycle verbs returned `Result<(), ShutdownTimeout>`, `run` a `RunError`, bring-up a raw `SpawnError` | one `NodeFault { node, kind: FaultKind }` everywhere, with an unconditional `Display`; match `fault.kind` against `ExecutorSlotEmpty`, `ResourceMissing`, `ReadyDepTimeout { dep }`, `Spawn(SpawnError)`, `ShutdownTimeout` |
+| `Graph<N>` / `Supervisor<N>`, edges read off `GRAPH.deps` / `GRAPH.order` | a `Topology` parameter — annotate with the macro's alias, `Supervisor<5, GRAPH_TOPOLOGY>` — and edges read through `GRAPH.deps_of(i)` / `GRAPH.order()` |
+| `TaskNode` carried `name`/`mode`/`spawn` fields and the `with_*` builders | flash `NodeCfg` + RAM handle: read `name()` / `mode()`; the builders live on `NodeCfg`; a hand-built node is two statics (macro graphs are unaffected) |
+| default features `["control", "pool", "macros"]` | just `["macros"]` — name `control`/`pool` explicitly where used (`restart`/`bound-deps` still pull `control` in; a `pool` without the feature is a spanned macro error) |
+| `trace::register_graph(&NODES)`, capped at 4 graphs | `trace::register_graph(GRAPH.graph_ref)`, no cap — only hand-registered graphs are affected, `Supervisor::start` registers for you |
+| exhaustive `match` on `ControlOp` | the enum is `#[non_exhaustive]` (and gains `Restart` under the `restart` feature) |
+| sequential bring-up and teardown | concurrent waves, order guarantees intact. The contract to re-check: an **unordered** node may be told to stop while others still run; a node publishing a handle to consumers it has no edge from holds its own shutdown with `Leased` + `drain`; whatever a node uses *during* its shutdown must be one of its `deps:` |
+| gate waits budgeted 100 ms per gate | one `slot_timeout` budget per node in the `start()` wave; the single-node verbs still bound each gate |
+
+Behavioural changes needing no code edit: `clear_ready()` stays status-not-control
+unless an edge opts in with `bound`; the monitor wakes per earliest-due node instead
+of on a global `min(beat_timeout)/2` period; resources no longer cross the spawn
+call, so a failed claim cannot drop a `lend`/`consume` value.
 
 ### 0.4.0 → 0.4.1
 
@@ -1691,7 +2527,7 @@ compiler finds all three:
 |---|---|
 | `request_control(cmd)` (sync, silently dropped on a full mailbox) | `request_control(cmd).await` (awaits capacity), or `try_request_control(cmd)` → `Err(ControlQueueFull)` in a sync context (ISR, callback) |
 | `sup.stop_node(&N).await` / `teardown()` / `apply_control(..)` panicked on a missed ack | they return `Result<(), ShutdownTimeout>` (`.node.name` names the offender); `.unwrap()` restores the old behavior |
-| `sup.run_pools(spawner).await` never returned | returns `ShutdownTimeout` (only on a shrink whose member missed its ack) |
+| `sup.run_pools(&spawner).await` never returned | returns `ShutdownTimeout` (only on a shrink whose member missed its ack) |
 | a hand-written `spawn:` task calling `node.ack_dropped()` **on exit** | call `node.mark_exited()` there instead (acks *and* records completion, so the node stops reading as running); `ack_dropped()` stays correct for a `Pause` node's park |
 
 `teardown()` now aborts at the first missed ack instead of stopping a wedged node's
@@ -1709,7 +2545,7 @@ Bring-up went `async`; the callers are already async tasks, so the change is mec
 
 | 0.2.x | 0.3.0 |
 |---|---|
-| `sup.start(spawner)?` | `sup.start(spawner).await?` |
+| `sup.start(spawner)?` | `sup.start(&spawner).await?` |
 | `sup.start_node(&N, spawner)?` | `sup.start_node(&N, spawner).await?` |
 | `sup.respawn_terminate(spawner)?` | `sup.respawn_terminate(spawner).await?` |
 | explicit `SLOT.ready().await` before `start()` | no longer needed — `start` awaits each `executor:` node's slot itself |

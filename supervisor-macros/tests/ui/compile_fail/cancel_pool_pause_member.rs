@@ -1,6 +1,3 @@
-//! `cancel` + a `Pause` member is the pool form of the node contradiction: the
-//! parked member must survive its stop and resume, but `cancel` drops its future
-//! and records an exit.
 
 use embassy_supervisor::supervisor_graph;
 

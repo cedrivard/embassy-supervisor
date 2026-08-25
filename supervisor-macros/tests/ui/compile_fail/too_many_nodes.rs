@@ -1,7 +1,3 @@
-//! The graph is capped at 256 node slots: every graph index (dep tables,
-//! `topo_sort_const` queue/order) is a `u8`, so a 257th slot would silently
-//! truncate. The macro rejects the declaration at expansion time instead.
-//! (257 parked nodes, no `spawn:`, generated mechanically.)
 
 use embassy_supervisor::supervisor_graph;
 

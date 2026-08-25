@@ -1,5 +1,5 @@
 error: `cancel` cannot be combined with a `Pause` member — a Pause worker must survive the stop and park on `wait_resume()`, but `cancel` drops its future and records an exit; use `Terminate` (or `OnDemand`) members, or drive the pause by hand in the worker
-  --> tests/ui/compile_fail/cancel_pool_pause_member.rs:14:32
+  --> tests/ui/compile_fail/cancel_pool_pause_member.rs:11:32
    |
-14 |     pool WORKERS = [Terminate, Pause], deps: [],
+11 |     pool WORKERS = [Terminate, Pause], deps: [],
    |                                ^^^^^

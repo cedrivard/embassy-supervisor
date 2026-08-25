@@ -1,5 +1,3 @@
-//! A pool's `executor: NAME` must reference a declared `executor NAME;`, same
-//! as a node's — an unknown name is a macro-expansion error.
 
 use embassy_supervisor::supervisor_graph;
 

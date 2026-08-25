@@ -1,5 +1,3 @@
-//! Trailing commas are tolerated in both node/pool dependency lists
-//! (`parse_dep_list`) and the pool mode list (`Punctuated::parse_terminated`).
 
 use embassy_supervisor::{DeferredShrink, TaskNode, supervisor_graph};
 
@@ -19,7 +17,7 @@ supervisor_graph! {
 fn main() {
     // A,B,C + two pool members P0,P1.
     assert_eq!(GRAPH.nodes.len(), 5);
-    assert_eq!(GRAPH.deps[1], [0u8].as_slice());
-    assert_eq!(GRAPH.deps[2], [0u8, 1u8].as_slice());
+    assert_eq!(GRAPH.deps_of(1), [0u8].as_slice());
+    assert_eq!(GRAPH.deps_of(2), [0u8, 1u8].as_slice());
     assert_eq!(GRAPH.pools.len(), 1);
 }

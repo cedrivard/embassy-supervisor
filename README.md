@@ -2,12 +2,14 @@
 
 [![crates.io](https://img.shields.io/crates/v/embassy-supervisor.svg)](https://crates.io/crates/embassy-supervisor)
 [![docs.rs](https://docs.rs/embassy-supervisor/badge.svg)](https://docs.rs/embassy-supervisor)
+[![docs](https://img.shields.io/badge/docs-embassy--supervisor.github.io-blue)](https://embassy-supervisor.github.io/)
 
-**Supervision trees for bare-metal async Rust.** A composable architecture for real
+
+**Run-time supervision for bare-metal async Rust.** A composable architecture for real
 [embassy](https://embassy.dev) firmware — a dependency-ordered task lifecycle over layered
-executors, with a governed heap and coordinated power and OTA — the structure and guarantees of an
-RTOS with none of its kernel, stacks, or overhead. The `no_std` **`embassy-supervisor`** crate is
-its drop-in core.
+executors, and a declared-and-verified dataflow between the tasks, with a governed heap and
+coordinated power and OTA — the structure and guarantees of an RTOS with none of its kernel,
+stacks, or overhead. The `no_std` **`embassy-supervisor`** crate is its drop-in core.
 
 [<img src="https://i.ytimg.com/vi_webp/rlLaaMKMPWo/maxresdefault.webp" alt="Video: embassy-supervisor — RTOS-grade Lifecycle for Async Rust Firmware" width="640">](https://youtu.be/rlLaaMKMPWo)
 
@@ -15,7 +17,7 @@ its drop-in core.
 of the architecture: the graph declaration and its compile-time guarantees, executor tiers, the
 lifecycle matrix, and where it fits.
 📖 **[`supervisor/README.md`](supervisor/README.md)** — the library reference: model, lifecycle
-matrix, `supervisor_graph!` DSL, recipes, and feature matrix.
+matrix, `supervisor_graph!` DSL, dataflow supervision, recipes, and feature matrix.
 
 ---
 
@@ -135,10 +137,10 @@ shutdown ack is named to the application, which decides whether to retry, log, o
 ```mermaid
 flowchart LR
     NODE["A node<br/>Terminate · Pause · OnDemand"]
-    RES["resources:<br/>moved in from main, restored on exit"]
+    RES["resources:<br/>a value handed over at spawn, from main or a provides: node"]
     STATE["state:<br/>heap per activation, freed on exit"]
     DONE["completion<br/>a task that returns is observed; exit: keeps its value"]
-    READY["readiness<br/>dependents wait until it actually serves"]
+    READY["readiness<br/>dependents wait for a state it asserts, where no value crosses"]
     LIVE["liveness<br/>a heartbeat a watchdog can read"]
     TRACE["trace<br/>ticks · polls · stall detection"]
 
@@ -176,11 +178,19 @@ once with the `supervisor_graph!` macro; the supervisor does the rest:
 - **Elastic pools** — grow workers under load, shrink them after a cooldown, within a fixed budget.
 - **Multi-executor, multi-core placement** — `executor:` slots put nodes on an interrupt-priority
   tier or a second core, straight from the graph declaration.
-- **Safe resource threading** — `resources:` entries move owned peripherals from `main` into
-  workers through `ResourceSlot`s (compile-time exclusive ownership, no `steal()` in tasks),
-  restored on exit so a respawn re-takes the same instance.
+- **Safe resource threading** — `resources:` entries hand owned values to workers through
+  `ResourceSlot`s: peripherals moved in from `main` (compile-time exclusive ownership, no
+  `steal()` in tasks) or values another node builds at runtime and `provides:`. The consumer's
+  spawn waits for the value; a lent one is restored on exit so a respawn re-takes the same
+  instance. Signals are the other relation: `'static`s that outlive every task and are
+  declared as dataflow, below, never threaded as resources.
 - **Dependency- and pool-honoring runtime control** — start/stop/pause/resume a task (or a whole
   pool) from anywhere; a stop cascades through dependents, a start through dependencies.
+- **Declared and verified dataflow (feature-gated)** — `reads:`/`writes:` entries name the
+  signal statics tasks exchange data through, declared beside the dependency edges; entries
+  can drive the node's heartbeat by polling (`observed beat`) or at the access (`beat`),
+  and the `#[dataflow]` attribute derives a task's tables straight from its body, so the
+  declaration cannot drift from the code.
 - **Trace observability (feature-gated)** — per-task CPU ticks, poll counts, and per-executor
   idle/in-poll stats, with zero cost when the features are off.
 
@@ -190,13 +200,13 @@ use embassy_supervisor::{supervisor_graph, Supervisor};
 // One declaration generates the node `static`s and a single `GRAPH` bundling the
 // node slots, deps, and compile-time order. `app` depends on `net`, so it starts after it.
 supervisor_graph! {
-    node NET = Terminate, deps: [],    task: net_task;
+    node NET = Terminate, task: net_task;
     node APP = Terminate, deps: [NET], task: app_task;
 }
 
 // in your supervisor task (an async context):
 let sup = Supervisor::new(&GRAPH);                    // infallible — a cycle is a compile error
-sup.start(spawner).await.expect("spawn");             // brings up net, then app
+sup.start(&spawner).await.expect("spawn");            // brings up net, then app
 ```
 
 The library is feature-gated — the control plane, pools, and tracing are optional, so a minimal
@@ -260,6 +270,9 @@ and how to read the observability data.
 | [`supervisor/`](supervisor/) | the `embassy-supervisor` library — HAL-agnostic, `no_std`; model, lifecycle matrix, DSL, recipes, feature matrix in [`supervisor/README.md`](supervisor/README.md) |
 | [`firmware/`](firmware/) | the demo application — build/run, per-task breakdown, heap budget, observability in [`firmware/README.md`](firmware/README.md) |
 | [`bootloader/`](bootloader/) | the embassy-boot A/B bootloader the demo's OTA swaps against |
+| [`supervisor-syntax/`](supervisor-syntax/) | the graph DSL's parser and AST, shared by the proc-macro and the tooling |
+| [`supervisor-observe/`](supervisor-observe/) | the observation facade (`Observable`, `Counted`) a signal library implements without depending on the supervisor |
+| [`supervisor-tools/`](supervisor-tools/) | host tools over a graph declaration: `supervisor-mermaid` draws it as a Mermaid flowchart, `supervisor-lint` reports its one-sided signals, see [`supervisor-tools/README.md`](supervisor-tools/README.md) |
 
 Dual-licensed under **MIT OR Apache-2.0**.
 

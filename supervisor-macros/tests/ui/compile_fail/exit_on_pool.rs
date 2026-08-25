@@ -1,5 +1,3 @@
-//! `exit:` is rejected on `pool` — K members share one generated shell, so
-//! per-member exit values would need per-member storage.
 
 use embassy_supervisor::{DeferredShrink, TaskNode, supervisor_graph};
 

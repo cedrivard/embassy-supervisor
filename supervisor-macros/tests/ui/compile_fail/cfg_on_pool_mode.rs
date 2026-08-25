@@ -1,6 +1,3 @@
-//! `#[cfg(...)]` on a pool *mode* is unsupported: the mode list is parsed as a
-//! plain `Punctuated<Ident, ,>`, so an attribute where an identifier is expected
-//! is a parse error.
 
 use embassy_supervisor::supervisor_graph;
 

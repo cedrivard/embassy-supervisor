@@ -1,5 +1,5 @@
 error: `state:` requires `task:` — the generated shell owns the boxed state across the worker call and drops it on exit; a `spawn:` task fn can Box its own state
-  --> tests/ui/compile_fail_heap_state/state_without_task.rs:12:55
+  --> tests/ui/compile_fail_heap_state/state_without_task.rs:10:55
    |
-12 |     node CRUNCH = Terminate, deps: [], spawn: worker, state: Big = Big([0; 1024]);
+10 |     node CRUNCH = Terminate, deps: [], spawn: worker, state: Big = Big([0; 1024]);
    |                                                       ^^^^^

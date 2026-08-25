@@ -1,0 +1,5 @@
+error: a bare `beat` entry is not a declaration: write the heartbeat at the site that produces it, with `node.beat_put(&SIG, v)` / `node.beat_writer(&SIG)` or a `node.beat()` call in the body. `observed beat` is the form for a body the supervisor cannot see
+ --> tests/ui/compile_fail/bare_beat_is_not_a_declaration.rs:9:64
+  |
+9 |     node A = Terminate, deps: [], task: f, writes: [crate::OUT beat];
+  |                                                                ^^^^
