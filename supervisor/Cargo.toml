@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.5.0"
+version = "0.5.1"
 description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
@@ -531,6 +531,10 @@ required-features = ["macros", "restart", "readiness"]
 # back, while unmarked `ready` edges keep the status-not-control behaviour.
 [[test]]
 name = "bound_deps"
+required-features = ["macros", "bound-deps"]
+
+[[test]]
+name = "bound_boot_defer"
 required-features = ["macros", "bound-deps"]
 
 # `log`: that the crate's log macros reach the facade at all.

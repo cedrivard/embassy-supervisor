@@ -4,6 +4,17 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-08-26
+
+No API change; the macro pin stays `embassy-supervisor-macros = "=0.7.0"`.
+
+### Changed
+- `bound-deps`: a `ready bound` edge whose readiness budget runs out during
+  bring-up now **parks** the dependent (`BOUND_STOPPED`, no spawn, no fault)
+  and the wave carries on; the bind loop lifts it when the provider asserts.
+  The same applies to a direct `start_node`, so an `Activate` over a down
+  provider parks too.
+
 ## [0.5.0] - 2026-08-25
 
 Macro pin moves to `embassy-supervisor-macros = "=0.7.0"`.
@@ -912,6 +923,7 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
+[0.5.1]: https://github.com/cedrivard/embassy-supervisor/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/cedrivard/embassy-supervisor/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/cedrivard/embassy-supervisor/compare/v0.4.1...v0.4.2

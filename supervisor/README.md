@@ -1884,7 +1884,9 @@ async fn net_worker(node: &'static TaskNode) {
 `set_ready()` latches until `clear_ready()` or the pre-spawn reset (a respawned
 provider re-asserts for its new instance). The wait is bounded by the DEPENDENT's
 `slot_timeout:` and fails the spawn with `FaultKind::ReadyDepTimeout`, so a provider that never
-becomes ready is a loud, retryable error — never a hang.
+becomes ready is a loud, retryable error — never a hang. A `bound` edge is the
+exception: there the spent budget PARKS the dependent (`BOUND_STOPPED`) instead of
+faulting, and the bind loop lifts it when the provider asserts (defer until serving).
 
 `ready` carries a state, not a value. When what the dependent waits for *is* something
 the provider hands over (a stream, a stack handle), a `resources:` slot filled under
@@ -2256,7 +2258,7 @@ already pins.
 | `data-deps` | `graph-ref` + `dataflow` | data-driven dependencies, both directions. Bring-up: `node.open(&SIG).await` runs the signal's own `Gated::ensure` first, `Backed<T>` (with `readiness`) starts the producer on first open and holds the reader until it is ready, and `producer_of` finds that producer through the graph by address. Teardown: `Leased<T>` + `node.lease(&SIG)` count the live holders so a producer's `drain()` waits for zero before it frees what it published. Nothing names anything; a signal that uses neither costs nothing |
 | `node-status` | | `report_status()`/`status()` — a one-line self-description per node, `sd_notify(STATUS=..)` style; shown when asked, cleared on activation, never an event |
 | `restart` | | `Supervisor::restart` — rest_for_one: cycle a node and its transitive dependents, re-gating them on the way back up (implies `control`) |
-| `bound-deps` | | the `bound` dep marker — ⚠ **the one feature that changes a documented contract**, per edge and only where you opt in: `clear_ready()` stops a `bound` dependent instead of merely deferring its next spawn (implies `readiness` + `control`) |
+| `bound-deps` | | the `bound` dep marker — ⚠ **the one feature that changes a documented contract**, per edge and only where you opt in: `clear_ready()` stops a `bound` dependent instead of merely deferring its next spawn, and a bring-up readiness budget spent on a `bound` edge parks the dependent (`BOUND_STOPPED`, lifted by the next `set_ready`) instead of faulting (implies `readiness` + `control`) |
 | `heap-state` | | `state: Type = expr` / `state: zeroed Type` per-activation boxed state, reclaimed on task exit — ⚠ opt-in: emits the ~6-line fallible-boxing `unsafe` helper into your crate; needs a `#[global_allocator]`; pulls `bytemuck` for `Zeroable` |
 | `defmt`   |         | route the supervisor's logs through `defmt`; takes precedence over `log` if both are on |
 | `log`     |         | route them through the `log` facade instead, for hosted and std consumers. With **neither** backend the log macros are no-ops, so the `liveness-monitor` stale reports and every bring-up line print nothing |

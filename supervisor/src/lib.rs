@@ -490,7 +490,8 @@ pub struct NodeFault {
 pub enum FaultKind {
     /// A `ready`-marked dep did not assert readiness within the dependent's
     /// `slot_timeout`. Either the dep is failing to reach its serving state, or
-    /// the budget is too tight for this build.
+    /// the budget is too tight for this build. Only plain `ready` edges fault
+    /// here: a `bound` edge parks the dependent instead.
     ReadyDepTimeout {
         /// The dep that never asserted.
         dep: &'static TaskNode,
@@ -822,11 +823,12 @@ mod flag {
     /// and by `reset()` so a respawned provider re-asserts.
     #[cfg(feature = "readiness")]
     pub const READY: u16 = 1 << 7;
-    /// Stopped by a bound provider's `clear_ready`, eligible to come back
-    /// when readiness returns. Deliberately NOT `DISABLED`: a manual stop must
-    /// survive a readiness flap, and a bound stop must not survive the
-    /// provider's recovery. Not cleared by `reset()` — it spans the stopped
-    /// instance's whole absence.
+    /// Stopped by a bound provider's `clear_ready` — or never started, when a
+    /// bound dep was still un-ready at the end of the bring-up gate budget —
+    /// and eligible to come back when readiness returns. Deliberately NOT
+    /// `DISABLED`: a manual stop must survive a readiness flap, and a bound
+    /// stop must not survive the provider's recovery. Not cleared by `reset()`
+    /// — it spans the stopped instance's whole absence.
     #[cfg(feature = "bound-deps")]
     pub const BOUND_STOPPED: u16 = 1 << 8;
 }
@@ -2648,7 +2650,24 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     ) -> Result<(), NodeFault> {
         node.reset();
         if let Some(spawn) = node.cfg.spawn {
-            Self::await_gates(node).await?;
+            match Self::await_gates(node).await {
+                Ok(()) => {}
+                Err(_fault) => {
+                    #[cfg(feature = "bound-deps")]
+                    if let FaultKind::ReadyDepTimeout { dep } = _fault.kind
+                        && node.bound_deps().iter().any(|b| core::ptr::eq(*b, dep))
+                    {
+                        info!(
+                            "supervisor: {} parked, bound dep {} not ready",
+                            node.name(),
+                            dep.name()
+                        );
+                        node.handle.flag_set(flag::BOUND_STOPPED);
+                        return Ok(());
+                    }
+                    return Err(_fault);
+                }
+            }
             let mut result = spawn(*spawner);
             if result.is_err() {
                 // A just-stopped instance's storage frees one executor pass
@@ -2661,6 +2680,8 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             })?;
         }
         node.set_running(true);
+        #[cfg(feature = "bound-deps")]
+        node.handle.flag_clear(flag::BOUND_STOPPED);
         info!("supervisor: started {}", node.name());
         Ok(())
     }
@@ -2861,6 +2882,8 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                             info!("supervisor: resuming {} in place", node.name());
                             node.signal_resume();
                             node.set_running(true);
+                            #[cfg(feature = "bound-deps")]
+                            node.handle.flag_clear(flag::BOUND_STOPPED);
                             pending[j] = false;
                             progress = true;
                             continue;
@@ -2913,7 +2936,23 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                     Some(b) => Some(b),
                     None if Self::has(shape::READY_DEPS) => {
                         match node.ready_deps().iter().find(|d| !d.is_ready()) {
-                            Some(dep) => Some(unsatisfied(FaultKind::ReadyDepTimeout { dep })?),
+                            Some(dep) => {
+                                #[cfg(feature = "bound-deps")]
+                                if overdue
+                                    && node.bound_deps().iter().any(|b| core::ptr::eq(*b, *dep))
+                                {
+                                    info!(
+                                        "supervisor: {} parked, bound dep {} not ready",
+                                        node.name(),
+                                        dep.name()
+                                    );
+                                    node.handle.flag_set(flag::BOUND_STOPPED);
+                                    pending[j] = false;
+                                    progress = true;
+                                    continue 'nodes;
+                                }
+                                Some(unsatisfied(FaultKind::ReadyDepTimeout { dep })?)
+                            }
                             None => None,
                         }
                     }
@@ -2943,6 +2982,8 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                     continue;
                 }
                 node.set_running(true);
+                #[cfg(feature = "bound-deps")]
+                node.handle.flag_clear(flag::BOUND_STOPPED);
                 pending[j] = false;
                 progress = true;
             }
@@ -3324,9 +3365,8 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             match node.mode() {
                 Mode::Terminate => {
                     info!("supervisor: bound-restart {}", node.name());
-                    match self.start_node(node, spawner).await {
-                        Ok(()) => node.handle.flag_clear(flag::BOUND_STOPPED),
-                        Err(_) => warn!("supervisor: {} could not be bound-restarted", node.name()),
+                    if self.start_node(node, spawner).await.is_err() {
+                        warn!("supervisor: {} could not be bound-restarted", node.name());
                     }
                 }
                 Mode::Pause if Self::has(shape::PAUSE) => {
