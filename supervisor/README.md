@@ -367,15 +367,6 @@ chain through each graph's `GraphRef`).
 
 ## Writing supervised tasks (the TaskNode API)
 
-> **A worker typed `-> !`** (or a service contract returning a `Never` type) opts out
-> of `Terminate`/restart *by type* — the body can never return, so stop and respawn
-> semantics are inert on it as-is. Two ways in: add
-> [`cancel`](#cancel--supervisor-unaware-workers) to the node and the generated shell
-> races the body against shutdown for you (no signature change, the future is dropped
-> in place), or keep the node argument and race the work yourself (one
-> `run_cancellable` call) when teardown needs ordered post-cancel work.
-> `Pause`-parked and detached daemons are the forms that legitimately never return.
-
 A supervised task is an async fn whose first parameter is its node — the macro's glue
 passes it automatically; extra arguments come from the partial-call form
 (`task: my_task(EXTRA)`). (A [`cancel`](#cancel--supervisor-unaware-workers) node is
@@ -389,72 +380,10 @@ async fn my_task(node: &'static TaskNode) { /* ... */ }
 ```
 
 Alternatively, write the attribute yourself and declare the fn with `spawn:` — needed in a
-few situations ([which to use](#spawn-vs-task--which-to-use)). Everything below (the four
-rules, the method table) applies identically to both styles; only who writes the
-`#[embassy_executor::task]` differs.
+few situations ([which to use](#spawn-vs-task--which-to-use)). Everything below applies
+identically to both styles; only who writes the `#[embassy_executor::task]` differs.
 
-The node is the task's half of the lifecycle protocol. Four rules cover all of it:
-
-1. **Select your work against `wait_shutdown()`** at every await point that can block
-   indefinitely — that's how a teardown/stop reaches you.
-2. **Ack exactly once per stop** with `ack_dropped()`: on exit (`Terminate`/`OnDemand`),
-   or on each pause (`Pause`) *before* parking. A task that never acks surfaces as a
-   `FaultKind::ShutdownTimeout` fault naming the node — a loud bug report, not a hang, and the
-   application chooses the escalation.
-3. **An autonomous exit calls `mark_exited()`** — it acks like `ack_dropped()` *and*
-   records the completion, so a worker that returns on its own reads as down
-   (`has_exited()`, not running-forever) and a control `Activate` can respawn it.
-   `task:` shells do this automatically after the worker returns; only hand-written
-   `spawn:` tasks call it themselves.
-4. **Resources follow the mode**: a `Terminate` task re-acquires everything on respawn
-   (drop-on-exit is the cleanup); a `Pause` task keeps what it holds across
-   pause→resume and never re-acquires.
-
-Task-side methods:
-
-| method | role |
-|---|---|
-| `run_cancellable_acked(fut).await` | the everyday body: race `fut` against shutdown AND complete the handshake on `Err(Aborted)` — discarding the result (`let _ =`) is fine, the ack already happened |
-| `run_cancellable(fut).await` | same race, no ack — run cleanup between the cancellation and your own `ack_dropped()` |
-| `run_pausable(fut).await` | `Pause` bodies: same race, and on a pause it acks, parks, and returns `Err(Resumed)` only after the resume — the loop body is the fresh cycle |
-| `run_pausable_loop(body).await` | the whole `Pause` protocol in one call: rebuilds `body` (an async closure) every cycle, never returns |
-| `wait_shutdown().await` | the underlying primitive: park until a stop/pause is requested (immediate if already requested) |
-| `ack_dropped()` | complete the handshake: clears `running`, wakes the supervisor's ack wait |
-| `mark_exited()` | `ack_dropped()` + record the completion (`has_exited()`) — call on an autonomous exit; `task:` shells emit it automatically |
-| `wait_resume().await` | `Pause` only: park (after acking) until resumed |
-| `mark_busy()` / `mark_idle()` | pool workers: report load; a *real* transition fires the scale signal itself — no manual `request_scale()` needed |
-| `shutdown_requested()` | synchronous check, e.g. at the loop top before starting new work |
-| `has_exited()` | true once the last instance's body returned; cleared by the pre-spawn reset |
-| `set_detached(true)` | opt out of supervision from now on (self-managed daemon or run-once — see the [lifecycle reference](#lifecycle-reference)) |
-| `adopt(&token)` | parked nodes: register a hand-spawned task's id so trace accounting sees it |
-
-The cancellable combinators return `Result<F::Output, Aborted>` and the pausable
-one `Result<F::Output, Resumed>`; both markers are crate types —
-`use embassy_supervisor::{Aborted, Resumed, TaskNode};` covers the canonical loops.
-
-**Status methods** — readable from anywhere (a status endpoint iterates `GRAPH.nodes`
-and reads these; all are cheap atomic loads):
-
-| method | true when |
-|---|---|
-| `is_running()` | the supervisor has an instance up (spawned, not acked, not exited) — "did it come up / go down" checks read this |
-| `is_busy()` | the instance reported `mark_busy()` (pool load) |
-| `is_disabled()` | stopped-at-boot or control-`Deactivate`d, and not yet re-activated |
-| `is_detached()` | self-managed; every lifecycle op skips it |
-| `has_exited()` | the last instance's body returned (recorded by the `task:` shell / `mark_exited`); cleared by the pre-spawn reset |
-| `shutdown_requested()` | a stop/pause was requested — set at the request, readable until the next pre-spawn reset (so a parked `Pause` node still reads `true`) |
-| `is_ready()` *(feature `readiness`)* | the task asserted `set_ready()` (cleared by `clear_ready()` and the pre-spawn reset) |
-| `is_stale(max_age)` *(feature `liveness`)* | running but no `beat()` within `max_age` |
-
-Useful compositions: **down** = `!is_running()`; **parked `Pause`** = mode `Pause` +
-`!is_running()` + `shutdown_requested()`; **autonomous completion** = `has_exited() &&
-!shutdown_requested()`. A spawn that fail-closed (a `NodeFault` from a gate)
-leaves the node `!is_running()` — nothing was taken or spawned. Ordering guarantees: when `stop_node`/`teardown`/`deactivate`
-return `Ok`, the ack has happened and `is_running()` is already `false`; for bodies
-that ack by returning (the `run_cancellable_acked` idiom), `has_exited()` is also
-already `true` — the ack and the return land in the same poll.
-
-**`Terminate` / `OnDemand` worker** — the canonical cancellable loop:
+**The canonical loop** — race work against shutdown, return on `Err(Aborted)`:
 
 ```rust,ignore
 #[embassy_executor::task]
@@ -469,13 +398,21 @@ async fn worker_task(node: &'static TaskNode) {
 }
 ```
 
-The combinators own the select rule 1 asks for. Use bare `run_cancellable` when
-cleanup must run between the cancellation and the ack (flush, unpublish, busy/idle
-bracketing); keep a hand-written `select3` when the loop races more than work vs
-shutdown — nesting combinators there buys nothing.
+The combinators own the select and the ack. Three rules cover the rest:
 
-**`Pause` node** — ack, then park; held resources survive. `run_pausable_loop`
-owns the whole protocol:
+1. **Race work against shutdown at every blocking await** — `run_cancellable_acked` and
+   `run_pausable_loop` own this; use bare `run_cancellable` only when cleanup must run
+   between the cancellation and the ack (flush, unpublish, busy/idle bracketing).
+2. **Autonomous exit calls `mark_exited()`** — it acks like `ack_dropped()` *and* records
+   the completion, so a worker that returns on its own reads as down and a control
+   `Activate` can respawn it. `task:` shells do this automatically; `spawn:` tasks call
+   it themselves.
+3. **Resources follow the mode** — a `Terminate` task re-acquires everything on respawn
+   (drop-on-exit is the cleanup); a `Pause` task keeps what it holds across pause→resume
+   and never re-acquires.
+
+**`Pause` node** — ack, then park; held resources survive. `run_pausable_loop` owns the
+whole protocol:
 
 ```rust,ignore
 #[embassy_executor::task]
@@ -489,10 +426,9 @@ async fn sensor_task(node: &'static TaskNode) {
 }
 ```
 
-Per-cycle `run_pausable` is the same minus the loop, for a body with its own
-control flow between cycles. When cleanup must run between the cancellation and
-the ack, spell the tail out: `run_cancellable`, the cleanup, `ack_dropped()`,
-`wait_resume().await`.
+Per-cycle `run_pausable` is the same minus the loop, for a body with its own control
+flow between cycles. When cleanup must run between the cancellation and the ack, spell
+the tail out: `run_cancellable`, the cleanup, `ack_dropped()`, `wait_resume().await`.
 
 **Pool worker** — same as `Terminate`, plus load reporting around the busy section:
 
@@ -502,21 +438,21 @@ serve_connection(&mut socket).await;
 node.mark_idle();                                // busy→idle fires it again
 ```
 
-Keep `mark_busy()` held for the whole session the worker's resource is tied up (e.g. a
-keep-alive connection): the policy only shrinks non-busy workers. The connection-bound
-worker that must stay busy *across* a possible cancellation composes the pieces like
-this — busy for the whole serve, ack only after the bracketing:
+Keep `mark_busy()` held for the whole session the worker's resource is tied up. The
+connection-bound worker that must stay busy *across* a possible cancellation composes
+the pieces like this — busy for the whole serve, the return (whose shell ack completes
+the handshake) only after the bracketing:
 
 ```rust,ignore
 loop {
     match node.run_cancellable(socket.accept(PORT)).await {
-        Err(Aborted) => return node.ack_dropped(), // idle here: nothing to bracket
+        Err(Aborted) => return, // idle here: nothing to bracket
         Ok(conn) => {
             node.mark_busy();
             let served = node.run_cancellable(serve(conn)).await; // busy across the race
             node.mark_idle();
             if served.is_err() {
-                return node.ack_dropped(); // cancelled mid-serve: bracket, THEN ack
+                return; // cancelled mid-serve: bracketed, and the shell acks
             }
         }
     }
@@ -534,14 +470,77 @@ async fn confirm_task(node: &'static TaskNode) {
 }
 ```
 
-**Parked node** (declared with no `spawn:`) — the app spawns it by hand, typically because
-it needs values only `main` owns; `adopt` keeps trace attribution working:
+**Parked node** (declared with no `spawn:`) — the app spawns it by hand, typically
+because it needs values only `main` owns; `adopt` keeps trace attribution working:
 
 ```rust,ignore
 let token = pump_task(&PUMP, hw_handle).unwrap(); // task fns return Result<SpawnToken, _>
 PUMP.adopt(&token);                               // register its task id for trace
 spawner.spawn(token);                             // Spawner::spawn takes the token
 ```
+
+### Method reference
+
+The cancellable combinators return `Result<F::Output, Aborted>` and the pausable one
+`Result<F::Output, Resumed>`; both markers are crate types —
+`use embassy_supervisor::{Aborted, Resumed, TaskNode};` covers the canonical loops.
+
+**Lifecycle methods** — the task-side half of the protocol:
+
+| method | role |
+|---|---|
+| `run_cancellable_acked(fut).await` | the everyday body: race `fut` against shutdown AND complete the handshake on `Err(Aborted)` — discarding the result (`let _ =`) is fine, the ack already happened |
+| `run_cancellable(fut).await` | same race, no ack — for cleanup between the cancellation and the ack |
+| `run_pausable_loop(body).await` | the whole `Pause` protocol in one call: rebuilds `body` every cycle, never returns |
+| `run_pausable(fut).await` | `Pause` bodies: same race, and on a pause it acks, parks, and returns `Err(Resumed)` only after the resume |
+| `wait_shutdown().await` | the underlying primitive: park until a stop/pause is requested |
+| `ack_dropped()` | complete the handshake: clears `running`, wakes the supervisor's ack wait — `task:` shells call this on return; `run_cancellable_acked` calls it on `Err(Aborted)`; hand-written `spawn:` tasks call it themselves |
+| `mark_exited()` | `ack_dropped()` + record the completion (`has_exited()`) — call on an autonomous exit; `task:` shells emit it automatically |
+| `wait_resume().await` | `Pause` only: park (after acking) until resumed |
+
+**Pool and status methods** — load reporting and observability:
+
+| method | role |
+|---|---|
+| `mark_busy()` / `mark_idle()` | pool workers: report load; a *real* transition fires the scale signal itself |
+| `shutdown_requested()` | synchronous check, e.g. at the loop top before starting new work |
+| `has_exited()` | true once the last instance's body returned; cleared by the pre-spawn reset |
+| `set_detached(true)` | opt out of supervision from now on (self-managed daemon or run-once) |
+| `adopt(&token)` | parked nodes: register a hand-spawned task's id so trace accounting sees it |
+
+**Status reads** — readable from anywhere (a status endpoint iterates `GRAPH.nodes`
+and reads these; all are cheap atomic loads):
+
+| method | true when |
+|---|---|
+| `is_running()` | the supervisor has an instance up (spawned, not acked, not exited) |
+| `is_busy()` | the instance reported `mark_busy()` |
+| `is_disabled()` | stopped-at-boot or control-`Deactivate`d, and not yet re-activated |
+| `is_detached()` | self-managed; every lifecycle op skips it |
+| `shutdown_requested()` | a stop/pause was requested — readable until the next pre-spawn reset |
+| `is_ready()` *(feature `readiness`)* | the task asserted `set_ready()` |
+| `is_stale(max_age)` *(feature `liveness`)* | running but no `beat()` within `max_age` |
+
+Useful compositions: **down** = `!is_running()`; **parked `Pause`** = mode `Pause` +
+`!is_running()` + `shutdown_requested()`; **autonomous completion** = `has_exited() &&
+!shutdown_requested()`. A spawn that fail-closed (a `NodeFault` from a gate) leaves the
+node `!is_running()` — nothing was taken or spawned. Ordering guarantees: when
+`stop_node`/`teardown`/`deactivate` return `Ok`, the ack has happened and
+`is_running()` is already `false`; for bodies that ack by returning (the
+`run_cancellable_acked` idiom), `has_exited()` is also already `true` — the ack and
+the return land in the same poll.
+
+### Special case: workers that never return
+
+A worker typed `-> !` (or a service contract returning a `Never` type) opts out of
+`Terminate`/restart *by type* — the body can never return, so stop and respawn
+semantics are inert on it as-is. Two ways in: add
+[`cancel`](#cancel--supervisor-unaware-workers) to the node and the generated shell
+races the body against shutdown for you (no signature change, the future is dropped
+in place), or keep the node argument and race the work yourself (one
+`run_cancellable` call) when teardown needs ordered post-cancel work.
+`Pause`-parked and detached daemons are the forms that legitimately never return.
+
 
 ## The `supervisor_graph!` DSL
 
@@ -1831,8 +1830,7 @@ async fn radio_hw(node: &'static TaskNode) {
     RUNNER.provide(runner);     // consume slot: empty again after teardown
     CONTROL.provide(control);   // consume slot
     STACK.provide(stack);       // shared slot: fanned out, stays filled
-    node.wait_shutdown().await;
-    node.ack_dropped();
+    node.wait_shutdown().await; // returning acks via the shell's mark_exited
 }
 
 supervisor_graph! {

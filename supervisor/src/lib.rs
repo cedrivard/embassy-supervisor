@@ -447,7 +447,7 @@ fn emit_health(ev: HealthEvent) {
 
 /// Default per-node timeout for `wait_dropped` (`ack_timeout:` in the graph
 /// overrides it per node). A task that doesn't ack within its window is a bug
-/// (e.g. a missing `ack_dropped()` call) or a wedge; the shutdown paths
+/// (a body that never notices the stop) or a wedge; the shutdown paths
 /// surface it as a [`NodeFault`] naming the node, and the application decides
 /// the escalation. 2 s comfortably exceeds a typical task's poll period and
 /// peripheral settle time.
