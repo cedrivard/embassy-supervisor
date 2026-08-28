@@ -1,3 +1,7 @@
+// `defmt` being on changes nothing here: the defmt backend is embedded-only
+// (target_os = "none"), so on this host target `log` is the live backend
+// even under --all-features.
+
 use embassy_supervisor::supervisor_graph;
 use std::sync::Mutex;
 

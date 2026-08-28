@@ -441,6 +441,26 @@ pub struct AdoptedFn {
     pub path: syn::Path,
 }
 
+/// A clause value together with the `#[cfg(...)]` attributes gating it.
+#[derive(Clone)]
+pub struct Gated<K, V = ()> {
+    /// `#[cfg(...)]` attributes gating this clause.
+    pub cfg: Vec<Attribute>,
+    /// The clause keyword token, for diagnostics.
+    pub kw: K,
+    /// The clause value.
+    pub value: V,
+}
+
+/// A single `provides:` entry: a resource-slot name, optionally `#[cfg]`-gated.
+#[derive(Clone)]
+pub struct ProvideDecl {
+    /// `#[cfg(...)]` attributes attached to this entry.
+    pub cfg: Vec<Attribute>,
+    /// The resource slot this item fills.
+    pub ident: Ident,
+}
+
 /// A parsed `node NAME = Mode, ...;` declaration.
 #[derive(Clone)]
 pub struct NodeItem {
@@ -458,20 +478,20 @@ pub struct NodeItem {
     pub pool_size: Option<LitInt>,
     /// The `resources:` list.
     pub resources: Vec<ResourceDecl>,
-    /// Whether the node is marked `disabled`.
-    pub disabled: bool,
+    /// The `disabled` marker, if present, with any `#[cfg(...)]` gate.
+    pub disabled: Option<Gated<kw::disabled>>,
     /// The named executor, if specified.
     pub executor: Option<Ident>,
-    /// The `slot_timeout:` value in milliseconds.
-    pub slot_timeout: Option<LitInt>,
-    /// The `ack_timeout:` value in milliseconds.
-    pub ack_timeout: Option<LitInt>,
-    /// The `beat_timeout:` value in milliseconds.
-    pub beat_timeout: Option<(kw::beat_timeout, LitInt)>,
-    /// The `beat_window:` value.
-    pub beat_window: Option<(kw::beat_window, LitInt)>,
-    /// Present when the node is marked `ready_on_write`.
-    pub ready_on_write: Option<Ident>,
+    /// The `slot_timeout:` value in milliseconds, with any `#[cfg(...)]` gate.
+    pub slot_timeout: Option<Gated<kw::slot_timeout, LitInt>>,
+    /// The `ack_timeout:` value in milliseconds, with any `#[cfg(...)]` gate.
+    pub ack_timeout: Option<Gated<kw::ack_timeout, LitInt>>,
+    /// The `beat_timeout:` value in milliseconds, with any `#[cfg(...)]` gate.
+    pub beat_timeout: Option<Gated<kw::beat_timeout, LitInt>>,
+    /// The `beat_window:` value, with any `#[cfg(...)]` gate.
+    pub beat_window: Option<Gated<kw::beat_window, LitInt>>,
+    /// The `ready_on_write` marker, if present, with any `#[cfg(...)]` gate.
+    pub ready_on_write: Option<Gated<Ident>>,
     /// The `reads:` signal list.
     pub reads: Vec<SignalDecl>,
     /// The `writes:` signal list.
@@ -482,12 +502,12 @@ pub struct NodeItem {
     pub state: Option<(kw::state, syn::Type, StateInit)>,
     /// Whether the node is marked `cancel`.
     pub cancel: bool,
-    /// Present when the node uses `discover`.
-    pub discover: Option<kw::discover>,
+    /// The `discover` marker, if present, with any `#[cfg(...)]` gate.
+    pub discover: Option<Gated<kw::discover>>,
     /// Functions adopted via `dataflow:`.
     pub dataflow: Vec<AdoptedFn>,
-    /// Slots this node `provides:`.
-    pub provides: Vec<Ident>,
+    /// Slots this node `provides:`, each optionally `#[cfg]`-gated.
+    pub provides: Vec<ProvideDecl>,
     /// The `provides` keyword token, for diagnostics.
     pub provides_kw: Option<kw::provides>,
     /// The fragment name this node belongs to, if any.
@@ -524,10 +544,10 @@ pub struct PoolItem {
     pub executor: Option<Ident>,
     /// The `resources:` list.
     pub resources: Vec<ResourceDecl>,
-    /// The `slot_timeout:` value in milliseconds.
-    pub slot_timeout: Option<LitInt>,
-    /// The `ack_timeout:` value in milliseconds.
-    pub ack_timeout: Option<LitInt>,
+    /// The `slot_timeout:` value in milliseconds, with any `#[cfg(...)]` gate.
+    pub slot_timeout: Option<Gated<kw::slot_timeout, LitInt>>,
+    /// The `ack_timeout:` value in milliseconds, with any `#[cfg(...)]` gate.
+    pub ack_timeout: Option<Gated<kw::ack_timeout, LitInt>>,
     /// The `reads:` signal list.
     pub reads: Vec<SignalDecl>,
     /// The `writes:` signal list.
@@ -540,8 +560,8 @@ pub struct PoolItem {
     pub state: Option<(kw::state, syn::Type, StateInit)>,
     /// Whether pool members are marked `cancel`.
     pub cancel: bool,
-    /// Present when the pool uses `discover`.
-    pub discover: Option<kw::discover>,
+    /// The `discover` marker, if present, with any `#[cfg(...)]` gate.
+    pub discover: Option<Gated<kw::discover>>,
     /// Functions adopted via `dataflow:`.
     pub dataflow: Vec<AdoptedFn>,
     /// The fragment name this pool belongs to, if any.
@@ -708,14 +728,14 @@ pub struct CommonClauses {
     pub writes: Vec<SignalDecl>,
     /// The `state:` declaration, if any.
     pub state: Option<(kw::state, syn::Type, StateInit)>,
-    /// The `slot_timeout:` value in milliseconds.
-    pub slot_timeout: Option<LitInt>,
-    /// The `ack_timeout:` value in milliseconds.
-    pub ack_timeout: Option<LitInt>,
+    /// The `slot_timeout:` value in milliseconds, with any `#[cfg(...)]` gate.
+    pub slot_timeout: Option<Gated<kw::slot_timeout, LitInt>>,
+    /// The `ack_timeout:` value in milliseconds, with any `#[cfg(...)]` gate.
+    pub ack_timeout: Option<Gated<kw::ack_timeout, LitInt>>,
     /// Present when the item is marked `cancel`.
     pub cancel: Option<kw::cancel>,
-    /// Present when the item is marked `discover`.
-    pub discover: Option<kw::discover>,
+    /// The `discover` marker, if present, with any `#[cfg(...)]` gate.
+    pub discover: Option<Gated<kw::discover>>,
     /// The `dataflow:` adoption list, if any.
     pub dataflow: Option<(kw::dataflow, Vec<AdoptedFn>)>,
 }
@@ -731,12 +751,83 @@ fn dup_clause<T: quote::ToTokens>(tok: &T, name: &str) -> syn::Error {
     )
 }
 
+/// The `#[cfg]` attributes' token text, normalized for predicate comparison.
+pub fn cfg_text(attrs: &[Attribute]) -> String {
+    attrs
+        .iter()
+        .map(|a| {
+            quote::ToTokens::to_token_stream(a)
+                .to_string()
+                .replace(' ', "")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[derive(Clone, Copy)]
+enum ClauseHost {
+    Node,
+    Pool,
+}
+
+fn require_cfg_list(a: &Attribute, what: &str) -> SynResult<()> {
+    match &a.meta {
+        Meta::List(l) if l.path.is_ident("cfg") => Ok(()),
+        _ => Err(syn::Error::new_spanned(
+            a,
+            format!("only `#[cfg(...)]` attributes may gate a {what}"),
+        )),
+    }
+}
+
+/// Parse an optional run of `#[cfg(...)]` attributes gating the NEXT clause.
+fn parse_clause_cfg(input: ParseStream, host: ClauseHost) -> SynResult<Vec<Attribute>> {
+    if !input.peek(Token![#]) {
+        return Ok(Vec::new());
+    }
+    let attrs = input.call(Attribute::parse_outer)?;
+    for a in &attrs {
+        require_cfg_list(a, "clause")?;
+    }
+    let common =
+        input.peek(kw::slot_timeout) || input.peek(kw::ack_timeout) || input.peek(kw::discover);
+    let gateable = match host {
+        ClauseHost::Node => {
+            common
+                || input.peek(kw::beat_timeout)
+                || input.peek(kw::beat_window)
+                || input.peek(kw::ready_on_write)
+                || input.peek(kw::disabled)
+        }
+        ClauseHost::Pool => common,
+    };
+    if !gateable {
+        return Err(input.error(match host {
+            ClauseHost::Node => {
+                "`#[cfg(...)]` may only gate `slot_timeout:`, `ack_timeout:`, \
+                 `beat_timeout:`, `beat_window:`, `ready_on_write`, `disabled`, \
+                 or `discover` — gate the whole node, or a single entry inside \
+                 `deps:`/`resources:`/`reads:`/`writes:`/`dataflow:`/`provides:`, \
+                 for anything structural"
+            }
+            ClauseHost::Pool => {
+                "`#[cfg(...)]` may only gate `slot_timeout:`, `ack_timeout:`, or \
+                 `discover` — gate the whole pool, or a single entry inside \
+                 `deps:`/`resources:`/`reads:`/`writes:`/`dataflow:`, for \
+                 anything structural"
+            }
+        }));
+    }
+    Ok(attrs)
+}
+
 impl CommonClauses {
     /// Parse the next common clause from `input` into `self`.
-    ///
-    /// Returns `true` if a known clause was consumed and `false` if the next
-    /// token does not start a common clause.
-    pub fn parse_one(&mut self, input: ParseStream) -> SynResult<bool> {
+    pub fn parse_one(
+        &mut self,
+        input: ParseStream,
+        clause_cfg: &mut Vec<Attribute>,
+    ) -> SynResult<bool> {
         if input.peek(kw::spawn) {
             let k = input.parse::<kw::spawn>()?;
             input.parse::<Token![:]>()?;
@@ -810,7 +901,11 @@ impl CommonClauses {
                     "`slot_timeout:` must be at least 1 (milliseconds)",
                 ));
             }
-            self.slot_timeout = Some(st);
+            self.slot_timeout = Some(Gated {
+                cfg: core::mem::take(clause_cfg),
+                kw: k,
+                value: st,
+            });
         } else if input.peek(kw::ack_timeout) {
             let k = input.parse::<kw::ack_timeout>()?;
             input.parse::<Token![:]>()?;
@@ -824,7 +919,11 @@ impl CommonClauses {
                     "`ack_timeout:` must be at least 1 (milliseconds)",
                 ));
             }
-            self.ack_timeout = Some(at);
+            self.ack_timeout = Some(Gated {
+                cfg: core::mem::take(clause_cfg),
+                kw: k,
+                value: at,
+            });
         } else if input.peek(kw::discover) {
             let k = input.parse::<kw::discover>()?;
             if self.discover.is_some() {
@@ -837,7 +936,11 @@ impl CommonClauses {
                      task fn's `#[dataflow]` attribute, sized by its scan",
                 ));
             }
-            self.discover = Some(k);
+            self.discover = Some(Gated {
+                cfg: core::mem::take(clause_cfg),
+                kw: k,
+                value: (),
+            });
         } else if input.peek(kw::dataflow) {
             let k = input.parse::<kw::dataflow>()?;
             input.parse::<Token![:]>()?;
@@ -916,16 +1019,17 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
 
     let mut common = CommonClauses::default();
     let mut pool_size = None;
-    let mut disabled = false;
+    let mut disabled: Option<Gated<kw::disabled>> = None;
     let mut beat_timeout = None;
     let mut beat_window = None;
-    let mut ready_on_write: Option<Ident> = None;
+    let mut ready_on_write: Option<Gated<Ident>> = None;
     let mut exit: Option<(kw::exit, syn::Type)> = None;
-    let mut provides: Vec<Ident> = Vec::new();
+    let mut provides: Vec<ProvideDecl> = Vec::new();
     let mut provides_kw: Option<kw::provides> = None;
     while input.peek(Token![,]) {
         input.parse::<Token![,]>()?;
-        if common.parse_one(input)? {
+        let mut clause_cfg = parse_clause_cfg(input, ClauseHost::Node)?;
+        if common.parse_one(input, &mut clause_cfg)? {
             continue;
         }
         if input.peek(kw::deps) {
@@ -943,19 +1047,50 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
             input.parse::<Token![:]>()?;
             pool_size = Some(input.parse::<LitInt>()?);
         } else if input.peek(kw::disabled) {
-            input.parse::<kw::disabled>()?;
-            disabled = true;
+            let k = input.parse::<kw::disabled>()?;
+            if disabled.is_some() {
+                return Err(syn::Error::new_spanned(k, "duplicate `disabled` marker"));
+            }
+            disabled = Some(Gated {
+                cfg: clause_cfg,
+                kw: k,
+                value: (),
+            });
         } else if input.peek(kw::ready_on_write) {
             let k = input.parse::<kw::ready_on_write>()?;
-            ready_on_write = Some(Ident::new("ready_on_write", k.span));
+            if ready_on_write.is_some() {
+                return Err(syn::Error::new_spanned(
+                    k,
+                    "duplicate `ready_on_write` marker",
+                ));
+            }
+            ready_on_write = Some(Gated {
+                cfg: clause_cfg,
+                kw: Ident::new("ready_on_write", k.span),
+                value: (),
+            });
         } else if input.peek(kw::beat_timeout) {
             let k = input.parse::<kw::beat_timeout>()?;
             input.parse::<Token![:]>()?;
-            beat_timeout = Some((k, input.parse::<LitInt>()?));
+            if beat_timeout.is_some() {
+                return Err(dup_clause(&k, "beat_timeout"));
+            }
+            beat_timeout = Some(Gated {
+                cfg: clause_cfg,
+                kw: k,
+                value: input.parse::<LitInt>()?,
+            });
         } else if input.peek(kw::beat_window) {
             let k = input.parse::<kw::beat_window>()?;
             input.parse::<Token![:]>()?;
-            beat_window = Some((k, input.parse::<LitInt>()?));
+            if beat_window.is_some() {
+                return Err(dup_clause(&k, "beat_window"));
+            }
+            beat_window = Some(Gated {
+                cfg: clause_cfg,
+                kw: k,
+                value: input.parse::<LitInt>()?,
+            });
         } else if input.peek(kw::exit) {
             let k = input.parse::<kw::exit>()?;
             input.parse::<Token![:]>()?;
@@ -966,14 +1101,21 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
             let content;
             bracketed!(content in input);
             while !content.is_empty() {
+                let entry_cfg = content.call(Attribute::parse_outer)?;
+                for a in &entry_cfg {
+                    require_cfg_list(a, "`provides:` entry")?;
+                }
                 let slot: Ident = content.parse()?;
-                if provides.contains(&slot) {
+                if provides.iter().any(|p| p.ident == slot) {
                     return Err(syn::Error::new_spanned(
                         &slot,
                         "duplicate `provides:` slot — one entry clears it",
                     ));
                 }
-                provides.push(slot);
+                provides.push(ProvideDecl {
+                    cfg: entry_cfg,
+                    ident: slot,
+                });
                 if content.peek(Token![,]) {
                     content.parse::<Token![,]>()?;
                 }
@@ -1010,32 +1152,57 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
         dataflow,
     } = common;
 
-    if let Some((_, bt)) = &beat_timeout
-        && bt.base10_parse::<u64>()? == 0
+    if let Some(bt) = &beat_timeout
+        && bt.value.base10_parse::<u64>()? == 0
     {
         return Err(syn::Error::new_spanned(
-            bt,
+            &bt.value,
             "`beat_timeout:` must be at least 1 (milliseconds) — omit the clause \
              to leave the node unpoliced",
         ));
     }
 
-    if let (Some((_, bw)), None) = (&beat_window, &beat_timeout) {
+    if let (Some(bw), None) = (&beat_window, &beat_timeout) {
         return Err(syn::Error::new_spanned(
-            bw,
+            &bw.value,
             "`beat_window:` requires `beat_timeout:` — the window counts \
              consecutive sweeps that found the node past its beat budget",
         ));
     }
 
-    if let Some((_, bw)) = &beat_window
-        && !(1..=255).contains(&bw.base10_parse::<u64>()?)
+    if let Some(bw) = &beat_window
+        && !(1..=255).contains(&bw.value.base10_parse::<u64>()?)
     {
         return Err(syn::Error::new_spanned(
-            bw,
+            &bw.value,
             "`beat_window:` must be in 1..=255 — omit the clause for the \
              default of 1, which reports on the first stale sweep",
         ));
+    }
+
+    if let Some(bt) = &beat_timeout
+        && !bt.cfg.is_empty()
+    {
+        if let Some(bw) = &beat_window
+            && cfg_text(&bw.cfg) != cfg_text(&bt.cfg)
+        {
+            return Err(syn::Error::new_spanned(
+                &bw.value,
+                "`beat_window:` must carry the same `#[cfg]` predicate as its \
+                 `beat_timeout:` — the window counts sweeps of a budget that \
+                 gate compiles out",
+            ));
+        }
+        if let Some(row) = &ready_on_write
+            && cfg_text(&row.cfg) != cfg_text(&bt.cfg)
+        {
+            return Err(syn::Error::new_spanned(
+                &row.kw,
+                "`ready_on_write` must carry the same `#[cfg]` predicate as its \
+                 `beat_timeout:` — readiness is asserted by the monitor sweep, \
+                 which that gate compiles out",
+            ));
+        }
     }
 
     for d in &reads {
@@ -1063,7 +1230,7 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
         }
         if spawn.is_none() && task.is_none() {
             return Err(syn::Error::new_spanned(
-                k,
+                k.kw,
                 "`discover` needs a `task:`/`spawn:` fn to take its tables \
                  from — a parked node has nothing to scan",
             ));
@@ -1076,7 +1243,7 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
             .any(|w| w.beat.is_some() && w.observed.is_some())
         {
             return Err(syn::Error::new_spanned(
-                row,
+                &row.kw,
                 "`ready_on_write` requires an `observed beat` entry in \
                  `writes:` — the sweep's own poll of that write is what asserts \
                  the readiness. A body that beats through its verbs asserts \
@@ -1085,7 +1252,7 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
         }
         if beat_timeout.is_none() {
             return Err(syn::Error::new_spanned(
-                row,
+                &row.kw,
                 "`ready_on_write` requires `beat_timeout:` — readiness is \
                  asserted from the monitor sweep, which only visits nodes that \
                  declare a beat budget",
@@ -1231,7 +1398,8 @@ pub fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem
 
     while input.peek(Token![,]) {
         input.parse::<Token![,]>()?;
-        if common.parse_one(input)? {
+        let mut clause_cfg = parse_clause_cfg(input, ClauseHost::Pool)?;
+        if common.parse_one(input, &mut clause_cfg)? {
             continue;
         }
         if input.peek(kw::deps) {
@@ -2598,6 +2766,125 @@ mod tests {
     }
 
     #[test]
+    fn cfg_gated_clauses() {
+        const P: &str = "#[cfg(feature = \"x\")]";
+        let spec = syn::parse_str::<GraphSpec>(&format!(
+            "node A = Terminate, deps: [], task: w, discover, \
+             {P} slot_timeout: 100, {P} ack_timeout: 200, \
+             {P} beat_timeout: 100, {P} beat_window: 3, {P} disabled;\n\
+             node B = Terminate, deps: [], task: w, {P} discover, \
+             provides: [{P} R1, R2];",
+        ))
+        .expect("cfg-gated clauses parse");
+        let Item::Node(a) = &spec.items[0] else {
+            unreachable!()
+        };
+        assert_eq!(a.slot_timeout.as_ref().unwrap().cfg.len(), 1);
+        assert_eq!(a.ack_timeout.as_ref().unwrap().cfg.len(), 1);
+        assert_eq!(a.beat_timeout.as_ref().unwrap().cfg.len(), 1);
+        assert_eq!(a.beat_window.as_ref().unwrap().cfg.len(), 1);
+        assert_eq!(a.disabled.as_ref().unwrap().cfg.len(), 1);
+        assert!(
+            a.discover.as_ref().unwrap().cfg.is_empty(),
+            "un-gated stays empty"
+        );
+        let Item::Node(b) = &spec.items[1] else {
+            unreachable!()
+        };
+        assert_eq!(b.discover.as_ref().unwrap().cfg.len(), 1);
+        assert_eq!(b.provides[0].cfg.len(), 1);
+        assert!(b.provides[1].cfg.is_empty());
+
+        // `ready_on_write` needs its prerequisites in place to parse at all.
+        let spec = syn::parse_str::<GraphSpec>(&format!(
+            "node A = Terminate, deps: [], task: w, \
+             writes: [crate::S observed beat via it.get()], \
+             {P} beat_timeout: 100, {P} ready_on_write;",
+        ))
+        .expect("gated ready_on_write parses beside its gated beat_timeout");
+        let Item::Node(a) = &spec.items[0] else {
+            unreachable!()
+        };
+        assert_eq!(a.ready_on_write.as_ref().unwrap().cfg.len(), 1);
+
+        // Structural clauses reject the gate, naming the gateable set.
+        for clause in [
+            "task: w",
+            "spawn: f()",
+            "executor: HIGH",
+            "exit: u32",
+            "state: u32 = 0",
+            "cancel",
+            "pool_size: 2",
+            "deps: [X]",
+            "resources: [R: u32]",
+            "reads: [crate::S]",
+            "provides: [R]",
+            "dataflow: [crate::f]",
+        ] {
+            match syn::parse_str::<GraphSpec>(&format!(
+                "node A = Terminate, deps: [], {P} {clause};"
+            )) {
+                Ok(_) => panic!("`#[cfg]` on `{clause}` accepted"),
+                Err(err) => assert!(
+                    err.to_string().contains("may only gate `slot_timeout:`"),
+                    "`{clause}`: wrong error: {err}"
+                ),
+            }
+        }
+        match syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], #[allow(dead_code)] beat_timeout: 100;",
+        ) {
+            Ok(_) => panic!("a non-cfg attribute accepted"),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("only `#[cfg(...)]` attributes may gate a clause"),
+                "wrong error: {err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn gated_beat_timeout_predicate_pairing() {
+        const P: &str = "#[cfg(feature = \"x\")]";
+        assert!(
+            syn::parse_str::<GraphSpec>(&format!(
+                "node A = Terminate, deps: [], beat_timeout: 100, {P} beat_window: 3;"
+            ))
+            .is_ok()
+        );
+        for (tail, needle) in [
+            (
+                "beat_window: 3",
+                "`beat_window:` must carry the same `#[cfg]`",
+            ),
+            (
+                "#[cfg(feature = \"y\")] beat_window: 3",
+                "`beat_window:` must carry the same `#[cfg]`",
+            ),
+        ] {
+            match syn::parse_str::<GraphSpec>(&format!(
+                "node A = Terminate, deps: [], {P} beat_timeout: 100, {tail};"
+            )) {
+                Ok(_) => panic!("mismatched gate accepted: {tail}"),
+                Err(err) => assert!(err.to_string().contains(needle), "{tail}: {err}"),
+            }
+        }
+        match syn::parse_str::<GraphSpec>(&format!(
+            "node A = Terminate, deps: [], task: w, \
+             writes: [crate::S observed beat via it.get()], \
+             {P} beat_timeout: 100, ready_on_write;"
+        )) {
+            Ok(_) => panic!("un-gated ready_on_write over a gated beat_timeout accepted"),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("`ready_on_write` must carry the same `#[cfg]`"),
+                "{err}"
+            ),
+        }
+    }
+
+    #[test]
     fn duplicate_clauses_rejected() {
         for (src, needle) in [
             (
@@ -2627,10 +2914,76 @@ mod tests {
                  min: 1, max: 1, max: 2;",
                 "duplicate `max:` clause",
             ),
+            (
+                "node A = Terminate, deps: [], beat_timeout: 100, beat_timeout: 200;",
+                "duplicate `beat_timeout:` clause",
+            ),
+            (
+                "node A = Terminate, deps: [], beat_timeout: 100, \
+                 beat_window: 3, beat_window: 4;",
+                "duplicate `beat_window:` clause",
+            ),
+            (
+                "node A = Terminate, deps: [], disabled, disabled;",
+                "duplicate `disabled` marker",
+            ),
+            (
+                "node A = Terminate, deps: [], task: w, \
+                 writes: [crate::S observed beat via it.get()], \
+                 beat_timeout: 100, ready_on_write, ready_on_write;",
+                "duplicate `ready_on_write` marker",
+            ),
         ] {
             match syn::parse_str::<GraphSpec>(src) {
                 Ok(_) => panic!("duplicate accepted: {src}"),
                 Err(err) => assert!(err.to_string().contains(needle), "got: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_cfg_attribute_rejected() {
+        for attr in ["#[cfg]", "#[cfg = \"x\"]", "#[cfg] #[cfg(feature = \"x\")]"] {
+            for decl in [
+                format!("node A = Terminate, deps: [], {attr} disabled;"),
+                format!("node A = Terminate, deps: [], provides: [{attr} R];"),
+            ] {
+                match syn::parse_str::<GraphSpec>(&decl) {
+                    Ok(_) => panic!("malformed cfg accepted: {decl}"),
+                    Err(err) => assert!(
+                        err.to_string().contains("only `#[cfg(...)]` attributes"),
+                        "{decl}: {err}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pool_clause_cfg_rejection_names_pool_alternatives() {
+        const P: &str = "#[cfg(feature = \"x\")]";
+        let spec = syn::parse_str::<GraphSpec>(&format!(
+            "pool P = [Terminate], deps: [], task: w, \
+             policy: Pol::new(), min: 1, max: 1, \
+             {P} slot_timeout: 100, {P} ack_timeout: 200;"
+        ))
+        .expect("gated pool timeouts parse");
+        let Item::Pool(p) = &spec.items[0] else {
+            unreachable!()
+        };
+        assert_eq!(p.slot_timeout.as_ref().unwrap().cfg.len(), 1);
+        assert_eq!(p.ack_timeout.as_ref().unwrap().cfg.len(), 1);
+
+        for clause in ["policy: Pol::new()", "min: 1", "beat_timeout: 100"] {
+            match syn::parse_str::<GraphSpec>(&format!(
+                "pool P = [Terminate], deps: [], task: w, {P} {clause};"
+            )) {
+                Ok(_) => panic!("`#[cfg]` on pool `{clause}` accepted"),
+                Err(err) => {
+                    let msg = err.to_string();
+                    assert!(msg.contains("gate the whole pool"), "`{clause}`: {msg}");
+                    assert!(!msg.contains("provides"), "`{clause}`: {msg}");
+                }
             }
         }
     }

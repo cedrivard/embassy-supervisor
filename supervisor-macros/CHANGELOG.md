@@ -6,6 +6,31 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.8.0] - 2026-08-27
+
+Rides `embassy-supervisor-syntax = "=0.2.0"`.
+
+### Added
+
+- Every value-level clause is `#[cfg]`-aware — `slot_timeout:`, `ack_timeout:`,
+  `beat_timeout:`, `beat_window:`, `ready_on_write`, `disabled`, `discover`,
+  and per-entry `provides:`. A gated clause whose feature is present emits its
+  builder call under the predicate (a `const`-block rebinding, so the config
+  chain stays `const`); with the feature absent, the macro-time "requires
+  feature" error defers to a `compile_error!` under the same predicate, firing
+  only in builds where the clause exists. A gated `disabled` becomes a
+  cfg-block `true`/`false` argument to `TaskNode::new`; a gated `discover`
+  rides the adopted tables' per-entry machinery, marker assertions included.
+  `shape_bits` stays deliberately conservative: a compiled-out clause may
+  still set its bit, an over-approximation that costs a driver-loop arm that
+  never fires and can never be wrong.
+
+### Changed
+
+- syn 3; the trybuild fixture resolves `embassy-supervisor` with the full
+  forwarded feature superset, so the ui suite also runs under
+  `--all-features`.
+
 ## [0.7.0] - 2026-08-25
 
 ### Added

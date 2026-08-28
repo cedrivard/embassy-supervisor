@@ -16,6 +16,19 @@
 #[macro_use]
 mod fmt;
 
+#[cfg(all(
+    feature = "log",
+    not(target_os = "none"),
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+mod host_log;
+#[cfg(all(
+    feature = "log",
+    not(target_os = "none"),
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+pub use host_log::init_host_logging;
+
 use core::cell::Cell;
 use core::future::Future;
 use core::pin::Pin;

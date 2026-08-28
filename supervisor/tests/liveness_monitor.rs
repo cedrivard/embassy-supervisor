@@ -6,9 +6,9 @@ use embassy_supervisor::{HealthKind, Supervisor, supervisor_graph, try_wait_heal
 use embassy_time::{Duration, MockDriver};
 
 supervisor_graph! {
-    node BEATER = Terminate, deps: [], beat_timeout: 100;
+    node BEATER = Terminate, deps: [], #[cfg(all())] beat_timeout: 100;
     node JITTERY = Terminate, deps: [], beat_timeout: 100, beat_window: 3;
-    node UNPOLICED = Terminate, deps: [];
+    node UNPOLICED = Terminate, deps: [], #[cfg(any())] beat_timeout: 1;
 }
 
 static SUP: Supervisor<3, GRAPH_TOPOLOGY> = Supervisor::new(&GRAPH);
@@ -95,7 +95,7 @@ async fn driver(spawner: Spawner) {
     let events = drain();
     assert!(
         !events.iter().any(|(n, _)| *n == "unpoliced"),
-        "a node without beat_timeout: is never policed, got {events:?}"
+        "a node whose beat_timeout: is cfg'd out is never policed, got {events:?}"
     );
 
     assert!(

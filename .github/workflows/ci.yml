@@ -34,57 +34,15 @@ jobs:
           # cycle cases are blessed with the source available, so CI must match.
           components: rust-src
       - uses: Swatinem/rust-cache@v2
-      # `defmt` is an embedded-logging feature: it needs a `#[global_logger]` to
-      # link a binary, so it cannot run in a host test. Its compilation is covered
-      # by the `embedded` (build --all-features) and `lint` (clippy --all-features,
-      # check-only) jobs; here we run the functional matrix (control + pool) without it.
-      # The default set is just `macros`, so this row is deliberately narrow;
-      # every row below names `control`/`pool` explicitly rather than inheriting
-      # them, so a change to the defaults cannot silently shrink coverage.
       - run: cargo test -p embassy-supervisor --target $HOST
       - run: cargo test -p embassy-supervisor --target $HOST --no-default-features
+      - run: cargo test -p embassy-supervisor --target $HOST --all-features
       - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,trace-hooks
-      # Charge-splitting (preemption-exact) accounting + the base trace tests again
-      # under the extra feature. `local-resources` rides along so the gated
-      # `resource_kinds` suite (a `!Send` value through a local slot) runs too,
-      # and `trace-self` so the hidden-node adoption suite runs.
-      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,trace-nested,trace-hooks,local-resources,trace-self
-      # Readiness rendezvous (ready-marked deps; needs pool for the growth gate)
-      # + the liveness heartbeat. `required-features` silently skips otherwise.
-      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,readiness,liveness
-      # The runtime-coupling features, together: the activation generation
-      # (epochs), the liveness sweep (liveness-monitor), the declared and derived
-      # dataflow (coupling), rest_for_one (restart), and readiness
-      # propagation across `bound` edges (bound-deps). Run as one set because
-      # several of their suites need `readiness` and/or `control` alongside.
-      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,coupling-observe,dataflow,data-deps,node-status,restart,bound-deps,epochs,liveness-monitor,readiness,liveness
-      # The explicit tier without the polled one: the two are independent, and
-      # the items they share sit behind `any(..)` cfgs this row keeps honest.
-      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,dataflow,data-deps,node-status,readiness,liveness
-      # `log` backend: that the crate's log macros emit at all. Separate run
-      # because `log` and `defmt` are mutually exclusive, so it cannot ride
-      # along with any set that might pull `defmt` in.
-      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,log,coupling,node-status
-      # Reclaimable per-activation heap state (state: clause): counting-allocator
-      # net-zero + OOM->Busy behavior.
-      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,heap-state
       # `supervisor_graph!` UI tests (trybuild): compile-fail cases lock the macro's
       # error contracts (cycle, unknown dep, ...); compile-pass cases run the generated
       # graph. Host-only — trybuild compiles real graphs — so `--target $HOST`.
-      # Twice: without `local-resources` (the `local`-requires-feature rejection can
-      # only fire then) and with it (the `local` kind's pass/fail cases).
       - run: cargo test -p embassy-supervisor-macros --target $HOST
-      - run: cargo test -p embassy-supervisor-macros --target $HOST --features local-resources
-      # The `ready` dep marker's UI pass/fail split (no no-feature split — see
-      # tests/ui.rs; the rejection is unit-tested inside the macros crate).
-      - run: cargo test -p embassy-supervisor-macros --target $HOST --features readiness
-      # The `state:` clause's UI split (its no-feature rejection runs in the
-      # plain macros invocation above).
-      - run: cargo test -p embassy-supervisor-macros --target $HOST --features heap-state
-      # The new clauses and dep markers. Their no-feature rejections are
-      # unit-tested inside the crate (same trybuild caveat as `readiness`), so
-      # this run is about the accepting side and the marker-composition rules.
-      - run: cargo test -p embassy-supervisor-macros --target $HOST --features coupling-observe,dataflow,data-deps,liveness-monitor,bound-deps,readiness
+      - run: cargo test -p embassy-supervisor-macros --target $HOST --all-features
 
       # The graph grammar itself, which both the proc-macro and the diagram tool
       # parse with. It has no features: it always accepts the full syntax.
@@ -116,9 +74,7 @@ jobs:
         with:
           targets: thumbv8m.main-none-eabihf
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build -p embassy-supervisor
       - run: cargo build -p embassy-supervisor --no-default-features
-      - run: cargo build -p embassy-supervisor --features trace
       - run: cargo build -p embassy-supervisor --all-features
 
   # Independent feature combinations: the crate markets `default-features = false`,

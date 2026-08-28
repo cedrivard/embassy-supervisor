@@ -178,7 +178,8 @@ supervisor_graph! {
         , discover                      //   or: bind the tables the task fn's #[dataflow] derived
                                         //     (a list beside it may only add markers)
         , dataflow: [crate::setter]     //   adopt an accessor fn's #[dataflow] tables
-        , beat_timeout: MS , ready_on_write
+        , beat_timeout: MS , ready_on_write //   every value-level clause (the timeouts, beats,
+                                        //     ready_on_write, disabled, discover) takes a #[cfg(...)] gate
         , pool_size: N , executor: NAME , slot_timeout: MS , ack_timeout: MS , disabled;
 
     pool NAME = [Mode, ..],             // one Mode per member, floor first
@@ -2260,8 +2261,8 @@ already pins.
 | `restart` | | `Supervisor::restart` — rest_for_one: cycle a node and its transitive dependents, re-gating them on the way back up (implies `control`) |
 | `bound-deps` | | the `bound` dep marker — ⚠ **the one feature that changes a documented contract**, per edge and only where you opt in: `clear_ready()` stops a `bound` dependent instead of merely deferring its next spawn, and a bring-up readiness budget spent on a `bound` edge parks the dependent (`BOUND_STOPPED`, lifted by the next `set_ready`) instead of faulting (implies `readiness` + `control`) |
 | `heap-state` | | `state: Type = expr` / `state: zeroed Type` per-activation boxed state, reclaimed on task exit — ⚠ opt-in: emits the ~6-line fallible-boxing `unsafe` helper into your crate; needs a `#[global_allocator]`; pulls `bytemuck` for `Zeroable` |
-| `defmt`   |         | route the supervisor's logs through `defmt`; takes precedence over `log` if both are on |
-| `log`     |         | route them through the `log` facade instead, for hosted and std consumers. With **neither** backend the log macros are no-ops, so the `liveness-monitor` stale reports and every bring-up line print nothing |
+| `defmt`   |         | route the supervisor's logs through `defmt` — on embedded targets (`target_os = "none"`) only, where a `#[global_logger]` exists to link against; takes precedence over `log` there. On a hosted target the feature is inert and `log` is the live backend, so one feature list serves a SITL's both halves and `--all-features` host tests link with no defmt sink |
+| `log`     |         | route them through the `log` facade — the live backend on any target with an OS. `init_host_logging(LevelFilter)` (hosted targets only) installs a dependency-free stderr sink in one call, `[uptime] LEVEL target: message`; or install `env_logger` and filter with `RUST_LOG=embassy_supervisor=trace`. With **neither** backend the log macros are no-ops, so the `liveness-monitor` stale reports and every bring-up line print nothing |
 | `trace`   |         | trace-hook observability: per-node CPU time / poll counts / max-poll watermark, executor idle time, stall detection |
 | `trace-hooks` |     | batteries-included: the graph declaration also defines the `_embassy_trace_*` hook symbols (implies `trace`) |
 | `metadata-names` |  | stamp node names into task Metadata for external tooling (rtos-trace/SystemView); independent of `trace` — no hook symbols |

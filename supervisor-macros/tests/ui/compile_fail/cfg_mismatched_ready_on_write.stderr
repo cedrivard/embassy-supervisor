@@ -1,0 +1,5 @@
+error: `ready_on_write` must carry the same `#[cfg]` predicate as its `beat_timeout:` — readiness is asserted by the monitor sweep, which that gate compiles out
+  --> tests/ui/compile_fail/cfg_mismatched_ready_on_write.rs:18:9
+   |
+18 |         ready_on_write;
+   |         ^^^^^^^^^^^^^^

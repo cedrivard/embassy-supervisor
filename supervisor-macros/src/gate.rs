@@ -28,45 +28,57 @@ fn gate_node(n: &NodeItem) -> SynResult<()> {
         require_heap_state(k)?;
     }
     if let Some(row) = &n.ready_on_write {
-        if !cfg!(feature = "coupling-observe") {
-            return Err(syn::Error::new_spanned(
-                row,
-                "`ready_on_write` requires the `coupling-observe` feature \
-                 (embassy-supervisor feature of the same name) — readiness \
-                 is asserted by the monitor sweep seeing an `observed beat` \
-                 write advance. A body that beats through its verbs asserts \
-                 its own readiness, with `set_ready()` at the write",
-            ));
-        }
-        if !cfg!(feature = "readiness") {
-            return Err(syn::Error::new_spanned(
-                row,
-                "`ready_on_write` requires the `readiness` feature \
-                 (embassy-supervisor feature `readiness`) — it is what \
-                 set_ready() and `deps: [X ready]` come from",
-            ));
-        }
+        require_feature_ungated(
+            &row.cfg,
+            &row.kw,
+            cfg!(feature = "coupling-observe"),
+            "`ready_on_write` requires the `coupling-observe` feature \
+             (embassy-supervisor feature of the same name) — readiness \
+             is asserted by the monitor sweep seeing an `observed beat` \
+             write advance. A body that beats through its verbs asserts \
+             its own readiness, with `set_ready()` at the write",
+        )?;
+        require_feature_ungated(
+            &row.cfg,
+            &row.kw,
+            cfg!(feature = "readiness"),
+            "`ready_on_write` requires the `readiness` feature \
+             (embassy-supervisor feature `readiness`) — it is what \
+             set_ready() and `deps: [X ready]` come from",
+        )?;
     }
-    if let Some((k, _)) = &n.beat_timeout
-        && !cfg!(feature = "liveness-monitor")
-    {
-        return Err(syn::Error::new_spanned(
-            k,
+    if let Some(bt) = &n.beat_timeout {
+        require_feature_ungated(
+            &bt.cfg,
+            &bt.kw,
+            cfg!(feature = "liveness-monitor"),
             "`beat_timeout:` requires the `liveness-monitor` feature \
              (embassy-supervisor feature `liveness-monitor`) — the \
              supervisor then reports this node once it has been running \
              that long without a beat()",
-        ));
+        )?;
     }
-    if let Some((k, _)) = &n.beat_window
-        && !cfg!(feature = "liveness-monitor")
-    {
-        return Err(syn::Error::new_spanned(
-            k,
+    if let Some(bw) = &n.beat_window {
+        require_feature_ungated(
+            &bw.cfg,
+            &bw.kw,
+            cfg!(feature = "liveness-monitor"),
             "`beat_window:` requires the `liveness-monitor` feature \
              (embassy-supervisor feature `liveness-monitor`) — it sets \
              how many consecutive stale sweeps are reported on",
-        ));
+        )?;
+    }
+    Ok(())
+}
+
+fn require_feature_ungated<T: quote::ToTokens>(
+    cfg: &[syn::Attribute],
+    tok: &T,
+    feature_on: bool,
+    msg: &str,
+) -> SynResult<()> {
+    if !feature_on && cfg.is_empty() {
+        return Err(syn::Error::new_spanned(tok, msg));
     }
     Ok(())
 }
@@ -137,18 +149,20 @@ fn gate_coupling(reads: &[SignalDecl], writes: &[SignalDecl]) -> SynResult<()> {
     Ok(())
 }
 
-fn require_discover(discover: &Option<embassy_supervisor_syntax::kw::discover>) -> SynResult<()> {
-    if let Some(k) = discover
-        && !cfg!(feature = "dataflow")
-    {
-        return Err(syn::Error::new_spanned(
-            k,
+fn require_discover(
+    discover: &Option<embassy_supervisor_syntax::Gated<embassy_supervisor_syntax::kw::discover>>,
+) -> SynResult<()> {
+    if let Some(k) = discover {
+        require_feature_ungated(
+            &k.cfg,
+            &k.kw,
+            cfg!(feature = "dataflow"),
             "`discover` requires the `dataflow` feature \
              (embassy-supervisor feature `dataflow`) — it binds the \
              coupling tables the task fn's `#[dataflow]` attribute derives, \
              in place of `reads:`/`writes:` declarations, which may then \
              only add markers",
-        ));
+        )?;
     }
     Ok(())
 }

@@ -220,15 +220,15 @@ fn coupling_binding_tokens(
 fn marker_assert_tokens(
     ctx: &EmitCtx<'_>,
     owner: &str,
-    discover: bool,
+    discover: Option<&[Attribute]>,
     foreign: &[AdoptedFn],
     decls: &[SignalDecl],
     prefix: &str,
 ) -> TokenStream2 {
     let EmitCtx { cfg, cr, .. } = ctx;
-    if !discover || foreign.is_empty() {
+    let (Some(dcfg), false) = (discover, foreign.is_empty()) else {
         return quote!();
-    }
+    };
     let clause = if prefix == "READS" { "reads" } else { "writes" };
     let mut out = quote!();
     for d in decls {
@@ -257,6 +257,7 @@ fn marker_assert_tokens(
         );
         out.extend(quote! {
             #(#cfg)*
+            #(#dcfg)*
             #(#entry_cfg)*
             const _: () = {
                 let mut __sv_found = false;
@@ -302,6 +303,71 @@ fn discover_fn_path(
     Ok(Some(path.path.clone()))
 }
 
+struct GatedBuilder {
+    cfg: Vec<Attribute>,
+    tokens: TokenStream2,
+    available: bool,
+    err: &'static str,
+}
+
+fn builder_clause_tokens(
+    item_cfg: &[Attribute],
+    clauses: impl IntoIterator<Item = GatedBuilder>,
+) -> (TokenStream2, TokenStream2, TokenStream2) {
+    let (mut inline, mut stmts, mut errors) = (quote!(), quote!(), quote!());
+    for c in clauses {
+        let (clause_cfg, tokens) = (&c.cfg, &c.tokens);
+        if !c.available && !clause_cfg.is_empty() {
+            let err = c.err;
+            errors.extend(quote!( #(#item_cfg)* #(#clause_cfg)* ::core::compile_error!(#err); ));
+        } else if clause_cfg.is_empty() {
+            inline.extend(tokens.clone());
+        } else {
+            stmts.extend(quote!( #(#clause_cfg)* let __sv_cfg = __sv_cfg #tokens; ));
+        }
+    }
+    (inline, stmts, errors)
+}
+
+fn discover_error_tokens(
+    item_cfg: &[Attribute],
+    discover: Option<&embassy_supervisor_syntax::Gated<kw::discover>>,
+) -> TokenStream2 {
+    match discover {
+        Some(g) if !g.cfg.is_empty() && !cfg!(feature = "dataflow") => {
+            let c = &g.cfg;
+            quote!( #(#item_cfg)* #(#c)* ::core::compile_error!(
+                "`discover` requires the `dataflow` feature (embassy-supervisor \
+                 feature `dataflow`) — it binds the coupling tables the task \
+                 fn's `#[dataflow]` attribute derives"
+            ); )
+        }
+        _ => quote!(),
+    }
+}
+
+fn disabled_tokens(
+    disabled: Option<&embassy_supervisor_syntax::Gated<kw::disabled>>,
+) -> TokenStream2 {
+    match disabled {
+        None => quote!(false),
+        Some(g) if g.cfg.is_empty() => quote!(true),
+        Some(g) => {
+            let pred = cfg_predicate(&g.cfg).expect("parse validated cfg attrs");
+            quote!({
+                #[cfg(#pred)]
+                {
+                    true
+                }
+                #[cfg(not(#pred))]
+                {
+                    false
+                }
+            })
+        }
+    }
+}
+
 fn cfg_predicate(attrs: &[Attribute]) -> Option<TokenStream2> {
     let preds: Vec<TokenStream2> = attrs
         .iter()
@@ -337,11 +403,12 @@ fn provides_tokens(
     if n.provides.is_empty() {
         return Ok((quote!(), quote!()));
     }
-    let mut cfgs: Vec<&Vec<Attribute>> = Vec::new();
+    let mut cfgs: Vec<Vec<Attribute>> = Vec::new();
     let refs = n
         .provides
         .iter()
-        .map(|slot| {
+        .map(|p| {
+            let slot = &p.ident;
             let Some((cfg, from_pool)) = resource_cfgs.get(&slot.to_string()) else {
                 return Err(syn::Error::new_spanned(
                     slot,
@@ -364,11 +431,12 @@ fn provides_tokens(
                     ),
                 ));
             }
-            cfgs.push(cfg);
-            Ok(quote!(#(#cfg)* &#slot))
+            let entry_cfg = &p.cfg;
+            cfgs.push(cfg.iter().chain(entry_cfg.iter()).cloned().collect());
+            Ok(quote!(#(#cfg)* #(#entry_cfg)* &#slot))
         })
         .collect::<SynResult<Vec<_>>>()?;
-    let len = cfg_aware_len(cfgs.into_iter());
+    let len = cfg_aware_len(cfgs.iter());
     let node_cfg = &n.cfg;
     let arr = format_ident!("__SV_PROVIDES_{}", n.ident);
     Ok((
@@ -927,7 +995,7 @@ fn emit_node(
     let cfg = &n.cfg;
     let mode = &n.mode;
     let name = name_string(&n.ident);
-    let disabled = n.disabled;
+    let disabled = disabled_tokens(n.disabled.as_ref());
     let (shell_def, spawn_expr) = match &n.source {
         Some(TaskSource::Shell(worker)) => {
             let ps = match &n.pool_size {
@@ -1038,38 +1106,64 @@ fn emit_node(
             quote!( .with_resources(&#gates_ident) ),
         )
     };
-    // `slot_timeout: N` — override the node's pre-spawn slot/gate wait bound
-    // (see `TaskNode::with_slot_timeout`; sized to a provider node's build time).
-    let with_timeout = match &n.slot_timeout {
-        Some(ms) => quote!( .with_slot_timeout(#cr::_export::Duration::from_millis(#ms)) ),
-        None => quote!(),
-    };
-    // `ack_timeout: N` — override how long a stop waits for the node's
-    // shutdown ack before faulting it (see `TaskNode::with_ack_timeout`).
-    let with_ack = match &n.ack_timeout {
-        Some(ms) => quote!( .with_ack_timeout(#cr::_export::Duration::from_millis(#ms)) ),
-        None => quote!(),
-    };
-    // `beat_timeout: N` / `beat_window: N` (feature `liveness-monitor`) — opt
-    // the node into the supervisor's liveness sweep. Absent = unpoliced, which
-    // is the right default for every node whose body does not beat().
-    let with_beat = match (&n.beat_timeout, &n.beat_window) {
-        (Some((_, ms)), Some((_, w))) => quote!(
-            .with_beat_timeout(#cr::_export::Duration::from_millis(#ms))
-            .with_beat_window(#w)
-        ),
-        (Some((_, ms)), None) => {
-            quote!( .with_beat_timeout(#cr::_export::Duration::from_millis(#ms)) )
-        }
-        // `beat_window:` alone is rejected as a shape error.
-        (None, _) => quote!(),
-    };
-    // `ready_on_write` — the sweep asserts readiness on the first advance of an
-    // `observed` write, instead of the task calling set_ready() itself.
-    let with_ready_on_write = n
-        .ready_on_write
-        .as_ref()
-        .map(|_| quote!( .with_ready_on_write() ));
+    let (with_clauses, clause_stmts, clause_errors) = builder_clause_tokens(
+        cfg,
+        [
+            n.slot_timeout.as_ref().map(|g| {
+                let (c, ms) = (&g.cfg, &g.value);
+                GatedBuilder {
+                    cfg: c.clone(),
+                    tokens: quote!( .with_slot_timeout(#cr::_export::Duration::from_millis(#ms)) ),
+                    available: true,
+                    err: "",
+                }
+            }),
+            n.ack_timeout.as_ref().map(|g| {
+                let (c, ms) = (&g.cfg, &g.value);
+                GatedBuilder {
+                    cfg: c.clone(),
+                    tokens: quote!( .with_ack_timeout(#cr::_export::Duration::from_millis(#ms)) ),
+                    available: true,
+                    err: "",
+                }
+            }),
+            n.beat_timeout.as_ref().map(|g| {
+                let (c, ms) = (&g.cfg, &g.value);
+                GatedBuilder {
+                    cfg: c.clone(),
+                    tokens: quote!( .with_beat_timeout(#cr::_export::Duration::from_millis(#ms)) ),
+                    available: cfg!(feature = "liveness-monitor"),
+                    err: "`beat_timeout:` requires the `liveness-monitor` feature \
+                          (embassy-supervisor feature `liveness-monitor`) — the \
+                          supervisor then reports this node once it has been running \
+                          that long without a beat()",
+                }
+            }),
+            // `beat_window:` alone is rejected as a shape error.
+            n.beat_window.as_ref().map(|g| {
+                let (c, w) = (&g.cfg, &g.value);
+                GatedBuilder {
+                    cfg: c.clone(),
+                    tokens: quote!( .with_beat_window(#w) ),
+                    available: cfg!(feature = "liveness-monitor"),
+                    err: "`beat_window:` requires the `liveness-monitor` feature \
+                          (embassy-supervisor feature `liveness-monitor`) — it sets \
+                          how many consecutive stale sweeps are reported on",
+                }
+            }),
+            n.ready_on_write.as_ref().map(|g| GatedBuilder {
+                cfg: g.cfg.clone(),
+                tokens: quote!( .with_ready_on_write() ),
+                available: cfg!(all(feature = "coupling-observe", feature = "readiness")),
+                err: "`ready_on_write` requires the `coupling-observe` and \
+                      `readiness` features (embassy-supervisor features of the \
+                      same names) — readiness is asserted by the monitor sweep \
+                      seeing an `observed beat` write advance",
+            }),
+        ]
+        .into_iter()
+        .flatten(),
+    );
     // The node's view of its own graph: what a data-driven dependency resolves
     // its producer through. Const, and a cycle only in the address sense — the
     // graph names the nodes, each node names the graph.
@@ -1090,10 +1184,16 @@ fn emit_node(
     let (bound_def, with_bound) = marker(|d| d.bound.is_some(), "BOUND", "with_bound_deps");
     let mut foreign: Vec<AdoptedFn> = Vec::new();
     foreign.extend(
-        discover_fn_path(n.discover.as_ref(), n.source.as_ref())?.map(|path| AdoptedFn {
-            cfg: Vec::new(),
-            path,
-        }),
+        discover_fn_path(n.discover.as_ref().map(|g| &g.kw), n.source.as_ref())?
+            .filter(|_| cfg!(feature = "dataflow"))
+            .map(|path| AdoptedFn {
+                cfg: n
+                    .discover
+                    .as_ref()
+                    .map(|g| g.cfg.clone())
+                    .unwrap_or_default(),
+                path,
+            }),
     );
     foreign.extend(n.dataflow.iter().cloned());
     let (reads_def, with_reads) = coupling_binding_tokens(
@@ -1105,7 +1205,7 @@ fn emit_node(
         &foreign,
     );
     let marker_asserts = {
-        let d = n.discover.is_some();
+        let d = n.discover.as_ref().map(|g| g.cfg.as_slice());
         let r = marker_assert_tokens(&ctx, &name_string(ident), d, &foreign, &n.reads, "READS");
         let w = marker_assert_tokens(&ctx, &name_string(ident), d, &foreign, &n.writes, "WRITES");
         quote!( #r #w )
@@ -1144,7 +1244,25 @@ fn emit_node(
     );
     let cfg_ident = format_ident!("__SV_CFG_{}", ident);
     let (prov_def, with_provides) = provides_tokens(n, cr, resource_cfgs)?;
+    let cfg_chain = quote! {
+        #cr::NodeCfg::new(#name, #cr::Mode::#mode, #spawn)
+            #with_exec #with_res #with_provides #with_clauses #with_ready
+            #with_bound #with_reads #with_writes
+            #with_graph
+    };
+    let cfg_init = if clause_stmts.is_empty() {
+        cfg_chain
+    } else {
+        quote! {{
+            let __sv_cfg = #cfg_chain;
+            #clause_stmts
+            __sv_cfg
+        }}
+    };
+    let discover_errors = discover_error_tokens(cfg, n.discover.as_ref());
     let def = quote! {
+        #clause_errors
+        #discover_errors
         #res_defs
         #prov_def
         #exit_def
@@ -1156,11 +1274,7 @@ fn emit_node(
         #shell_def
         #(#cfg)*
         #[doc(hidden)]
-        static #cfg_ident: #cr::NodeCfg =
-            #cr::NodeCfg::new(#name, #cr::Mode::#mode, #spawn)
-                #with_exec #with_res #with_provides #with_timeout #with_ack #with_beat #with_ready
-                #with_bound #with_reads #with_writes
-                #with_ready_on_write #with_graph;
+        static #cfg_ident: #cr::NodeCfg = #cfg_init;
         #(#cfg)*
         #[doc = #node_doc]
         pub static #ident: #cr::TaskNode = #cr::TaskNode::new(&#cfg_ident, #disabled);
@@ -1384,10 +1498,16 @@ fn emit_pool(
     let (bound_def, member_with_bound) = marker(|d| d.bound.is_some(), "BOUND", "with_bound_deps");
     let mut foreign: Vec<AdoptedFn> = Vec::new();
     foreign.extend(
-        discover_fn_path(p.discover.as_ref(), Some(&p.source))?.map(|path| AdoptedFn {
-            cfg: Vec::new(),
-            path,
-        }),
+        discover_fn_path(p.discover.as_ref().map(|g| &g.kw), Some(&p.source))?
+            .filter(|_| cfg!(feature = "dataflow"))
+            .map(|path| AdoptedFn {
+                cfg: p
+                    .discover
+                    .as_ref()
+                    .map(|g| g.cfg.clone())
+                    .unwrap_or_default(),
+                path,
+            }),
     );
     foreign.extend(p.dataflow.iter().cloned());
     let (reads_def, member_with_reads) = coupling_binding_tokens(
@@ -1409,7 +1529,7 @@ fn emit_pool(
     // Empty token streams for absent clauses, so pushing unconditionally is a
     // no-op rather than a special case.
     {
-        let d = p.discover.is_some();
+        let d = p.discover.as_ref().map(|g| g.cfg.as_slice());
         let owner = name_string(&p.ident);
         defs.push(marker_assert_tokens(
             &ctx, &owner, d, &foreign, &p.reads, "READS",
@@ -1420,15 +1540,33 @@ fn emit_pool(
     }
     defs.extend([ready_def, bound_def, reads_def, writes_def]);
 
-    // `slot_timeout: N` — every member's pre-spawn slot/gate wait bound.
-    let member_with_timeout = match &p.slot_timeout {
-        Some(ms) => quote!( .with_slot_timeout(#cr::_export::Duration::from_millis(#ms)) ),
-        None => quote!(),
-    };
-    let member_with_ack = match &p.ack_timeout {
-        Some(ms) => quote!( .with_ack_timeout(#cr::_export::Duration::from_millis(#ms)) ),
-        None => quote!(),
-    };
+    let (member_with_clauses, member_clause_stmts, member_clause_errors) = builder_clause_tokens(
+        cfg,
+        [
+            p.slot_timeout.as_ref().map(|g| {
+                let (c, ms) = (&g.cfg, &g.value);
+                GatedBuilder {
+                    cfg: c.clone(),
+                    tokens: quote!( .with_slot_timeout(#cr::_export::Duration::from_millis(#ms)) ),
+                    available: true,
+                    err: "",
+                }
+            }),
+            p.ack_timeout.as_ref().map(|g| {
+                let (c, ms) = (&g.cfg, &g.value);
+                GatedBuilder {
+                    cfg: c.clone(),
+                    tokens: quote!( .with_ack_timeout(#cr::_export::Duration::from_millis(#ms)) ),
+                    available: true,
+                    err: "",
+                }
+            }),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    defs.push(member_clause_errors);
+    defs.push(discover_error_tokens(cfg, p.discover.as_ref()));
     let member_graph_ref = &helpers.graph_ref;
     let member_with_graph =
         cfg!(feature = "data-deps").then(|| quote!( .with_graph(&#member_graph_ref) ));
@@ -1441,14 +1579,23 @@ fn emit_pool(
         .map(|(j, (mode, sp))| {
             let nm = format!("{lname}{j}");
             let with_res = &member_with_res[j];
-            quote! {
+            let chain = quote! {
                 #cr::NodeCfg::new(
                     #nm, #cr::Mode::#mode,
                     ::core::option::Option::Some((#sp) as #spawn_fn),
-                ) #member_with_exec #with_res #member_with_timeout #member_with_ack
+                ) #member_with_exec #with_res #member_with_clauses
                   #member_with_ready
                   #member_with_bound
                   #member_with_reads #member_with_writes #member_with_graph
+            };
+            if member_clause_stmts.is_empty() {
+                chain
+            } else {
+                quote! {{
+                    let __sv_cfg = #chain;
+                    #member_clause_stmts
+                    __sv_cfg
+                }}
             }
         });
     let members =
@@ -2414,6 +2561,7 @@ fn dataflow_expand(args: TokenStream2, item: TokenStream2) -> SynResult<TokenStr
         &mut |call| {
             if !cfg!(feature = "liveness")
                 && matches!(call.verb.as_str(), "beat_put" | "beat_writer")
+                && call.cfgs.is_empty()
             {
                 return Err(syn::Error::new_spanned(
                     &call.target,
@@ -2607,6 +2755,76 @@ mod tests {
     }
 
     #[test]
+    fn cfg_gated_clauses_defer_to_rustc() {
+        for (src, feature_on, builder) in [
+            (
+                "node A = Terminate, deps: [], \
+                 #[cfg(feature = \"x\")] beat_timeout: 100, \
+                 #[cfg(feature = \"x\")] beat_window: 3;",
+                cfg!(feature = "liveness-monitor"),
+                "with_beat_timeout",
+            ),
+            (
+                "node A = Terminate, deps: [], task: w, \
+                 writes: [crate::S observed beat via it.get()], \
+                 #[cfg(feature = \"x\")] beat_timeout: 100, \
+                 #[cfg(feature = \"x\")] ready_on_write;",
+                cfg!(all(
+                    feature = "liveness-monitor",
+                    feature = "coupling-observe",
+                    feature = "readiness"
+                )),
+                "with_ready_on_write",
+            ),
+            (
+                "node A = Terminate, deps: [], task: w, #[cfg(feature = \"x\")] discover;",
+                cfg!(feature = "dataflow"),
+                "__SV_DATAFLOW_",
+            ),
+        ] {
+            let spec = parse_gated(src).expect("a gated clause passes the gate");
+            let out = expand(spec).expect("expansion succeeds").to_string();
+            if feature_on {
+                assert!(out.contains(builder), "{src}\n{out}");
+                assert!(!out.contains("compile_error"), "{src}\n{out}");
+            } else {
+                assert!(out.contains("compile_error"), "{src}\n{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn cfg_gated_featureless_clauses_emit_both_ways() {
+        let spec = parse_gated(
+            "node A = Terminate, deps: [], \
+             #[cfg(feature = \"x\")] slot_timeout: 100, \
+             #[cfg(feature = \"x\")] ack_timeout: 200, \
+             #[cfg(feature = \"x\")] disabled;\n\
+             node B = Terminate, deps: [], slot_timeout: 300;",
+        )
+        .expect("gated featureless clauses pass the gate");
+        let out = expand(spec).expect("expansion succeeds").to_string();
+        assert!(out.contains("with_slot_timeout"), "{out}");
+        assert!(out.contains("with_ack_timeout"), "{out}");
+        // The gated `disabled` becomes a cfg-block bool, not a bare literal.
+        assert!(out.contains("# [cfg (feature = \"x\")] { true }"), "{out}");
+        assert!(!out.contains("compile_error"), "{out}");
+
+        // Pool timeouts ride the same emitter.
+        if cfg!(feature = "pool") {
+            let spec = parse_gated(
+                "pool P = [Terminate], deps: [], task: w, \
+                 policy: embassy_supervisor::DeferredShrink::new(d()), \
+                 min: 1, max: 1, #[cfg(feature = \"x\")] slot_timeout: 100;",
+            )
+            .expect("gated pool timeout passes the gate");
+            let out = expand(spec).expect("expansion succeeds").to_string();
+            assert!(out.contains("with_slot_timeout"), "{out}");
+            assert!(!out.contains("compile_error"), "{out}");
+        }
+    }
+
+    #[test]
     fn beat_verb_requires_feature() {
         let expand = |verb: &str| {
             dataflow_expand(
@@ -2642,6 +2860,14 @@ mod tests {
         }
         if cfg!(feature = "dataflow") {
             assert!(expand("put").is_ok(), "`put` needs no liveness");
+            let gated = dataflow_expand(
+                quote!(),
+                "fn f(node: &'static TaskNode) { \
+                 #[cfg(feature = \"x\")] node.beat_put(&crate::OUT, 1); }"
+                    .parse()
+                    .unwrap(),
+            );
+            assert!(gated.is_ok(), "a cfg-gated beat verb defers to rustc");
         }
     }
 

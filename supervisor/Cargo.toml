@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.5.1"
+version = "0.6.0"
 description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
@@ -22,18 +22,18 @@ embassy-executor = { version = "0.10" }     # Spawner / SpawnError types only
 embassy-sync = { version = "0.8" }
 embassy-time = { version = "0.5" }
 embassy-futures = { version = "0.1" }
-portable-atomic = { version = "1", features = ["critical-section"] }
+portable-atomic = { version = "1.15.0", features = ["critical-section"] }
 # The observation facade (see the `coupling-observe` feature). Version range,
 # not `=`: it is a stable contract signal libraries also depend on.
 embassy-supervisor-observe = { version = "0.1", path = "../supervisor-observe", optional = true }
-pin-project-lite = "0.2"
+pin-project-lite = "0.2.17"
 defmt = { version = "1.1.0", optional = true }
 # `default-features = false` keeps it no_std; only its macros are used.
-log = { version = "0.4", optional = true, default-features = false }
+log = { version = "0.4.33", optional = true, default-features = false }
 # `state: zeroed Type` (heap-state): `Zeroable` is the all-zero-is-valid contract.
-bytemuck = { version = "1", optional = true, default-features = false }
+bytemuck = { version = "1.25.0", optional = true, default-features = false }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.7.0", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.8.0", path = "../supervisor-macros", optional = true }
 
 [features]
 # Just the graph macro: everything the supervisor can DO is opt-in, matching the
@@ -47,11 +47,18 @@ control = []
 # the proc-macro (weak `?`, so only when the optional `macros` dep is enabled) so
 # `supervisor_graph!` emits the `GRAPH.pools` field iff this feature is on.
 pool = ["embassy-supervisor-macros?/pool"]
-# Logging backends. Only one can be live, so `defmt` TAKES PRECEDENCE when both
-# are on (`--all-features` does that, and it is what docs.rs builds).
+# Logging backends. Only one is live per BUILD, chosen by feature and target:
+# `defmt` is embedded-only (`target_os = "none"` — a binary carrying defmt
+# statements needs a `#[global_logger]` to link, which only firmware has), and
+# takes precedence over `log` there. On a hosted target the same feature set
+# routes through `log` instead, so one feature list serves a SITL setup's both
+# halves — and `--all-features` (docs.rs, host test runs) links with no defmt
+# sink.
 defmt = ["dep:defmt"]
-# For hosted and std consumers. With NEITHER backend the crate logs nothing at
-# all — no stale-node reports, no bring-up lines.
+# The `log`-facade backend, for hosted and std consumers — the live backend on
+# any target with an OS. `init_host_logging` (hosted targets only) installs a
+# dependency-free stderr sink in one call. With NEITHER backend the crate logs
+# nothing at all — no stale-node reports, no bring-up lines.
 log = ["dep:log"]
 # Re-export the `supervisor_graph!` proc-macro.
 macros = ["dep:embassy-supervisor-macros"]
@@ -542,6 +549,12 @@ required-features = ["macros", "bound-deps"]
 name = "log_backend"
 required-features = ["macros", "coupling", "log", "node-status"]
 
+# `init_host_logging`: the hosted-target stderr sink installs once, is live
+# for a node's status report, and a second install is refused untouched.
+[[test]]
+name = "host_logging"
+required-features = ["macros", "log", "node-status"]
+
 # `liveness-monitor`: the supervisor-side sweep. Only `beat_timeout:` nodes are
 # policed, a stall reports once (not per sweep), `beat_window:` requires
 # consecutive misses, recovery is reported, and nothing is ever stopped.
@@ -628,6 +641,13 @@ required-features = ["macros", "data-deps", "restart"]
 # the gate before the provider is spawned and times out.
 [[test]]
 name = "bringup_concurrent"
+required-features = ["macros"]
+
+# `#[cfg(...)]`-gated value-level clauses through a real bring-up: an
+# `all()`-gated `disabled`/`slot_timeout:` is active via the gated emission
+# path, an `any()`-gated one is stripped and leaves the default.
+[[test]]
+name = "cfg_clauses"
 required-features = ["macros"]
 
 # `Leased`: the teardown side of a data dependency. The producer counts its

@@ -7,6 +7,39 @@ This crate is pinned by exact version from `embassy-supervisor-macros`: its AST 
 internal contract between the two, not a stable public API, and it changes whenever the
 graph syntax does. Publish it before the macro crate that depends on it.
 
+## [0.2.0] - 2026-08-27
+
+The AST changes shape; `embassy-supervisor-macros = "=0.8.0"` is the matching
+consumer.
+
+### Added
+
+- `Gated<K, V>`: a clause keyword and value together with the `#[cfg(...)]`
+  attributes gating it. Every value-level clause takes a gate — `slot_timeout:`,
+  `ack_timeout:`, `beat_timeout:`, `beat_window:`, `ready_on_write`, `disabled`
+  and `discover` — as does a single `provides:` entry (`ProvideDecl`, mirroring
+  the other per-entry lists). A gate on anything structural is a spanned error
+  naming the alternatives; the pool variant names the pool's own gateable set
+  (`slot_timeout:`, `ack_timeout:`, `discover`) and per-entry lists.
+- Predicate pairing: a gated `beat_timeout:` requires the token-identical
+  predicate on any `beat_window:` or `ready_on_write` riding on it — an active
+  claim must not outlive the budget its gate compiles out.
+
+### Changed
+
+- **Breaking**: `CommonClauses::slot_timeout`/`ack_timeout`/`discover` and
+  `NodeItem::beat_timeout`/`beat_window`/`ready_on_write`/`disabled` are
+  `Option<Gated<..>>`; `NodeItem::provides` is `Vec<ProvideDecl>`.
+- syn 3.
+
+### Fixed
+
+- Duplicate `beat_timeout:`, `beat_window:`, `disabled` and `ready_on_write`
+  clauses are errors like their siblings instead of last-wins — two
+  differently gated copies would have silently dropped the first predicate.
+- A malformed gate (`#[cfg]`, `#[cfg = "..."]`) is a spanned parse error
+  instead of a downstream proc-macro panic or a silently dropped attribute.
+
 ## [0.1.0] - 2026-08-25
 
 Initial release: the `supervisor_graph!` grammar, extracted from
