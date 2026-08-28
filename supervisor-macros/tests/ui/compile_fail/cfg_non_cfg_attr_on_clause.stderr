@@ -1,0 +1,5 @@
+error: only `#[cfg(...)]` attributes may gate a clause
+ --> tests/ui/compile_fail/cfg_non_cfg_attr_on_clause.rs:8:49
+  |
+8 |     node N = Terminate, deps: [], task: worker, #[allow(dead_code)] slot_timeout: 100;
+  |                                                 ^^^^^^^^^^^^^^^^^^^

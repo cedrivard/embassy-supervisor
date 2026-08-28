@@ -4,7 +4,7 @@ name = "embassy-supervisor-macros"
 # version (`=x.y.z`): the generated code references doc(hidden) supervisor internals,
 # so only the tested pair is guaranteed compatible. Bump only when the macro changes;
 # the supervisor updates its pin to match.
-version = "0.7.0"
+version = "0.8.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -107,10 +107,10 @@ trace-hooks = ["trace"]
 [dependencies]
 # The graph grammar, shared with the diagram tool. Pinned by EXACT version: the
 # AST is an internal contract between the two crates and changes with the syntax.
-embassy-supervisor-syntax = { version = "=0.1.0", path = "../supervisor-syntax" }
-syn = { version = "2.0.118", features = ["full"] }
-quote = "1"
-proc-macro2 = "1"
+embassy-supervisor-syntax = { version = "=0.2.0", path = "../supervisor-syntax" }
+syn = { version = "3.0.4", features = ["full"] }
+quote = "1.0.46"
+proc-macro2 = "1.0.106"
 
 # `trybuild` UI tests: compile-fail cases lock the macro's error contracts (cycle,
 # unknown dep, etc.); compile-pass cases exercise the codegen end-to-end. The graph
@@ -142,6 +142,12 @@ embassy-supervisor = { path = "../supervisor", features = [
     # in the scratch project, so its rejection is unit-tested here instead (see
     # `beat_verb_requires_feature`) — the same arrangement as `readiness`.
     "liveness",
+    "liveness-monitor",
+    "bound-deps",
+    "graph-ref",
+    "trace",
+    "trace-hooks",
+    "metadata-names",
 ] }
 # `platform-std` + `executor-thread` give embassy-executor a host Pender/executor so a
 # compile-pass case that uses real `#[embassy_executor::task]`s can link on the host.

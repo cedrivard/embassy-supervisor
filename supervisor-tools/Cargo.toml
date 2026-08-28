@@ -1,12 +1,16 @@
 [package]
 name = "embassy-supervisor-tools"
-version = "0.1.0"
+version = "0.2.0"
 description = "Host tools reading supervisor_graph!, supervisor_fragment! and compose_graph! declarations: Mermaid diagrams, and dataflow lints"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/embassy-supervisor-tools"
+keywords = ["embassy", "supervisor", "mermaid", "diagram", "lint"]
+categories = ["embedded", "development-tools", "visualization"]
 
 # Two tools over one model: `supervisor-mermaid` draws it, `supervisor-lint`
 # reports what it says about the dataflow. Named explicitly (the file stems
@@ -26,14 +30,14 @@ path = "src/bin/lint.rs"
 # The graph grammar, shared with the proc-macro so the diagram cannot drift from
 # what the macro accepts. No features: the syntax crate always parses in full,
 # and which constructs a build permits is the macro's policy, not a diagram's.
-embassy-supervisor-syntax = { version = "=0.1.0", path = "../supervisor-syntax" }
+embassy-supervisor-syntax = { version = "=0.2.0", path = "../supervisor-syntax" }
 # `span-locations` is what puts a file:line on each declaration.
-proc-macro2 = { version = "1", features = ["span-locations"] }
-quote = "1"
-syn = { version = "2.0.118", features = ["full"] }
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
+quote = "1.0.46"
+syn = { version = "3.0.4", features = ["full"] }
 # `--live-url`: the mermaid.live link is the diagram JSON, zlib-deflated and
 # base64url'd (the editor's own "pako" share scheme).
-flate2 = "1"
+flate2 = "1.1.9"
 # Parsing `cargo metadata` (the `--deps` source discovery) and emitting the
 # `--json` model dump.
-serde_json = "1"
+serde_json = "1.0.150"

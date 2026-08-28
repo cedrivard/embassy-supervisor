@@ -4,6 +4,47 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-27
+
+Macro pin moves to `embassy-supervisor-macros = "=0.8.0"`.
+
+A graph that forwards this crate's optional features from its own cargo features
+can now say so in the declaration: every value-level clause takes a `#[cfg(...)]`
+gate, so one graph source compiles with and without the feature. The other theme
+is hosted builds: the `defmt` backend is embedded-only now, which makes every
+feature combination — `--all-features` included — testable on the host, and a
+one-call stderr sink covers the simulator-logging gap that opens.
+
+### Added
+
+- `#[cfg(...)]` on every value-level graph clause — `slot_timeout:`,
+  `ack_timeout:`, `beat_timeout:`, `beat_window:`, `ready_on_write`, `disabled`,
+  `discover` — and on a single `provides:` entry, joining the existing per-entry
+  gates in `deps:`/`resources:`/`reads:`/`writes:`/`dataflow:`. A gated clause
+  drops out of the builds where its predicate is off; a gated clause whose
+  feature is missing errors only in the builds where it exists. Structural
+  clauses reject the gate with an error naming the alternatives, and a gated
+  `beat_timeout:` pulls `beat_window:`/`ready_on_write` under the identical
+  predicate. Duplicate value-level clauses are parse errors now (last-wins
+  would silently drop a gated duplicate's other predicate), and a malformed
+  `#[cfg]` is a spanned error rather than a macro panic.
+- `init_host_logging(LevelFilter)` (feature `log`, hosted targets): a
+  dependency-free stderr sink for simulators and tests, `[uptime] LEVEL
+  target: message`, formatted to read like defmt's `timestamp-uptime` output.
+  Not on `wasm32-unknown-unknown`, which has no reachable stderr and no
+  monotonic clock — install `console_log` there and the records arrive through
+  the `log` facade the same way.
+
+### Changed
+
+- The `defmt` backend is embedded-only: the `fmt.rs` arms are gated
+  `all(feature = "defmt", target_os = "none")`, and a hosted build with both
+  backends enabled routes through `log` instead of failing to link against
+  `_defmt_*` symbols. Firmware is unaffected; `cargo test --all-features`
+  passes on the host for every crate in the workspace.
+- Dependency floors raised to the lock-proven versions (`portable-atomic
+  1.15.0` and friends) so the requirements say what is actually tested.
+
 ## [0.5.1] - 2026-08-26
 
 No API change; the macro pin stays `embassy-supervisor-macros = "=0.7.0"`.

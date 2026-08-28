@@ -488,12 +488,16 @@ pub fn render(decl: &Decl, opts: &Options) -> String {
             };
             let node = ids.get("n", &name);
             for slot in &n.provides {
-                let slot = slot.to_string();
-                if !slots.contains(&slot) {
+                let name = slot.ident.to_string();
+                if !slots.contains(&name) {
                     continue;
                 }
-                let slot = ids.get("r", &slot);
-                let _ = writeln!(out, "  {node} -- \"provides\" --> {slot}");
+                let id = ids.get("r", &name);
+                let label = match cfg_note(&slot.cfg, opts.show_cfg) {
+                    Some(c) => format!("provides · {c}"),
+                    None => "provides".to_string(),
+                };
+                let _ = writeln!(out, "  {node} -- \"{}\" --> {id}", esc(&label));
             }
         }
         if !slots.is_empty() {
@@ -513,7 +517,9 @@ pub fn render(decl: &Decl, opts: &Options) -> String {
         };
         let id = ids.get("n", &name);
         match item {
-            Item::Node(n) if n.disabled => classed.entry("disabled").or_default().push(id),
+            Item::Node(n) if n.disabled.is_some() => {
+                classed.entry("disabled").or_default().push(id)
+            }
             Item::Node(n) if n.source.is_none() => classed.entry("parked").or_default().push(id),
             _ => {}
         }
@@ -944,11 +950,17 @@ fn node_label(n: &NodeItem, show_cfg: bool) -> String {
     if let Some(e) = &n.executor {
         facts.push(format!("@{e}"));
     }
-    if let Some((_, ms)) = &n.beat_timeout {
-        facts.push(format!("beat {ms}"));
+    if let Some(bt) = &n.beat_timeout {
+        let ms = &bt.value;
+        facts.push(gated_fact(format!("beat {ms}"), &bt.cfg, show_cfg));
     }
-    if n.ready_on_write.is_some() {
-        facts.push("ready_on_write".to_string());
+    if let Some(r) = &n.ready_on_write {
+        facts.push(gated_fact("ready_on_write".to_string(), &r.cfg, show_cfg));
+    }
+    if let Some(d) = &n.disabled
+        && let Some(c) = cfg_note(&d.cfg, show_cfg)
+    {
+        facts.push(format!("disabled {c}"));
     }
     if n.cancel {
         facts.push("cancel".to_string());
@@ -975,6 +987,14 @@ fn pool_label(p: &PoolItem, show_cfg: bool) -> String {
         facts.push(c);
     }
     format!("{}<br/>{}", p.ident, facts.join(" · "))
+}
+
+/// A label fact with its clause gate appended — `beat 100 <small>cfg(..)</small>`.
+fn gated_fact(fact: String, cfg: &[syn::Attribute], show_cfg: bool) -> String {
+    match cfg_note(cfg, show_cfg) {
+        Some(c) => format!("{fact} {c}"),
+        None => fact,
+    }
 }
 
 fn cfg_note(attrs: &[syn::Attribute], show: bool) -> Option<String> {

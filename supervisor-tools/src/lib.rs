@@ -608,6 +608,7 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
             "local": r.local.is_some(),
             "consume": r.consume.is_some(),
             "shared": r.shared.is_some(),
+            "cfg": cfg_texts(&r.cfg),
         })
     };
     let dataflow_json = |fns: &[embassy_supervisor_syntax::AdoptedFn]| {
@@ -638,12 +639,17 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                         "deps": n.deps.iter().map(dep_json).collect::<Vec<_>>(),
                         "executor": n.executor.as_ref().map(|e| e.to_string()),
                         "resources": n.resources.iter().map(res_json).collect::<Vec<_>>(),
-                        "provides": n.provides.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                        "provides": n.provides.iter().map(|p| serde_json::json!({
+                            "name": p.ident.to_string(),
+                            "cfg": cfg_texts(&p.cfg),
+                        })).collect::<Vec<_>>(),
                         "discover": n.discover.is_some(),
+                        "discover_cfg": n.discover.as_ref().map(|g| cfg_texts(&g.cfg)).unwrap_or_default(),
                         "dataflow": dataflow_json(&n.dataflow),
                         "reads": n.reads.iter().map(sig_json).collect::<Vec<_>>(),
                         "writes": n.writes.iter().map(sig_json).collect::<Vec<_>>(),
-                        "disabled": n.disabled,
+                        "disabled": n.disabled.is_some(),
+                        "disabled_cfg": n.disabled.as_ref().map(|g| cfg_texts(&g.cfg)).unwrap_or_default(),
                         "parked": n.source.is_none(),
                     }),
                     Item::Pool(p) => serde_json::json!({
@@ -655,6 +661,7 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                         "executor": p.executor.as_ref().map(|e| e.to_string()),
                         "resources": p.resources.iter().map(res_json).collect::<Vec<_>>(),
                         "discover": p.discover.is_some(),
+                        "discover_cfg": p.discover.as_ref().map(|g| cfg_texts(&g.cfg)).unwrap_or_default(),
                         "dataflow": dataflow_json(&p.dataflow),
                         "reads": p.reads.iter().map(sig_json).collect::<Vec<_>>(),
                         "writes": p.writes.iter().map(sig_json).collect::<Vec<_>>(),
@@ -735,7 +742,7 @@ mod tests {
         assert_eq!(hb.mode, "Pause");
         assert!(matches!(hb.source, Some(TaskSource::Shell(_))));
         assert_eq!(hb.executor.as_ref().unwrap(), "HIGH");
-        assert_eq!(hb.beat_timeout.as_ref().unwrap().1.to_string(), "15000");
+        assert_eq!(hb.beat_timeout.as_ref().unwrap().value.to_string(), "15000");
         assert!(hb.writes[0].observed.is_some() && hb.writes[0].beat.is_some());
         // `observed via <expr>` parses as a real expression, not a token blob.
         assert!(hb.reads[0].observed.is_some() && hb.reads[0].via.is_some());
@@ -2112,6 +2119,36 @@ mod tests {
     }
 
     #[test]
+    fn gated_clause_facts_and_provides_edges_carry_the_predicate() {
+        let src = r#"
+            embassy_supervisor::supervisor_graph! {
+                node A = Terminate, task: f,
+                    writes: [crate::S observed beat via it.get()],
+                    #[cfg(feature = "x")] beat_timeout: 100,
+                    #[cfg(feature = "x")] ready_on_write,
+                    provides: [#[cfg(feature = "x")] R];
+                node B = Terminate, deps: [A], task: g, resources: [R: u32],
+                    #[cfg(feature = "x")] disabled;
+            }
+        "#;
+        let d = parse_source(src, "t.rs").unwrap();
+        let out = render(&d[0], &Options::default());
+        let note = "<small>cfg(feature = #quot;x#quot;)</small>";
+        assert!(out.contains(&format!("beat 100 {note}")), "{out}");
+        assert!(out.contains(&format!("ready_on_write {note}")), "{out}");
+        assert!(out.contains(&format!("disabled {note}")), "{out}");
+        assert!(out.contains(&format!("provides · {note}")), "{out}");
+        let hidden = render(
+            &d[0],
+            &Options {
+                show_cfg: false,
+                ..Default::default()
+            },
+        );
+        assert!(!hidden.contains("cfg("), "{hidden}");
+    }
+
+    #[test]
     fn cfg_predicates_can_be_hidden() {
         let src = r#"
             embassy_supervisor::supervisor_graph! {
@@ -2330,7 +2367,9 @@ mod tests {
     fn the_model_dump_holds_the_graph_and_the_scan() {
         let src = r#"
             embassy_supervisor::supervisor_graph! {
-                node A = Terminate, task: worker, discover, provides: [OUT];
+                node A = Terminate, task: worker, discover,
+                    provides: [#[cfg(feature = "x")] OUT],
+                    #[cfg(feature = "x")] disabled;
             }
             #[embassy_supervisor::dataflow]
             async fn worker(node: &'static TaskNode) {
@@ -2343,7 +2382,12 @@ mod tests {
         let m = model_json(&decls, &discovered);
         let item = &m["graphs"][0]["items"][0];
         assert_eq!(item["name"], "A");
-        assert_eq!(item["provides"][0], "OUT");
+        assert_eq!(item["provides"][0]["name"], "OUT");
+        assert_eq!(item["provides"][0]["cfg"][0], "feature=\"x\"");
+        assert_eq!(item["disabled"], true);
+        assert_eq!(item["disabled_cfg"][0], "feature=\"x\"");
+        assert_eq!(item["discover"], true);
+        assert_eq!(item["discover_cfg"], serde_json::json!([]));
         assert_eq!(m["discovered"][0]["fn"], "worker");
         assert_eq!(m["discovered"][0]["path"], "IN");
     }

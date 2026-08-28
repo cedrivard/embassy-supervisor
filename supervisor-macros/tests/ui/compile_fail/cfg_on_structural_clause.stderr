@@ -1,0 +1,5 @@
+error: `#[cfg(...)]` may only gate `slot_timeout:`, `ack_timeout:`, `beat_timeout:`, `beat_window:`, `ready_on_write`, `disabled`, or `discover` — gate the whole node, or a single entry inside `deps:`/`resources:`/`reads:`/`writes:`/`dataflow:`/`provides:`, for anything structural
+ --> tests/ui/compile_fail/cfg_on_structural_clause.rs:9:57
+  |
+9 |     node N = Terminate, deps: [], #[cfg(feature = "x")] task: worker;
+  |                                                         ^^^^

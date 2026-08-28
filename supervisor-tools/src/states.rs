@@ -52,8 +52,8 @@ fn node_gates(n: &NodeItem) -> Gates {
         .filter(|d| d.ready.is_some() || d.bound.is_some())
         .map(|d| d.ident.to_string())
         .collect();
-    g.clears = n.provides.iter().map(|i| i.to_string()).collect();
-    g.within = n.slot_timeout.as_ref().map(|t| t.to_string());
+    g.clears = n.provides.iter().map(|i| i.ident.to_string()).collect();
+    g.within = n.slot_timeout.as_ref().map(|t| t.value.to_string());
     for (is_write, sig) in [(false, &n.reads), (true, &n.writes)] {
         for decl in sig.iter() {
             let d = decl.display();
@@ -92,7 +92,7 @@ fn pool_gates(p: &PoolItem) -> Gates {
             .filter(|d| d.ready.is_some() || d.bound.is_some())
             .map(|d| d.ident.to_string())
             .collect(),
-        within: p.slot_timeout.as_ref().map(|t| t.to_string()),
+        within: p.slot_timeout.as_ref().map(|t| t.value.to_string()),
         ..Gates::default()
     };
     for (is_write, sig) in [(false, &p.reads), (true, &p.writes)] {
@@ -226,12 +226,12 @@ fn node_shape(n: &NodeItem, items: &[Item]) -> Shape {
         mode: n.mode.to_string(),
         pool: false,
         parked: n.source.is_none(),
-        disabled: n.disabled,
+        disabled: n.disabled.is_some(),
         cancel: n.cancel,
         asserts_ready: gated_by_readiness(&n.ident.to_string(), items),
         ready_on_write: n.ready_on_write.is_some(),
         bound: n.deps.iter().any(|d| d.bound.is_some()),
-        beat: n.beat_timeout.as_ref().map(|(_, ms)| ms.to_string()),
+        beat: n.beat_timeout.as_ref().map(|bt| bt.value.to_string()),
     }
 }
 
