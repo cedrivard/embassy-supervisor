@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor-tools"
-version = "0.2.0"
+version = "0.3.0"
 description = "Host tools reading supervisor_graph!, supervisor_fragment! and compose_graph! declarations: Mermaid diagrams, and dataflow lints"
 edition.workspace = true
 authors.workspace = true

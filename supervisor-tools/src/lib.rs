@@ -15,6 +15,7 @@ pub mod find;
 pub mod inputs;
 /// Dataflow linting: orphan reads and dead writes.
 pub mod lint;
+pub mod model;
 /// Output helpers: mermaid.live links, HTML pages, and markdown updates.
 pub mod out;
 /// Rendering task graphs as Mermaid diagrams.
@@ -30,6 +31,7 @@ use std::str::FromStr;
 pub use embassy_supervisor_syntax::{Access, scan_dataflow};
 pub use find::{Decl, DeclKind, Error, parse_source};
 pub use lint::{LintCats, dataflow_lints};
+pub use model::{FullModel, TaskKind, full_model};
 pub use render::{Options, legend_diagram};
 
 /// A dataflow access discovered in a scanned source file.
@@ -568,115 +570,137 @@ pub fn coverage_warnings(
 /// Build a JSON representation of the declarations and discovered accesses.
 ///
 /// This is the machine-readable model consumed by the HTML renderer and other
-/// tooling.
+/// tooling. It is a projection of [`full_model`]: every clause the typed model
+/// carries appears here, so the two cannot drift.
 pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Value {
-    use embassy_supervisor_syntax::{Dep, SignalDecl};
-    let cfg_texts = |attrs: &[syn::Attribute]| -> Vec<String> {
-        attrs
-            .iter()
-            .filter_map(|a| match &a.meta {
-                syn::Meta::List(l) if l.path.is_ident("cfg") => {
-                    Some(l.tokens.to_string().replace(' ', ""))
-                }
-                _ => None,
-            })
-            .collect()
+    use model::{ItemModel, TaskKind};
+    let lit_json = |l: &Option<model::LitValue>| match l {
+        Some(v) => match v.as_u64() {
+            Some(n) => serde_json::json!(n),
+            None => serde_json::json!(v.text),
+        },
+        None => serde_json::Value::Null,
     };
-    let dep_json = |d: &Dep| {
+    let lit_cfg = |l: &Option<model::LitValue>| -> Vec<String> {
+        l.as_ref().map(|v| v.cfg.clone()).unwrap_or_default()
+    };
+    let dep_json = |d: &model::DepModel| {
         serde_json::json!({
-            "name": d.ident.to_string(),
-            "ready": d.ready.is_some(),
-            "bound": d.bound.is_some(),
-            "cfg": cfg_texts(&d.cfg),
+            "name": d.name,
+            "ready": d.ready,
+            "bound": d.bound,
+            "cfg": d.cfg,
         })
     };
-    let sig_json = |s: &SignalDecl| {
+    let sig_json = |s: &model::SignalModel| {
         serde_json::json!({
-            "path": s.display(),
-            "observed": s.observed.is_some(),
-            "beat": s.beat.is_some(),
-            "via": s.via.as_ref().map(|e| {
-                use quote::ToTokens;
-                e.to_token_stream().to_string()
-            }),
-            "cfg": cfg_texts(&s.cfg),
+            "path": s.path,
+            "observed": s.observed,
+            "beat": s.beat,
+            "via": s.via,
+            "cfg": s.cfg,
         })
     };
-    let res_json = |r: &embassy_supervisor_syntax::ResourceDecl| {
+    let res_json = |r: &model::ResourceModel| {
         serde_json::json!({
-            "name": r.ident.to_string(),
-            "local": r.local.is_some(),
-            "consume": r.consume.is_some(),
-            "shared": r.shared.is_some(),
-            "cfg": cfg_texts(&r.cfg),
+            "name": r.name,
+            "local": r.local,
+            "consume": r.consume,
+            "shared": r.shared,
+            "cfg": r.cfg,
         })
     };
-    let dataflow_json = |fns: &[embassy_supervisor_syntax::AdoptedFn]| {
-        fns.iter()
-            .map(|f| {
-                f.path
-                    .segments
-                    .iter()
-                    .map(|s| s.ident.to_string())
-                    .collect::<Vec<_>>()
-                    .join("::")
-            })
-            .collect::<Vec<_>>()
+    let task_json = |t: &model::TaskModel| {
+        serde_json::json!({
+            "kind": match t.kind { TaskKind::Spawn => "spawn", TaskKind::Shell => "task" },
+            "path": t.path,
+        })
     };
-    let graphs: Vec<serde_json::Value> = decls
+    let state_json = |st: &Option<model::StateModel>| match st {
+        Some(v) => serde_json::json!({ "ty": v.ty.text, "init": v.init }),
+        None => serde_json::Value::Null,
+    };
+    let full = full_model(decls);
+    let graphs: Vec<serde_json::Value> = full
+        .graphs
         .iter()
-        .map(|d| {
-            let items: Vec<serde_json::Value> = d
-                .spec
+        .map(|g| {
+            let items: Vec<serde_json::Value> = g
                 .items
                 .iter()
                 .map(|item| match item {
-                    Item::Node(n) => serde_json::json!({
+                    ItemModel::Node(n) => serde_json::json!({
                         "kind": "node",
-                        "name": n.ident.to_string(),
-                        "mode": n.mode.to_string(),
-                        "cfg": cfg_texts(&n.cfg),
+                        "name": n.name,
+                        "mode": n.mode,
+                        "cfg": n.cfg,
                         "deps": n.deps.iter().map(dep_json).collect::<Vec<_>>(),
-                        "executor": n.executor.as_ref().map(|e| e.to_string()),
+                        "executor": n.executor,
                         "resources": n.resources.iter().map(res_json).collect::<Vec<_>>(),
                         "provides": n.provides.iter().map(|p| serde_json::json!({
-                            "name": p.ident.to_string(),
-                            "cfg": cfg_texts(&p.cfg),
+                            "name": p.name,
+                            "cfg": p.cfg,
                         })).collect::<Vec<_>>(),
                         "discover": n.discover.is_some(),
-                        "discover_cfg": n.discover.as_ref().map(|g| cfg_texts(&g.cfg)).unwrap_or_default(),
-                        "dataflow": dataflow_json(&n.dataflow),
+                        "discover_cfg": n.discover.clone().unwrap_or_default(),
+                        "dataflow": n.dataflow,
                         "reads": n.reads.iter().map(sig_json).collect::<Vec<_>>(),
                         "writes": n.writes.iter().map(sig_json).collect::<Vec<_>>(),
                         "disabled": n.disabled.is_some(),
-                        "disabled_cfg": n.disabled.as_ref().map(|g| cfg_texts(&g.cfg)).unwrap_or_default(),
-                        "parked": n.source.is_none(),
+                        "disabled_cfg": n.disabled.clone().unwrap_or_default(),
+                        "parked": n.task.is_none(),
+                        "task": n.task.as_ref().map(task_json),
+                        "pool_size": lit_json(&n.pool_size),
+                        "slot_timeout_ms": lit_json(&n.slot_timeout_ms),
+                        "slot_timeout_cfg": lit_cfg(&n.slot_timeout_ms),
+                        "ack_timeout_ms": lit_json(&n.ack_timeout_ms),
+                        "ack_timeout_cfg": lit_cfg(&n.ack_timeout_ms),
+                        "beat_timeout_ms": lit_json(&n.beat_timeout_ms),
+                        "beat_timeout_cfg": lit_cfg(&n.beat_timeout_ms),
+                        "beat_window": lit_json(&n.beat_window),
+                        "beat_window_cfg": lit_cfg(&n.beat_window),
+                        "ready_on_write": n.ready_on_write.is_some(),
+                        "ready_on_write_cfg": n.ready_on_write.clone().unwrap_or_default(),
+                        "exit": n.exit.as_ref().map(|t| t.text.clone()),
+                        "state": state_json(&n.state),
+                        "cancel": n.cancel,
                     }),
-                    Item::Pool(p) => serde_json::json!({
+                    ItemModel::Pool(p) => serde_json::json!({
                         "kind": "pool",
-                        "name": p.ident.to_string(),
-                        "modes": p.modes.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
-                        "cfg": cfg_texts(&p.cfg),
+                        "name": p.name,
+                        "modes": p.modes,
+                        "cfg": p.cfg,
                         "deps": p.deps.iter().map(dep_json).collect::<Vec<_>>(),
-                        "executor": p.executor.as_ref().map(|e| e.to_string()),
+                        "executor": p.executor,
                         "resources": p.resources.iter().map(res_json).collect::<Vec<_>>(),
                         "discover": p.discover.is_some(),
-                        "discover_cfg": p.discover.as_ref().map(|g| cfg_texts(&g.cfg)).unwrap_or_default(),
-                        "dataflow": dataflow_json(&p.dataflow),
+                        "discover_cfg": p.discover.clone().unwrap_or_default(),
+                        "dataflow": p.dataflow,
                         "reads": p.reads.iter().map(sig_json).collect::<Vec<_>>(),
                         "writes": p.writes.iter().map(sig_json).collect::<Vec<_>>(),
+                        "task": task_json(&p.task),
+                        "policy": p.policy.text,
+                        "policy_ty": p.policy_ty.as_ref().map(|t| t.text.clone()),
+                        "min": p.min.text,
+                        "max": p.max.text,
+                        "slot_timeout_ms": lit_json(&p.slot_timeout_ms),
+                        "slot_timeout_cfg": lit_cfg(&p.slot_timeout_ms),
+                        "ack_timeout_ms": lit_json(&p.ack_timeout_ms),
+                        "ack_timeout_cfg": lit_cfg(&p.ack_timeout_ms),
+                        "state": state_json(&p.state),
+                        "cancel": p.cancel,
                     }),
-                    Item::Executor(x) => serde_json::json!({
+                    ItemModel::Executor(x) => serde_json::json!({
                         "kind": "executor",
-                        "name": x.ident.to_string(),
+                        "name": x.name,
                     }),
                 })
                 .collect();
             serde_json::json!({
-                "macro": d.kind.macro_name(),
-                "name": d.name(),
-                "origin": d.origin,
-                "line": d.line,
+                "macro": g.macro_name,
+                "name": g.name,
+                "origin": g.origin,
+                "line": g.line,
                 "items": items,
             })
         })
@@ -2390,6 +2414,152 @@ mod tests {
         assert_eq!(item["discover_cfg"], serde_json::json!([]));
         assert_eq!(m["discovered"][0]["fn"], "worker");
         assert_eq!(m["discovered"][0]["path"], "IN");
+    }
+
+    const FULL_GRAPH: &str = r#"
+        embassy_supervisor::supervisor_graph! {
+            name: RIG;
+            node GNSS = Terminate, task: crate::gnss_task, pool_size: 2,
+                slot_timeout: 5000, ack_timeout: 100,
+                beat_timeout: 500, beat_window: 2, ready_on_write,
+                exit: Result<(), FixError>, state: u32 = 7, cancel,
+                writes: [FIX observed beat];
+            node PARKED = Terminate, deps: [GNSS ready];
+            node RAW = Terminate, spawn: crate::raw_task;
+            pool WORKERS = [Terminate, OnDemand], task: crate::worker,
+                policy: DeferredShrink = DeferredShrink::new(Duration::from_secs(2)),
+                min: 1, max: 2, slot_timeout: 1000, ack_timeout: 50,
+                state: zeroed u8, cancel, reads: [FIX];
+        }
+    "#;
+
+    #[test]
+    fn the_typed_model_maps_every_node_clause() {
+        use model::{ItemModel, TaskKind};
+        let decls = parse_source(FULL_GRAPH, "t.rs").unwrap();
+        let full = full_model(&decls);
+        assert_eq!(full.graphs.len(), 1);
+        let g = &full.graphs[0];
+        assert_eq!(g.name.as_deref(), Some("RIG"));
+        assert_eq!(g.macro_name, "supervisor_graph!");
+        let ItemModel::Node(n) = &g.items[0] else {
+            panic!("node")
+        };
+        assert_eq!(n.name, "GNSS");
+        let task = n.task.as_ref().unwrap();
+        assert_eq!(task.kind, TaskKind::Shell);
+        assert_eq!(task.path.replace(' ', ""), "crate::gnss_task");
+        let ItemModel::Node(raw) = &g.items[2] else {
+            panic!("node")
+        };
+        assert_eq!(raw.task.as_ref().unwrap().kind, TaskKind::Spawn);
+        assert_eq!(n.pool_size.as_ref().unwrap().as_u64(), Some(2));
+        assert_eq!(n.slot_timeout_ms.as_ref().unwrap().as_u64(), Some(5000));
+        assert_eq!(n.ack_timeout_ms.as_ref().unwrap().as_u64(), Some(100));
+        assert_eq!(n.beat_timeout_ms.as_ref().unwrap().as_u64(), Some(500));
+        assert_eq!(n.beat_window.as_ref().unwrap().as_u64(), Some(2));
+        assert!(n.ready_on_write.is_some());
+        assert_eq!(
+            n.exit.as_ref().unwrap().text.replace(' ', ""),
+            "Result<(),FixError>"
+        );
+        let st = n.state.as_ref().unwrap();
+        assert_eq!(st.ty.text, "u32");
+        assert_eq!(st.init, "7");
+        assert!(n.cancel);
+        let ItemModel::Node(parked) = &g.items[1] else {
+            panic!("node")
+        };
+        assert!(parked.task.is_none());
+        assert!(!parked.cancel);
+    }
+
+    #[test]
+    fn the_typed_model_maps_every_pool_clause() {
+        use model::{ItemModel, TaskKind};
+        let decls = parse_source(FULL_GRAPH, "t.rs").unwrap();
+        let full = full_model(&decls);
+        let ItemModel::Pool(p) = &full.graphs[0].items[3] else {
+            panic!("pool")
+        };
+        assert_eq!(p.name, "WORKERS");
+        assert_eq!(p.task.kind, TaskKind::Shell);
+        assert_eq!(p.task.path.replace(' ', ""), "crate::worker");
+        assert_eq!(p.policy_ty.as_ref().unwrap().text, "DeferredShrink");
+        assert!(
+            p.policy
+                .text
+                .replace(' ', "")
+                .starts_with("DeferredShrink::new")
+        );
+        assert_eq!(p.min.text, "1");
+        assert_eq!(p.max.text, "2");
+        assert_eq!(p.slot_timeout_ms.as_ref().unwrap().as_u64(), Some(1000));
+        assert_eq!(p.ack_timeout_ms.as_ref().unwrap().as_u64(), Some(50));
+        let st = p.state.as_ref().unwrap();
+        assert_eq!(st.ty.text, "u8");
+        assert_eq!(st.init, "zeroed");
+        assert!(p.cancel);
+    }
+
+    #[test]
+    fn the_json_dump_projects_the_typed_model() {
+        use model::ItemModel;
+        let decls = parse_source(FULL_GRAPH, "t.rs").unwrap();
+        let full = full_model(&decls);
+        let m = model_json(&decls, &[]);
+        let ItemModel::Node(n) = &full.graphs[0].items[0] else {
+            panic!("node")
+        };
+        let j = &m["graphs"][0]["items"][0];
+        assert_eq!(
+            j["slot_timeout_ms"].as_u64(),
+            n.slot_timeout_ms.as_ref().unwrap().as_u64()
+        );
+        assert_eq!(
+            j["ack_timeout_ms"].as_u64(),
+            n.ack_timeout_ms.as_ref().unwrap().as_u64()
+        );
+        assert_eq!(
+            j["beat_timeout_ms"].as_u64(),
+            n.beat_timeout_ms.as_ref().unwrap().as_u64()
+        );
+        assert_eq!(
+            j["beat_window"].as_u64(),
+            n.beat_window.as_ref().unwrap().as_u64()
+        );
+        assert_eq!(j["ready_on_write"], n.ready_on_write.is_some());
+        assert_eq!(
+            j["pool_size"].as_u64(),
+            n.pool_size.as_ref().unwrap().as_u64()
+        );
+        assert_eq!(j["task"]["kind"], "task");
+        assert_eq!(m["graphs"][0]["items"][2]["task"]["kind"], "spawn");
+        assert_eq!(j["task"]["path"], n.task.as_ref().unwrap().path);
+        assert_eq!(j["exit"], n.exit.as_ref().unwrap().text);
+        assert_eq!(j["state"]["ty"], n.state.as_ref().unwrap().ty.text);
+        assert_eq!(j["cancel"], n.cancel);
+        assert_eq!(m["graphs"][0]["items"][1]["parked"], true);
+        assert_eq!(m["graphs"][0]["items"][1]["task"], serde_json::Value::Null);
+        let ItemModel::Pool(p) = &full.graphs[0].items[3] else {
+            panic!("pool")
+        };
+        let jp = &m["graphs"][0]["items"][3];
+        assert_eq!(jp["min"], p.min.text);
+        assert_eq!(jp["max"], p.max.text);
+        assert_eq!(jp["policy"], p.policy.text);
+        assert_eq!(jp["policy_ty"], p.policy_ty.as_ref().unwrap().text);
+        assert_eq!(jp["task"]["kind"], "task");
+        assert_eq!(
+            jp["slot_timeout_ms"].as_u64(),
+            p.slot_timeout_ms.as_ref().unwrap().as_u64()
+        );
+        assert_eq!(
+            jp["ack_timeout_ms"].as_u64(),
+            p.ack_timeout_ms.as_ref().unwrap().as_u64()
+        );
+        assert_eq!(jp["state"]["init"], "zeroed");
+        assert_eq!(jp["cancel"], p.cancel);
     }
 
     #[test]
