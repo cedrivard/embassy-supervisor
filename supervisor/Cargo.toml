@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.6.0"
+version = "0.7.0"
 description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
@@ -792,6 +792,26 @@ name = "topo_sort"
 [[test]]
 name = "pool_policy"
 required-features = ["macros", "pool"]
+
+# Event pokes that wake a parked pool driver: readiness transitions, the
+# restart cycle of a pool's provider, and apply_bind's OnDemand recovery arm.
+[[test]]
+name = "pool_regrow"
+required-features = ["macros", "pool", "readiness", "restart", "bound-deps"]
+
+# deactivate/activate symmetry: the disabled latch on the seed vs the
+# collateral hold on dependents, overlapping deactivations over a diamond,
+# and pool members returning to grow candidacy after activate.
+[[test]]
+name = "deactivate_collateral"
+required-features = ["macros", "control", "pool"]
+
+# The in-flight race: a deactivate latching collateral while apply_bind's
+# recovery spawn pends must leave the member running flagged, not silently
+# unheld (the manual-start override clears at spawn entry, not completion).
+[[test]]
+name = "collateral_race"
+required-features = ["macros", "control", "pool", "readiness", "bound-deps"]
 
 # Topology selection and shape bits: `Flat` for an edge-free graph (identity
 # order, empty dep rows, zero SHAPE), `Ordered` with exactly the declared bits

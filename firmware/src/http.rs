@@ -75,7 +75,8 @@ if(/^http[0-9]+$/.test(t.name)){\
 pool=pool||{n:0,r:0,b:0,dis:true,deps:t.deps,e:0,mp:0};\
 pool.n++;if(t.running)pool.r++;if(t.busy)pool.b++;if(!t.disabled)pool.dis=false;\
 pool.e=(pool.e+t.exec_ticks)>>>0;pool.mp=Math.max(pool.mp,t.max_poll_ticks);continue;}\
-let st=t.detached?'detached':t.disabled?'disabled':t.bound_stopped?'link-stopped':\
+let st=t.detached?'detached':t.disabled?'disabled':t.collateral?'held':\
+t.bound_stopped?'link-stopped':\
 t.running?(t.ready===false?'up (not ready)':t.busy?'busy':'running'):'stopped';\
 let pause=t.mode=='pause';let act=t.disabled||!t.running;\
 let op=act?(pause?'resume':'start'):(pause?'pause':'stop');\
@@ -329,7 +330,8 @@ fn build_tasks_json(json: &mut String) {
 fn write_task(json: &mut String, node: &'static TaskNode, deps: &'static [u8]) {
     let _ = write!(
         json,
-        "{{\"name\":\"{}\",\"mode\":\"{}\",\"running\":{},\"busy\":{},\"disabled\":{},\"detached\":{},\
+        "{{\"name\":\"{}\",\"mode\":\"{}\",\"running\":{},\"busy\":{},\"disabled\":{},\
+         \"collateral\":{},\"detached\":{},\
          \"ready\":{},\"bound_stopped\":{},\"epoch\":{},\
          \"exec_ticks\":{},\"polls\":{},\"max_poll_ticks\":{},",
         node.name(),
@@ -337,6 +339,7 @@ fn write_task(json: &mut String, node: &'static TaskNode, deps: &'static [u8]) {
         node.is_running(),
         node.is_busy(),
         node.is_disabled(),
+        node.is_collateral(),
         node.is_detached(),
         node.is_ready(),
         node.is_bound_stopped(),

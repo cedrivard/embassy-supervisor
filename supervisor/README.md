@@ -299,12 +299,13 @@ All of these are importable from the crate root (`embassy_supervisor::try_reques
 `embassy_supervisor::ControlOp`, …); a `NodeFault`'s fields are
 `pub node: &'static TaskNode` and `pub kind: FaultKind`.
 
-One cascade asymmetry worth knowing: `activate` expands *dependencies* (up) and
-`deactivate` expands *dependents* (down) — so a pool taken down as a **dependent** of
-a deactivated node is not re-enabled by re-activating that node. Re-enable it by
-targeting the pool itself: `Activate` on **any member** expands to the whole pool
-(membership is part of the seed), respawning the floor and re-enabling the `OnDemand`
-members for policy-driven growth.
+activate walks up through dependencies; deactivate walks down through dependents. They are opposites, but they compose symmetrically over a subtree.
+
+A deactivate call marks only the seed node as disabled. The seed is the target node, or the whole pool if the target is a pool member. Dependents are marked as collateral instead. Collateral blocks automatic bring-up just like disabled, but `activate` clears it once no disabled node remains anywhere in the dependent's transitive dependencies. Any Terminate or Pause dependents released this way restart in the same wave.
+
+Overlapping deactivations compose cleanly. A node below two deactivated ancestors restarts on the second `activate`. A node deactivated directly keeps its latch through an ancestor's cycle. A manual `start_node` overrides the hold, but the override only clears at spawn entry, so a node that started while a hold was being latched still runs flagged and releasable instead of coming up silently unheld.
+
+Released OnDemand pool members are not started immediately. They regrow through demand from the elastic policy or a gated read, and `activate` prompts the pool driver to re-check standing demand. A pool deactivated directly still needs its own Activate later. Targeting any member expands to the whole pool, since membership is part of the seed.
 
 `Mode` decides what each transition does to a node:
 
@@ -320,7 +321,7 @@ How a task implements its half of these transitions is the
 ## Lifecycle reference
 
 The canonical per-operation matrix — what each supervisor operation does to a node, by mode
-and by the two lifecycle-spanning flags (`disabled`, `detached`). Other docs link here.
+and by the three lifecycle-spanning flags (`disabled`, `collateral`, `detached`). Other docs link here.
 
 **Missed acks are errors, not panics.** Every stop path awaits the target's ack with a
 2 s timeout (per-node override: `ack_timeout:`); a node that misses it is returned as a
@@ -338,18 +339,21 @@ the first timeout at the end.
 |---|---|---|---|---|---|
 | `start` *(boot + re-entry, async)* | spawned in dep order; already-running skipped (idempotent) | spawned (cold); an instance parked by an earlier `teardown` is **resumed in place**; a parked (no-`spawn:`) node is only marked running | skipped | skipped | first start spawns it (tasks detach *themselves* after that); re-entry skips it — its instance survived the teardown |
 | `teardown` | shutdown + ack, exits | shutdown + ack, parks on `wait_resume()` | stopped if running, else skipped | already down — nothing to do | **skipped** (self-managed) |
-| `deactivate` *(control)* | disabled + stopped; cascades to transitive dependents, dependents first | disabled + stopped, parks; stays parked | disabled + stopped — the whole pool, atomically | re-disabled (idempotent) | **skipped** — never pulled into the cascade, even when targeted directly |
-| `activate` *(control)* | enabled + started, after its transitive deps | enabled + resumed in place | enabled only — the pool policy regrows it under load | this is the flag it clears | **skipped** — not re-enabled, not restarted; its `deps:` are start-ordering only and are not expanded |
+| `deactivate` *(control)* | seed: disabled + stopped; transitive dependents: `collateral` + stopped, dependents first | disabled (or `collateral`) + stopped, parks; stays parked | disabled + stopped — the whole pool, atomically, when a member is the target; `collateral` as a dependent | re-disabled (idempotent) | **skipped** — never pulled into the cascade, even when targeted directly |
+| `activate` *(control)* | enabled + started, after its transitive deps; a `collateral` dependent with no disabled dep left is released + restarted in the same wave | enabled + resumed in place | enabled/released only — the pool policy regrows it under load (the wave pokes the pool driver) | this is the flag it clears | **skipped** — not re-enabled, not restarted; its `deps:` are start-ordering only and are not expanded |
 | `stop_node` | shutdown + ack | shutdown + ack, parks (**this is the single-node pause**) | shutdown + ack (the pool-shrink path) | not running → no-op | **no-op** |
 | `resume_node` | no-op (wrong mode) | reset + resumed in place, keeps held resources | no-op (wrong mode) | skipped — a manual pause sticks | **no-op** |
 | `respawn_terminate` *(async)* | reset + respawned in dep order | untouched (use `resume_pausable`) | left down — the policy regrows it | skipped — a manual stop sticks | **skipped** — it never went down, respawning would double-spawn |
 | `resume_pausable` | untouched | reset + resumed in place, keeps held resources | untouched | skipped — a manual pause sticks | **left parked** |
 
-Two flags cut across the modes:
+Three flags cut across the modes:
 
-- **`disabled`** is the "a human said stop" latch: `deactivate` sets it, `activate` clears it,
-  and every bring-up path honors it so a manual stop/pause survives a wake respawn or an
-  elastic regrow.
+- **`disabled`** is the "a human said stop" latch: `deactivate` sets it (on its seed),
+  `activate` clears it, and every bring-up path honors it so a manual stop/pause survives a
+  wake respawn or an elastic regrow. Its companion **`collateral`**
+  (`TaskNode::is_collateral()`) marks a node stopped only as a *dependent* of a deactivated
+  node — the bring-up paths honor it the same way, but `activate` on the ancestor releases
+  it.
 - **`detached`** (`TaskNode::set_detached(true)`) is full hands-off: the node manages its own
   lifecycle and the supervisor never drives it again. Its `deps:` still order its *first*
   spawn — after that, the graph only remembers where it was declared.
@@ -2487,6 +2491,22 @@ Measured on the demo firmware (RP2350, release + fat LTO): the whole feature set
 steady-state stack — a threaded resource travels inside the task's future.
 
 ## Migration
+
+### 0.6 → 0.7
+
+Ships with `embassy-supervisor-macros` 0.8.0, unchanged — no action needed. No API
+is removed and no signature changes; two control-plane behaviors are corrected.
+`deactivate` no longer latches `disabled` on the target's transitive dependents:
+they take the new `collateral` hold (`TaskNode::is_collateral()`), which every
+automatic bring-up path honors the same way, and which `activate` on the ancestor
+releases — restarting the released `Terminate`/`Pause` dependents in the same wave.
+Code that read `is_disabled()` on a dependent to detect a subtree stop should read
+`is_collateral()`; showing both flags distinguishes "deactivated in its own right"
+from "held as a dependent". And an elastic pool now regrows without an app-side
+`request_scale()` once its provider recovers: a readiness assertion, a provider
+`restart`, `activate`, and the bound recovery path poke the pool driver
+themselves, so a manual poke that papered over the parked driver is redundant
+(and harmless).
 
 ### 0.4 → 0.5
 
