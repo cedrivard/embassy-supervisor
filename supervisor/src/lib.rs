@@ -844,6 +844,13 @@ mod flag {
     /// — it spans the stopped instance's whole absence.
     #[cfg(feature = "bound-deps")]
     pub const BOUND_STOPPED: u16 = 1 << 8;
+    /// Stopped as a dependent of a deactivated node. `deactivate` marks only
+    /// its seed as `DISABLED`; dependents are marked `COLLATERAL` instead.
+    /// Both block automatic bring-up, but `activate` clears `COLLATERAL` once
+    /// no disabled node remains in the node's transitive dependencies. A manual
+    /// `start_node` also clears it. Unlike `BOUND_STOPPED`, a readiness flap
+    /// does not release a control stop. Lifecycle-spanning: not cleared by `reset()`.
+    pub const COLLATERAL: u16 = 1 << 9;
 }
 
 /// Coordination state for one task. Embedded inside [`TaskNode`].
@@ -1742,6 +1749,8 @@ impl TaskNode {
         crate::data_deps::notify_serving();
         #[cfg(feature = "bound-deps")]
         notify_bind();
+        #[cfg(feature = "pool")]
+        request_scale();
     }
 
     #[cfg(feature = "readiness")]
@@ -2016,6 +2025,12 @@ impl TaskNode {
         self.handle.flag(flag::DISABLED)
     }
 
+    /// Return `true` if the node is held stopped as a dependent of a
+    /// deactivated node.
+    pub fn is_collateral(&self) -> bool {
+        self.handle.flag(flag::COLLATERAL)
+    }
+
     /// Set whether this node is detached from automatic lifecycle management.
     pub fn set_detached(&self, detached: bool) {
         self.handle.flag_put(flag::DETACHED, detached);
@@ -2151,6 +2166,7 @@ impl core::fmt::Debug for TaskNode {
             .field("running", &self.is_running())
             .field("busy", &self.is_busy())
             .field("disabled", &self.is_disabled())
+            .field("collateral", &self.is_collateral())
             .field("detached", &self.is_detached());
         #[cfg(feature = "epochs")]
         d.field("epoch", &self.epoch());
@@ -2511,6 +2527,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             &mut |_, node| {
                 !(Self::has(shape::ON_DEMAND) && matches!(node.mode(), Mode::OnDemand))
                     && !node.is_disabled()
+                    && !node.is_collateral()
                     && !node.is_running()
                     && !node.is_detached()
             },
@@ -2662,6 +2679,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         spawner: &Spawner,
     ) -> Result<(), NodeFault> {
         node.reset();
+        node.handle.flag_clear(flag::COLLATERAL);
         if let Some(spawn) = node.cfg.spawn {
             match Self::await_gates(node).await {
                 Ok(()) => {}
@@ -3079,6 +3097,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         if !Self::has(shape::PAUSE)
             || !matches!(node.mode(), Mode::Pause)
             || node.is_disabled()
+            || node.is_collateral()
             || node.is_detached()
             || !node.has_acked_stop()
         {
@@ -3108,6 +3127,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             };
             if matches!(node.mode(), Mode::Pause)
                 && !node.is_disabled()
+                && !node.is_collateral()
                 && !node.is_detached()
                 && node.has_acked_stop()
             {
@@ -3127,6 +3147,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             &mut |_, node| {
                 matches!(node.mode(), Mode::Terminate)
                     && !node.is_disabled()
+                    && !node.is_collateral()
                     && !node.is_detached()
                     && !node.is_running()
             },
@@ -3238,8 +3259,9 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
 
     /// Deactivate the target node and all of its dependents.
     pub async fn deactivate(&self, target: &'static TaskNode) -> Result<(), NodeFault> {
-        let mut set = [false; N];
-        self.seed(target, &mut set);
+        let mut seed = [false; N];
+        self.seed(target, &mut seed);
+        let mut set = seed;
         self.collect_dependents(&mut set);
 
         // Down in reverse topo order (dependents before their deps).
@@ -3257,9 +3279,11 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                 if node.is_detached() {
                     return false;
                 }
-                // Set on every node in the set, running or not: the flag is what makes
-                // the stop stick against the elastic policy and the wake respawn.
-                node.set_disabled(true);
+                if seed[j] {
+                    node.set_disabled(true);
+                } else {
+                    node.handle.flag_set(flag::COLLATERAL);
+                }
                 if !node.is_running() {
                     return false;
                 }
@@ -3289,21 +3313,53 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                 }
             }
         }
+        for j in self.order_iter() {
+            if set[j]
+                && let Some(node) = self.nodes[j]
+                && !node.is_detached()
+            {
+                node.set_disabled(false);
+            }
+        }
+        let mut held = [false; N]; // disabled, or depends on a disabled node
+        let mut revive = [false; N];
+        for j in self.order_iter() {
+            let Some(node) = self.nodes[j] else {
+                continue;
+            };
+            if node.is_detached() {
+                continue;
+            }
+            let blocked = self
+                .topo
+                .deps_of(j as u8)
+                .iter()
+                .any(|&di| held[di as usize]);
+            held[j] = blocked || node.is_disabled();
+            if !blocked && node.is_collateral() {
+                node.handle.flag_clear(flag::COLLATERAL);
+                revive[j] = !node.is_disabled();
+            }
+        }
 
         let _ = self
             .start_nodes(
                 spawner,
                 &mut |j, node| {
-                    if !set[j] || node.is_detached() {
+                    if !(set[j] || revive[j]) || node.is_detached() {
                         return false;
                     }
-                    node.set_disabled(false);
                     !node.is_running()
+                        && !node.is_collateral()
                         && !(Self::has(shape::ON_DEMAND) && matches!(node.mode(), Mode::OnDemand))
                 },
                 true,
             )
             .await;
+        #[cfg(feature = "pool")]
+        if Self::has(shape::POOLS) {
+            request_scale();
+        }
     }
 }
 
@@ -3369,7 +3425,8 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             if !node.handle.flag(flag::BOUND_STOPPED) {
                 continue;
             }
-            if node.is_disabled() || node.is_detached() || node.is_running() {
+            if node.is_disabled() || node.is_collateral() || node.is_detached() || node.is_running()
+            {
                 continue;
             }
             if !node.bound_deps().iter().all(|d| is_serving(d)) {
@@ -3390,7 +3447,13 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                     node.handle.flag_clear(flag::BOUND_STOPPED);
                 }
                 Mode::Pause => {}
-                Mode::OnDemand => node.handle.flag_clear(flag::BOUND_STOPPED),
+                Mode::OnDemand => {
+                    node.handle.flag_clear(flag::BOUND_STOPPED);
+                    #[cfg(feature = "pool")]
+                    if Self::has(shape::POOLS) {
+                        request_scale();
+                    }
+                }
             }
         }
         Ok(())
@@ -3431,18 +3494,26 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
 
         // Up, dependencies first, each through the full gate sequence — as a
         // wave, aborting on the first fault.
-        self.start_nodes(
-            spawner,
-            &mut |j, node| {
-                set[j]
-                    && !node.is_detached()
-                    && !node.is_disabled()
-                    && !node.is_running()
-                    && !(Self::has(shape::ON_DEMAND) && matches!(node.mode(), Mode::OnDemand))
-            },
-            false,
-        )
-        .await
+        let r = self
+            .start_nodes(
+                spawner,
+                &mut |j, node| {
+                    set[j]
+                        && !node.is_detached()
+                        && !node.is_disabled()
+                        && !node.is_collateral()
+                        && !node.is_running()
+                        && !(Self::has(shape::ON_DEMAND) && matches!(node.mode(), Mode::OnDemand))
+                },
+                false,
+            )
+            .await;
+        #[cfg(feature = "pool")]
+        if Self::has(shape::POOLS) {
+            request_scale();
+        }
+
+        r
     }
 }
 

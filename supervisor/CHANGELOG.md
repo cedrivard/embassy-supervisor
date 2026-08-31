@@ -4,6 +4,49 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-08-30
+
+A pool left parked, and a subtree that never came back: two control-plane fixes.
+
+### Fixed
+
+- An elastic pool now regrows on its own once its provider recovers. Previously
+  the pool driver could stay parked after it declined to grow, with nothing left
+  to wake it. Four events now poke the driver again:
+  - `set_ready` re-evaluates scaling, because readiness is what growth is gated on.
+  - `restart` pokes after its up-wave, which intentionally skips OnDemand members.
+  - `apply_bind` pokes after returning a bound-stopped OnDemand member to the policy.
+  - `activate` pokes after releasing pool members.
+  `clear_ready` is intentionally not in this list; withdrawing readiness can never
+  change a scaling decision. Previously, restarting a pool's provider or seeing a
+  bound provider recover its readiness could leave a `min: 0` pool empty until an
+  unrelated busy/idle transition, whether or not the dep carried a `ready` marker.
+
+- `deactivate` and `activate` are now symmetric over a subtree. `deactivate`
+  marks only the seed node as disabled. For a pool member, the seed is the whole
+  pool. Dependents are stopped with the new **`collateral`** hold instead.
+  Collateral blocks automatic bring-up just like `disabled`, but `activate`
+  clears it once no disabled node remains anywhere in the dependent's transitive
+  dependencies. Released `Terminate` and `Pause` dependents restart in the same
+  wave; released OnDemand pool members are left to the elastic policy.
+
+  Previously, dependents were marked `disabled` directly, and `activate` never
+  cleared them because it only walks upstream. A deactivate/activate cycle on a
+  provider could therefore leave its pool members disabled permanently, even an
+  explicit `request_scale` could not grow them.
+
+  Overlapping deactivations compose cleanly: a node below two deactivated
+  ancestors restarts on the second `activate`. A node deactivated directly keeps
+  its latch through an ancestor's cycle. A manual `start_node` overrides the
+  hold, but the override only clears at spawn entry, so a node that started
+  while a hold was being latched still runs flagged and releasable instead of
+  coming up silently unheld.
+
+### Added
+
+- `TaskNode::is_collateral()`, and a `collateral` field in the node's `Debug`
+  output.
+
 ## [0.6.0] - 2026-08-27
 
 Macro pin moves to `embassy-supervisor-macros = "=0.8.0"`.
@@ -964,6 +1007,8 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
+[0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/cedrivard/embassy-supervisor/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/cedrivard/embassy-supervisor/compare/v0.4.2...v0.4.3

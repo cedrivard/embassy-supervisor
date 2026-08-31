@@ -154,7 +154,12 @@ impl<P: ScalingPolicy + Sync> Pool for ElasticPool<P> {
             ScaleAction::Grow => self
                 .nodes
                 .iter()
-                .find(|n| matches!(n.mode(), Mode::OnDemand) && !n.is_running() && !n.is_disabled())
+                .find(|n| {
+                    matches!(n.mode(), Mode::OnDemand)
+                        && !n.is_running()
+                        && !n.is_disabled()
+                        && !n.is_collateral()
+                })
                 .map_or(PoolAction::None, |n| PoolAction::Start(n)),
             ScaleAction::Shrink => self
                 .nodes
