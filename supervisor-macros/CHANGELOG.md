@@ -6,6 +6,17 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [Unreleased]
+
+### Changed
+
+- `trace-hooks` expands the supervisor's `__sv_trace_hooks!` at the unnamed
+  graph's declaration site instead of spelling out the seven `no_mangle`
+  `_embassy_trace_*` functions itself: the hook bodies are the supervisor's,
+  so which executor hook API they speak (0.10's symbols, or the `Trace` impl
+  embassy git main takes under `--cfg embassy_supervisor_trace_v2`) is
+  decided by that crate's build. Same expansion result on embassy-executor 0.10.
+
 ## [0.9.0] - 2026-09-01
 
 Rides `embassy-supervisor-syntax = "=0.3.0"`.
@@ -499,6 +510,7 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.9.0...HEAD
 [0.9.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.8.0...embassy-supervisor-macros-v0.9.0
 [0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.7.0...embassy-supervisor-macros-v0.8.0
 [0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.6.2...embassy-supervisor-macros-v0.7.0

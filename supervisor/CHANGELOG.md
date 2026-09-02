@@ -4,6 +4,26 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The trace hooks follow the executor's next API.** embassy-executor's git
+  main (the release after 0.10) replaces the seven `_embassy_trace_*` symbols
+  with a `raw::trace::Trace` impl registered through `trace_impl!`, and passes
+  `ExecutorId`/`TaskId` newtypes instead of `u32`s. `RUSTFLAGS="--cfg
+  embassy_supervisor_trace_v2"` builds the trace layer against it; the
+  recorders keep their `u32` keys, ids narrowing through the new
+  `trace::task_key` / `trace::executor_key` (cfg-only). The hook bodies moved
+  from the proc-macro into `__sv_trace_hooks!`, a hidden macro of this crate
+  that `supervisor_graph!` expands under `trace-hooks`, so which API they
+  speak is decided by this crate's build. No change on embassy-executor 0.10.
+- CI's `trace vs embassy git (canary)` job now also runs the trace test
+  suite, and patches `embassy-executor-timer-queue` to git together with the
+  executor: with only the executor patched, embassy-time's queue utils kept a
+  second copy of the timer-queue crate, sized differently, and every timeout
+  in the wedged-task tests silently never fired.
+
 ## [0.8.0] - 2026-09-01
 
 Six things a graph could not say about its couplings, and now can.
@@ -1077,6 +1097,7 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.8.0...HEAD
 [0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.7.0...embassy-supervisor-v0.8.0
 [0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.6.0...embassy-supervisor-v0.7.0
 [0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.5.1...v0.6.0

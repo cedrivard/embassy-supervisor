@@ -36,9 +36,30 @@ fn node_for(task_id: u32) -> Option<&'static TaskNode> {
 /// Return the id of the currently executing task.
 pub async fn current_task_id() -> u32 {
     core::future::poll_fn(|cx| {
-        core::task::Poll::Ready(embassy_executor::raw::task_from_waker(cx.waker()).id())
+        let id = embassy_executor::raw::task_from_waker(cx.waker()).id();
+        #[cfg(embassy_supervisor_trace_v2)]
+        let id = task_key(id);
+        core::task::Poll::Ready(id)
     })
     .await
+}
+
+/// Narrow an executor `TaskId` to the recorders' `u32` key.
+///
+/// The recorders key tasks by the `u32` the embassy-executor 0.10 hooks pass.
+/// Under `--cfg embassy_supervisor_trace_v2` the executor hands out `TaskId`s
+/// instead, and this is the one place they narrow: the low 32 bits of the
+/// task's address, which is exactly the 0.10 id on a 32-bit target. Custom
+/// hooks forwarding to the `on_*` recorders go through here.
+#[cfg(embassy_supervisor_trace_v2)]
+pub fn task_key(id: embassy_executor::TaskId) -> u32 {
+    id.get() as u32
+}
+
+/// Narrow an `ExecutorId` to the recorders' `u32` key; see [`task_key`].
+#[cfg(embassy_supervisor_trace_v2)]
+pub fn executor_key(id: embassy_executor::ExecutorId) -> u32 {
+    id.get() as u32
 }
 
 /// Maximum number of executors that can be traced concurrently.

@@ -2096,7 +2096,10 @@ impl TaskNode {
     #[cfg(feature = "trace")]
     /// Adopt a spawn token's task id (and name, if enabled) for tracing.
     pub fn adopt<S>(&self, token: &embassy_executor::SpawnToken<S>) {
-        self.set_task_id(token.id());
+        let id = token.id();
+        #[cfg(embassy_supervisor_trace_v2)]
+        let id = trace::task_key(id);
+        self.set_task_id(id);
         #[cfg(feature = "metadata-names")]
         self.stamp_name(token);
     }
@@ -3682,6 +3685,103 @@ pub use graph_ref::*;
 #[cfg(feature = "trace")]
 /// Runtime tracing hooks and task introspection helpers.
 pub mod trace;
+
+#[cfg(feature = "trace")]
+#[doc(hidden)]
+pub use embassy_executor as __executor;
+
+/// The executor's trace hooks, forwarding to the [`trace`] recorders.
+///
+/// `supervisor_graph!` expands this once, at the unnamed graph's declaration
+/// site, under `trace-hooks`; it lives here rather than in the proc-macro so
+/// the hook *bodies* follow this crate's build, not the macro crate's. The
+/// executor's hook API is an implementation detail that has already changed
+/// shape once: embassy-executor 0.10 links seven `_embassy_trace_*` symbols
+/// taking `u32` ids, while its git main (the next release) takes a
+/// `raw::trace::Trace` impl registered with `trace_impl!` and passes
+/// `ExecutorId`/`TaskRef`. `--cfg embassy_supervisor_trace_v2` (RUSTFLAGS)
+/// selects the latter; the recorders keep their `u32` keys either way, ids
+/// narrowing through [`trace::task_key`] / [`trace::executor_key`] at the hook.
+#[cfg(all(feature = "trace", not(embassy_supervisor_trace_v2)))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __sv_trace_hooks {
+    () => {
+        #[unsafe(no_mangle)]
+        fn _embassy_trace_poll_start(executor_id: u32) {
+            $crate::trace::on_poll_start(executor_id);
+        }
+        #[unsafe(no_mangle)]
+        fn _embassy_trace_task_new(_executor_id: u32, _task_id: u32) {}
+        #[unsafe(no_mangle)]
+        fn _embassy_trace_task_end(executor_id: u32, task_id: u32) {
+            $crate::trace::on_task_end(executor_id, task_id);
+        }
+        #[unsafe(no_mangle)]
+        fn _embassy_trace_task_exec_begin(executor_id: u32, task_id: u32) {
+            $crate::trace::on_task_exec_begin(executor_id, task_id);
+        }
+        #[unsafe(no_mangle)]
+        fn _embassy_trace_task_exec_end(executor_id: u32, task_id: u32) {
+            $crate::trace::on_task_exec_end(executor_id, task_id);
+        }
+        #[unsafe(no_mangle)]
+        fn _embassy_trace_task_ready_begin(_executor_id: u32, _task_id: u32) {}
+        #[unsafe(no_mangle)]
+        fn _embassy_trace_executor_idle(executor_id: u32) {
+            $crate::trace::on_executor_idle(executor_id);
+        }
+    };
+}
+
+#[cfg(all(feature = "trace", embassy_supervisor_trace_v2))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __sv_trace_hooks {
+    () => {
+        const _: () = {
+            // `trace_impl!` spells its shims' parameter types unqualified, so
+            // both must be in scope where it expands.
+            use $crate::__executor::ExecutorId;
+            use $crate::__executor::raw::TaskRef;
+
+            struct __SvTraceHooks;
+            impl $crate::__executor::raw::trace::Trace for __SvTraceHooks {
+                fn poll_start(executor: ExecutorId) {
+                    $crate::trace::on_poll_start($crate::trace::executor_key(executor));
+                }
+                fn task_new(_executor: ExecutorId, _task: TaskRef) {}
+                fn task_end(executor: ExecutorId, task: TaskRef) {
+                    $crate::trace::on_task_end(
+                        $crate::trace::executor_key(executor),
+                        $crate::trace::task_key(task.id()),
+                    );
+                }
+                fn task_exec_begin(executor: ExecutorId, task: TaskRef) {
+                    $crate::trace::on_task_exec_begin(
+                        $crate::trace::executor_key(executor),
+                        $crate::trace::task_key(task.id()),
+                    );
+                }
+                fn task_exec_end(executor: ExecutorId, task: TaskRef) {
+                    $crate::trace::on_task_exec_end(
+                        $crate::trace::executor_key(executor),
+                        $crate::trace::task_key(task.id()),
+                    );
+                }
+                fn task_ready_begin(_executor: ExecutorId, _task: TaskRef) {}
+                fn executor_idle(executor: ExecutorId) {
+                    $crate::trace::on_executor_idle($crate::trace::executor_key(executor));
+                }
+                fn idle() {}
+                fn task_name_set(_task: TaskRef, _name: &'static str) {}
+                fn task_priority_set(_task: TaskRef, _priority: u8) {}
+                fn task_deadline_set(_task: TaskRef, _deadline: u64) {}
+            }
+            $crate::__executor::trace_impl!(__SvTraceHooks);
+        };
+    };
+}
 
 #[cfg(feature = "macros")]
 pub use embassy_supervisor_macros::supervisor_fragment;

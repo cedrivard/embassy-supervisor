@@ -2639,33 +2639,10 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
         quote!()
     };
 
+    // The hook bodies are the supervisor's (`__sv_trace_hooks!`): which executor
+    // hook API they speak is decided by that crate's build, not this one's.
     let trace_hooks = if cfg!(feature = "trace-hooks") && graph.name.is_none() {
-        quote! {
-            #[unsafe(no_mangle)]
-            fn _embassy_trace_poll_start(executor_id: u32) {
-                #cr::trace::on_poll_start(executor_id);
-            }
-            #[unsafe(no_mangle)]
-            fn _embassy_trace_task_new(_executor_id: u32, _task_id: u32) {}
-            #[unsafe(no_mangle)]
-            fn _embassy_trace_task_end(executor_id: u32, task_id: u32) {
-                #cr::trace::on_task_end(executor_id, task_id);
-            }
-            #[unsafe(no_mangle)]
-            fn _embassy_trace_task_exec_begin(executor_id: u32, task_id: u32) {
-                #cr::trace::on_task_exec_begin(executor_id, task_id);
-            }
-            #[unsafe(no_mangle)]
-            fn _embassy_trace_task_exec_end(executor_id: u32, task_id: u32) {
-                #cr::trace::on_task_exec_end(executor_id, task_id);
-            }
-            #[unsafe(no_mangle)]
-            fn _embassy_trace_task_ready_begin(_executor_id: u32, _task_id: u32) {}
-            #[unsafe(no_mangle)]
-            fn _embassy_trace_executor_idle(executor_id: u32) {
-                #cr::trace::on_executor_idle(executor_id);
-            }
-        }
+        quote!( #cr::__sv_trace_hooks!(); )
     } else {
         quote!()
     };

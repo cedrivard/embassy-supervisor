@@ -12,6 +12,12 @@ documentation = "https://docs.rs/embassy-supervisor"
 keywords = ["embassy", "async", "embedded", "supervisor", "no-std"]
 categories = ["embedded", "asynchronous", "no-std"]
 
+[lints.rust]
+# `RUSTFLAGS=--cfg embassy_supervisor_trace_v2`: build the trace layer against
+# embassy-executor's post-0.10 hook API (git main: a `Trace` trait registered
+# with `trace_impl!`, `TaskId`/`ExecutorId` ids). See the `trace` feature.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(embassy_supervisor_trace_v2)'] }
+
 [dependencies]
 # Pure-embassy dependencies only — no HAL, no allocator, no board crates, so the
 # supervisor compiles for any embassy target.
@@ -383,6 +389,14 @@ liveness-monitor = ["liveness", "embassy-supervisor-macros?/liveness-monitor"]
 # Pulls `graph-ref` for the id -> node scan: a hook holds an opaque `u32` and
 # no node, so it walks every graph linked into the binary, of which there may
 # be any number.
+#
+# The hook API is an executor implementation detail and has changed shape past
+# 0.10: git main (the next release) replaces the seven `_embassy_trace_*`
+# symbols with a `raw::trace::Trace` impl registered via `trace_impl!`, and its
+# ids are `TaskId`/`ExecutorId` newtypes. `RUSTFLAGS=--cfg
+# embassy_supervisor_trace_v2` builds against that API (with the executor
+# patched to git); the recorders keep their `u32` keys either way. The cfg goes
+# away once the crate pins the release that ships it.
 trace = [
     "graph-ref",
     "embassy-executor/trace",
@@ -399,10 +413,11 @@ metadata-names = [
     "embassy-executor/metadata-name",
     "embassy-supervisor-macros?/metadata-names",
 ]
-# Batteries-included: `supervisor_graph!` defines the seven `no_mangle`
-# `_embassy_trace_*` symbols at the graph declaration site. Exactly ONE
-# definition may exist per binary: enable this OR define your own hooks and
-# forward to the `trace` recorders.
+# Batteries-included: `supervisor_graph!` expands the hook definitions
+# (`__sv_trace_hooks!`: the seven `no_mangle` `_embassy_trace_*` symbols, or
+# the `Trace` impl under `embassy_supervisor_trace_v2`) at the graph
+# declaration site. Exactly ONE definition may exist per binary: enable this
+# OR define your own hooks and forward to the `trace` recorders.
 trace-hooks = ["trace", "embassy-supervisor-macros?/trace-hooks"]
 # The supervisor's trace layer WITH node names: `trace` (recorders) plus the
 # `metadata-names` stamp, as a composition of the two independent capabilities.

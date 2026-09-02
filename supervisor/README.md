@@ -2369,9 +2369,8 @@ executor poll is attributed to a *named* node — correctly across respawns.
   polls-per-pass as a wake-storm tell).
 
 The split across the family: `trace` is recorders only; `trace-hooks` additionally emits the
-seven hook symbol definitions at the graph declaration site (exactly one set may exist per
-binary — define your own hooks and forward to the `trace::on_*` recorders if you need
-custom ones); `metadata-names` stamps node names into task Metadata for external tooling
+hook definitions at the graph declaration site (exactly one set may exist per binary —
+define your own hooks and forward to the `trace::on_*` recorders if you need custom ones); `metadata-names` stamps node names into task Metadata for external tooling
 (SystemView, debuggers); `trace-names` is shorthand for `trace` + `metadata-names`;
 `trace-nested` makes accounting preemption-exact — a nested higher-tier poll credits its
 time back to the window it interrupted (register `trace::set_core_id_fn` on multi-core for
@@ -2392,9 +2391,19 @@ closure-spawned nodes register with one call: `TaskNode::adopt(&token)` — or
 `node.adopt_current().await` from inside the task body, when nobody holds the token. The
 supervisor's own host task is part of the unsupervised share unless `trace-self` is on:
 each graph then carries a hidden `"supervisor"` node that `start()` adopts as its calling
-task, attribution being task-granular (everything else that task polls is billed to it). The hook API is an
-executor implementation detail — this feature tracks the executor minor version the crate
-already pins.
+task, attribution being task-granular (everything else that task polls is billed to it).
+
+The hook API is an executor implementation detail, and this feature tracks the executor
+minor version the crate pins. It has already changed shape past 0.10: embassy's git main
+(the next release) replaces the seven `_embassy_trace_*` symbols with a `raw::trace::Trace`
+impl registered through `trace_impl!`, and passes `ExecutorId`/`TaskId` newtypes instead
+of `u32`s. Building against that executor takes `RUSTFLAGS="--cfg
+embassy_supervisor_trace_v2"` (with `[patch.crates-io]` pointing `embassy-executor` **and**
+`embassy-executor-timer-queue` at git — the two must move together, or embassy-time's queue
+utils size `TimerQueueItem` through a second copy and timeouts stop firing). The recorders
+keep their `u32` keys either way; custom hooks narrow ids with `trace::task_key` /
+`trace::executor_key`. CI's canary job builds and tests exactly that configuration, and the
+cfg goes away once the crate pins the release that ships it.
 
 ## Cargo features
 
@@ -2422,7 +2431,7 @@ already pins.
 | `defmt`   |         | route the supervisor's logs through `defmt` — on embedded targets (`target_os = "none"`) only, where a `#[global_logger]` exists to link against; takes precedence over `log` there. On a hosted target the feature is inert and `log` is the live backend, so one feature list serves a SITL's both halves and `--all-features` host tests link with no defmt sink |
 | `log`     |         | route them through the `log` facade — the live backend on any target with an OS. `init_host_logging(LevelFilter)` (hosted targets only) installs a dependency-free stderr sink in one call, `[uptime] LEVEL target: message`; or install `env_logger` and filter with `RUST_LOG=embassy_supervisor=trace`. With **neither** backend the log macros are no-ops, so the `liveness-monitor` stale reports and every bring-up line print nothing |
 | `trace`   |         | trace-hook observability: per-node CPU time / poll counts / max-poll watermark, executor idle time, stall detection |
-| `trace-hooks` |     | batteries-included: the graph declaration also defines the `_embassy_trace_*` hook symbols (implies `trace`) |
+| `trace-hooks` |     | batteries-included: the graph declaration also defines the executor's trace hooks — the `_embassy_trace_*` symbols, or the `Trace` impl under `--cfg embassy_supervisor_trace_v2` (implies `trace`) |
 | `metadata-names` |  | stamp node names into task Metadata for external tooling (rtos-trace/SystemView); independent of `trace` — no hook symbols |
 | `trace-names` |     | shorthand for `trace` + `metadata-names` |
 | `trace-nested` |    | preemption-exact accounting: nested higher-tier polls are credited back to the window they interrupt (implies `trace`) |

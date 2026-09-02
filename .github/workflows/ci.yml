@@ -118,12 +118,17 @@ jobs:
           done
 
   # Canary against embassy's main branch (allow-failure): the executor's trace-hook
-  # API is documented as unstable, so this job builds the trace feature with
-  # embassy-executor patched to git.
+  # API is documented as unstable, so this job builds and tests the trace feature
+  # with embassy-executor patched to git. Main already speaks the post-0.10 hook
+  # API (a `Trace` trait registered with `trace_impl!`, `TaskId`/`ExecutorId`),
+  # which the supervisor selects with `--cfg embassy_supervisor_trace_v2`; drop
+  # the cfg here once the crate pins the release that ships it.
   trace-canary:
     name: trace vs embassy git (canary)
     runs-on: ubuntu-latest
     continue-on-error: true
+    env:
+      RUSTFLAGS: --cfg embassy_supervisor_trace_v2
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -132,13 +137,19 @@ jobs:
         run: |
           # Appending a second `[patch.crates-io]` is a duplicate-key error, so
           # only add one when the checked-out manifest doesn't already patch.
+          # The timer-queue crate must move with the executor: embassy-time's
+          # queue utils size `TimerQueueItem` through their own copy, and a
+          # second copy next to the executor's would let the queue write past
+          # the item in every task header (timeouts then never fire).
           if grep -q '^embassy-executor = { git' Cargo.toml; then
             echo "manifest already patches embassy-executor to git; using it as is"
           else
-            printf '\n[patch.crates-io]\nembassy-executor = { git = "https://github.com/embassy-rs/embassy" }\n' >> Cargo.toml
+            printf '\n[patch.crates-io]\nembassy-executor = { git = "https://github.com/embassy-rs/embassy" }\nembassy-executor-timer-queue = { git = "https://github.com/embassy-rs/embassy" }\n' >> Cargo.toml
           fi
-          cargo update -p embassy-executor
+          cargo update -p embassy-executor -p embassy-time-queue-utils
+          test "$(grep -c 'name = "embassy-executor-timer-queue"' Cargo.lock)" = 1
       - run: cargo build -p embassy-supervisor --target $HOST --features trace-hooks,trace-names
+      - run: cargo test -p embassy-supervisor --target $HOST --features macros,trace-hooks,trace-names,trace-nested,trace-self
 
   lint:
     name: fmt + clippy

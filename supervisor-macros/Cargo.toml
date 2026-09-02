@@ -107,9 +107,11 @@ metadata-names = []
 # Forwarded from `trace-names`: the full trace layer with node names = trace + the
 # name stamp.
 trace-names = ["trace", "metadata-names"]
-# Forwarded from the supervisor's `trace-hooks`: emit the seven `no_mangle`
-# `_embassy_trace_*` hook definitions at the graph declaration site (the supervisor
-# crate itself is `forbid(unsafe_code)` and cannot define them).
+# Forwarded from the supervisor's `trace-hooks`: expand the supervisor's
+# `__sv_trace_hooks!` at the graph declaration site. The bodies (seven `no_mangle`
+# `_embassy_trace_*` symbols, or a `Trace` impl against embassy git main) are the
+# supervisor's: the graph site only hosts them, because the supervisor crate is
+# `forbid(unsafe_code)` and `no_mangle` cannot be written there.
 trace-hooks = ["trace"]
 
 [dependencies]
