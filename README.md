@@ -1,9 +1,16 @@
 # embassy-supervisor
 
+
 [![crates.io](https://img.shields.io/crates/v/embassy-supervisor.svg)](https://crates.io/crates/embassy-supervisor)
 [![docs.rs](https://docs.rs/embassy-supervisor/badge.svg)](https://docs.rs/embassy-supervisor)
 [![docs](https://img.shields.io/badge/docs-embassy--supervisor.github.io-blue)](https://embassy-supervisor.github.io/)
+[<img src="https://embassy-supervisor.github.io/og.png" alt="embassy-supervisor.github.io — docs, guides and an in-browser playground" width="640">](https://embassy-supervisor.github.io/)
 
+**[embassy-supervisor.github.io](https://embassy-supervisor.github.io/)** — docs and guides,
+plus an in-browser playground that runs the real crate compiled to WebAssembly: declare a graph,
+wire behaviors to it, and watch the supervisor drive lifecycle, couplings and dataflow live.
+
+---
 
 **Run-time supervision for bare-metal async Rust.** A composable architecture for real
 [embassy](https://embassy.dev) firmware — a dependency-ordered task lifecycle over layered
