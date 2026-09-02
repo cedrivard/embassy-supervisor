@@ -499,6 +499,8 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
+[0.9.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.8.0...embassy-supervisor-macros-v0.9.0
+[0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.7.0...embassy-supervisor-macros-v0.8.0
 [0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.6.2...embassy-supervisor-macros-v0.7.0
 [0.6.2]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.6.1...embassy-supervisor-macros-v0.6.2
 [0.6.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.6.0...embassy-supervisor-macros-v0.6.1

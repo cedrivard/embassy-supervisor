@@ -1077,8 +1077,8 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.7.0...v0.8.0
-[0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.6.0...v0.7.0
+[0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.7.0...embassy-supervisor-v0.8.0
+[0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.6.0...embassy-supervisor-v0.7.0
 [0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/cedrivard/embassy-supervisor/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.4.3...v0.5.0

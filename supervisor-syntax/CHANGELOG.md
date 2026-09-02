@@ -106,3 +106,7 @@ tooling that wants it.
 - **No name resolution.** Unknown deps, duplicate names and the 256-slot cap are checked
   against a whole graph by the macro. A fragment legitimately names nodes it does not
   contain, so parsing one in isolation has to succeed.
+
+[0.3.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.2.0...embassy-supervisor-syntax-v0.3.0
+[0.2.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.1.0...embassy-supervisor-syntax-v0.2.0
+[0.1.0]: https://github.com/cedrivard/embassy-supervisor/releases/tag/embassy-supervisor-syntax-v0.1.0
