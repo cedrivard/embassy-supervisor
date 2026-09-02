@@ -1,0 +1,5 @@
+error: `divisible` takes no type — the slot is a `Budget<K>` the graph sizes to its declaring nodes and pool members
+ --> tests/ui/compile_fail_budget/divisible_with_type.rs:6:70
+  |
+6 |     node ONE = Terminate, deps: [], task: holder, resources: [POWER: divisible u32];
+  |                                                                      ^^^^^^^^^

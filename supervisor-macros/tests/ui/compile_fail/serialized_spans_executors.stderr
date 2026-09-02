@@ -1,0 +1,5 @@
+error: `BUS` is `serialized`: every holder must run on one executor so no higher-tier waiter can be starved by a lower-tier holder (priority ceiling by construction), but `MODBUS` runs on the supervisor's executor and `LOGGER` on `HIGH`
+  --> tests/ui/compile_fail/serialized_spans_executors.rs:12:33
+   |
+12 |         resources: [BUS: shared serialized Bus];
+   |                                 ^^^^^^^^^^

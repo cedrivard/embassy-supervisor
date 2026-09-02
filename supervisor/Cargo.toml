@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.7.0"
+version = "0.8.0"
 description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
@@ -33,7 +33,7 @@ log = { version = "0.4.33", optional = true, default-features = false }
 # `state: zeroed Type` (heap-state): `Zeroable` is the all-zero-is-valid contract.
 bytemuck = { version = "1.25.0", optional = true, default-features = false }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.8.0", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.9.0", path = "../supervisor-macros", optional = true }
 
 [features]
 # Just the graph macro: everything the supervisor can DO is opt-in, matching the
@@ -154,8 +154,13 @@ restart = ["control"]
 # status endpoint, the diagram tool, or a reader of the graph. The two tiers
 # below turn it into behaviour — a heartbeat and a readiness assertion.
 #
+# Also ships `Stamped<T>`, the read-side half of write freshness: a wrapper
+# that stamps each write so a consumer can ask `age()` / `read_fresh(max)`.
+# (The monitor-side half is `writes: [X observed beat]` + `beat_timeout:`.)
+# Neither can judge whether a fresh value is valid; that is the consumer's.
+#
 # Flash-only cost (const slices, one `&str` + one thin ref per entry); no RAM
-# and no hot-path work.
+# and no hot-path work. `Stamped` costs 8 bytes per wrapped signal.
 coupling = ["embassy-supervisor-macros?/coupling"]
 
 # Polled coupling: the `observed` entry marker on `reads:`/`writes:`, and a
@@ -292,6 +297,35 @@ graph-ref = ["embassy-supervisor-macros?/graph-ref"]
 # the number of graphs, and a gate resolves as readily before
 # `Supervisor::start` as after.
 data-deps = ["graph-ref", "dataflow", "embassy-supervisor-macros?/data-deps"]
+
+# Divisible resource budgets. `resources: [POWER: divisible]` creates a
+# `Budget<K>` shared by every node or pool member that names it. Each holder
+# gets a `Claimant`; an allocator node sets capacity and splits it with a
+# `BudgetPolicy` (`FairShare`, `ShrinkFastGrowSlow`).
+#
+# Lifecycle tie: a stopped holder releases its share on shutdown ack, or on
+# `ShutdownTimeout` if the ack never comes. A paused holder keeps its claim.
+#
+# Cost: 4 + 8 × K atomics, two Signals and K waker slots per budget, plus a small
+# config slice per claimant. Skip this for exclusive singletons; use a normal
+# `resources:` slot instead.
+budget = ["embassy-supervisor-macros?/budget"]
+
+# Distributed veto: `writes: [crate::TRIP veto]` gives each writer one
+# contributor slot of a `VetoGate<N>` — asserted while any contributor holds
+# it, released only once all have let go. The graph numbers the writers (a
+# node takes one slot, a pool one per member) and proves at compile time that
+# the target is a `VetoGate` with a slot for each; a writer takes its handle
+# with `node.veto(&TRIP)` and can only ever move its own bit, so no protection
+# function can clear another's trip. The actuator reads the gate and parks on
+# `wait_asserted` / `wait_released`.
+#
+# A stopped writer's bit stays asserted (fail-safe): release is explicit.
+# Costs 4 bytes + one Signal per gate, 4 more under `coupling-observe` for the
+# transition counter that makes `TRIP veto observed beat` a heartbeat, and one
+# byte (a niche) per `Coupling` in every graph once the feature is on. Pulls
+# `dataflow`: the handle resolves through the node's `Sig`.
+veto = ["dataflow", "embassy-supervisor-macros?/veto"]
 
 # A per-node status line: report_status()/status() on TaskNode, in the mold of
 # sd_notify's STATUS=. Passive: shown when asked (a dashboard, a log line on
@@ -469,6 +503,41 @@ required-features = ["macros"]
 [[test]]
 name = "resource_kinds"
 required-features = ["macros", "local-resources"]
+
+# The budget primitive by hand: FairShare's split and remainder,
+# ShrinkFastGrowSlow's immediate cut and stepped ramp, and a Budget's
+# provide/want/rebalance/release/clear protocol with a hand-polled waiter.
+[[test]]
+name = "budget_policy"
+required-features = ["budget"]
+
+# A `divisible` resource in a graph: an allocator provides and divides it, a
+# clean stop releases the holder's share, a never-acking holder's share is
+# released by the supervisor with its ShutdownTimeout, a Pause holder keeps its
+# claim, an unprovided budget is ResourceMissing, and `provides:` empties it.
+[[test]]
+name = "budget"
+required-features = ["macros", "budget", "control"]
+
+# Pool members over one budget: slots follow the declaring node's, one per
+# member, and a member's stop releases only its own.
+[[test]]
+name = "budget_pool"
+required-features = ["macros", "budget", "pool", "control"]
+
+# A distributed veto: writers numbered across nodes and pool members, any one
+# trips the gate, only all of them reset it, a stopped writer's trip persists
+# until released on purpose, a reader holds no slot, and the token counts flips.
+[[test]]
+name = "veto"
+required-features = ["macros", "veto", "pool", "control", "coupling-observe"]
+
+# `Stamped<T>`: no age until the first write, an age that grows with the mock
+# clock, `read_fresh` against a bound, `put` through the node stamps, and the
+# token forwards to the inner signal (writes, not ticks).
+[[test]]
+name = "stamped"
+required-features = ["macros", "coupling", "dataflow", "coupling-observe"]
 
 # The provider-node pattern: a first-in-topo node builds `consume`/`shared`
 # resources at runtime and provide()s them; consumers rendezvous via their
@@ -685,6 +754,14 @@ required-features = ["macros", "trace"]
 # searching the caller's own graph, so nothing names it.
 [[test]]
 name = "gated_signal"
+required-features = ["macros", "data-deps", "readiness", "control"]
+
+# The refcounted stop: `open` hands out a guard, the producer retires through
+# `retire` once the last guard has been gone for a cooldown, a reader arriving
+# inside the cooldown cancels it, and one arriving between the readiness
+# withdrawal and the stop waits for the respawn instead of reading a corpse.
+[[test]]
+name = "gated_refcount"
 required-features = ["macros", "data-deps", "readiness", "control"]
 
 # Two openers racing one gate during the producer's bring-up: both must pass

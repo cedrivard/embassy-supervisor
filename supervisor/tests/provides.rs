@@ -48,12 +48,14 @@ async fn preader_worker(node: &'static TaskNode, _handle: Handle) {
 supervisor_graph! {
     node PROVIDER = Terminate, deps: [], task: provider_worker,
         provides: [HANDLE];
+    // `serialized`: both holders run on the supervisor's executor, which is
+    // all the marker asks (it changes nothing at runtime).
     node READ_A = Terminate, deps: [PROVIDER], task: reader_worker,
         slot_timeout: 5000,
-        resources: [HANDLE: shared Handle];
+        resources: [HANDLE: shared serialized Handle];
     node READ_B = Terminate, deps: [PROVIDER], task: reader_worker,
         slot_timeout: 5000,
-        resources: [HANDLE: shared Handle];
+        resources: [HANDLE: shared serialized Handle];
 
     node PAUSER = Pause, deps: [], task: pauser_worker,
         provides: [PHANDLE];

@@ -6,6 +6,45 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.9.0] - 2026-09-01
+
+Rides `embassy-supervisor-syntax = "=0.3.0"`.
+
+### Added
+
+- Feature `budget`: the `divisible` resource kind. One `pub static NAME:
+  Budget<K>` per name, sized to its declaring nodes plus pool members
+  (counted syntactically, so a `#[cfg]`'d-out holder still reserves its
+  slot); the shell receives a `Claimant` bound to the holder's slot (a pool
+  wrapper builds member `I`'s as `base + I`); a claims table per holder wired
+  with `.with_claims(..)`; shape bit `CLAIMS`. `provides:` may name a budget.
+  Rejected: `divisible` with a type or any other kind marker, more than 256
+  slots, `pool_size > 1` beside a `divisible` entry (one claimant slot, which
+  the instances would share), the marker without the feature.
+- Feature `veto`: the `veto` marker on `writes:` entries. Writers of one gate
+  are numbered in item order (a node one slot, a pool one per member, with a
+  writes table per member so each carries its own slot), the slot rides in
+  the entry's `Coupling`, and one `const _: () = __sv_check_veto(&TARGET, K)`
+  per gate makes a non-`VetoGate` target a type error and too few slots a
+  const-eval error; the check carries the union of its writers' `#[cfg]`s, so
+  a gate that rides a feature with them is not named without it. Rejected:
+  `veto` on a `reads:` entry, more than 32 writers, one gate spelled two ways
+  across the graph (slots are numbered per spelling), the marker without the
+  feature.
+- `shared serialized`: a re-declaration whose item routes through a different
+  `executor:` than the first holder's is rejected, naming both holders and
+  their tiers. Syntactic; `#[cfg]`s are not consulted.
+
+### Changed
+
+- The `#[dataflow]` scanner names the missing feature for an `open` or
+  `lease` call (`data-deps`), a `veto` call (`veto`) or a `retire` call
+  (`data-deps` + `readiness`) instead of leaving rustc to report the method.
+- Per-kind codegen branches on `ResourceKind` instead of marker probes, and
+  the shared-slot plan is a graph-wide slot plan carrying `divisible` slot
+  counts and the first holder's executor. Emitted code for the three existing
+  kinds is unchanged.
+
 ## [0.8.0] - 2026-08-27
 
 Rides `embassy-supervisor-syntax = "=0.2.0"`.

@@ -1,0 +1,5 @@
+error: `veto` belongs on a `writes:` entry — a veto is something a node asserts, not something it consumes
+ --> tests/ui/compile_fail_veto/veto_in_reads.rs:8:76
+  |
+8 |     node BREAKER = Terminate, deps: [], task: breaker, reads: [crate::TRIP veto];
+  |                                                                            ^^^^

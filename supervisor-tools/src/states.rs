@@ -32,19 +32,28 @@ struct Gates {
     writes: Vec<String>,
 }
 
+/// `NAME (kind)`: the slot with how its holder gets the value.
+fn resource_label(r: &embassy_supervisor_syntax::ResourceDecl) -> String {
+    let kind = if r.divisible.is_some() {
+        " (divisible)"
+    } else if r.serialized.is_some() {
+        " (shared serialized)"
+    } else if r.shared.is_some() {
+        " (shared)"
+    } else if r.local.is_some() {
+        " (local)"
+    } else if r.consume.is_some() {
+        " (consume)"
+    } else {
+        ""
+    };
+    format!("{}{kind}", r.ident)
+}
+
 fn node_gates(n: &NodeItem) -> Gates {
     let mut g = Gates::default();
     for r in &n.resources {
-        let kind = if r.shared.is_some() {
-            " (shared)"
-        } else if r.local.is_some() {
-            " (local)"
-        } else if r.consume.is_some() {
-            " (consume)"
-        } else {
-            ""
-        };
-        g.takes.push(format!("{}{kind}", r.ident));
+        g.takes.push(resource_label(r));
     }
     g.waits = n
         .deps
@@ -70,22 +79,7 @@ fn node_gates(n: &NodeItem) -> Gates {
 
 fn pool_gates(p: &PoolItem) -> Gates {
     let mut g = Gates {
-        takes: p
-            .resources
-            .iter()
-            .map(|r| {
-                let kind = if r.shared.is_some() {
-                    " (shared)"
-                } else if r.local.is_some() {
-                    " (local)"
-                } else if r.consume.is_some() {
-                    " (consume)"
-                } else {
-                    ""
-                };
-                format!("{}{kind}", r.ident)
-            })
-            .collect(),
+        takes: p.resources.iter().map(resource_label).collect(),
         waits: p
             .deps
             .iter()

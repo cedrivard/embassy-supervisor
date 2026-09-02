@@ -174,6 +174,7 @@ supervisor_graph! {
         , state: zeroed Type            //   same, allocated zero-filled (Type: Zeroable)
         , cancel                        //   shell owns the shutdown race; worker takes no node
         , reads: [crate::SIG, ..]       //   declared dataflow; entry marker: observed
+        , writes: [crate::TRIP veto]    //   a contributor slot of a VetoGate (feature veto)
         , writes: [crate::SIG beat]     //     `beat` marks the heartbeat write
         , discover                      //   or: bind the tables the task fn's #[dataflow] derived
                                         //     (a list beside it may only add markers)
@@ -730,9 +731,9 @@ The protocol, per (re)spawn:
 The supervisor awaits a node's slots being filled before each (re)spawn (same bounded wait
 as `executor` slots), so late provisioning and the respawn-vs-restore window on another core
 are both covered. Caveats: a panic in the worker skips the restore (embedded panic = reboot);
-`pool_size > 1` cannot combine with lend/consume entries — the slot holds ONE value, so the
-macro rejects it (use `shared`, or an `ElasticPool`, whose members get per-member slot
-arrays).
+`pool_size > 1` cannot combine with lend/consume/divisible entries — the slot holds ONE
+value (a budget, one claimant), so the macro rejects it (use `shared`, or an `ElasticPool`,
+whose members get per-member slot arrays).
 
 `ResourceSlot<T>`'s hand-usable API, for providers and app code (the macro's glue uses
 the same calls): `provide(T)` / `restore(T)` fill the slot (restore is provide, named for
@@ -742,11 +743,11 @@ latch, and `async wait_take() -> T` awaits a fill then takes — how an `exit:` 
 read. `provide` on an already-filled slot overwrites (the old value is dropped): every
 slot is a mailbox, not a log.
 
-#### Resource kinds: `local`, `consume`, and `shared`
+#### Resource kinds: `local`, `consume`, `shared`, and `divisible`
 
 Per-entry markers (order-free; `local` composes with either of the mutually exclusive
-`consume`/`shared`) refine the default lend-and-restore protocol. The kind follows from
-what the worker does with the value:
+`consume`/`shared`; `divisible` stands alone) refine the default lend-and-restore
+protocol. The kind follows from what the worker does with the value:
 
 - it only **borrows** it, and the same instance should serve the next activation →
   the default;
@@ -754,7 +755,9 @@ what the worker does with the value:
   or the node is one-shot by construction (its setup claims `StaticCell`s a second run
   would re-initialise) → `consume`: the slot stays empty afterwards, so a respawn fails
   at the supervisor with `ResourceMissing` instead of panicking inside the worker;
-- several nodes need the **same `Copy` handle** → `shared`.
+- several nodes need the **same `Copy` handle** → `shared`;
+- several nodes each need a **share of one quantity** (a power budget, a bandwidth
+  cap) → `divisible`, feature `budget`.
 
 | kind | worker receives | on worker exit | use for |
 |---|---|---|---|
@@ -762,6 +765,7 @@ what the worker does with the value:
 | `consume` | `Type` **by value** (shell `take()`s) | nothing — the slot stays **empty** | resources the worker must *drop* at teardown (a driver whose `Drop` releases pins/DMA) or that go stale across a power cycle and are rebuilt each run |
 | `shared` | `Type` **by value** (shell **copies** via `get()`, `T: Copy`) | nothing — the slot **stays filled** | one handle fanned out to many consumers (`embassy_net::Stack`, a `&'static` shared-bus ref); several nodes — and whole `task:` pools — declare the SAME slot name |
 | `local` | as the kind it composes with | as the kind it composes with | `!Send` values (`RefCell`-/`NoopRawMutex`-based driver handles) on a **single core** |
+| `divisible` | a `Claimant` **by value**: its own slot in the graph's `Budget<K>` | its share is **released** by the supervisor (`Pause` parks keep it) | one quantity split among N holders, where a dead holder must not strand its share |
 
 `consume` makes teardown-drop explicit and turns the wake path into "build fresh, `provide()`,
 respawn": until the application re-provides, a respawn fail-closes with `FaultKind::ResourceMissing`
@@ -774,6 +778,40 @@ instead of reusing a stale instance.
 the declaring sites' `#[cfg]` predicates); every re-declaration must repeat the same
 kind markers and type. Entries may also carry per-entry `#[cfg(...)]` — gate the worker
 fn's matching parameter with the same attribute.
+
+`shared serialized` adds a compile-time rule to a shared slot: **every holder must run on
+one executor**. This prevents a low-priority holder from starving a high-priority waiter
+on a serialized bus such as RS-485 or shared SPI. The check is syntactic and costs nothing
+at runtime.
+
+`divisible` (feature `budget`) declares a shared budget: `resources: [POWER: divisible]`.
+The graph emits one `pub static POWER: Budget<K>` with one slot per declaring node and pool
+member. The capacity is `provide()`d at runtime; an unprovided budget is
+`FaultKind::ResourceMissing`. Each holder receives a `Claimant` and can state a want, read its
+grant, or wait for grant changes. An allocator task calls `POWER.rebalance(&policy, ..)` to
+redistribute. Two policies ship: `FairShare` and `ShrinkFastGrowSlow`.
+
+A holder's share is released when it stops. If the shutdown ack never comes, the supervisor
+releases the share itself. A `Pause` ack keeps the claim.
+
+```rust,ignore
+async fn session(node: &'static TaskNode, power: Claimant) {
+    power.want(7_000); // watts, say
+    let mut allowed = power.grant();
+    let _ = node.run_cancellable_acked(async {
+        loop {
+            enforce(allowed);
+            allowed = power.wait_grant_change(allowed).await; // a cut lands here first
+        }
+    }).await;
+}
+
+supervisor_graph! {
+    node SITE   = Terminate, task: site_manager, provides: [POWER];
+    pool EVSE   = [Terminate, OnDemand, OnDemand, OnDemand], deps: [SITE], task: session,
+        resources: [POWER: divisible], policy: DeferredShrink::new(..), min: 1, max: 4;
+}
+```
 
 `local` **requires the non-default `local-resources` feature**: it swaps the emitted
 `ResourceSlot` for a graph-site slot type without the `T: Send` bound, and that type
@@ -1074,9 +1112,17 @@ offending token:
 - **a repeated kind marker on a `resources:` entry** (`consume consume T`) — declaration bug
 - **`local` without the `local-resources` feature** — the kind emits an `unsafe impl Sync`,
   so it is strictly opt-in
-- **`shared` with `consume`** — contradictory: one exclusive owner vs any number of copies
-- **a `shared` slot re-declared with different kinds/type** — every declaration of the
-  same name is ONE static and must repeat its shape verbatim
+- **`shared` with `consume`** — one value cannot both fan out and move by value.
+- **`divisible` with any other kind marker, or with a type** — a budget is its own kind.
+  Also rejected without the `budget` feature, with more than 256 slots, or with
+  `pool_size > 1` (one claimant per slot).
+- **`serialized` without `shared`** — serialization applies only to fan-out slots. Also
+  rejected when holders span multiple executors.
+- **`veto` on a `reads:` entry** — vetoes are asserted, not read. Also rejected without
+  the `veto` feature, with more than 32 writers, or when one gate is spelled two ways.
+  A `veto` target must be a `VetoGate` with enough slots.
+- **a `shared` slot re-declared with different kinds/type** — all declarations of the same
+  name must match exactly.
 - **`local` resources with `executor:`** — on a node or a pool: a local slot carries
   `!Send` values; a `SpawnerSlot`-routed spawn needs a `Send` future
 - **`slot_timeout: 0`** — would fail every gated spawn instantly
@@ -1101,7 +1147,8 @@ offending token:
 Generated surface at the call site: one `pub static` per node, the pool array + `NAME_POOL`
 \+ the `NAME_MIN`/`NAME_MAX`/`NAME_MEMBERS` consts,
 one `SpawnerSlot` static per `executor NAME;`, one slot static per `resources:` entry (plus,
-iff any entry is `local`, the local slot type), and `pub static GRAPH` — nothing else.
+iff any entry is `local`, the local slot type; one `Budget<K>` per `divisible` name), and
+`pub static GRAPH` — nothing else.
 
 ## Dataflow supervision
 
@@ -1494,9 +1541,11 @@ that they read:
 // ships: start the producer on first open, then wait for its readiness.
 pub static ESTIMATE: Backed<Watch<Estimate>> = Backed::new(Watch::new());
 
-// The consumer states a read. `Deref` gives the wrapped signal's own API back, so
-// every existing consumer of ESTIMATE keeps compiling unchanged.
-let mut rx = node.open(&crate::ESTIMATE).await.receiver();
+// The consumer states a read. `open` hands back an `Open` guard; `Deref` gives
+// the wrapped signal's own API back, and the guard is the reader's hold on the
+// producer (below), so bind it for as long as the reading lasts.
+let est = node.open(&crate::ESTIMATE).await;
+let mut rx = est.receiver();
 ```
 
 **Nothing names the producer.** The graph already knows who writes a signal, so
@@ -1516,6 +1565,32 @@ boot-started producer and reported for any other.
 `open` is the only awaiting verb — a gate fires once per consumer at setup, so the
 future belongs there and not on every access — and it grants no exclusive access.
 A signal with no gate carries no wrapper, no state and no code.
+
+#### Retiring when the last reader leaves
+
+`Backed` counts its readers. Every `open` is counted before it waits, and the `Open`
+guard decrements the count on drop. The producer can retire once the count stays zero
+for a cooldown:
+
+```rust,ignore
+#[dataflow]
+async fn estimator(node: &'static TaskNode) {
+    node.writer(&crate::ESTIMATE).send(first_estimate());
+    node.set_ready();
+    let _ = select(
+        node.wait_shutdown(),
+        node.retire(&crate::ESTIMATE, Duration::from_secs(5)),
+    ).await;
+}
+```
+
+`retire` waits for `ESTIMATE.openers()` to stay zero for the whole cooldown. A reader
+arriving during the cooldown restarts the clock. When it resolves, the producer
+withdraws its readiness and, with `control`, requests its own `Deactivate`. A reader
+admitted after readiness is withdrawn waits for the next activation instead of reading
+a stopped producer. `Backed::unwatched(cooldown)` is the same wait without the automatic
+stop. `Open::signal()` returns the wrapped signal for APIs that need a `'static`
+reference, but references kept past the guard drop are no longer counted.
 
 ### Leases: the teardown side (feature `data-deps`)
 
@@ -1562,6 +1637,77 @@ Costs one `AtomicU32` and one `Signal` per leased signal, and nothing at all
 for signals that do not opt in. `Deref` keeps the wrapped signal's own API
 reachable, which also means reaching the static directly is uncounted — the
 same advisory property a gate has.
+
+### Gates are advisory; make bypass deliberate
+
+`Backed`, `Leased`, and `VetoGate` guard the access path, not the data. The wrapper is
+a plain static, so code that names it directly reads the value uncounted and ungated.
+Make bypass deliberate by keeping the static private and exposing only `#[dataflow]`
+accessors:
+
+```rust,ignore
+mod estimate {
+    static ESTIMATE: Backed<Watch<Estimate>> = Backed::new(Watch::new());
+
+    #[dataflow]
+    pub async fn publish(node: &'static TaskNode, e: Estimate) {
+        node.writer(&ESTIMATE).send(e);
+    }
+
+    #[dataflow]
+    pub async fn subscribe(node: &'static TaskNode) -> Open<Watch<Estimate>> {
+        node.open(&ESTIMATE).await
+    }
+}
+```
+
+The derived tables are public, so the graph can bind the accessors by fn path
+(`task: estimate::publish, discover`) without naming the signal. Every reader outside
+the module goes through `open`. `supervisor-lint --only public-gate` reports any gate
+static that is not private.
+
+### Distributed veto (feature `veto`)
+
+Use `VetoGate` when several protection functions share one trip signal and no single
+writer owns release. Any contributor can assert the gate; the gate stays asserted until
+every contributor releases its own bit.
+
+```rust,ignore
+pub static TRIP: VetoGate<8> = VetoGate::new();
+
+supervisor_graph! {
+    node PROT_50_51 = Terminate, task: overcurrent, discover, writes: [crate::TRIP veto];
+    node PROT_87    = Terminate, task: differential, discover, writes: [crate::TRIP veto];
+    node TRIP_LOGIC = Terminate, task: trip_logic, discover, reads: [crate::TRIP];
+}
+
+#[dataflow]
+async fn overcurrent(node: &'static TaskNode) {
+    let veto = node.veto(&crate::TRIP).expect("declared `veto`");
+    veto.assert();   // gate asserted while ANY contributor holds it
+    // ...
+    veto.release();  // clears only this writer's bit
+}
+
+#[dataflow]
+async fn trip_logic(node: &'static TaskNode) {
+    let gate = node.reader(&crate::TRIP);
+    loop {
+        gate.wait_asserted().await;
+        open_breaker();
+        gate.wait_released().await; // once every contributor let go
+        rearm();
+    }
+}
+```
+
+The macro assigns each `veto` writer a contributor slot in declaration order and checks
+at compile time that the target is a `VetoGate` with enough slots. It also rejects mixed
+spellings of the same gate, so `TRIP` and `crate::TRIP` cannot both appear. A writer can
+move only its own bit, so no writer can clear another's trip. A stopped writer's bit stays
+asserted, keeping the trip latched. Under `coupling-observe`, `writes: [crate::TRIP veto
+observed beat]` counts trips as the writer's heartbeat. All writers of one gate must live
+in the same graph.
 
 ### Channels, mutexes, and anything else `Sync`
 
@@ -1648,6 +1794,12 @@ for (i, node) in GRAPH.iter_nodes() {
 
 With `liveness-monitor` the polling is done for you: declare `beat_timeout:` on the
 nodes whose bodies beat, and consume `wait_health()`.
+
+**Write freshness is not value validity.** The monitor only answers whether a node
+wrote recently. `Stamped<T>` lets a reader check a value's age, but that means
+"written within `max_age`", not "this exact read is correct". It cannot detect
+semantic problems like a clock servo drifting while still writing. The application
+must decide what a stale report means.
 
 **What to do about a report is deliberately yours.** Where a subsystem can be cycled
 safely, feeding a `Stale` event to `Supervisor::restart` (feature `restart`) or to
@@ -2252,14 +2404,16 @@ already pins.
 | `control` |         | runtime control plane (`ControlOp`, `request_control`, `apply_control`) |
 | `pool`    |         | elastic worker pools (`ElasticPool`, `run_pools`, `GRAPH.pools`) |
 | `local-resources` | | permit the `local` resource kind — ⚠ opt-in to the macro emitting a documented `unsafe impl Sync` (single-core contract) |
+| `budget` | | the `divisible` resource kind: a graph-sized `Budget<K>` of units, a `Claimant` per holder, `FairShare`/`ShrinkFastGrowSlow` policies, and a holder's share released by the supervisor when it stops — including a wedged holder that misses its ack |
 | `readiness` | | task-asserted readiness: `set_ready`/`wait_ready`/`clear_ready` + the `ready` dep marker (bring-up + pool-growth gating) |
 | `liveness` | | per-node heartbeat: `beat()` raises a flag that `ticks_since_beat() -> u32` converts using the clock read it already makes, plus `is_stale(max_age)` — alive-but-wedged detection without `trace`. A fresh spawn counts as a beat, so a node is never instantly stale. The `beat_put`/`beat_writer` verbs exist only with this on |
 | `liveness-monitor` | | the sweep over those heartbeats: `beat_timeout:` / `beat_window:` clauses, `Supervisor::monitor`, `HealthEvent` on `wait_health()`. **Report-only** — escalation is the application's call (implies `liveness`) |
 | `epochs` | | per-node activation generation (`epoch()`, `wait_epoch_change()`), so an *already-running* dependent can notice that a provider was restarted underneath it. Pure status |
-| `coupling` | | declared dataflow: `reads:` / `writes:` naming real signal statics, and the signal-indexed queries |
+| `coupling` | | declared dataflow: `reads:` / `writes:` naming real signal statics, and the signal-indexed queries; `Stamped<T>`, the read-side write-freshness wrapper (`age`, `read_fresh`) |
 | `coupling-observe` | `coupling` | the `observed` entry marker and its accessor (`via`, graph default, or the `Observable` facade): a way to ask whether a signal moved. `beat` is what currently asks — with `liveness-monitor` it drives the heartbeat and `ready_on_write` by polling, nothing asked of the task |
 | `dataflow` | `coupling` | the node as the access path: `#[dataflow]` derives a fn's coupling tables from its `put`/`get`/`writer`/`reader` calls, `discover` binds the task fn's and `dataflow: [..]` adopts accessors' (flash-const, no second place to update); `beat_put`/`beat_writer` carry the node's heartbeat at the write that proves it, and `#[dataflow(read(..), write(..))]` registers verbs of your own |
 | `graph-ref` | | a graph as one addressable `'static`: `supervisor_graph!` emits a `GraphRef` beside the node table and `GRAPH.graph_ref` names it. Carries no behaviour of its own — it is the handle `data-deps` and `trace` both need, in opposite directions |
+| `veto` | `dataflow` | the `veto` entry marker: one contributor slot of a `VetoGate<N>` per writer, numbered and capacity-checked by the macro; `node.veto(&GATE)` moves only that writer's bit, the actuator parks on `wait_asserted`/`wait_released`; a stopped writer's trip persists |
 | `data-deps` | `graph-ref` + `dataflow` | data-driven dependencies, both directions. Bring-up: `node.open(&SIG).await` runs the signal's own `Gated::ensure` first, `Backed<T>` (with `readiness`) starts the producer on first open and holds the reader until it is ready, and `producer_of` finds that producer through the graph by address. Teardown: `Leased<T>` + `node.lease(&SIG)` count the live holders so a producer's `drain()` waits for zero before it frees what it published. Nothing names anything; a signal that uses neither costs nothing |
 | `node-status` | | `report_status()`/`status()` — a one-line self-description per node, `sd_notify(STATUS=..)` style; shown when asked, cleared on activation, never an event |
 | `restart` | | `Supervisor::restart` — rest_for_one: cycle a node and its transitive dependents, re-gating them on the way back up (implies `control`) |
@@ -2491,6 +2645,22 @@ Measured on the demo firmware (RP2350, release + fat LTO): the whole feature set
 steady-state stack — a threaded resource travels inside the task's future.
 
 ## Migration
+
+### 0.7 → 0.8
+
+Ships with `embassy-supervisor-macros` 0.9.0 on `embassy-supervisor-syntax` 0.3.0
+(both pinned by exact version — no action needed). One signature changes, and the
+compiler finds every site:
+
+| 0.7.x | 0.8.0 |
+|---|---|
+| `node.open(&SIG).await` returned `&'static T` | it returns the gate's `Handle` — an `Open<T>` guard for `Backed`, which `Deref`s to the signal and leaves the reader count on drop. `let est = node.open(&SIG).await; est.receiver()` where `node.open(&SIG).await.receiver()` no longer lives long enough; `.signal()` where a `&'static T` is what you need (a `Leased` inside a `Backed`) |
+| a hand-written `Gated` impl had `ensure` only | add `type Handle = &'static Self;` and `fn admit(&'static self) -> &'static Self { self }` (or a counting guard of your own) |
+| a `#[dataflow]` body calling a node method named `retire` or `veto` | those are scanner verbs now (the producer's retirement, the writer's veto handle) and their first argument is rewritten to a `Sig` |
+
+Everything else is additive: the `budget` and `veto` features, the `serialized` marker,
+`Stamped`, the `public-gate` lint. A `Backed` gains 4 bytes and a `Signal`; a `Coupling`
+gains a byte only under `veto`.
 
 ### 0.6 → 0.7
 

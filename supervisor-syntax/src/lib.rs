@@ -144,6 +144,9 @@ pub struct SignalDecl {
     pub observed: Option<Ident>,
     /// Present when the entry is marked `beat`.
     pub beat: Option<Ident>,
+    /// Present when the entry is marked `veto`: this writer holds one
+    /// contributor slot of a `VetoGate`.
+    pub veto: Option<Ident>,
     /// The accessor expression supplied by `observed via <expr>`.
     pub via: Option<Expr>,
 }
@@ -187,50 +190,46 @@ pub fn parse_signal_list(input: ParseStream) -> SynResult<Vec<SignalDecl>> {
         };
         let mut observed = None;
         let mut beat = None;
+        let mut veto = None;
         let mut via = None;
-        if content.peek(Ident) {
+        // Markers in any order; `via <expr>` qualifies `observed`, follows it,
+        // and ends the entry (an expression has no marker after it).
+        while content.peek(Ident) {
             let marker: Ident = content.parse()?;
-            match marker.to_string().as_str() {
-                "observed" => observed = Some(marker),
-                "beat" => beat = Some(marker),
+            let slot = match marker.to_string().as_str() {
+                "observed" => &mut observed,
+                "beat" => &mut beat,
+                "veto" => &mut veto,
                 "via" => {
-                    return Err(syn::Error::new_spanned(
-                        &marker,
-                        "`via` supplies the accessor for an `observed` entry: \
-                         write `observed via <expr>`",
-                    ));
+                    if observed.is_none() {
+                        return Err(syn::Error::new_spanned(
+                            &marker,
+                            "`via` supplies the accessor an `observed` entry polls, \
+                             which only an `observed` entry has: write `observed via \
+                             <expr>`. `beat` only ever qualifies `observed`, and a \
+                             heartbeat the body can state is stated by its verb",
+                        ));
+                    }
+                    via = Some(content.parse::<Expr>()?);
+                    break;
                 }
                 other => {
                     return Err(syn::Error::new_spanned(
                         &marker,
                         format!(
-                            "expected `,`, `]`, or the `observed`/`beat` markers, \
+                            "expected `,`, `]`, or the `observed`/`beat`/`veto` markers, \
                              found `{other}`"
                         ),
                     ));
                 }
+            };
+            if slot.is_some() {
+                return Err(syn::Error::new_spanned(
+                    &marker,
+                    format!("duplicate `{marker}` marker"),
+                ));
             }
-            if beat.is_none() && content.peek(Ident) && content.fork().parse::<Ident>()? == "beat" {
-                beat = Some(content.parse::<Ident>()?);
-            }
-            if content.peek(Ident) {
-                let kw: Ident = content.parse()?;
-                if kw != "via" {
-                    return Err(syn::Error::new_spanned(
-                        &kw,
-                        format!("expected `beat`, `via <accessor>`, `,` or `]`, found `{kw}`"),
-                    ));
-                }
-                if observed.is_none() {
-                    return Err(syn::Error::new_spanned(
-                        &kw,
-                        "`via` supplies the polling accessor, which only an `observed` \
-                         entry has: `beat` only ever qualifies `observed`, and a \
-                         heartbeat the body can state is stated by its verb",
-                    ));
-                }
-                via = Some(content.parse::<Expr>()?);
-            }
+            *slot = Some(marker);
         }
         if let (Some(b), None) = (&beat, &observed) {
             return Err(syn::Error::new_spanned(
@@ -248,6 +247,7 @@ pub fn parse_signal_list(input: ParseStream) -> SynResult<Vec<SignalDecl>> {
             index,
             observed,
             beat,
+            veto,
             via,
         });
         if !content.is_empty() {
@@ -338,29 +338,71 @@ pub struct ResourceDecl {
     pub cfg: Vec<Attribute>,
     /// The resource slot identifier.
     pub ident: Ident,
-    /// The Rust type stored in the slot.
-    pub ty: Type,
+    /// The Rust type stored in the slot. `None` only for a `divisible` entry,
+    /// whose slot is a `Budget<K>` the graph sizes itself.
+    pub ty: Option<Type>,
     /// Present when the resource is marked `local`.
     pub local: Option<Ident>,
     /// Present when the resource is marked `consume`.
     pub consume: Option<Ident>,
     /// Present when the resource is marked `shared`.
     pub shared: Option<Ident>,
+    /// Present when the resource is marked `divisible`.
+    pub divisible: Option<Ident>,
+    /// Present when the resource is marked `serialized` (only beside `shared`).
+    pub serialized: Option<Ident>,
+}
+
+/// How a `resources:` entry hands its value to the task, as one value the
+/// consumers branch on instead of probing the marker fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceKind {
+    /// The default: taken out of the slot, lent to the worker as `&mut`, and
+    /// restored after it returns.
+    Lend,
+    /// `consume`: taken out by value; the slot stays empty after the task exits.
+    Consume,
+    /// `shared`: a `Copy` handle copied out; the slot stays filled.
+    Shared,
+    /// `divisible`: a budget of units the holder claims from, with one slot per
+    /// declaring node or pool member.
+    Divisible,
 }
 
 impl ResourceDecl {
+    /// The entry's kind, from its markers.
+    pub fn kind(&self) -> ResourceKind {
+        if self.divisible.is_some() {
+            ResourceKind::Divisible
+        } else if self.shared.is_some() {
+            ResourceKind::Shared
+        } else if self.consume.is_some() {
+            ResourceKind::Consume
+        } else {
+            ResourceKind::Lend
+        }
+    }
+
     /// Return a human-readable signature string for the resource kind.
     pub fn shared_signature(&self) -> String {
         let ty = &self.ty;
         format!(
-            "{}shared {}",
+            "{}{}shared {}",
             if self.local.is_some() { "local " } else { "" },
+            if self.serialized.is_some() {
+                "serialized "
+            } else {
+                ""
+            },
             quote!(#ty)
         )
     }
 }
 
-/// Look ahead for a resource kind marker (`local`, `consume`, or `shared`).
+const KIND_MARKERS: [&str; 5] = ["local", "consume", "shared", "divisible", "serialized"];
+
+/// Look ahead for a resource kind marker (`local`, `consume`, `shared`,
+/// `divisible`, or `serialized`).
 ///
 /// Returns `None` for ordinary identifiers that happen to share a name with a
 /// marker, using the following token to decide.
@@ -370,8 +412,13 @@ pub fn peek_kind_marker(content: ParseStream) -> Option<Ident> {
     }
     let fork = content.fork();
     let ident: Ident = fork.parse().ok()?;
-    if ident != "local" && ident != "consume" && ident != "shared" {
+    if !KIND_MARKERS.iter().any(|m| ident == m) {
         return None;
+    }
+    // `divisible` is the one marker with no type behind it, so the end of the
+    // entry is where it is expected; a type by that name needs a path.
+    if ident == "divisible" {
+        return (!fork.peek(Token![::]) && !fork.peek(Token![<])).then_some(ident);
     }
     if fork.is_empty() || fork.peek(Token![,]) || fork.peek(Token![::]) || fork.peek(Token![<]) {
         return None;
@@ -388,26 +435,22 @@ pub fn parse_resource_list(input: ParseStream) -> SynResult<Vec<ResourceDecl>> {
         let cfg = content.call(Attribute::parse_outer)?;
         let ident: Ident = content.parse()?;
         content.parse::<Token![:]>()?;
-        let mut local: Option<Ident> = None;
-        let mut consume: Option<Ident> = None;
-        let mut shared: Option<Ident> = None;
+        let mut markers: [Option<Ident>; 5] = Default::default();
         while let Some(marker) = peek_kind_marker(&content) {
             content.parse::<Ident>()?;
-            let slot = if marker == "local" {
-                &mut local
-            } else if marker == "consume" {
-                &mut consume
-            } else {
-                &mut shared
-            };
-            if slot.is_some() {
+            let i = KIND_MARKERS
+                .iter()
+                .position(|m| marker == m)
+                .expect("peeked a kind marker");
+            if markers[i].is_some() {
                 return Err(syn::Error::new_spanned(
                     &marker,
                     format!("duplicate `{marker}` marker"),
                 ));
             }
-            *slot = Some(marker);
+            markers[i] = Some(marker);
         }
+        let [local, consume, shared, divisible, serialized] = markers;
         if let (Some(_), Some(s)) = (&consume, &shared) {
             return Err(syn::Error::new_spanned(
                 s,
@@ -416,7 +459,37 @@ pub fn parse_resource_list(input: ParseStream) -> SynResult<Vec<ResourceDecl>> {
                  any number of consumers",
             ));
         }
-        let ty: Type = content.parse()?;
+        if let Some(d) = &divisible
+            && let Some(other) = local.as_ref().or(consume.as_ref()).or(shared.as_ref())
+        {
+            return Err(syn::Error::new_spanned(
+                other,
+                format!(
+                    "`divisible` is its own kind and takes no other marker: `{other}` \
+                     describes how one value is handed over, `{d}` declares a \
+                     budget of units the holder claims a share of"
+                ),
+            ));
+        }
+        if let (Some(s), None) = (&serialized, &shared) {
+            return Err(syn::Error::new_spanned(
+                s,
+                "`serialized` only qualifies `shared` — a slot with a single holder \
+                 cannot be contended, so there is nothing to serialize",
+            ));
+        }
+        let ty = if let Some(d) = &divisible {
+            if !(content.is_empty() || content.peek(Token![,])) {
+                return Err(syn::Error::new_spanned(
+                    d,
+                    "`divisible` takes no type — the slot is a `Budget<K>` the graph \
+                     sizes to its declaring nodes and pool members",
+                ));
+            }
+            None
+        } else {
+            Some(content.parse::<Type>()?)
+        };
         resources.push(ResourceDecl {
             cfg,
             ident,
@@ -424,6 +497,8 @@ pub fn parse_resource_list(input: ParseStream) -> SynResult<Vec<ResourceDecl>> {
             local,
             consume,
             shared,
+            divisible,
+            serialized,
         });
         if content.peek(Token![,]) {
             content.parse::<Token![,]>()?;
@@ -599,6 +674,15 @@ pub fn item_resources(item: &Item) -> &[ResourceDecl] {
         Item::Node(n) => &n.resources,
         Item::Pool(p) => &p.resources,
         Item::Executor(_) => &[],
+    }
+}
+
+/// Return the `executor:` an item routes through, if it names one.
+pub fn item_executor(item: &Item) -> Option<&Ident> {
+    match item {
+        Item::Node(n) => n.executor.as_ref(),
+        Item::Pool(p) => p.executor.as_ref(),
+        Item::Executor(_) => None,
     }
 }
 
@@ -1214,10 +1298,19 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
             ));
         }
     }
+    for d in &reads {
+        if let Some(v) = &d.veto {
+            return Err(syn::Error::new_spanned(
+                v,
+                "`veto` belongs on a `writes:` entry — a veto is something a node \
+                 asserts, not something it consumes",
+            ));
+        }
+    }
 
     if let Some(k) = &discover {
         for d in reads.iter().chain(writes.iter()) {
-            if d.observed.is_none() && d.beat.is_none() {
+            if d.observed.is_none() && d.beat.is_none() && d.veto.is_none() {
                 return Err(syn::Error::new_spanned(
                     &d.path,
                     "beside `discover`, a `reads:`/`writes:` entry may only add \
@@ -1674,7 +1767,7 @@ pub struct VerbCall {
 /// Built-in read verb names recognised by the dataflow scanner.
 pub const BUILTIN_READS: &[&str] = &["get", "reader", "open", "lease"];
 /// Built-in write verb names recognised by the dataflow scanner.
-pub const BUILTIN_WRITES: &[&str] = &["put", "writer", "beat_put", "beat_writer"];
+pub const BUILTIN_WRITES: &[&str] = &["put", "writer", "beat_put", "beat_writer", "retire", "veto"];
 
 /// Registry of read/write verbs used when scanning a `#[dataflow]` fn.
 #[derive(Debug, Clone, Default)]
@@ -3037,5 +3130,134 @@ mod tests {
         })
         .unwrap();
         assert_eq!(seen, ["OURS"]);
+    }
+
+    fn parse_err(src: &str) -> String {
+        syn::parse_str::<GraphSpec>(src)
+            .err()
+            .expect("rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn divisible_parses_bare_and_takes_no_type() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], task: f, resources: [P: divisible, Q: divisible];",
+        )
+        .unwrap();
+        let Item::Node(n) = &spec.items[0] else {
+            panic!("node")
+        };
+        assert_eq!(n.resources.len(), 2);
+        assert_eq!(n.resources[0].kind(), ResourceKind::Divisible);
+        assert!(n.resources[0].ty.is_none());
+        assert_eq!(n.resources[1].kind(), ResourceKind::Divisible);
+        let err =
+            parse_err("node A = Terminate, deps: [], task: f, resources: [P: divisible u32];");
+        assert!(err.contains("takes no type"), "{err}");
+    }
+
+    #[test]
+    fn divisible_is_exclusive_with_the_other_kinds() {
+        for other in ["shared", "consume", "local"] {
+            let err = parse_err(&format!(
+                "node A = Terminate, deps: [], task: f, resources: [P: {other} divisible];"
+            ));
+            assert!(err.contains("its own kind"), "{other}: {err}");
+        }
+        let err = parse_err(
+            "node A = Terminate, deps: [], task: f, resources: [P: divisible divisible];",
+        );
+        assert!(err.contains("duplicate `divisible`"), "{err}");
+    }
+
+    #[test]
+    fn a_type_named_divisible_needs_a_path() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], task: f, resources: [P: crate::divisible];",
+        )
+        .unwrap();
+        let Item::Node(n) = &spec.items[0] else {
+            panic!("node")
+        };
+        assert_eq!(n.resources[0].kind(), ResourceKind::Lend);
+        assert!(n.resources[0].ty.is_some());
+    }
+
+    #[test]
+    fn serialized_only_qualifies_shared() {
+        let err =
+            parse_err("node A = Terminate, deps: [], task: f, resources: [B: serialized Bus];");
+        assert!(err.contains("only qualifies `shared`"), "{err}");
+        let spec = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], task: f, resources: [B: shared serialized Bus];",
+        )
+        .unwrap();
+        let Item::Node(n) = &spec.items[0] else {
+            panic!("node")
+        };
+        assert_eq!(n.resources[0].kind(), ResourceKind::Shared);
+        assert_eq!(n.resources[0].shared_signature(), "serialized shared Bus");
+        assert_eq!(item_executor(&spec.items[0]).map(ToString::to_string), None);
+    }
+
+    #[test]
+    fn item_executor_names_the_routing_slot() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "executor HIGH; node A = Terminate, deps: [], executor: HIGH, spawn: f;",
+        )
+        .unwrap();
+        assert_eq!(item_executor(&spec.items[0]), None);
+        assert_eq!(
+            item_executor(&spec.items[1]).map(ToString::to_string),
+            Some("HIGH".into())
+        );
+    }
+
+    #[test]
+    fn veto_is_a_writes_marker_in_any_order() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "observe writes: it.get();\n\
+             node A = Terminate, deps: [], task: f, \
+             writes: [crate::T veto, crate::U observed veto beat, crate::V beat veto observed via it.x()];",
+        )
+        .unwrap();
+        let Item::Node(n) = &spec.items[0] else {
+            panic!("node")
+        };
+        assert!(n.writes[0].veto.is_some() && n.writes[0].observed.is_none());
+        assert!(
+            n.writes[1].veto.is_some()
+                && n.writes[1].beat.is_some()
+                && n.writes[1].observed.is_some()
+        );
+        assert!(n.writes[2].via.is_some() && n.writes[2].veto.is_some());
+        let err = parse_err("node A = Terminate, deps: [], task: f, writes: [crate::T veto veto];");
+        assert!(err.contains("duplicate `veto`"), "{err}");
+        let err = parse_err("node A = Terminate, deps: [], task: f, reads: [crate::T veto];");
+        assert!(err.contains("belongs on a `writes:` entry"), "{err}");
+        let err =
+            parse_err("node A = Terminate, deps: [], task: f, writes: [crate::T via it.x()];");
+        assert!(err.contains("only an `observed` entry has"), "{err}");
+        let err = parse_err(
+            "node A = Terminate, deps: [], task: f, writes: [crate::T observed via it.x() veto];",
+        );
+        assert!(
+            err.contains("expected `,`"),
+            "`via <expr>` ends the entry: {err}"
+        );
+        let err = parse_err("node A = Terminate, deps: [], task: f, writes: [crate::T bogus];");
+        assert!(err.contains("`observed`/`beat`/`veto` markers"), "{err}");
+        assert!(BUILTIN_WRITES.contains(&"veto") && BUILTIN_WRITES.contains(&"retire"));
+    }
+
+    #[test]
+    fn veto_beside_discover_is_a_marker() {
+        assert!(
+            syn::parse_str::<GraphSpec>(
+                "node A = Terminate, deps: [], task: w, discover, writes: [crate::T veto];"
+            )
+            .is_ok()
+        );
     }
 }

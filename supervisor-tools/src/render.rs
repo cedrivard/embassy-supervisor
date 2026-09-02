@@ -1134,6 +1134,12 @@ fn resource_edge(slot: &str, node: &str, r: &ResourceDecl, show_cfg: bool) -> St
     if r.shared.is_some() {
         marks.push("shared".to_string());
     }
+    if r.serialized.is_some() {
+        marks.push("serialized".to_string());
+    }
+    if r.divisible.is_some() {
+        marks.push("divisible".to_string());
+    }
     if let Some(c) = cfg_note(&r.cfg, show_cfg) {
         marks.push(c);
     }
@@ -1151,6 +1157,9 @@ fn sig_edge(from: &str, to: &str, sig: &SignalDecl, show_cfg: bool, dotted: bool
     }
     if sig.beat.is_some() {
         marks.push("beat".to_string());
+    }
+    if sig.veto.is_some() {
+        marks.push("veto".to_string());
     }
     if let Some(c) = cfg_note(&sig.cfg, show_cfg) {
         marks.push(c);

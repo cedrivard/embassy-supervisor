@@ -109,7 +109,9 @@ jobs:
                    dataflow,readiness,liveness macros,coupling-observe,dataflow \
                    graph-ref macros,graph-ref graph-ref,trace \
                    data-deps macros,data-deps data-deps,readiness \
-                   control,pool,macros,readiness,liveness,epochs,liveness-monitor,coupling,restart,bound-deps; do
+                   budget macros,budget budget,pool,macros,control \
+                   veto macros,veto veto,coupling-observe,macros,pool \
+                   control,pool,macros,readiness,liveness,epochs,liveness-monitor,coupling,restart,bound-deps,budget,veto; do
             echo "::group::features=[${f:-none}]"
             cargo check -p embassy-supervisor --no-default-features ${f:+--features "$f"}
             echo "::endgroup::"

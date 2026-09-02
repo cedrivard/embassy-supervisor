@@ -3,7 +3,7 @@ name = "embassy-supervisor-syntax"
 # Pinned by EXACT version from `embassy-supervisor-macros`: the AST is an
 # internal contract between the two, not a stable public API, and it changes
 # whenever the graph syntax does.
-version = "0.2.0"
+version = "0.3.0"
 description = "Parser for the embassy-supervisor graph DSL, shared by its proc-macro and its tooling"
 edition.workspace = true
 authors.workspace = true

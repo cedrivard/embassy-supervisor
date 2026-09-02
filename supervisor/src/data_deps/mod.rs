@@ -4,9 +4,9 @@ mod gated;
 mod leased;
 
 #[cfg(feature = "readiness")]
-pub use backed::Backed;
-#[cfg(feature = "readiness")]
 pub(crate) use backed::notify_serving;
+#[cfg(feature = "readiness")]
+pub use backed::{Backed, Open};
 pub use gated::Gated;
 pub use leased::{Lease, Leased};
 

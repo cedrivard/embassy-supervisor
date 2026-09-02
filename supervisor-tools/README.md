@@ -199,10 +199,15 @@ OPTIONS:
 The same model, asked what its dataflow is missing:
 
 - `orphan-reads`: a signal some node reads that nothing in the graph writes;
-- `dead-writes`: a signal some node writes that nothing reads.
+- `dead-writes`: a signal some node writes that nothing reads;
+- `public-gate`: a gate static (`Backed`, `Leased`, or `VetoGate`) reachable
+  from outside its module. Keep the gate private and expose `#[dataflow]`
+  accessors so a bypass is deliberate. The lint matches by the type's last
+  segment, so aliases and re-exports escape it.
 
-The static shape of the one-sided-signal diagnostics a running supervisor
-logs, at build time instead of on a serial console.
+Build-time checks for the one-sided-signal diagnostics a running supervisor
+logs, plus exposed gates. A gate guards the access path, not the static; keep
+it private and expose `#[dataflow]` accessors to make any bypass deliberate.
 
 ```console
 $ cd firmware && supervisor-lint
@@ -227,13 +232,14 @@ look one-sided when it is not; failing on them is `supervisor-mermaid
 | --- | --- | --- |
 | `orphan-reads` | a signal is read by a node but nothing in the graph writes it | nothing |
 | `dead-writes` | a signal is written by a node but nothing in the graph reads it | `observed` / `beat` entries and `beat_*` verbs: their consumer is the supervisor, so no task-side reader is needed |
+| `public-gate` | a gate-wrapped static (`Backed`, `Leased`, `VetoGate`) has any visibility but private | nothing: make the static private and expose `#[dataflow]` accessors |
 
 `--allow` entries are matched like signal labels: exact, or by `::`-segment
 suffix in either direction. An indexed element (`ARR[0]`) must be spelled with
 its index: element and whole array are two coupling identities.
 
 ```
-supervisor-lint — one-sided signals in an embassy-supervisor graph
+supervisor-lint — one-sided signals and exposed gates in an embassy-supervisor graph
 
 USAGE:
     supervisor-lint [OPTIONS] [FILE|DIR]...
@@ -242,8 +248,9 @@ Reads the same sources `supervisor-mermaid` draws from — `supervisor_graph!`,
 `supervisor_fragment!` and `compose_graph!`, plus the `#[dataflow]` fn bodies
 a `discover` node or a `dataflow:` adoption binds — and reports what the
 dataflow model says: a signal read where nothing writes it, a signal written
-where nothing reads it. The static shape of the diagnostics a running
-supervisor logs, at build time instead of on a serial console.
+where nothing reads it, a gate-wrapped static (`Backed`, `Leased`, `VetoGate`)
+reachable from outside its module. The static shape of the diagnostics a
+running supervisor logs, at build time instead of on a serial console.
 
 A directory is walked recursively for `*.rs`; with no inputs at all, the crate
 the working directory is in is scanned (its `src/` roots, expanded through
@@ -259,7 +266,9 @@ OPTIONS:
                            repeatable): `orphan-reads` (read, never written),
                            `dead-writes` (written, never read — `observed` /
                            `beat` entries and `beat_*` verbs are exempt, their
-                           consumer is the supervisor), or `all`, the default
+                           consumer is the supervisor), `public-gate` (a gated
+                           static any module can reach around its gate), or
+                           `all`, the default
         --allow <SIGNALS>  accept these signals' findings (comma separated,
                            repeatable; matched like signal labels, by
                            `::`-suffix); an entry suppressing nothing is

@@ -1,0 +1,23 @@
+error[E0080]: evaluation panicked: supervisor: more `veto` writers declared for this gate than it has contributor slots
+  --> tests/ui/compile_fail_veto/veto_too_many_writers.rs:7:1
+   |
+ 7 | / supervisor_graph! {
+ 8 | |     node A = Terminate, deps: [], task: protector, writes: [crate::TRIP veto];
+ 9 | |     node B = Terminate, deps: [], task: protector, writes: [crate::TRIP veto];
+10 | |     node C = Terminate, deps: [], task: protector, writes: [crate::TRIP veto];
+11 | | }
+   | |_^ evaluation of `_` failed inside this call
+   |
+note: inside `embassy_supervisor::__sv_check_veto::<2>`
+  --> $RUST/core/src/panic.rs
+   |
+   |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+   |
+  ::: $WORKSPACE/supervisor/src/veto.rs
+   |
+   | /     assert!(
+   | |         writers <= N,
+   | |         "supervisor: more `veto` writers declared for this gate than it has contributor slots"
+   | |     );
+   | |_____- in this macro invocation

@@ -7,6 +7,31 @@ This crate is pinned by exact version from `embassy-supervisor-macros`: its AST 
 internal contract between the two, not a stable public API, and it changes whenever the
 graph syntax does. Publish it before the macro crate that depends on it.
 
+## [0.3.0] - 2026-09-01
+
+The AST changes shape; `embassy-supervisor-macros = "=0.9.0"` is the matching
+consumer.
+
+### Added
+
+- `ResourceKind` and `ResourceDecl::kind()`: `Lend`, `Consume`, `Shared`,
+  `Divisible`, so consumers branch on one value.
+- `item_executor(&Item) -> Option<&Ident>` beside `item_resources`.
+- Grammar rules: `divisible` takes no type and no other kind marker;
+  `serialized` only qualifies `shared`; `veto` belongs on `writes:`.
+
+### Changed
+
+- **Breaking**: `ResourceDecl.ty` is `Option<Type>` (`None` only for
+  `divisible`); `ResourceDecl` gains `divisible` and `serialized`;
+  `shared_signature()` includes `serialized`.
+- **Breaking**: `SignalDecl` gains `veto`. Entry markers (`observed`, `beat`,
+  `veto`) parse in any order; `via <expr>` must follow `observed` and ends
+  the entry. The bare-`via` diagnostic names both halves in one message.
+- **Breaking**: `BUILTIN_WRITES` gains `retire` and `veto`.
+- `peek_kind_marker` treats `divisible` at the end of an entry as the marker
+  (a type by that name needs a path).
+
 ## [0.2.0] - 2026-08-27
 
 The AST changes shape; `embassy-supervisor-macros = "=0.8.0"` is the matching
