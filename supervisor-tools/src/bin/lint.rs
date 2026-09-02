@@ -1,12 +1,14 @@
 use std::process::ExitCode;
 
 use embassy_supervisor_tools::inputs::Sources;
-use embassy_supervisor_tools::{LintCats, coverage_warnings, dataflow_lints, inputs, resolve};
+use embassy_supervisor_tools::{
+    LintCats, coverage_warnings, dataflow_lints, gate_lints, inputs, resolve,
+};
 
 const TOOL: &str = "supervisor-lint";
 
 const USAGE: &str = "\
-supervisor-lint — one-sided signals in an embassy-supervisor graph
+supervisor-lint — one-sided signals and exposed gates in an embassy-supervisor graph
 
 USAGE:
     supervisor-lint [OPTIONS] [FILE|DIR]...
@@ -15,8 +17,9 @@ Reads the same sources `supervisor-mermaid` draws from — `supervisor_graph!`,
 `supervisor_fragment!` and `compose_graph!`, plus the `#[dataflow]` fn bodies
 a `discover` node or a `dataflow:` adoption binds — and reports what the
 dataflow model says: a signal read where nothing writes it, a signal written
-where nothing reads it. The static shape of the diagnostics a running
-supervisor logs, at build time instead of on a serial console.
+where nothing reads it, a gate-wrapped static (`Backed`, `Leased`, `VetoGate`)
+reachable from outside its module. The static shape of the diagnostics a
+running supervisor logs, at build time instead of on a serial console.
 
 A directory is walked recursively for `*.rs`; with no inputs at all, the crate
 the working directory is in is scanned (its `src/` roots, expanded through
@@ -32,7 +35,9 @@ OPTIONS:
                            repeatable): `orphan-reads` (read, never written),
                            `dead-writes` (written, never read — `observed` /
                            `beat` entries and `beat_*` verbs are exempt, their
-                           consumer is the supervisor), or `all`, the default
+                           consumer is the supervisor), `public-gate` (a gated
+                           static any module can reach around its gate), or
+                           `all`, the default
         --allow <SIGNALS>  accept these signals' findings (comma separated,
                            repeatable; matched like signal labels, by
                            `::`-suffix); an entry suppressing nothing is
@@ -123,13 +128,17 @@ fn lint(args: &Args, files: &Sources) -> Result<ExitCode, String> {
     }
 
     let mut findings = 0usize;
-    for w in dataflow_lints(
+    let dataflow = dataflow_lints(
         &resolved,
         &scan.scanned_accesses,
         &scan.bundles,
         &args.only,
         &args.allow,
-    ) {
+    );
+    for w in dataflow
+        .iter()
+        .chain(&gate_lints(&scan.gate_statics, &args.only))
+    {
         eprintln!("{TOOL}: lint: {w}");
         findings += 1;
     }

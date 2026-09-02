@@ -30,7 +30,7 @@ use std::str::FromStr;
 
 pub use embassy_supervisor_syntax::{Access, scan_dataflow};
 pub use find::{Decl, DeclKind, Error, parse_source};
-pub use lint::{LintCats, dataflow_lints};
+pub use lint::{LintCats, dataflow_lints, gate_lints};
 pub use model::{FullModel, TaskKind, full_model};
 pub use render::{Options, legend_diagram};
 
@@ -65,6 +65,61 @@ pub fn scan_source(src: &str, origin: &str, out: &mut Vec<Discovered>) {
             access,
             relative,
         });
+    }
+}
+
+/// A `static` whose type is one of the supervisor's gates (`Backed`, `Leased`,
+/// `VetoGate`), found in a scanned source file.
+#[derive(Debug, Clone)]
+pub struct GateStatic {
+    /// The source file.
+    pub file: String,
+    /// The line the static is declared on.
+    pub line: usize,
+    /// The static's name.
+    pub name: String,
+    /// The gate type's last path segment.
+    pub ty: String,
+    /// `true` for any visibility but private (`pub`, `pub(crate)`, ...).
+    pub public: bool,
+}
+
+/// Scan Rust source for statics wrapped in a supervisor gate and append them
+/// to `out`, walking inline modules.
+pub fn scan_gate_statics(src: &str, file: &str, out: &mut Vec<GateStatic>) {
+    fn walk(items: &[syn::Item], file: &str, out: &mut Vec<GateStatic>) {
+        for item in items {
+            match item {
+                syn::Item::Static(s) => {
+                    let syn::Type::Path(tp) = &*s.ty else {
+                        continue;
+                    };
+                    let Some(last) = tp.path.segments.last() else {
+                        continue;
+                    };
+                    let ty = last.ident.to_string();
+                    if !matches!(ty.as_str(), "Backed" | "Leased" | "VetoGate") {
+                        continue;
+                    }
+                    out.push(GateStatic {
+                        file: file.to_string(),
+                        line: s.ident.span().start().line,
+                        name: s.ident.to_string(),
+                        ty,
+                        public: !matches!(s.vis, syn::Visibility::Inherited),
+                    });
+                }
+                syn::Item::Mod(m) => {
+                    if let Some((_, items)) = &m.content {
+                        walk(items, file, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Ok(parsed) = syn::parse_file(src) {
+        walk(&parsed.items, file, out);
     }
 }
 
@@ -597,6 +652,7 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
             "path": s.path,
             "observed": s.observed,
             "beat": s.beat,
+            "veto": s.veto,
             "via": s.via,
             "cfg": s.cfg,
         })
@@ -607,6 +663,8 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
             "local": r.local,
             "consume": r.consume,
             "shared": r.shared,
+            "divisible": r.divisible,
+            "serialized": r.serialized,
             "cfg": r.cfg,
         })
     };
@@ -1361,6 +1419,10 @@ mod tests {
                 resources: [STACK_H: shared Stack, BUF: consume Buf];
             node WD = Terminate, deps: [], task: h, resources: [WD_DEV: Watchdog];
             node LONE = Terminate, deps: [NET], task: k;
+            node PWR = Terminate, deps: [], task: m,
+                resources: [BUDGET: divisible, BUS: shared serialized Bus];
+            node PWR2 = Terminate, deps: [], task: m,
+                resources: [BUDGET: divisible, BUS: shared serialized Bus];
         }
     "#;
 
@@ -1385,6 +1447,58 @@ mod tests {
         );
         assert!(out.contains("r_USB --> n_NET"), "{out}");
         assert!(out.contains("r_BUF -- \"consume\" --> n_HTTP"), "{out}");
+    }
+
+    #[test]
+    fn a_veto_write_carries_its_mark() {
+        let src = r#"
+            embassy_supervisor::supervisor_graph! {
+                node OC = Terminate, deps: [], task: f, writes: [crate::TRIP veto];
+                node DIFF = Terminate, deps: [], task: f, writes: [crate::TRIP veto observed beat];
+                node BREAKER = Terminate, deps: [], task: g, reads: [crate::TRIP];
+            }
+        "#;
+        let out = runtime(src);
+        assert!(out.contains("n_OC -- \"veto\" --> s_crate__TRIP"), "{out}");
+        assert!(
+            out.contains("n_DIFF -- \"observed · beat · veto\" --> s_crate__TRIP"),
+            "{out}"
+        );
+        let decls = parse_source(src, "t.rs").unwrap();
+        let full = full_model(&decls);
+        let model::ItemModel::Node(oc) = &full.graphs[0].items[0] else {
+            panic!("node")
+        };
+        assert!(oc.writes[0].veto);
+        let j = &model_json(&decls, &[])["graphs"][0]["items"][0]["writes"][0];
+        assert_eq!(j["veto"], true);
+    }
+
+    #[test]
+    fn a_divisible_budget_and_a_serialized_bus_carry_their_marks() {
+        let out = runtime(RESOURCED);
+        assert_eq!(out.matches("label: \"BUDGET\"").count(), 1, "{out}");
+        assert!(out.contains("r_BUDGET -- \"divisible\" --> n_PWR"), "{out}");
+        assert!(
+            out.contains("r_BUDGET -- \"divisible\" --> n_PWR2"),
+            "{out}"
+        );
+        assert!(
+            out.contains("r_BUS -- \"shared · serialized\" --> n_PWR"),
+            "{out}"
+        );
+        let decls = parse_source(RESOURCED, "t.rs").unwrap();
+        let full = full_model(&decls);
+        let model::ItemModel::Node(pwr) = &full.graphs[0].items[4] else {
+            panic!("node")
+        };
+        assert_eq!(pwr.name, "PWR");
+        assert!(pwr.resources[0].divisible && !pwr.resources[0].serialized);
+        assert!(pwr.resources[1].serialized && pwr.resources[1].shared);
+        let j = &model_json(&decls, &[])["graphs"][0]["items"][4]["resources"];
+        assert_eq!(j[0]["divisible"], true);
+        assert_eq!(j[0]["serialized"], false);
+        assert_eq!(j[1]["serialized"], true);
     }
 
     #[test]

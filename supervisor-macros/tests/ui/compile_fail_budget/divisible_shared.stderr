@@ -1,0 +1,5 @@
+error: `divisible` is its own kind and takes no other marker: `shared` describes how one value is handed over, `divisible` declares a budget of units the holder claims a share of
+ --> tests/ui/compile_fail_budget/divisible_shared.rs:6:70
+  |
+6 |     node ONE = Terminate, deps: [], task: holder, resources: [POWER: shared divisible];
+  |                                                                      ^^^^^^

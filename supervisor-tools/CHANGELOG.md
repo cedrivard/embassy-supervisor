@@ -3,6 +3,21 @@
 All notable changes to `embassy-supervisor-tools` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-09-01
+
+Pins `embassy-supervisor-syntax = "=0.3.0"`.
+
+### Added
+
+- `supervisor-lint --only public-gate`: reports a `Backed`, `Leased` or
+  `VetoGate` static with any visibility but private, with file and line.
+  `scan_gate_statics` / `GateStatic` / `gate_lints` are the library side;
+  `inputs::Scan` carries `gate_statics`.
+- `ResourceModel.divisible` / `.serialized` and `SignalModel.veto`, with the
+  matching `model_json` keys; the runtime diagram labels the edges
+  (`divisible`, `shared · serialized`, `veto`) and the state diagram's takes
+  name the kind.
+
 ## [0.3.0] - 2026-08-30
 
 ### Added

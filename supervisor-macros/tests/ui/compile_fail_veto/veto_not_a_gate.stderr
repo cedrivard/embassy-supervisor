@@ -1,0 +1,19 @@
+error[E0308]: mismatched types
+  --> tests/ui/compile_fail_veto/veto_not_a_gate.rs:9:1
+   |
+ 9 | / supervisor_graph! {
+10 | |     node OC = Terminate, deps: [], task: protector, writes: [crate::TRIP veto];
+11 | | }
+   | | ^
+   | | |
+   | |_expected `&VetoGate<_>`, found `&Atomic<u32>`
+   |   arguments to this function are incorrect
+   |
+   = note: expected reference `&VetoGate<_>`
+              found reference `&Atomic<u32>`
+note: function defined here
+  --> $WORKSPACE/supervisor/src/veto.rs
+   |
+   | pub const fn __sv_check_veto<const N: usize>(_: &VetoGate<N>, writers: usize) {
+   |              ^^^^^^^^^^^^^^^
+   = note: this error originates in the macro `supervisor_graph` (in Nightly builds, run with -Z macro-backtrace for more info)

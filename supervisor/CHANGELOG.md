@@ -4,6 +4,76 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-01
+
+Six things a graph could not say about its couplings, and now can.
+
+Ships with `embassy-supervisor-macros` 0.9.0 (pinned by exact version) on
+`embassy-supervisor-syntax` 0.3.0; `embassy-supervisor-tools` 0.4.0 reads the
+new markers.
+
+### Added
+
+- **The other half of demand-start.** `Backed` counts its readers: `open`
+  hands back an `Open<T>` guard (`Deref` to the signal, `signal()` for the
+  `'static` reference), `Backed::openers()` is the count, and
+  `Backed::unwatched(cooldown)` resolves once it has sat at zero for the
+  whole cooldown — a reader arriving inside it restarts the clock.
+  `TaskNode::retire(&SIG, cooldown)` is the producer's verb: it waits that
+  out, withdraws readiness (so a late opener waits instead of reading a
+  producer on its way out, and an opener admitted just before cancels the
+  retirement), and with `control` requests its own `Deactivate`. The next
+  `open` re-activates it, as before.
+- **`divisible` resources** (feature `budget`). `resources: [POWER:
+  divisible]` declares a `Budget<K>` the graph sizes to its holders (one slot
+  per node, one per pool member). Each holder's shell receives a `Claimant`
+  bound to its slot (`want`, `grant`, `wait_grant_change`); an allocator
+  `provide`s the capacity and divides it with a `BudgetPolicy` — `FairShare`
+  or `ShrinkFastGrowSlow` — on `wait_change()`; a change landing while
+  `rebalance` runs re-arms `wait_change`, so a looping allocator re-divides
+  at once. The supervisor releases a
+  holder's share when it stops, including a holder that misses its shutdown
+  ack; a `Pause` park keeps it. An unprovided budget is `ResourceMissing`;
+  `provides:` may name one.
+- **Distributed veto** (feature `veto`). `writes: [crate::TRIP veto]` gives a
+  writer one contributor slot of a `VetoGate<N>`: asserted while any
+  contributor holds it, released only once all let go. The macro numbers the
+  writers per gate and emits a compile-time check that the target is a
+  `VetoGate` with a slot for each. `node.veto(&TRIP)` yields a `Veto` that
+  moves only its own bit; the actuator parks on `wait_asserted` /
+  `wait_released`. A stopped writer's bit stays asserted; release is explicit.
+  Under `coupling-observe` the gate counts its flips, so `veto observed beat`
+  is a heartbeat.
+- **`shared serialized`**: a compile-time rule that every holder of the slot
+  runs on one executor — priority ceiling by construction for a serialized
+  link, since embassy can neither boost a holder nor migrate a task. No
+  feature, no runtime cost.
+- **`Stamped<T>`** (feature `coupling`): `w()` stamps when a write begins and
+  hands the inner signal over, so a consumer can ask `age()`, `is_fresh(max)`
+  or `read_fresh(max)`; the token forwards to the inner signal. The read-side
+  half of write freshness; the README draws the line to value validity, which
+  stays the consumer's.
+- The README states the private-module recipe for gated statics and its
+  limit ("bypass requires going out of your way"); `supervisor-lint --only
+  public-gate` reports a `Backed`/`Leased`/`VetoGate` static that is not
+  private.
+
+### Changed
+
+- **Breaking:** `TaskNode::open` returns `T::Handle` instead of `&'static T` —
+  an `Open<T>` for `Backed`. A reader that chained a `'static`-taking call
+  onto the result (`node.open(&X).await.receiver()`) binds the guard first;
+  one that needs the `'static` reference itself calls `.signal()`. `Gated`
+  gains `type Handle: Deref` and `fn admit(&'static self) -> Self::Handle`; a
+  wrapper that only waits sets `Handle = &'static Self`.
+- `retire` and `veto` are built-in write verbs of the `#[dataflow]` scanner.
+  A body that already called a node method by either name is now rewritten.
+- `ack_dropped` also wakes openers parked on the stopped producer's gate (so
+  they request the next start without waiting out the retry) and releases the
+  node's `divisible` shares; `FaultKind::ShutdownTimeout` releases them too.
+- Signal entry markers (`observed`, `beat`, `veto`) parse in any order;
+  `via <expr>` still qualifies `observed` and ends the entry.
+
 ## [0.7.0] - 2026-08-30
 
 A pool left parked, and a subtree that never came back: two control-plane fixes.
@@ -1007,6 +1077,7 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
+[0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/cedrivard/embassy-supervisor/compare/v0.5.0...v0.5.1

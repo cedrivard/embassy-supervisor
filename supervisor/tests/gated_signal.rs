@@ -127,6 +127,11 @@ fn open_starts_the_producer_and_waits_for_readiness() {
         "`open` returned only after the producer published and set_ready"
     );
     assert_eq!(SECOND_SAW.load(Ordering::SeqCst), 42, "late opener passes");
+    assert_eq!(
+        ESTIMATE.openers(),
+        2,
+        "both readers hold their guard, so both are counted"
+    );
 
     // ── the latch is per down cycle ─────────────────────────────────────
     // Stop the producer again through the same mailbox the gate uses; once it

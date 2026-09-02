@@ -27,4 +27,14 @@ fn ui() {
     }
     #[cfg(not(feature = "heap-state"))]
     t.compile_fail("tests/ui/compile_fail_no_heap_state/*.rs");
+    #[cfg(feature = "budget")]
+    {
+        t.compile_fail("tests/ui/compile_fail_budget/*.rs");
+        t.pass("tests/ui/compile_pass_budget/*.rs");
+    }
+    #[cfg(feature = "veto")]
+    {
+        t.compile_fail("tests/ui/compile_fail_veto/*.rs");
+        t.pass("tests/ui/compile_pass_veto/*.rs");
+    }
 }

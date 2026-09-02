@@ -1,0 +1,5 @@
+error: `pool_size > 1` cannot combine with lend/consume/divisible `resources:` (the slot holds one value, or one claimant; use `shared`, or an `ElasticPool` with per-member slots)
+ --> tests/ui/compile_fail_budget/pool_size_with_divisible.rs:6:60
+  |
+6 |     node A = Terminate, deps: [], task: worker, pool_size: 2,
+  |                                                            ^

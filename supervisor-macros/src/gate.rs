@@ -88,11 +88,7 @@ fn gate_pool(p: &PoolItem) -> SynResult<()> {
     gate_coupling(&p.reads, &p.writes)?;
     require_discover(&p.discover)?;
     require_dataflow(&p.dataflow)?;
-    for r in &p.resources {
-        if let Some(l) = &r.local {
-            require_local(l)?;
-        }
-    }
+    gate_resource_list(&p.resources)?;
     if let Some((k, _, _)) = &p.state {
         require_heap_state(k)?;
     }
@@ -100,9 +96,16 @@ fn gate_pool(p: &PoolItem) -> SynResult<()> {
 }
 
 fn gate_resources(n: &NodeItem) -> SynResult<()> {
-    for r in &n.resources {
+    gate_resource_list(&n.resources)
+}
+
+fn gate_resource_list(resources: &[embassy_supervisor_syntax::ResourceDecl]) -> SynResult<()> {
+    for r in resources {
         if let Some(l) = &r.local {
             require_local(l)?;
+        }
+        if let Some(d) = &r.divisible {
+            require_budget(d)?;
         }
     }
     Ok(())
@@ -143,6 +146,9 @@ fn gate_coupling(reads: &[SignalDecl], writes: &[SignalDecl]) -> SynResult<()> {
         for s in list {
             if let Some(o) = &s.observed {
                 require_observe(o)?;
+            }
+            if let Some(v) = &s.veto {
+                require_veto(v)?;
             }
         }
     }
@@ -217,6 +223,30 @@ fn require_local<T: quote::ToTokens>(tok: &T) -> SynResult<()> {
         tok,
         "`local` resources emit an `unsafe impl Sync` — opt in by \
          enabling embassy-supervisor's `local-resources` feature",
+    ))
+}
+
+fn require_veto<T: quote::ToTokens>(tok: &T) -> SynResult<()> {
+    if cfg!(feature = "veto") {
+        return Ok(());
+    }
+    Err(syn::Error::new_spanned(
+        tok,
+        "the `veto` entry marker requires the `veto` feature (embassy-supervisor \
+         feature `veto`) — it gives this writer one contributor slot of a \
+         `VetoGate<N>`, asserted while any writer holds it",
+    ))
+}
+
+fn require_budget<T: quote::ToTokens>(tok: &T) -> SynResult<()> {
+    if cfg!(feature = "budget") {
+        return Ok(());
+    }
+    Err(syn::Error::new_spanned(
+        tok,
+        "`divisible` resources require the `budget` feature (embassy-supervisor \
+         feature `budget`) — the slot is a `Budget<K>` whose shares the \
+         supervisor releases when a holder stops",
     ))
 }
 

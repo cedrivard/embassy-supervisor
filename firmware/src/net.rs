@@ -67,7 +67,7 @@ impl StackCell {
 /// frees the backing, so the module invariant above is checked rather than
 /// argued. Both are `#[repr(C)]` with the wrapped value first, so the derived
 /// write in [`publish_stack`], the module's own `STACK.set(..)` and a
-pub(crate) static STACK: Backed<Leased<StackCell>> = Backed::new(Leased::new(StackCell::new()));
+static STACK: Backed<Leased<StackCell>> = Backed::new(Leased::new(StackCell::new()));
 
 /// A leased handle to the network stack; the lease keeps the stack alive.
 pub struct StackLease {
@@ -90,7 +90,7 @@ pub fn try_stack() -> Option<Stack<'static>> {
 /// Wait for the network stack to be published and return a leased handle.
 #[embassy_supervisor::dataflow]
 pub async fn stack_ready(node: &'static TaskNode) -> Option<StackLease> {
-    let cell = node.open(&crate::net::STACK).await;
+    let cell = node.open(&crate::net::STACK).await.signal();
     loop {
         let hold = cell.lease()?;
         if let Some(stack) = cell.get() {

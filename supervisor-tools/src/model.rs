@@ -121,6 +121,8 @@ pub struct SignalModel {
     pub observed: bool,
     /// The `beat` marker.
     pub beat: bool,
+    /// The `veto` marker: this writer holds a contributor slot of the gate.
+    pub veto: bool,
     /// The `via ...` accessor expression's token text, if any.
     pub via: Option<String>,
     /// `#[cfg(...)]` gates on the entry.
@@ -138,6 +140,10 @@ pub struct ResourceModel {
     pub consume: bool,
     /// The `shared` marker.
     pub shared: bool,
+    /// The `divisible` marker: a budget the holder claims a share of.
+    pub divisible: bool,
+    /// The `serialized` marker: every holder runs on one executor.
+    pub serialized: bool,
     /// `#[cfg(...)]` gates on the entry.
     pub cfg: CfgTexts,
 }
@@ -342,6 +348,7 @@ fn signal_model(s: &SignalDecl) -> SignalModel {
         path: s.display(),
         observed: s.observed.is_some(),
         beat: s.beat.is_some(),
+        veto: s.veto.is_some(),
         via: s.via.as_ref().map(expr_text),
         cfg: cfg_texts(&s.cfg),
     }
@@ -353,6 +360,8 @@ fn resource_model(r: &ResourceDecl) -> ResourceModel {
         local: r.local.is_some(),
         consume: r.consume.is_some(),
         shared: r.shared.is_some(),
+        divisible: r.divisible.is_some(),
+        serialized: r.serialized.is_some(),
         cfg: cfg_texts(&r.cfg),
     }
 }

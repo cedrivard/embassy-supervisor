@@ -204,6 +204,8 @@ pub struct Coupling {
     observe: Option<Observer>,
     #[cfg(feature = "coupling-observe")]
     beat: bool,
+    #[cfg(feature = "veto")]
+    veto: Option<u8>,
 }
 
 #[cfg(feature = "coupling")]
@@ -217,7 +219,22 @@ impl Coupling {
             observe: None,
             #[cfg(feature = "coupling-observe")]
             beat: false,
+            #[cfg(feature = "veto")]
+            veto: None,
         }
+    }
+
+    #[cfg(feature = "veto")]
+    /// Mark this coupling as a `veto` write holding contributor `slot`.
+    pub const fn veto(mut self, slot: u8) -> Self {
+        self.veto = Some(slot);
+        self
+    }
+
+    /// This writer's contributor slot, if the entry carries the `veto` marker.
+    #[cfg(feature = "veto")]
+    pub const fn veto_slot(&self) -> Option<u8> {
+        self.veto
     }
 
     #[cfg(feature = "coupling-observe")]
@@ -520,7 +537,8 @@ pub enum FaultKind {
     /// cases embassy's own `SpawnError` describes.
     Spawn(SpawnError),
     /// The node did not acknowledge a requested shutdown within its ack window.
-    /// It is still marked running; the sane escalations are app-level.
+    /// It is still marked running; the sane escalations are app-level. Its
+    /// `divisible` shares, if any, have been released on its behalf.
     ShutdownTimeout,
 }
 
@@ -1313,6 +1331,11 @@ pub struct NodeCfg {
     /// sees the value's absence rather than a previous activation's leftover.
     /// A `Pause` ack is exempt: the parked task still backs what it published.
     provides: &'static [&'static dyn ResourceGate],
+    /// `divisible` budget slots this node claims (`resources:`). Released on
+    /// shutdown, or by the supervisor if the ack times out, so a dead holder
+    /// does not strand its share. A `Pause` ack keeps the claim.
+    #[cfg(feature = "budget")]
+    claims: &'static [(&'static dyn Divisible, u8)],
     /// Deps whose task-asserted readiness (`set_ready`) bring-up awaits before
     /// spawning this node — the `ready`-marked subset of `deps:`. Spawn-order
     /// deps stay in the graph's dep table; this is the readiness overlay.
@@ -1395,6 +1418,8 @@ impl NodeCfg {
             spawn_slot: None,
             resource_gates: &[],
             provides: &[],
+            #[cfg(feature = "budget")]
+            claims: &[],
             #[cfg(feature = "readiness")]
             ready_deps: &[],
             slot_timeout: SLOT_READY_TIMEOUT,
@@ -1441,6 +1466,14 @@ impl NodeCfg {
     /// `static` initializer; emitted by [`supervisor_graph!`].
     pub const fn with_provides(mut self, slots: &'static [&'static dyn ResourceGate]) -> Self {
         self.provides = slots;
+        self
+    }
+
+    /// Declare the `divisible` budget slots this node claims (`resources:`).
+    /// Released on stop. `const` and chainable; emitted by [`supervisor_graph!`].
+    #[cfg(feature = "budget")]
+    pub const fn with_claims(mut self, claims: &'static [(&'static dyn Divisible, u8)]) -> Self {
+        self.claims = claims;
         self
     }
 
@@ -1710,6 +1743,8 @@ impl TaskNode {
             for gate in self.cfg.provides {
                 gate.clear();
             }
+            #[cfg(feature = "budget")]
+            self.release_claims();
         }
         self.handle.flag_clear(flag::RUNNING);
         self.handle.flag_set(flag::DROPPED);
@@ -1717,6 +1752,17 @@ impl TaskNode {
         STOP_EVT.signal(());
         #[cfg(feature = "bound-deps")]
         notify_bind();
+        #[cfg(all(feature = "data-deps", feature = "readiness"))]
+        crate::data_deps::notify_serving();
+    }
+
+    /// Give back every `divisible` share this node holds (see
+    /// [`NodeCfg::with_claims`]). Idempotent: releasing an empty slot stores zero.
+    #[cfg(feature = "budget")]
+    pub fn release_claims(&self) {
+        for (budget, slot) in self.cfg.claims {
+            budget.release(*slot);
+        }
     }
 
     /// Mark the node as completed and then acknowledge its drop.
@@ -2198,6 +2244,8 @@ pub mod shape {
     pub const BOUND_DEPS: u32 = 1 << 7;
     /// The graph declares at least one elastic pool.
     pub const POOLS: u32 = 1 << 8;
+    /// The graph declares at least one `divisible` resource.
+    pub const CLAIMS: u32 = 1 << 9;
     /// All shape bits set.
     pub const ALL: u32 = u32::MAX;
 }
@@ -2734,6 +2782,10 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                 node.name(),
                 node.ack_timeout().as_millis(),
             );
+            #[cfg(feature = "budget")]
+            if Self::has(shape::CLAIMS) {
+                node.release_claims();
+            }
             return Err(NodeFault {
                 node,
                 kind: FaultKind::ShutdownTimeout,
@@ -2834,6 +2886,10 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                     node.name(),
                     node.ack_timeout().as_millis(),
                 );
+                #[cfg(feature = "budget")]
+                if Self::has(shape::CLAIMS) {
+                    node.release_claims();
+                }
                 let fault = NodeFault {
                     node,
                     kind: FaultKind::ShutdownTimeout,
@@ -3592,6 +3648,21 @@ pub const fn topo_sort_const<const N: usize>(deps: &[&'static [u8]; N]) -> [u8; 
 mod pool;
 #[cfg(feature = "pool")]
 pub use pool::*;
+
+#[cfg(feature = "budget")]
+mod budget;
+#[cfg(feature = "budget")]
+pub use budget::*;
+
+#[cfg(feature = "veto")]
+mod veto;
+#[cfg(feature = "veto")]
+pub use veto::*;
+
+#[cfg(feature = "coupling")]
+mod stamped;
+#[cfg(feature = "coupling")]
+pub use stamped::Stamped;
 
 #[cfg(feature = "dataflow")]
 mod dataflow;

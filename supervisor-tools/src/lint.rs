@@ -1,7 +1,7 @@
 //! Dataflow linting: finding one-sided signal couplings.
 
 use crate::render::{boxed_name, discovered_access_matches, discovered_key, signals_of};
-use crate::{Bundle, Decl, Discovered, expand_bundles, module_of};
+use crate::{Bundle, Decl, Discovered, GateStatic, expand_bundles, module_of};
 use std::collections::BTreeMap;
 
 /// Enabled lint categories for a `supervisor-lint` run.
@@ -11,12 +11,15 @@ pub struct LintCats {
     pub orphan_reads: bool,
     /// Report signals that are written but never read.
     pub dead_writes: bool,
+    /// Report gate-wrapped statics (`Backed`, `Leased`, `VetoGate`) that are
+    /// reachable from outside their module.
+    pub public_gate: bool,
 }
 
 impl LintCats {
     /// Return `true` if any category is enabled.
     pub fn any(&self) -> bool {
-        self.orphan_reads || self.dead_writes
+        self.orphan_reads || self.dead_writes || self.public_gate
     }
 
     /// Enable every lint category.
@@ -24,6 +27,7 @@ impl LintCats {
         Self {
             orphan_reads: true,
             dead_writes: true,
+            public_gate: true,
         }
     }
 
@@ -33,14 +37,12 @@ impl LintCats {
             match cat {
                 "orphan-reads" => self.orphan_reads = true,
                 "dead-writes" => self.dead_writes = true,
-                "all" => {
-                    self.orphan_reads = true;
-                    self.dead_writes = true;
-                }
+                "public-gate" => self.public_gate = true,
+                "all" => *self = Self::all(),
                 other => {
                     return Err(format!(
                         "unknown lint category `{other}`; the categories are \
-                         orphan-reads, dead-writes, all"
+                         orphan-reads, dead-writes, public-gate, all"
                     ));
                 }
             }
@@ -204,6 +206,27 @@ pub fn dataflow_lints(
     warnings
 }
 
+/// A gate guards the access path, not the static. A gate-wrapped static that
+/// is reachable from outside its module can be bypassed; keep it private and
+/// expose only `#[dataflow]` accessors.
+pub fn gate_lints(statics: &[GateStatic], cats: &LintCats) -> Vec<String> {
+    if !cats.public_gate {
+        return Vec::new();
+    }
+    statics
+        .iter()
+        .filter(|g| g.public)
+        .map(|g| {
+            format!(
+                "public gate: `{}:{}` `{}: {}<..>` is reachable from outside its module; \
+                 reaching the static directly bypasses the gate — keep it private and \
+                 expose `#[dataflow]` accessors",
+                g.file, g.line, g.name, g.ty
+            )
+        })
+        .collect()
+}
+
 fn allow_matches(key: &str, allowed: &str) -> bool {
     let k = key.strip_prefix("crate::").unwrap_or(key);
     let a = allowed.strip_prefix("crate::").unwrap_or(allowed);
@@ -216,10 +239,7 @@ mod tests {
     use crate::{parse_source, scan_source};
 
     fn all() -> LintCats {
-        LintCats {
-            orphan_reads: true,
-            dead_writes: true,
-        }
+        LintCats::all()
     }
 
     #[test]
@@ -287,6 +307,45 @@ mod tests {
                 .any(|w| w.contains("orphan read") || w.contains("dead write")),
             "{w:?}"
         );
+    }
+
+    #[test]
+    fn public_gates_are_reported_and_private_ones_are_not() {
+        let src = r#"
+            use embassy_supervisor::{Backed, Leased, VetoGate};
+            pub static EST: Backed<u32> = Backed::new(0);
+            pub(crate) static HANDLE: Leased<u32> = Leased::new(0);
+            mod inner {
+                static TRIP: VetoGate<4> = VetoGate::new();
+                pub static LOUD: VetoGate<4> = VetoGate::new();
+                pub static PLAIN: u32 = 0;
+            }
+            static QUIET: Backed<u32> = Backed::new(0);
+        "#;
+        let mut found = Vec::new();
+        crate::scan_gate_statics(src, "sig.rs", &mut found);
+        let names: Vec<&str> = found.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["EST", "HANDLE", "TRIP", "LOUD", "QUIET"],
+            "a plain static is not a gate"
+        );
+        let w = gate_lints(&found, &all());
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w[0].contains("`sig.rs:3` `EST: Backed<..>`"), "{}", w[0]);
+        assert!(
+            w[1].contains("HANDLE: Leased<..>"),
+            "pub(crate) is reachable too: {}",
+            w[1]
+        );
+        assert!(w[2].contains("LOUD: VetoGate<..>"), "{}", w[2]);
+        assert!(w.iter().all(|w| w.contains("#[dataflow]")), "{w:?}");
+        let mut narrowed = LintCats::default();
+        narrowed.parse("orphan-reads").unwrap();
+        assert!(gate_lints(&found, &narrowed).is_empty(), "off unless asked");
+        let mut only = LintCats::default();
+        only.parse("public-gate").unwrap();
+        assert!(only.public_gate && !only.dead_writes);
     }
 
     #[test]

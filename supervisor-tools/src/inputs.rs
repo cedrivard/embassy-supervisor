@@ -261,6 +261,8 @@ pub struct Scan {
     pub dep_fns: Vec<(String, String)>,
     /// Discovered `#[dataflow_bundle]` modules.
     pub bundles: Vec<Bundle>,
+    /// Gate-wrapped statics (`Backed`, `Leased`, `VetoGate`) in graph sources.
+    pub gate_statics: Vec<crate::GateStatic>,
 }
 
 /// Scan all sources and return the collected declarations, accesses, and bundles.
@@ -285,6 +287,7 @@ pub fn scan(sources: &Sources) -> Result<Scan, String> {
                 .extend(crate::parse_source(&src, file).map_err(|e| e.to_string())?);
         }
         crate::scan_source(&src, file, &mut out.scanned_accesses);
+        crate::scan_gate_statics(&src, file, &mut out.gate_statics);
         crate::scan_fns(
             &src,
             file,

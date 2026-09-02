@@ -1,9 +1,9 @@
 mod gate;
 
 use embassy_supervisor_syntax::{
-    AdoptedFn, Dep, GraphSpec, Item, NodeItem, PoolItem, ResourceDecl, SignalDecl, StateInit,
-    TaskSource, VerbTable, item_ident_cfg, item_resources, kw, name_string, node_param,
-    normalize_fragment_crate, rewrite_verb_calls, substitute_dollar_crate,
+    AdoptedFn, Dep, GraphSpec, Item, NodeItem, PoolItem, ResourceDecl, ResourceKind, SignalDecl,
+    StateInit, TaskSource, VerbTable, item_executor, item_ident_cfg, item_resources, kw,
+    name_string, node_param, normalize_fragment_crate, rewrite_verb_calls, substitute_dollar_crate,
 };
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -150,6 +150,15 @@ fn marker_array_tokens(
     )
 }
 
+/// The `veto` contributor slots of one item's `writes:` list: the base slot
+/// per entry (aligned with the list, `None` where the marker is absent) and
+/// the member offset a pool table adds to it.
+#[derive(Clone, Copy, Default)]
+struct VetoSlots<'a> {
+    bases: &'a [Option<u8>],
+    offset: usize,
+}
+
 fn coupling_binding_tokens(
     ctx: &EmitCtx<'_>,
     decls: &[SignalDecl],
@@ -157,6 +166,7 @@ fn coupling_binding_tokens(
     builder: &str,
     default_observe: Option<&Expr>,
     foreign: &[AdoptedFn],
+    veto: VetoSlots<'_>,
 ) -> (TokenStream2, TokenStream2) {
     let EmitCtx { cfg, cr, owner } = ctx;
     let mut defs = quote!();
@@ -169,8 +179,14 @@ fn coupling_binding_tokens(
         let len = cfg_aware_len(decls.iter().map(|d| &d.cfg));
         let entries: Vec<TokenStream2> = decls
             .iter()
-            .map(|d| {
+            .enumerate()
+            .map(|(i, d)| {
                 let (entry_cfg, name, target) = (&d.cfg, d.display(), d.target());
+                let veto = veto.bases.get(i).copied().flatten().map(|base| {
+                    let slot = u8::try_from(usize::from(base) + veto.offset)
+                        .expect("veto slot count checked");
+                    quote!( .veto(#slot) )
+                });
                 let observed = d.observed.as_ref().map(|_| {
                     // `it` names the signal inside the accessor, so one
                     // graph-level default serves every entry in the direction.
@@ -185,7 +201,7 @@ fn coupling_binding_tokens(
                     quote!( .observed(#cr::Observer::new(|| #accessor)) )
                 });
                 let beat = d.beat.as_ref().map(|_| quote!( .beat() ));
-                quote!( #(#entry_cfg)* #cr::Coupling::new(#name, &#target) #observed #beat )
+                quote!( #(#entry_cfg)* #cr::Coupling::new(#name, &#target) #observed #beat #veto )
             })
             .collect();
         defs.extend(quote! {
@@ -393,6 +409,84 @@ fn gate_tokens(resources: &[ResourceDecl]) -> (TokenStream2, Vec<TokenStream2>) 
         })
         .collect();
     (cfg_aware_len(resources.iter().map(|r| &r.cfg)), gate_refs)
+}
+
+/// Graph-wide facts the per-item emitters consult: resource slots and the
+/// contributor slots of `veto` writes.
+struct ResourcePlan {
+    /// Per resource name: the first declaring entry's `#[cfg]`s, and whether
+    /// the name is a pool's per-member slot array (which `provides:` may not
+    /// name).
+    cfgs: HashMap<String, (Vec<Attribute>, bool)>,
+    /// `(owner, resource)` -> the owner's base slot in that `divisible` budget.
+    claim_bases: HashMap<(String, String), u8>,
+    /// `(owner, signal display)` -> the owner's base contributor slot in that
+    /// `VetoGate`.
+    veto_bases: HashMap<(String, String), u8>,
+}
+
+impl ResourcePlan {
+    /// `owner`'s base contributor slot per entry of its `writes:`, aligned with
+    /// the list (`None` where the entry carries no `veto`).
+    fn veto_slots(&self, owner: &Ident, writes: &[SignalDecl]) -> Vec<Option<u8>> {
+        writes
+            .iter()
+            .map(|d| {
+                self.veto_bases
+                    .get(&(owner.to_string(), d.display()))
+                    .copied()
+            })
+            .collect()
+    }
+
+    /// `owner`'s base slot per entry of its `resources:`, aligned with the list
+    /// (`None` for every kind but `divisible`).
+    fn claims(&self, owner: &Ident, resources: &[ResourceDecl]) -> Vec<Option<u8>> {
+        resources
+            .iter()
+            .map(|r| {
+                self.claim_bases
+                    .get(&(owner.to_string(), r.ident.to_string()))
+                    .copied()
+            })
+            .collect()
+    }
+}
+
+/// The claims table for one holder: `(&BUDGET, slot)` per `divisible` entry,
+/// wired with `.with_claims(..)` so a stop releases each slot. `offset` is the
+/// pool member index (0 for a node), added to the entry's base slot.
+fn claims_tokens(
+    arr: &Ident,
+    item_cfg: &[Attribute],
+    resources: &[ResourceDecl],
+    claims: &[Option<u8>],
+    offset: usize,
+    cr: &TokenStream2,
+) -> (TokenStream2, TokenStream2) {
+    let entries: Vec<(&Vec<Attribute>, TokenStream2)> = resources
+        .iter()
+        .zip(claims)
+        .filter_map(|(r, base)| {
+            let base = (*base)?;
+            let cfg = &r.cfg;
+            let res = &r.ident;
+            let slot = u8::try_from(usize::from(base) + offset).expect("slot count checked");
+            Some((cfg, quote!(#(#cfg)* (&#res, #slot))))
+        })
+        .collect();
+    if entries.is_empty() {
+        return (quote!(), quote!());
+    }
+    let len = cfg_aware_len(entries.iter().map(|(c, _)| *c));
+    let refs = entries.iter().map(|(_, t)| t);
+    (
+        quote! {
+            #(#item_cfg)*
+            static #arr: [(&'static dyn #cr::Divisible, u8); #len] = [#(#refs),*];
+        },
+        quote!( .with_claims(&#arr) ),
+    )
 }
 
 fn provides_tokens(
@@ -714,6 +808,9 @@ fn emit_shell(
     worker: &Expr,
     pool_size: usize,
     resources: &[ResourceDecl],
+    // Aligned with `resources`: the holder's slot in each `divisible` entry's
+    // budget (a pool shell gets the member's `Claimant` as a parameter instead).
+    claims: &[Option<u8>],
     exit: Option<&syn::Type>,
     // `state: Type = ..`: the shell owns the glue-boxed state across the worker
     // call (worker sees `&mut Type`) and DROPS it first thing after the worker
@@ -754,62 +851,76 @@ fn emit_shell(
     // hardware. A `Pause` worker parks instead of returning and simply retains
     // them. `consume` and `shared` forward by value with no restore: a consumed
     // slot stays empty until the app re-`provide()`s (fail-closed respawn), a
-    // shared slot was never emptied.
+    // shared slot was never emptied. A `divisible` entry forwards the member's
+    // `Claimant` by value; its share is released by the supervisor, not here.
     //
     // Per-entry `#[cfg]` rides on params, reads, worker-call arguments, and
     // restore statements alike, so a cfg'd-out entry disappears from the whole
     // chain (the worker fn must gate its matching parameter the same way).
-    let by_value = |r: &ResourceDecl| r.consume.is_some() || r.shared.is_some();
+    let typed = |r: &ResourceDecl| r.ty.clone().expect("a typed resource kind");
     let res_params: Vec<TokenStream2> = resources
         .iter()
         .enumerate()
         .filter_map(|(i, r)| {
             let cfg = &r.cfg;
-            let ty = &r.ty;
-            if r.shared.is_none() && pool_member {
+            match r.kind() {
                 // A pool shell is shared by its members and cannot name `RES[I]`
                 // itself, so member `I`'s slot element rides in as a reference.
                 // (`shared` slots are pool-wide statics, nameable directly.)
-                let slot_param = format_ident!("__r{}_slot", i);
-                Some(quote!(#(#cfg)* #slot_param: &'static #cr::ResourceSlot<#ty>))
-            } else {
-                None // read from the slot static inside the shell
+                ResourceKind::Lend | ResourceKind::Consume if pool_member => {
+                    let ty = typed(r);
+                    let slot_param = format_ident!("__r{}_slot", i);
+                    Some(quote!(#(#cfg)* #slot_param: &'static #cr::ResourceSlot<#ty>))
+                }
+                // Likewise the member's slot in a budget: the wrapper builds
+                // the `Claimant` and passes it in.
+                ResourceKind::Divisible if pool_member => {
+                    let var = format_ident!("__r{}", i);
+                    Some(quote!(#(#cfg)* #var: #cr::Claimant))
+                }
+                _ => None, // read from the slot static inside the shell
             }
         })
         .collect();
     let res_takes: Vec<TokenStream2> = resources
         .iter()
         .enumerate()
-        .map(|(i, r)| {
+        .filter_map(|(i, r)| {
             let cfg = &r.cfg;
             let var = format_ident!("__r{}", i);
             let res = &r.ident;
-            if r.shared.is_some() {
-                quote! {
+            match r.kind() {
+                ResourceKind::Shared => Some(quote! {
                     #(#cfg)*
                     let ::core::option::Option::Some(#var) = #res.get() else {
                         __node.mark_lost_resource();
                         return;
                     };
+                }),
+                ResourceKind::Divisible if pool_member => None,
+                ResourceKind::Divisible => {
+                    let slot = claims[i].expect("a divisible entry has a slot");
+                    Some(quote!(#(#cfg)* let #var = #res.claimant(#slot);))
                 }
-            } else {
-                let mutability = if r.consume.is_some() {
-                    quote!()
-                } else {
-                    quote!(mut)
-                };
-                let slot = if pool_member {
-                    let slot_param = format_ident!("__r{}_slot", i);
-                    quote!(#slot_param)
-                } else {
-                    quote!(#res)
-                };
-                quote! {
-                    #(#cfg)*
-                    let ::core::option::Option::Some(#mutability #var) = #slot.take() else {
-                        __node.mark_lost_resource();
-                        return;
+                kind => {
+                    let mutability = if kind == ResourceKind::Consume {
+                        quote!()
+                    } else {
+                        quote!(mut)
                     };
+                    let slot = if pool_member {
+                        let slot_param = format_ident!("__r{}_slot", i);
+                        quote!(#slot_param)
+                    } else {
+                        quote!(#res)
+                    };
+                    Some(quote! {
+                        #(#cfg)*
+                        let ::core::option::Option::Some(#mutability #var) = #slot.take() else {
+                            __node.mark_lost_resource();
+                            return;
+                        };
+                    })
                 }
             }
         })
@@ -820,17 +931,17 @@ fn emit_shell(
         .map(|(i, r)| {
             let cfg = &r.cfg;
             let var = format_ident!("__r{}", i);
-            if by_value(r) {
-                quote!(#(#cfg)* #var)
-            } else {
+            if r.kind() == ResourceKind::Lend {
                 quote!(#(#cfg)* &mut #var)
+            } else {
+                quote!(#(#cfg)* #var)
             }
         })
         .collect();
     let restores: Vec<TokenStream2> = resources
         .iter()
         .enumerate()
-        .filter(|(_, r)| !by_value(r))
+        .filter(|(_, r)| r.kind() == ResourceKind::Lend)
         .map(|(i, r)| {
             let cfg = &r.cfg;
             let var = format_ident!("__r{}", i);
@@ -987,11 +1098,12 @@ fn emit_node(
     pool_names: &std::collections::HashSet<String>,
     helpers: &HelperIdents,
     observe: &ObserveDefaults,
-    // Graph-wide resource-entry cfgs (+ pool provenance), for `provides:`
-    // name resolution.
-    resource_cfgs: &std::collections::HashMap<String, (Vec<Attribute>, bool)>,
+    // Graph-wide resource facts: `provides:` name resolution and this node's
+    // slot in each `divisible` budget.
+    plan: &ResourcePlan,
 ) -> SynResult<(TokenStream2, Slot)> {
     let ident = &n.ident;
+    let claims = plan.claims(&n.ident, &n.resources);
     let cfg = &n.cfg;
     let mode = &n.mode;
     let name = name_string(&n.ident);
@@ -1003,14 +1115,20 @@ fn emit_node(
                 None => 1,
             };
             // A node's take-kind slots hold ONE value, so extra instances
-            // could only race the shell's take; reject the combination
-            // instead of letting the loser exit as a lost resource.
-            if ps > 1 && n.resources.iter().any(|r| r.shared.is_none()) {
+            // could only race the shell's take; a divisible slot is ONE
+            // claimant, so extra instances would clobber each other's want
+            // and share one grant. Reject the combination instead of letting
+            // the loser exit as a lost resource.
+            if ps > 1
+                && n.resources
+                    .iter()
+                    .any(|r| !matches!(r.kind(), ResourceKind::Shared))
+            {
                 return Err(syn::Error::new_spanned(
                     n.pool_size.as_ref().unwrap(),
-                    "`pool_size > 1` cannot combine with lend/consume `resources:` \
-                     (the slot holds one value; use `shared`, or an `ElasticPool` \
-                     with per-member slots)",
+                    "`pool_size > 1` cannot combine with lend/consume/divisible \
+                     `resources:` (the slot holds one value, or one claimant; use \
+                     `shared`, or an `ElasticPool` with per-member slots)",
                 ));
             }
             let (def, path) = emit_shell(
@@ -1019,6 +1137,7 @@ fn emit_node(
                 worker,
                 ps,
                 &n.resources,
+                &claims,
                 n.exit.as_ref(),
                 n.state.as_ref().map(|(_, ty, init)| (ty, init)),
                 false,
@@ -1057,44 +1176,48 @@ fn emit_node(
         (quote!(), quote!())
     } else {
         let gates_ident = format_ident!("__SV_GATES_{}", ident);
-        // `shared` slots are emitted once per graph in `expand` (several items
-        // may declare the same one); only this node's exclusive (take-kind)
-        // slots are emitted here.
-        let slot_defs = n.resources.iter().filter(|r| r.shared.is_none()).map(|r| {
-            let ecfg = &r.cfg;
-            let res = &r.ident;
-            let ty = &r.ty;
-            // `local` entries use the graph-site slot type (emitted once per
-            // graph in `expand`): same provide/take protocol as `ResourceSlot`
-            // but without its `T: Send` bound, for `!Send` driver handles on a
-            // single-core system. `consume` changes only shell codegen (by-value
-            // arg, no restore) — the slot type is the same either way.
-            let slot_ty = if r.local.is_some() {
-                let local = &helpers.local_slot;
-                quote!(#local<#ty>)
-            } else {
-                quote!(#cr::ResourceSlot<#ty>)
-            };
-            let doc = if r.consume.is_some() {
-                format!(
-                    "Resource slot for node `{ident}` (generated by `supervisor_graph!`). \
+        // `shared` slots and `divisible` budgets are emitted once per graph in
+        // `expand` (several items may declare the same one); only this node's
+        // exclusive (take-kind) slots are emitted here.
+        let slot_defs = n
+            .resources
+            .iter()
+            .filter(|r| matches!(r.kind(), ResourceKind::Lend | ResourceKind::Consume))
+            .map(|r| {
+                let ecfg = &r.cfg;
+                let res = &r.ident;
+                let ty = r.ty.as_ref().expect("a typed resource kind");
+                // `local` entries use the graph-site slot type (emitted once per
+                // graph in `expand`): same provide/take protocol as `ResourceSlot`
+                // but without its `T: Send` bound, for `!Send` driver handles on a
+                // single-core system. `consume` changes only shell codegen (by-value
+                // arg, no restore) — the slot type is the same either way.
+                let slot_ty = if r.local.is_some() {
+                    let local = &helpers.local_slot;
+                    quote!(#local<#ty>)
+                } else {
+                    quote!(#cr::ResourceSlot<#ty>)
+                };
+                let doc = if r.consume.is_some() {
+                    format!(
+                        "Resource slot for node `{ident}` (generated by `supervisor_graph!`). \
                          Move the resource in with `.provide(..)` before `Supervisor::start`. \
                          `consume`: the worker owns (and may drop) the value, so the slot is \
                          empty after the task exits — re-`provide()` before any respawn."
-                )
-            } else {
-                format!(
-                    "Resource slot for node `{ident}` (generated by `supervisor_graph!`). \
+                    )
+                } else {
+                    format!(
+                        "Resource slot for node `{ident}` (generated by `supervisor_graph!`). \
                          Move the resource in with `.provide(..)` before `Supervisor::start`."
-                )
-            };
-            quote! {
-                #(#cfg)*
-                #(#ecfg)*
-                #[doc = #doc]
-                pub static #res: #slot_ty = <#slot_ty>::new();
-            }
-        });
+                    )
+                };
+                quote! {
+                    #(#cfg)*
+                    #(#ecfg)*
+                    #[doc = #doc]
+                    pub static #res: #slot_ty = <#slot_ty>::new();
+                }
+            });
         let (gates_len, gate_refs) = gate_tokens(&n.resources);
         (
             quote! {
@@ -1203,6 +1326,7 @@ fn emit_node(
         "with_reads",
         observe.reads.as_ref(),
         &foreign,
+        VetoSlots::default(),
     );
     let marker_asserts = {
         let d = n.discover.as_ref().map(|g| g.cfg.as_slice());
@@ -1210,6 +1334,7 @@ fn emit_node(
         let w = marker_assert_tokens(&ctx, &name_string(ident), d, &foreign, &n.writes, "WRITES");
         quote!( #r #w )
     };
+    let veto_bases = plan.veto_slots(&n.ident, &n.writes);
     let (writes_def, with_writes) = coupling_binding_tokens(
         &ctx,
         &n.writes,
@@ -1217,6 +1342,10 @@ fn emit_node(
         "with_writes",
         observe.writes.as_ref(),
         &foreign,
+        VetoSlots {
+            bases: &veto_bases,
+            offset: 0,
+        },
     );
     let exit_def = match &n.exit {
         Some(ty) => {
@@ -1243,10 +1372,18 @@ fn emit_node(
          `&'static TaskNode` for the task-side protocol."
     );
     let cfg_ident = format_ident!("__SV_CFG_{}", ident);
-    let (prov_def, with_provides) = provides_tokens(n, cr, resource_cfgs)?;
+    let (prov_def, with_provides) = provides_tokens(n, cr, &plan.cfgs)?;
+    let (claims_def, with_claims) = claims_tokens(
+        &format_ident!("__SV_CLAIMS_{}", ident),
+        cfg,
+        &n.resources,
+        &claims,
+        0,
+        cr,
+    );
     let cfg_chain = quote! {
         #cr::NodeCfg::new(#name, #cr::Mode::#mode, #spawn)
-            #with_exec #with_res #with_provides #with_clauses #with_ready
+            #with_exec #with_res #with_provides #with_claims #with_clauses #with_ready
             #with_bound #with_reads #with_writes
             #with_graph
     };
@@ -1265,6 +1402,7 @@ fn emit_node(
         #discover_errors
         #res_defs
         #prov_def
+        #claims_def
         #exit_def
         #ready_def
         #bound_def
@@ -1295,8 +1433,12 @@ fn emit_pool(
     pool_names: &std::collections::HashSet<String>,
     helpers: &HelperIdents,
     observe: &ObserveDefaults,
+    // Graph-wide resource facts: the pool's base slot in each `divisible`
+    // budget (member `j` holds base + j).
+    plan: &ResourcePlan,
 ) -> SynResult<(Vec<TokenStream2>, TokenStream2, Vec<Slot>)> {
     let ident = &p.ident;
+    let claims = plan.claims(&p.ident, &p.resources);
     let cfg = &p.cfg;
     let lname = name_string(&p.ident);
     let pool_static = format_ident!("{}_POOL", ident);
@@ -1352,6 +1494,7 @@ fn emit_pool(
             worker,
             k,
             &p.resources,
+            &claims,
             None,
             p.state.as_ref().map(|(_, ty, init)| (ty, init)),
             true,
@@ -1363,11 +1506,18 @@ fn emit_pool(
     let res_args: Vec<TokenStream2> = p
         .resources
         .iter()
-        .filter(|r| r.shared.is_none())
-        .map(|r| {
+        .zip(&claims)
+        .filter_map(|(r, base)| {
             let ecfg = &r.cfg;
             let res = &r.ident;
-            quote!(#(#ecfg)* &#res[I])
+            match r.kind() {
+                ResourceKind::Lend | ResourceKind::Consume => Some(quote!(#(#ecfg)* &#res[I])),
+                ResourceKind::Divisible => {
+                    let base = base.expect("a divisible entry has a slot");
+                    Some(quote!(#(#ecfg)* #res.claimant((#base as usize + I) as u8)))
+                }
+                ResourceKind::Shared => None,
+            }
         })
         .collect();
     let (state_prelude, state_arg) = match &p.state {
@@ -1396,10 +1546,9 @@ fn emit_pool(
         .map(|r| {
             let ecfg = &r.cfg;
             let res = &r.ident;
-            let slot = if r.shared.is_some() {
-                quote!(#res)
-            } else {
-                quote!(#res[I])
+            let slot = match r.kind() {
+                ResourceKind::Lend | ResourceKind::Consume => quote!(#res[I]),
+                ResourceKind::Shared | ResourceKind::Divisible => quote!(#res),
             };
             quote! {
                 #(#ecfg)*
@@ -1431,10 +1580,14 @@ fn emit_pool(
         Some(ex) => quote!( .with_executor(&#ex) ),
         None => quote!(),
     };
-    for r in p.resources.iter().filter(|r| r.shared.is_none()) {
+    for r in p
+        .resources
+        .iter()
+        .filter(|r| matches!(r.kind(), ResourceKind::Lend | ResourceKind::Consume))
+    {
         let ecfg = &r.cfg;
         let res = &r.ident;
-        let ty = &r.ty;
+        let ty = r.ty.as_ref().expect("a typed resource kind");
         let doc = format!(
             "Per-member resource slots for pool `{ident}` (generated by \
              `supervisor_graph!`): member `I` takes/restores element `I`. \
@@ -1463,10 +1616,13 @@ fn emit_pool(
                     .map(|r| {
                         let ecfg = &r.cfg;
                         let res = &r.ident;
-                        if r.shared.is_some() {
-                            quote!(#(#ecfg)* &#res)
-                        } else {
-                            quote!(#(#ecfg)* &#res[#j])
+                        match r.kind() {
+                            ResourceKind::Lend | ResourceKind::Consume => {
+                                quote!(#(#ecfg)* &#res[#j])
+                            }
+                            ResourceKind::Shared | ResourceKind::Divisible => {
+                                quote!(#(#ecfg)* &#res)
+                            }
                         }
                     })
                     .collect();
@@ -1479,6 +1635,20 @@ fn emit_pool(
             })
             .collect()
     };
+    let member_with_claims: Vec<TokenStream2> = (0..k)
+        .map(|j| {
+            let (def, with) = claims_tokens(
+                &format_ident!("__SV_CLAIMS_{}_{}", ident, j),
+                cfg,
+                &p.resources,
+                &claims,
+                j,
+                cr,
+            );
+            defs.push(def);
+            with
+        })
+        .collect();
     // `deps: [X ready, ..]` — ONE shared ready-dep array for the whole pool
     // (markers apply to every member; growth also checks it synchronously).
     // The three dep-marker overlays and the two coupling tables: one table per
@@ -1517,15 +1687,52 @@ fn emit_pool(
         "with_reads",
         observe.reads.as_ref(),
         &foreign,
+        VetoSlots::default(),
     );
-    let (writes_def, member_with_writes) = coupling_binding_tokens(
-        &ctx,
-        &p.writes,
-        "WRITES",
-        "with_writes",
-        observe.writes.as_ref(),
-        &foreign,
-    );
+    // A `veto` write gives every member its own contributor slot, so such a
+    // pool emits one writes table per member (the flash cost is the opt-in's);
+    // any other pool shares one table across its members, as before.
+    let veto_bases = plan.veto_slots(&p.ident, &p.writes);
+    let (writes_def, member_with_writes): (TokenStream2, Vec<TokenStream2>) =
+        if veto_bases.iter().any(Option::is_some) {
+            let mut def = quote!();
+            let withs = (0..k)
+                .map(|j| {
+                    let member_ident = format_ident!("{}_{}", ident, j);
+                    let member_ctx = EmitCtx {
+                        cfg,
+                        cr,
+                        owner: &member_ident,
+                    };
+                    let (d, w) = coupling_binding_tokens(
+                        &member_ctx,
+                        &p.writes,
+                        "WRITES",
+                        "with_writes",
+                        observe.writes.as_ref(),
+                        &foreign,
+                        VetoSlots {
+                            bases: &veto_bases,
+                            offset: j,
+                        },
+                    );
+                    def.extend(d);
+                    w
+                })
+                .collect();
+            (def, withs)
+        } else {
+            let (d, w) = coupling_binding_tokens(
+                &ctx,
+                &p.writes,
+                "WRITES",
+                "with_writes",
+                observe.writes.as_ref(),
+                &foreign,
+                VetoSlots::default(),
+            );
+            (d, (0..k).map(|_| w.clone()).collect())
+        };
     // Empty token streams for absent clauses, so pushing unconditionally is a
     // no-op rather than a special case.
     {
@@ -1579,11 +1786,13 @@ fn emit_pool(
         .map(|(j, (mode, sp))| {
             let nm = format!("{lname}{j}");
             let with_res = &member_with_res[j];
+            let with_claims = &member_with_claims[j];
+            let member_with_writes = &member_with_writes[j];
             let chain = quote! {
                 #cr::NodeCfg::new(
                     #nm, #cr::Mode::#mode,
                     ::core::option::Option::Some((#sp) as #spawn_fn),
-                ) #member_with_exec #with_res #member_with_clauses
+                ) #member_with_exec #with_res #with_claims #member_with_clauses
                   #member_with_ready
                   #member_with_bound
                   #member_with_reads #member_with_writes #member_with_graph
@@ -1919,7 +2128,9 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
         })
         .collect();
 
-    struct SharedPlan<'a> {
+    /// A graph-wide slot — a `shared` slot or a `divisible` budget — that
+    /// several items may declare and the graph emits once.
+    struct GraphSlotPlan<'a> {
         /// First declaration — supplies the emitted static's ident (span), type,
         decl: &'a ResourceDecl,
         /// Kinds+type token string every re-declaration must match.
@@ -1928,8 +2139,16 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
         /// then unconditional too), `Some(pred)` = that site's combined
         preds: Vec<Option<TokenStream2>>,
         owners: Vec<String>,
+        /// The first declarer's `executor:` (`None` = the supervisor's own),
+        /// which a `serialized` slot holds every other declarer to.
+        executor: Option<String>,
+        /// `divisible`: claimant slots handed out so far (a node takes one, a
+        /// pool one per member), which sizes the emitted `Budget<K>`.
+        slots: usize,
     }
-    let mut shared_plans: Vec<(String, SharedPlan)> = Vec::new();
+    let mut shared_plans: Vec<(String, GraphSlotPlan)> = Vec::new();
+    // (owner, resource) -> the owner's base slot in that budget.
+    let mut claim_bases: HashMap<(String, String), u8> = HashMap::new();
     {
         let mut taken: HashSet<String> = HashSet::new();
         for item in &graph.items {
@@ -1937,6 +2156,11 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                 continue;
             };
             let item_pred = cfg_predicate(item_cfg);
+            let member_count = match item {
+                Item::Pool(p) => p.modes.len(),
+                _ => 1,
+            };
+            let executor_text = item_executor(item).map(ToString::to_string);
             for r in item_resources(item) {
                 let key = r.ident.to_string();
                 if executor_names.contains(&key) {
@@ -1954,20 +2178,24 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                     (Some(p), None) | (None, Some(p)) => Some(p),
                     (Some(a), Some(b)) => Some(quote!(all(#a, #b))),
                 };
-                if r.shared.is_some() {
+                if matches!(r.kind(), ResourceKind::Shared | ResourceKind::Divisible) {
                     if taken.contains(&key) {
                         return Err(syn::Error::new_spanned(
                             &r.ident,
                             format!(
                                 "`{}` is already a take-kind resource elsewhere in \
                                  the graph — a name is either one exclusive slot or \
-                                 one `shared` slot, not both",
+                                 one `shared`/`divisible` slot, not both",
                                 r.ident
                             ),
                         ));
                     }
-                    let sig = r.shared_signature();
-                    match shared_plans.iter_mut().find(|(k, _)| *k == key) {
+                    let sig = if r.kind() == ResourceKind::Divisible {
+                        "divisible".to_string()
+                    } else {
+                        r.shared_signature()
+                    };
+                    let plan = match shared_plans.iter_mut().find(|(k, _)| *k == key) {
                         Some((_, plan)) => {
                             if plan.sig != sig {
                                 return Err(syn::Error::new_spanned(
@@ -1981,18 +2209,70 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                                     ),
                                 ));
                             }
+                            // `serialized`: every holder on one executor, so no
+                            // higher-tier waiter can be starved by a lower-tier
+                            // holder — priority ceiling by construction, since
+                            // embassy can neither boost a holder nor migrate a
+                            // task. Syntactic: `#[cfg]`s are not consulted.
+                            if let Some(marker) = &r.serialized
+                                && executor_text != plan.executor
+                            {
+                                let tier = |e: &Option<String>| match e {
+                                    Some(x) => format!("`{x}`"),
+                                    None => "the supervisor's executor".to_string(),
+                                };
+                                return Err(syn::Error::new_spanned(
+                                    marker,
+                                    format!(
+                                        "`{}` is `serialized`: every holder must run on one \
+                                         executor so no higher-tier waiter can be starved by \
+                                         a lower-tier holder (priority ceiling by \
+                                         construction), but `{}` runs on {} and `{}` on {}",
+                                        r.ident,
+                                        plan.owners[0],
+                                        tier(&plan.executor),
+                                        owner,
+                                        tier(&executor_text),
+                                    ),
+                                ));
+                            }
                             plan.preds.push(pred);
                             plan.owners.push(owner.to_string());
+                            plan
                         }
-                        None => shared_plans.push((
-                            key,
-                            SharedPlan {
-                                decl: r,
-                                sig,
-                                preds: vec![pred],
-                                owners: vec![owner.to_string()],
-                            },
-                        )),
+                        None => {
+                            shared_plans.push((
+                                key.clone(),
+                                GraphSlotPlan {
+                                    decl: r,
+                                    sig,
+                                    preds: vec![pred],
+                                    owners: vec![owner.to_string()],
+                                    executor: executor_text.clone(),
+                                    slots: 0,
+                                },
+                            ));
+                            &mut shared_plans.last_mut().expect("just pushed").1
+                        }
+                    };
+                    if r.kind() == ResourceKind::Divisible {
+                        // Counted syntactically: a `#[cfg]`'d-out declarer still
+                        // takes its slots, so the budget can only be oversized.
+                        let base = u8::try_from(plan.slots)
+                            .ok()
+                            .filter(|_| plan.slots + member_count <= usize::from(u8::MAX) + 1);
+                        let Some(base) = base else {
+                            return Err(syn::Error::new_spanned(
+                                &r.ident,
+                                format!(
+                                    "divisible resource `{}` has more than 256 claimant \
+                                     slots across the graph — slots are `u8`",
+                                    r.ident
+                                ),
+                            ));
+                        };
+                        claim_bases.insert((owner.to_string(), key), base);
+                        plan.slots += member_count;
                     }
                 } else {
                     if !taken.insert(key.clone()) || shared_plans.iter().any(|(k, _)| *k == key) {
@@ -2012,18 +2292,35 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
     }
     for (_, plan) in &shared_plans {
         let res = &plan.decl.ident;
-        let ty = &plan.decl.ty;
-        let slot_ty = if plan.decl.local.is_some() {
-            let local = &helpers.local_slot;
-            quote!(#local<#ty>)
-        } else {
-            quote!(#cr::ResourceSlot<#ty>)
-        };
         let cfg_attr = if plan.preds.iter().any(|p| p.is_none()) {
             quote!()
         } else {
             let preds = plan.preds.iter().flatten();
             quote!(#[cfg(any(#(#preds),*))])
+        };
+        if plan.decl.kind() == ResourceKind::Divisible {
+            let k = plan.slots;
+            let doc = format!(
+                "Divisible budget declared by `{}` (generated by `supervisor_graph!`): \
+                 {k} claimant slot(s), one per declaring node or pool member, in \
+                 declaration order. `provide()` the capacity before the holders \
+                 start (or from an allocator node that names it in `provides:`), \
+                 and `rebalance()` it with a `BudgetPolicy` when the wants move.",
+                plan.owners.join("`, `"),
+            );
+            defs.push(quote! {
+                #cfg_attr
+                #[doc = #doc]
+                pub static #res: #cr::Budget<#k> = #cr::Budget::new();
+            });
+            continue;
+        }
+        let ty = plan.decl.ty.as_ref().expect("a typed resource kind");
+        let slot_ty = if plan.decl.local.is_some() {
+            let local = &helpers.local_slot;
+            quote!(#local<#ty>)
+        } else {
+            quote!(#cr::ResourceSlot<#ty>)
         };
         let doc = format!(
             "Shared (fan-out) resource slot declared by `{}` (generated by \
@@ -2040,16 +2337,124 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
         });
     }
 
-    let mut resource_cfgs: std::collections::HashMap<String, (Vec<Attribute>, bool)> =
-        std::collections::HashMap::new();
+    let mut resource_cfgs: HashMap<String, (Vec<Attribute>, bool)> = HashMap::new();
     for item in &graph.items {
         let from_pool = matches!(item, Item::Pool(_));
         for r in item_resources(item) {
+            let per_member = matches!(r.kind(), ResourceKind::Lend | ResourceKind::Consume);
             resource_cfgs
                 .entry(r.ident.to_string())
-                .or_insert_with(|| (r.cfg.clone(), from_pool && r.shared.is_none()));
+                .or_insert_with(|| (r.cfg.clone(), from_pool && per_member));
         }
     }
+    // `veto` contributor slots: per gate (by its display text), writers are
+    // numbered in item order — a node takes one slot, a pool one per member —
+    // and the gate is checked once for the total. Counted syntactically, so a
+    // `#[cfg]`'d-out writer still reserves its slot: the check can only be
+    // stricter than the build. The text is load-bearing here (the slot is a
+    // bit of the static it resolves to), so one gate named two ways — `TRIP`
+    // beside `crate::TRIP` — is rejected rather than numbered twice.
+    struct VetoPlan {
+        key: String,
+        target: TokenStream2,
+        total: usize,
+        /// One entry per writer, `None` = unconditional: gates the check the
+        /// way `GraphSlotPlan::preds` gates a shared static, so a gate whose
+        /// writers all sit behind a `#[cfg]` is not named in a build without it.
+        preds: Vec<Option<TokenStream2>>,
+    }
+    let mut veto_bases: HashMap<(String, String), u8> = HashMap::new();
+    let mut veto_plans: Vec<VetoPlan> = Vec::new();
+    // Last path segment (plus index) -> the first spelling seen for it.
+    let mut veto_stems: HashMap<String, String> = HashMap::new();
+    for item in &graph.items {
+        let Some((owner, item_cfg)) = item_ident_cfg(item) else {
+            continue;
+        };
+        let item_pred = cfg_predicate(item_cfg);
+        let member_count = match item {
+            Item::Pool(p) => p.modes.len(),
+            _ => 1,
+        };
+        let writes = match item {
+            Item::Node(n) => &n.writes[..],
+            Item::Pool(p) => &p.writes[..],
+            Item::Executor(_) => &[][..],
+        };
+        for d in writes.iter().filter(|d| d.veto.is_some()) {
+            let key = d.display();
+            let stem = match (d.path.segments.last(), key.find('[')) {
+                (Some(last), Some(at)) => format!("{}{}", last.ident, &key[at..]),
+                (Some(last), None) => last.ident.to_string(),
+                (None, _) => key.clone(),
+            };
+            match veto_stems.get(&stem) {
+                Some(first) if *first != key => {
+                    return Err(syn::Error::new_spanned(
+                        &d.path,
+                        format!(
+                            "`{first}` and `{key}` both name a `veto` gate ending in \
+                             `{stem}`: contributor slots are numbered per spelling, so \
+                             one static named two ways would hand two writers the same \
+                             bit — spell the gate one way across the graph, or alias one \
+                             of two distinct statics with `use .. as`"
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    veto_stems.insert(stem, key.clone());
+                }
+            }
+            let pred = match (item_pred.clone(), cfg_predicate(&d.cfg)) {
+                (None, None) => None,
+                (Some(p), None) | (None, Some(p)) => Some(p),
+                (Some(a), Some(b)) => Some(quote!(all(#a, #b))),
+            };
+            let plan = match veto_plans.iter_mut().find(|p| p.key == key) {
+                Some(plan) => plan,
+                None => {
+                    veto_plans.push(VetoPlan {
+                        key: key.clone(),
+                        target: d.target(),
+                        total: 0,
+                        preds: Vec::new(),
+                    });
+                    veto_plans.last_mut().expect("just pushed")
+                }
+            };
+            if plan.total + member_count > 32 {
+                return Err(syn::Error::new_spanned(
+                    &d.path,
+                    format!(
+                        "`{key}` has more than 32 `veto` writers across the graph — a \
+                         `VetoGate` holds at most 32 contributors"
+                    ),
+                ));
+            }
+            veto_bases.insert((owner.to_string(), key), plan.total as u8);
+            plan.total += member_count;
+            plan.preds.push(pred);
+        }
+    }
+    for plan in &veto_plans {
+        let (target, total) = (&plan.target, plan.total);
+        let cfg_attr = if plan.preds.iter().any(|p| p.is_none()) {
+            quote!()
+        } else {
+            let preds = plan.preds.iter().flatten();
+            quote!(#[cfg(any(#(#preds),*))])
+        };
+        defs.push(quote! {
+            #cfg_attr
+            const _: () = #cr::__sv_check_veto(&#target, #total);
+        });
+    }
+    let plan = ResourcePlan {
+        cfgs: resource_cfgs,
+        claim_bases,
+        veto_bases,
+    };
 
     for item in &graph.items {
         match item {
@@ -2076,15 +2481,8 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                         ),
                     ));
                 }
-                let (def, slot) = emit_node(
-                    n,
-                    &cr,
-                    &spawn_fn,
-                    &pool_names,
-                    &helpers,
-                    &observe,
-                    &resource_cfgs,
-                )?;
+                let (def, slot) =
+                    emit_node(n, &cr, &spawn_fn, &pool_names, &helpers, &observe, &plan)?;
                 defs.push(def);
                 slots.push(slot);
             }
@@ -2110,7 +2508,7 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                         ));
                     }
                     let (pool_defs, pool_entry, pool_slots) =
-                        emit_pool(p, &cr, &spawn_fn, &pool_names, &helpers, &observe)?;
+                        emit_pool(p, &cr, &spawn_fn, &pool_names, &helpers, &observe, &plan)?;
                     if names.insert(p.ident.to_string(), slots.len()).is_some() {
                         return Err(syn::Error::new_spanned(
                             &p.ident,
@@ -2156,6 +2554,17 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
         const OBSERVED: u32 = 1 << 6;
         const BOUND_DEPS: u32 = 1 << 7;
         const POOLS: u32 = 1 << 8;
+        const CLAIMS: u32 = 1 << 9;
+        let claims_bit = |resources: &[ResourceDecl]| {
+            if resources
+                .iter()
+                .any(|r| r.kind() == ResourceKind::Divisible)
+            {
+                CLAIMS
+            } else {
+                0
+            }
+        };
         let mode_bit = |m: &Ident| match m.to_string().as_str() {
             "Pause" => PAUSE,
             "OnDemand" => ON_DEMAND,
@@ -2193,6 +2602,7 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                     if !n.resources.is_empty() {
                         bits |= RESOURCES;
                     }
+                    bits |= claims_bit(&n.resources);
                     if n.beat_timeout.is_some() {
                         bits |= BEATS;
                     }
@@ -2213,6 +2623,7 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                     if !p.resources.is_empty() {
                         bits |= RESOURCES;
                     }
+                    bits |= claims_bit(&p.resources);
                 }
                 Item::Executor(_) => {}
             }
@@ -2573,6 +2984,28 @@ fn dataflow_expand(args: TokenStream2, item: TokenStream2) -> SynResult<TokenStr
                          alone, or enable the feature",
                         call.verb,
                         call.verb.trim_start_matches("beat_"),
+                    ),
+                ));
+            }
+            // The verbs a feature adds to `TaskNode`: name the feature here
+            // rather than leave rustc to report a missing method.
+            let needs = match call.verb.as_str() {
+                "open" | "lease" if !cfg!(feature = "data-deps") => Some("`data-deps` feature"),
+                "veto" if !cfg!(feature = "veto") => Some("`veto` feature"),
+                "retire" if !cfg!(all(feature = "data-deps", feature = "readiness")) => {
+                    Some("`data-deps` and `readiness` features")
+                }
+                _ => None,
+            };
+            if let Some(needs) = needs
+                && call.cfgs.is_empty()
+            {
+                return Err(syn::Error::new_spanned(
+                    &call.target,
+                    format!(
+                        "`{}` requires the {needs} (embassy-supervisor features of \
+                         the same names), which add the verb to `TaskNode`",
+                        call.verb,
                     ),
                 ));
             }
@@ -3073,6 +3506,342 @@ mod tests {
             out.matches("feature = \"x\"").count(),
             1,
             "stale predicate survives: {out}"
+        );
+    }
+
+    #[test]
+    fn divisible_requires_feature() {
+        gate_rejects(
+            "node A = Terminate, deps: [], task: f, resources: [R: divisible];",
+            cfg!(feature = "budget"),
+            "`budget` feature",
+        );
+    }
+
+    #[cfg(all(feature = "budget", feature = "pool"))]
+    #[test]
+    fn divisible_emits_one_budget_sized_by_its_holders() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], task: f, resources: [P: divisible];\n\
+             pool W = [Terminate, Terminate, Terminate], deps: [], task: g, \
+             resources: [P: divisible], policy: DeferredShrink::new(d), min: 1, max: 3;\n\
+             node B = Terminate, deps: [], task: f, resources: [P: divisible];",
+        )
+        .unwrap();
+        let out = expand(spec).expect("expansion succeeds").to_string();
+        assert!(out.contains("pub static P : "), "{out}");
+        assert!(
+            out.contains("Budget < 5usize >"),
+            "one slot for A, three for W, one for B: {out}"
+        );
+        assert!(out.contains("P . claimant (0u8)"), "A takes slot 0: {out}");
+        assert!(
+            out.contains("P . claimant ((1u8 as usize + I) as u8)"),
+            "W's members take 1..=3: {out}"
+        );
+        assert!(out.contains("P . claimant (4u8)"), "B takes slot 4: {out}");
+        assert!(
+            out.contains("__SV_CLAIMS_W_2"),
+            "one claims table per member: {out}"
+        );
+        assert!(
+            out.contains("(& P , 3u8)"),
+            "member 2 releases slot 3: {out}"
+        );
+        assert_eq!(out.matches(". with_claims (").count(), 5, "{out}");
+        assert!(!out.contains(". restore ("), "nothing to restore: {out}");
+    }
+
+    #[cfg(feature = "budget")]
+    #[test]
+    fn divisible_slots_are_counted_syntactically() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], task: f, resources: [#[cfg(any())] P: divisible];\n\
+             node B = Terminate, deps: [], task: f, resources: [P: divisible];",
+        )
+        .unwrap();
+        let out = expand(spec).expect("expansion succeeds").to_string();
+        assert!(
+            out.contains("Budget < 2usize >"),
+            "a cfg'd-out holder still takes its slot: {out}"
+        );
+    }
+
+    #[cfg(feature = "budget")]
+    #[test]
+    fn a_budget_may_be_provided_by_a_node() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "node ALLOC = Terminate, deps: [], task: f, provides: [P];\n\
+             node A = Terminate, deps: [ALLOC], task: g, resources: [P: divisible];",
+        )
+        .unwrap();
+        let out = expand(spec).expect("expansion succeeds").to_string();
+        assert!(out.contains("__SV_PROVIDES_ALLOC"), "{out}");
+    }
+
+    #[cfg(feature = "budget")]
+    #[test]
+    fn a_budget_name_cannot_double_as_a_take_kind_slot() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], task: f, resources: [P: divisible];\n\
+             node B = Terminate, deps: [], task: f, resources: [P: u32];",
+        )
+        .unwrap();
+        match expand(spec) {
+            Ok(_) => panic!("accepted"),
+            Err(e) => assert!(e.to_string().contains("duplicate resource name"), "{e}"),
+        }
+    }
+
+    #[test]
+    fn veto_requires_feature() {
+        gate_rejects(
+            "node A = Terminate, deps: [], task: f, writes: [crate::TRIP veto];",
+            cfg!(feature = "veto"),
+            "`veto` feature",
+        );
+    }
+
+    #[cfg(all(feature = "veto", feature = "pool"))]
+    #[test]
+    fn veto_writers_are_numbered_in_item_order_across_nodes_and_pools() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], task: f, writes: [crate::TRIP veto];\n\
+             pool P = [Terminate, Terminate], deps: [], task: g, writes: [crate::TRIP veto], \
+             policy: DeferredShrink::new(d), min: 1, max: 2;\n\
+             node B = Terminate, deps: [], task: f, writes: [crate::TRIP veto observed beat];\n\
+             node R = Terminate, deps: [], task: h, reads: [crate::TRIP];",
+        )
+        .unwrap();
+        let out = expand(spec).expect("expansion succeeds").to_string();
+        assert!(out.contains(". veto (0u8)"), "A: {out}");
+        assert!(
+            out.contains("__SV_WRITES_P_0") && out.contains("__SV_WRITES_P_1"),
+            "a table per member: {out}"
+        );
+        assert!(
+            out.contains(". veto (1u8)") && out.contains(". veto (2u8)"),
+            "P's members: {out}"
+        );
+        assert!(
+            out.contains(". beat () . veto (3u8)"),
+            "B, beside its other markers: {out}"
+        );
+        assert!(
+            out.contains("__sv_check_veto (& crate :: TRIP , 4usize)"),
+            "one check per gate: {out}"
+        );
+        assert_eq!(out.matches("__sv_check_veto").count(), 1, "{out}");
+    }
+
+    #[cfg(feature = "veto")]
+    #[test]
+    fn a_pool_without_veto_keeps_one_writes_table() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "pool P = [Terminate, Terminate], deps: [], task: g, writes: [crate::OUT], \
+             policy: DeferredShrink::new(d), min: 1, max: 2;",
+        )
+        .unwrap();
+        let out = expand(spec).expect("expansion succeeds").to_string();
+        assert!(out.contains("__SV_WRITES_P :"), "{out}");
+        assert!(!out.contains("__SV_WRITES_P_0"), "{out}");
+    }
+
+    #[cfg(feature = "veto")]
+    #[test]
+    fn more_than_32_veto_writers_are_rejected() {
+        let mut src = String::new();
+        for i in 0..33 {
+            src.push_str(&format!(
+                "node N{i} = Terminate, deps: [], task: f, writes: [crate::TRIP veto];\n"
+            ));
+        }
+        let spec = syn::parse_str::<GraphSpec>(&src).unwrap();
+        match expand(spec) {
+            Ok(_) => panic!("accepted"),
+            Err(e) => assert!(e.to_string().contains("more than 32"), "{e}"),
+        }
+    }
+
+    #[cfg(feature = "budget")]
+    #[test]
+    fn pool_size_cannot_share_a_claimant_slot() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], task: f, pool_size: 2, resources: [P: divisible];",
+        )
+        .unwrap();
+        match expand(spec) {
+            Ok(_) => panic!("accepted"),
+            Err(e) => assert!(e.to_string().contains("lend/consume/divisible"), "{e}"),
+        }
+    }
+
+    #[cfg(feature = "veto")]
+    #[test]
+    fn a_veto_gate_spelled_two_ways_is_rejected() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], task: f, writes: [crate::TRIP veto];\n\
+             node B = Terminate, deps: [], task: f, writes: [TRIP veto];",
+        )
+        .unwrap();
+        match expand(spec) {
+            Ok(_) => panic!("accepted"),
+            Err(e) => {
+                let e = e.to_string();
+                assert!(e.contains("`crate::TRIP` and `TRIP`"), "{e}");
+                assert!(e.contains("numbered per spelling"), "{e}");
+            }
+        }
+        // Different statics that happen to share an ident are two gates.
+        let spec = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], task: f, writes: [crate::a::TRIP veto];\n\
+             node B = Terminate, deps: [], task: f, writes: [crate::b::TRIP veto];",
+        )
+        .unwrap();
+        match expand(spec) {
+            Ok(_) => panic!("accepted"),
+            Err(e) => assert!(e.to_string().contains("`use .. as`"), "{e}"),
+        }
+        // An indexed gate is keyed by its index too.
+        let spec = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], task: f, writes: [crate::TRIP[0] veto];\n\
+             node B = Terminate, deps: [], task: f, writes: [crate::TRIP[1] veto];",
+        )
+        .unwrap();
+        let out = expand(spec).expect("two elements, two gates").to_string();
+        assert_eq!(out.matches("__sv_check_veto").count(), 2, "{out}");
+        assert!(
+            out.contains(". veto (0u8)") && !out.contains(". veto (1u8)"),
+            "{out}"
+        );
+    }
+
+    #[cfg(feature = "veto")]
+    #[test]
+    fn the_veto_check_is_gated_like_its_writers() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "#[cfg(feature = \"x\")] node A = Terminate, deps: [], task: f, \
+             writes: [crate::TRIP veto];\n\
+             node B = Terminate, deps: [], task: f, \
+             writes: [#[cfg(feature = \"y\")] crate::TRIP veto];",
+        )
+        .unwrap();
+        let out = expand(spec).expect("expansion succeeds").to_string();
+        assert!(
+            out.contains("# [cfg (any (feature = \"x\" , feature = \"y\"))] const _ : () = "),
+            "the check carries the union of its writers' cfgs: {out}"
+        );
+        let spec = syn::parse_str::<GraphSpec>(
+            "#[cfg(feature = \"x\")] node A = Terminate, deps: [], task: f, \
+             writes: [crate::TRIP veto];\n\
+             node B = Terminate, deps: [], task: f, writes: [crate::TRIP veto];",
+        )
+        .unwrap();
+        let out = expand(spec).expect("expansion succeeds").to_string();
+        assert!(
+            out.contains("const _ : () = ") && !out.contains("))] const _ : () = "),
+            "one unconditional writer keeps the check bare: {out}"
+        );
+    }
+
+    #[cfg(feature = "dataflow")]
+    #[test]
+    fn feature_verbs_name_their_feature_in_dataflow_bodies() {
+        for (body, feature, needle) in [
+            (
+                quote::quote! { let _ = node.open(&crate::EST).await; },
+                cfg!(feature = "data-deps"),
+                "`data-deps` feature",
+            ),
+            (
+                quote::quote! { let _ = node.lease(&crate::LNK); },
+                cfg!(feature = "data-deps"),
+                "`data-deps` feature",
+            ),
+            (
+                quote::quote! { node.veto(&crate::TRIP); },
+                cfg!(feature = "veto"),
+                "`veto` feature",
+            ),
+            (
+                quote::quote! { node.retire(&crate::EST, d).await; },
+                cfg!(all(feature = "data-deps", feature = "readiness")),
+                "`data-deps` and `readiness` features",
+            ),
+        ] {
+            let item = quote::quote! {
+                async fn f(node: &'static TaskNode) { #body }
+            };
+            let res = dataflow_expand(TokenStream2::new(), item);
+            if feature {
+                assert!(res.is_ok(), "rejected with the feature: {:?}", res.err());
+            } else {
+                match res {
+                    Ok(_) => panic!("accepted without the feature"),
+                    Err(e) => assert!(e.to_string().contains(needle), "{e}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_serialized_slot_holds_its_holders_to_one_executor() {
+        let ok = syn::parse_str::<GraphSpec>(
+            "executor HIGH;\n\
+             node A = Terminate, deps: [], executor: HIGH, task: f, \
+             resources: [BUS: shared serialized Bus];\n\
+             node B = Terminate, deps: [], executor: HIGH, task: f, \
+             resources: [BUS: shared serialized Bus];",
+        )
+        .unwrap();
+        assert!(expand(ok).is_ok(), "one tier: accepted");
+        let root = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], task: f, resources: [BUS: shared serialized Bus];\n\
+             node B = Terminate, deps: [], task: f, resources: [BUS: shared serialized Bus];",
+        )
+        .unwrap();
+        assert!(
+            expand(root).is_ok(),
+            "both on the supervisor's executor: accepted"
+        );
+        for (src, a, b) in [
+            (
+                "executor HIGH;\n\
+                 node A = Terminate, deps: [], task: f, resources: [BUS: shared serialized Bus];\n\
+                 node B = Terminate, deps: [], executor: HIGH, task: f, \
+                 resources: [BUS: shared serialized Bus];",
+                "`A` runs on the supervisor's executor",
+                "`B` on `HIGH`",
+            ),
+            (
+                "executor HIGH; executor LOW;\n\
+                 node A = Terminate, deps: [], executor: HIGH, task: f, \
+                 resources: [BUS: shared serialized Bus];\n\
+                 node B = Terminate, deps: [], executor: LOW, task: f, \
+                 resources: [BUS: shared serialized Bus];",
+                "`A` runs on `HIGH`",
+                "`B` on `LOW`",
+            ),
+        ] {
+            let spec = syn::parse_str::<GraphSpec>(src).unwrap();
+            match expand(spec) {
+                Ok(_) => panic!("accepted across tiers: {src}"),
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(msg.contains("priority ceiling"), "{msg}");
+                    assert!(msg.contains(a) && msg.contains(b), "{msg}");
+                }
+            }
+        }
+        let plain = syn::parse_str::<GraphSpec>(
+            "executor HIGH;\n\
+             node A = Terminate, deps: [], task: f, resources: [BUS: shared Bus];\n\
+             node B = Terminate, deps: [], executor: HIGH, task: f, resources: [BUS: shared Bus];",
+        )
+        .unwrap();
+        assert!(
+            expand(plain).is_ok(),
+            "without the marker a shared slot may span tiers"
         );
     }
 }

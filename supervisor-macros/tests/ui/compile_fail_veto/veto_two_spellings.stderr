@@ -1,0 +1,5 @@
+error: `crate::TRIP` and `TRIP` both name a `veto` gate ending in `TRIP`: contributor slots are numbered per spelling, so one static named two ways would hand two writers the same bit — spell the gate one way across the graph, or alias one of two distinct statics with `use .. as`
+ --> tests/ui/compile_fail_veto/veto_two_spellings.rs:9:61
+  |
+9 |     node B = Terminate, deps: [], task: protector, writes: [TRIP veto];
+  |                                                             ^^^^
