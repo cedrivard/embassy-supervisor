@@ -2749,10 +2749,10 @@ fn bundle_expand(args: TokenStream2, item: TokenStream2) -> SynResult<TokenStrea
     let mut members = 0usize;
     for it in items {
         let syn::Item::Fn(f) = it else { continue };
-        let Some(attr) = f
+        let Some((attr, _)) = f
             .attrs
             .iter()
-            .find(|a| embassy_supervisor_syntax::is_dataflow_attr(a))
+            .find_map(embassy_supervisor_syntax::dataflow_attr)
         else {
             continue;
         };

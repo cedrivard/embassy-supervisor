@@ -2704,6 +2704,42 @@ mod tests {
     }
 
     #[test]
+    fn a_cfg_attr_wrapped_dataflow_fn_is_scanned_and_drawn_with_its_predicate() {
+        let src = r#"
+            embassy_supervisor::supervisor_graph! {
+                node U = Terminate, task: crate::worker, discover;
+            }
+            #[cfg_attr(feature = "grown", embassy_supervisor::dataflow)]
+            async fn worker(node: &'static TaskNode) {
+                let mut rx = node.reader(&crate::LATEST).receiver().unwrap();
+            }
+        "#;
+        let d = parse_source(src, "t.rs").unwrap();
+        let mut scanned = Vec::new();
+        scan_fns(src, "t.rs", &mut scanned);
+        assert_eq!(scanned, [("t".to_string(), "worker".to_string())]);
+        assert!(coverage_warnings(&d, &scanned, &[], &[]).is_empty());
+
+        let mut discovered = Vec::new();
+        scan_source(src, "t.rs", &mut discovered);
+        let text = render(
+            &d[0],
+            &Options {
+                runtime: true,
+                discovered,
+                ..Default::default()
+            },
+        );
+        assert!(text.contains("s_crate__LATEST"), "{text}");
+        assert!(
+            text.contains(
+                "s_crate__LATEST -- \"discovered · <small>cfg(feature=#quot;grown#quot;)</small>\" --> n_U"
+            ),
+            "the read edge carries the cfg_attr predicate, once: {text}"
+        );
+    }
+
+    #[test]
     fn a_bundle_adoption_resolves_to_its_members() {
         let src = r#"
             embassy_supervisor::supervisor_graph! {

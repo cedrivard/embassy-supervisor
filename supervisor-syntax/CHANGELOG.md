@@ -7,6 +7,27 @@ This crate is pinned by exact version from `embassy-supervisor-macros`: its AST 
 internal contract between the two, not a stable public API, and it changes whenever the
 graph syntax does. Publish it before the macro crate that depends on it.
 
+## [0.3.1] - 2026-09-03
+
+Additive. `embassy-supervisor-macros = "=0.9.1"` and `embassy-supervisor-tools`
+0.4.1 are the matching consumers.
+
+### Added
+
+- `dataflow_attr(&Attribute) -> Option<(Attribute, Option<String>)>`: the
+  `dataflow` attribute an attribute carries once `cfg_attr` is applied, plus
+  the predicate it sits under (`feature="grown"`; nested layers fold into
+  `all(..)`).
+
+### Fixed
+
+- `is_dataflow_attr` and `scan_dataflow` now see a `#[dataflow]` written as
+  `#[cfg_attr(pred, dataflow)]`. The compiler expands that form, so the
+  tables were emitted while the textual scan skipped the fn. Accesses found
+  this way carry `pred` in `cfgs`, as a `#[cfg]` on the fn would.
+- `Access::cfgs` records a predicate once when the fn and the call site
+  repeat it, instead of twice.
+
 ## [0.3.0] - 2026-09-01
 
 The AST changes shape; `embassy-supervisor-macros = "=0.9.0"` is the matching
@@ -107,6 +128,7 @@ tooling that wants it.
   against a whole graph by the macro. A fragment legitimately names nodes it does not
   contain, so parsing one in isolation has to succeed.
 
+[0.3.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.3.0...embassy-supervisor-syntax-v0.3.1
 [0.3.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.2.0...embassy-supervisor-syntax-v0.3.0
 [0.2.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.1.0...embassy-supervisor-syntax-v0.2.0
 [0.1.0]: https://github.com/cedrivard/embassy-supervisor/releases/tag/embassy-supervisor-syntax-v0.1.0

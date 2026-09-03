@@ -2093,12 +2093,65 @@ pub fn node_param(sig: &syn::Signature) -> Option<Ident> {
     })
 }
 
-/// Return `true` if `attr` is a `#[dataflow]` attribute.
+/// Return `true` if `attr` is a `#[dataflow]` attribute, written directly or
+/// wrapped in `#[cfg_attr(.., dataflow)]`. See [`dataflow_attr`].
 pub fn is_dataflow_attr(attr: &Attribute) -> bool {
-    attr.path()
+    dataflow_attr(attr).is_some()
+}
+
+/// Unwrap a `#[dataflow]` attribute, including any `#[cfg_attr(...)]` wrapper.
+///
+/// Returns the inner `#[dataflow]` attribute and the combined cfg predicate,
+/// or `None` for non-dataflow attributes. A bare `#[dataflow]` returns the
+/// attribute and `None`; nested `cfg_attr` predicates are folded into
+/// `all(outer, inner)`.
+///
+/// Who needs the unwrap: everything that reads attributes as written. The
+/// compiler applies `cfg_attr` before `#[dataflow]` itself runs, but the
+/// `#[dataflow_bundle]` macro receives its module's member fns with their
+/// attributes untouched, and the textual scanners ([`scan_dataflow`], the
+/// tools crate) read source. The predicate is how a wrapped fn's accesses
+/// keep the `cfg` they are conditional on, as a `#[cfg]` on the fn would.
+pub fn dataflow_attr(attr: &Attribute) -> Option<(Attribute, Option<String>)> {
+    let (meta, preds) = unwrap_cfg_attr(&attr.meta)?;
+    let attr = if preds.is_empty() {
+        attr.clone()
+    } else {
+        syn::parse_quote!(#[#meta])
+    };
+    let cfg = match preds.as_slice() {
+        [] => None,
+        [one] => Some(one.clone()),
+        many => Some(format!("all({})", many.join(","))),
+    };
+    Some((attr, cfg))
+}
+
+/// Peel `cfg_attr(pred, ..)` layers off `meta` until a `dataflow` attribute
+/// surfaces, collecting the predicates outermost first.
+fn unwrap_cfg_attr(meta: &Meta) -> Option<(Meta, Vec<String>)> {
+    if meta
+        .path()
         .segments
         .last()
         .is_some_and(|s| s.ident == "dataflow")
+    {
+        return Some((meta.clone(), Vec::new()));
+    }
+    let Meta::List(list) = meta else {
+        return None;
+    };
+    if !list.path.is_ident("cfg_attr") {
+        return None;
+    }
+    let mut args = list
+        .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+        .ok()?
+        .into_iter();
+    let pred = tokens_text(&args.next()?);
+    let (inner, mut preds) = args.find_map(|m| unwrap_cfg_attr(&m))?;
+    preds.insert(0, pred);
+    Some((inner, preds))
 }
 
 /// One dataflow access discovered by scanning a `#[dataflow]` fn body.
@@ -2112,7 +2165,11 @@ pub struct Access {
     pub write: bool,
     /// The signal path accessed, as a string.
     pub path: String,
-    /// `#[cfg(...)]` predicates that guard this access.
+    /// The predicates this access is conditional on, normalized (token text,
+    /// spaces stripped), outermost first: the fn's `#[cfg(...)]`s, the
+    /// `cfg_attr` predicate its `#[dataflow]` sits under if any, then the
+    /// call site's own `#[cfg(...)]`s. A predicate repeated across those
+    /// levels appears once.
     pub cfgs: Vec<String>,
 }
 
@@ -2152,14 +2209,17 @@ fn scan_item(item: &syn::Item, out: &mut Vec<Access>) {
 }
 
 fn scan_fn(attrs: &[Attribute], sig: &syn::Signature, block: &syn::Block, out: &mut Vec<Access>) {
-    let Some(attr) = attrs.iter().find(|a| is_dataflow_attr(a)) else {
+    let Some((attr, wrap_cfg)) = attrs.iter().find_map(dataflow_attr) else {
         return;
     };
     let Some(param) = node_param(sig) else {
         return;
     };
-    let verbs = verb_table_of(attr);
+    let verbs = verb_table_of(&attr);
     let func = sig.ident.to_string();
+    // The fn's own `#[cfg]`s, then the `cfg_attr` predicate the attribute
+    // itself sits under, if any: an access through a conditionally-dataflow
+    // fn is conditional on both.
     let fn_cfgs: Vec<String> = attrs
         .iter()
         .filter_map(|a| match &a.meta {
@@ -2168,21 +2228,31 @@ fn scan_fn(attrs: &[Attribute], sig: &syn::Signature, block: &syn::Block, out: &
             }
             _ => None,
         })
+        .chain(wrap_cfg)
         .collect();
     let mut seen: Vec<(bool, String)> = Vec::new();
     let _ = rewrite_verb_calls(quote!(#block), &param.to_string(), &verbs, &mut |call| {
         if !seen.contains(&(call.write, call.path.clone())) {
             seen.push((call.write, call.path.clone()));
+            // A predicate repeated at the fn and the call site (the usual
+            // shape once a `cfg_attr` fn also gates its statements) is one
+            // condition, so it is recorded once.
+            let mut cfgs: Vec<String> = Vec::new();
+            for c in fn_cfgs
+                .iter()
+                .cloned()
+                .chain(call.cfgs.iter().map(|c| c.to_string().replace(' ', "")))
+            {
+                if !cfgs.contains(&c) {
+                    cfgs.push(c);
+                }
+            }
             out.push(Access {
                 func: func.clone(),
                 verb: call.verb.clone(),
                 write: call.write,
                 path: call.path.clone(),
-                cfgs: fn_cfgs
-                    .iter()
-                    .cloned()
-                    .chain(call.cfgs.iter().map(|c| c.to_string().replace(' ', "")))
-                    .collect(),
+                cfgs,
             });
         }
         Ok(None)
@@ -2330,6 +2400,105 @@ mod tests {
             ],
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn cfg_attr_wrapped_dataflow_is_scanned_with_its_predicate() {
+        let src = r#"
+            #[cfg(feature = "x")]
+            #[cfg_attr(feature = "grown", embassy_supervisor::dataflow)]
+            async fn worker(node: &'static TaskNode) {
+                #[cfg(feature = "grown")] // same predicate again: recorded once
+                let mut rx = node.reader(&LATEST).receiver();
+            }
+            #[cfg_attr(feature = "a", inline, dataflow)]
+            async fn beside_others(node: &'static TaskNode) {
+                node.put(&OUT, 1);
+            }
+            #[cfg_attr(feature = "a", cfg_attr(feature = "b", dataflow))]
+            async fn nested(node: &'static TaskNode) {
+                node.put(&DEEP, 1);
+            }
+            #[cfg_attr(feature = "a", inline)]
+            async fn not_dataflow(node: &'static TaskNode) {
+                node.put(&IGNORED, 1);
+            }
+        "#;
+        let mut out = Vec::new();
+        scan_dataflow(src, &mut out);
+        let key: Vec<(&str, bool, &str, Vec<&str>)> = out
+            .iter()
+            .map(|a| {
+                (
+                    a.func.as_str(),
+                    a.write,
+                    a.path.as_str(),
+                    a.cfgs.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            key,
+            [
+                (
+                    "worker",
+                    false,
+                    "LATEST",
+                    vec!["feature=\"x\"", "feature=\"grown\""]
+                ),
+                ("beside_others", true, "OUT", vec!["feature=\"a\""]),
+                (
+                    "nested",
+                    true,
+                    "DEEP",
+                    vec!["all(feature=\"a\",feature=\"b\")"]
+                ),
+            ],
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn cfg_attr_wrapped_verb_registrations_are_honoured() {
+        let src = r#"
+            #[cfg_attr(feature = "a", dataflow(read(subscribe), write(publish)))]
+            async fn worker(node: &'static TaskNode) {
+                let rx = node.subscribe(&EST);
+                node.publish(&ARMED, true);
+            }
+        "#;
+        let mut out = Vec::new();
+        scan_dataflow(src, &mut out);
+        let key: Vec<(&str, bool, &str)> = out
+            .iter()
+            .map(|a| (a.verb.as_str(), a.write, a.path.as_str()))
+            .collect();
+        assert_eq!(
+            key,
+            [("subscribe", false, "EST"), ("publish", true, "ARMED")],
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn dataflow_attr_unwraps_cfg_attr() {
+        let bare: Attribute = syn::parse_quote!(#[embassy_supervisor::dataflow]);
+        let (attr, cfg) = dataflow_attr(&bare).unwrap();
+        assert!(matches!(attr.meta, Meta::Path(_)));
+        assert_eq!(cfg, None);
+
+        let wrapped: Attribute =
+            syn::parse_quote!(#[cfg_attr(all(feature = "a", not(test)), dataflow(read(sub)))]);
+        let (attr, cfg) = dataflow_attr(&wrapped).unwrap();
+        assert!(is_dataflow_attr(&wrapped));
+        assert_eq!(tokens_text(&attr), "#[dataflow(read(sub))]");
+        assert_eq!(cfg.as_deref(), Some("all(feature=\"a\",not(test))"));
+
+        let other: Attribute = syn::parse_quote!(#[cfg_attr(feature = "a", inline)]);
+        assert!(dataflow_attr(&other).is_none());
+        assert!(!is_dataflow_attr(&other));
+        let cfg_only: Attribute = syn::parse_quote!(#[cfg(feature = "a")]);
+        assert!(!is_dataflow_attr(&cfg_only));
     }
 
     #[test]

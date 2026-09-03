@@ -3,6 +3,17 @@
 All notable changes to `embassy-supervisor-tools` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.1] - 2026-09-03
+
+Pins `embassy-supervisor-syntax = "=0.3.1"`.
+
+### Fixed
+
+- A fn whose `#[dataflow]` is applied through `cfg_attr` was reported as
+  "no `#[dataflow]` fn among the scanned files" and its derived edges left
+  undrawn. `supervisor-mermaid` and `supervisor-lint` now scan it; the
+  `cfg_attr` predicate draws on its edges like a `#[cfg]` on the fn.
+
 ## [0.4.0] - 2026-09-01
 
 Pins `embassy-supervisor-syntax = "=0.3.0"`.
@@ -37,6 +48,7 @@ Pins `embassy-supervisor-syntax = "=0.3.0"`.
 
 Baseline for this changelog.
 
+[0.4.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.4.0...embassy-supervisor-tools-v0.4.1
 [0.4.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.3.0...embassy-supervisor-tools-v0.4.0
 [0.3.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.2.0...embassy-supervisor-tools-v0.3.0
 [0.2.0]: https://github.com/cedrivard/embassy-supervisor/releases/tag/embassy-supervisor-tools-v0.2.0

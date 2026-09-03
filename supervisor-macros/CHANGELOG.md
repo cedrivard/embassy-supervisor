@@ -6,7 +6,10 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
-## [Unreleased]
+## [0.9.1] - 2026-09-03
+
+Rides `embassy-supervisor-syntax = "=0.3.1"`; ships with `embassy-supervisor`
+0.8.1, whose `__sv_trace_hooks!` the `trace-hooks` expansion now calls.
 
 ### Changed
 
@@ -16,6 +19,14 @@ supervisor's CHANGELOG for the surrounding API history.
   so which executor hook API they speak (0.10's symbols, or the `Trace` impl
   embassy git main takes under `--cfg embassy_supervisor_trace_v2`) is
   decided by that crate's build. Same expansion result on embassy-executor 0.10.
+
+### Fixed
+
+- `#[dataflow_bundle]` sees its members' attributes as written, before the
+  compiler applies `cfg_attr`. A member declared `#[cfg_attr(pred, dataflow)]`
+  was skipped, its write or read missing from the bundle while the fn's own
+  tables carried it. The bundle now unwraps the layer through the syntax
+  crate's `dataflow_attr`.
 
 ## [0.9.0] - 2026-09-01
 
@@ -510,7 +521,8 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.9.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.9.1...HEAD
+[0.9.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.9.0...embassy-supervisor-macros-v0.9.1
 [0.9.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.8.0...embassy-supervisor-macros-v0.9.0
 [0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.7.0...embassy-supervisor-macros-v0.8.0
 [0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.6.2...embassy-supervisor-macros-v0.7.0

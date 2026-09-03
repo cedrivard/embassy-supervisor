@@ -82,8 +82,9 @@ in the title.
 
 A `#[cfg]`-gated node, dep, signal entry or `#[dataflow]` call site draws like
 any other, with the predicate in its label or on its edge: the diagram shows
-every build, and the `cfg(…)` text says which. Pass `--hide-cfg` to omit those
-markers.
+every build, and the `cfg(…)` text says which. A `#[dataflow]` applied through
+`#[cfg_attr(pred, dataflow)]` is scanned too, with `pred` on its edges. Pass
+`--hide-cfg` to omit those markers.
 
 Each diagram's Mermaid frontmatter title comes from its declaration. Use
 `--title 'Firmware bring-up'` to replace it, including the generated HTML
