@@ -4,6 +4,22 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-09-03
+
+One waker per budget slot, and the crates point at the documentation site.
+
+### Changed
+
+- **Breaking (hand-written `Divisible` only):** `Divisible::register` now takes
+  the slot to park on. `Budget` keeps one `AtomicWaker` per slot and only wakes
+  slots whose grant changed during rebalance.
+
+### Fixed
+
+- Corrected the `veto` feature's cost note: 4 bytes per `Coupling` without
+  `coupling-observe` (16 to 20 bytes on thumbv8m), zero with it. The `budget`
+  note now states the budget size and the 8-byte `claims` slice per node.
+
 ## [0.8.1] - 2026-09-03
 
 Ships with `embassy-supervisor-macros` 0.9.1 (pinned by exact version) on
@@ -1109,7 +1125,8 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.8.1...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.9.0...HEAD
+[0.9.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.8.1...embassy-supervisor-v0.9.0
 [0.8.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.8.0...embassy-supervisor-v0.8.1
 [0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.7.0...embassy-supervisor-v0.8.0
 [0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.6.0...embassy-supervisor-v0.7.0
