@@ -4,7 +4,19 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.1] - 2026-09-03
+
+Ships with `embassy-supervisor-macros` 0.9.1 (pinned by exact version) on
+`embassy-supervisor-syntax` 0.3.1; `embassy-supervisor-tools` 0.4.1 scans
+`cfg_attr`-applied `#[dataflow]` fns.
+
+### Fixed
+
+- `#[dataflow_bundle]` no longer drops a member fn whose `#[dataflow]` is
+  applied through `cfg_attr`: the bundle macro reads the module's attributes
+  before the compiler applies `cfg_attr`, so the layer is unwrapped there.
+  The tools' scanners see the same form now, so `supervisor-mermaid` draws
+  such a fn's derived edges instead of warning that it found no `#[dataflow]`.
 
 ### Changed
 
@@ -1097,7 +1109,8 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.8.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.8.1...HEAD
+[0.8.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.8.0...embassy-supervisor-v0.8.1
 [0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.7.0...embassy-supervisor-v0.8.0
 [0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.6.0...embassy-supervisor-v0.7.0
 [0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/v0.5.1...v0.6.0

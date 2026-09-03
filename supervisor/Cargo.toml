@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.8.0"
+version = "0.8.1"
 description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
@@ -39,7 +39,7 @@ log = { version = "0.4.33", optional = true, default-features = false }
 # `state: zeroed Type` (heap-state): `Zeroable` is the all-zero-is-valid contract.
 bytemuck = { version = "1.25.0", optional = true, default-features = false }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.9.0", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.9.1", path = "../supervisor-macros", optional = true }
 
 [features]
 # Just the graph macro: everything the supervisor can DO is opt-in, matching the
