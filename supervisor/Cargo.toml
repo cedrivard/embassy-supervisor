@@ -1,11 +1,12 @@
 [package]
 name = "embassy-supervisor"
-version = "0.8.1"
+version = "0.9.0"
 description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 readme = "README.md"
 documentation = "https://docs.rs/embassy-supervisor"
@@ -312,9 +313,11 @@ data-deps = ["graph-ref", "dataflow", "embassy-supervisor-macros?/data-deps"]
 # Lifecycle tie: a stopped holder releases its share on shutdown ack, or on
 # `ShutdownTimeout` if the ack never comes. A paused holder keeps its claim.
 #
-# Cost: 4 + 8 × K atomics, two Signals and K waker slots per budget, plus a small
-# config slice per claimant. Skip this for exclusive singletons; use a normal
-# `resources:` slot instead.
+# Cost: 4 + 8 × K atomics, two Signals and K single-waker slots per budget
+# (28 + 16 × K bytes of RAM on a 32-bit target), plus a small flash slice per
+# claimant and one 8-byte slice pointer in EVERY node's flash config once the
+# feature is on, claimant or not. Skip this for exclusive singletons; use a
+# normal `resources:` slot instead.
 budget = ["embassy-supervisor-macros?/budget"]
 
 # Distributed veto: `writes: [crate::TRIP veto]` gives each writer one
@@ -328,9 +331,8 @@ budget = ["embassy-supervisor-macros?/budget"]
 #
 # A stopped writer's bit stays asserted (fail-safe): release is explicit.
 # Costs 4 bytes + one Signal per gate, 4 more under `coupling-observe` for the
-# transition counter that makes `TRIP veto observed beat` a heartbeat, and one
-# byte (a niche) per `Coupling` in every graph once the feature is on. Pulls
-# `dataflow`: the handle resolves through the node's `Sig`.
+# transition counter that makes `TRIP veto observed beat` a heartbeat, and 4
+# bytes per `Coupling` in every graph once the feature is on.
 veto = ["dataflow", "embassy-supervisor-macros?/veto"]
 
 # A per-node status line: report_status()/status() on TaskNode, in the mold of

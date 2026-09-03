@@ -2,13 +2,13 @@
 //! declare `resources: [NAME: divisible]`, with every holder's share released
 //! by the supervisor when that holder stops.
 
-use core::cell::{Cell, RefCell};
+use core::cell::Cell;
 use core::task::{Poll, Waker};
 
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_sync::waitqueue::MultiWakerRegistration;
+use embassy_sync::waitqueue::AtomicWaker;
 use embassy_time::{Duration, Instant};
 use portable_atomic::{AtomicU32, Ordering};
 
@@ -39,7 +39,8 @@ use crate::ResourceGate;
 /// proportional, ramped) is the policy's, and *when* to re-divide is the
 /// allocator's — usually on [`wait_change`](Self::wait_change), which fires on
 /// every want, release and capacity change. Costs `4 + 8N` bytes of atomics,
-/// two `Signal`s and `N` waker slots per budget.
+/// two `Signal`s and `N` single-waker slots per budget: `28 + 16N` bytes on a
+/// 32-bit target.
 pub struct Budget<const N: usize> {
     /// `0` is "not provided": the gate reads empty.
     capacity: AtomicU32,
@@ -48,7 +49,7 @@ pub struct Budget<const N: usize> {
     /// The [`ResourceGate`] wake for the supervisor's pre-spawn wait.
     filled: Signal<CriticalSectionRawMutex, ()>,
     /// Holders parked in `wait_grant_change`, at most one per slot.
-    claimants: Mutex<CriticalSectionRawMutex, RefCell<MultiWakerRegistration<N>>>,
+    claimants: [AtomicWaker; N],
     /// The allocator's wake, single waiter: anything that should trigger a
     /// re-division.
     watch: Signal<CriticalSectionRawMutex, ()>,
@@ -69,7 +70,7 @@ impl<const N: usize> Budget<N> {
             wants: [const { AtomicU32::new(0) }; N],
             grants: [const { AtomicU32::new(0) }; N],
             filled: Signal::new(),
-            claimants: Mutex::new(RefCell::new(MultiWakerRegistration::new())),
+            claimants: [const { AtomicWaker::new() }; N],
             watch: Signal::new(),
         }
     }
@@ -134,14 +135,10 @@ impl<const N: usize> Budget<N> {
         let wants: [u32; N] = core::array::from_fn(|i| self.wants[i].load(Ordering::Acquire));
         let mut grants: [u32; N] = core::array::from_fn(|i| self.grants[i].load(Ordering::Acquire));
         let next = policy.divide(capacity, &wants, &mut grants, now);
-        let mut moved = false;
         for (i, g) in grants.iter().enumerate() {
             if self.grants[i].swap(*g, Ordering::AcqRel) != *g {
-                moved = true;
+                self.claimants[i].wake();
             }
-        }
-        if moved {
-            self.wake_claimants();
         }
         let stale = self.capacity() != capacity
             || wants
@@ -167,7 +164,9 @@ impl<const N: usize> Budget<N> {
     }
 
     fn wake_claimants(&self) {
-        self.claimants.lock(|w| w.borrow_mut().wake());
+        for w in &self.claimants {
+            w.wake();
+        }
     }
 }
 
@@ -202,8 +201,8 @@ pub trait Divisible: Sync {
     fn release(&self, slot: u8);
     /// `slot`'s current grant.
     fn grant(&self, slot: u8) -> u32;
-    /// Park `waker` until the next rebalance that moves a grant.
-    fn register(&self, waker: &Waker);
+    /// Park `waker` until the next rebalance that moves `slot`'s grant.
+    fn register(&self, slot: u8, waker: &Waker);
 }
 
 impl<const N: usize> Divisible for Budget<N> {
@@ -219,8 +218,8 @@ impl<const N: usize> Divisible for Budget<N> {
         Budget::grant(self, slot)
     }
 
-    fn register(&self, waker: &Waker) {
-        self.claimants.lock(|w| w.borrow_mut().register(waker));
+    fn register(&self, slot: u8, waker: &Waker) {
+        self.claimants[usize::from(slot)].register(waker);
     }
 }
 
@@ -249,16 +248,17 @@ impl Claimant {
         self.budget.grant(self.slot)
     }
 
-    /// Wait until the grant differs from `seen`, then return it. Check-then
-    /// park with a re-check after registering, so a rebalance landing between
-    /// the two is never missed.
+    /// Wait until the grant differs from `seen`, then return it.
+    /// Uses a check/register/recheck to avoid missing a rebalance between the
+    /// load and the park. Only one waiter may park per slot; use your own
+    /// `Claimant`.
     pub async fn wait_grant_change(&self, seen: u32) -> u32 {
         core::future::poll_fn(|cx| {
             let g = self.grant();
             if g != seen {
                 return Poll::Ready(g);
             }
-            self.budget.register(cx.waker());
+            self.budget.register(self.slot, cx.waker());
             let g = self.grant();
             if g != seen {
                 Poll::Ready(g)
