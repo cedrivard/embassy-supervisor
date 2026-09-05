@@ -5,7 +5,7 @@ use embedded_alloc::LlffHeap;
 static HEAP: LlffHeap = LlffHeap::empty();
 
 /// Total heap size in bytes.
-pub const HEAP_SIZE: usize = 32 * 1024;
+pub const HEAP_SIZE: usize = 33 * 1024;
 
 /// Initialize the global heap allocator.
 pub fn init() {

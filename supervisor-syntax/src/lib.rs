@@ -555,8 +555,11 @@ pub struct NodeItem {
     pub resources: Vec<ResourceDecl>,
     /// The `disabled` marker, if present, with any `#[cfg(...)]` gate.
     pub disabled: Option<Gated<kw::disabled>>,
-    /// The named executor, if specified.
+    /// Spawning executor: either an explicit `executor:` clause or the graph's
+    /// inherited default.
     pub executor: Option<Ident>,
+    /// `true` if the executor was inherited from the default, not written.
+    pub executor_defaulted: bool,
     /// The `slot_timeout:` value in milliseconds, with any `#[cfg(...)]` gate.
     pub slot_timeout: Option<Gated<kw::slot_timeout, LitInt>>,
     /// The `ack_timeout:` value in milliseconds, with any `#[cfg(...)]` gate.
@@ -596,6 +599,9 @@ pub struct ExecutorItem {
     pub cfg: Vec<Attribute>,
     /// The executor identifier.
     pub ident: Ident,
+    /// `true` if this is the graph's default executor, inherited by eligible
+    /// nodes and pools.
+    pub default: bool,
 }
 
 /// A parsed `pool NAME = [Mode, ...], ...;` declaration.
@@ -615,8 +621,11 @@ pub struct PoolItem {
     pub policy: Expr,
     /// The optional explicit scaling policy type.
     pub policy_ty: Option<Type>,
-    /// The named executor, if specified.
+    /// Spawning executor: either an explicit `executor:` clause or the graph's
+    /// inherited default.
     pub executor: Option<Ident>,
+    /// `true` if the executor was inherited from the default, not written.
+    pub executor_defaulted: bool,
     /// The `resources:` list.
     pub resources: Vec<ResourceDecl>,
     /// The `slot_timeout:` value in milliseconds, with any `#[cfg(...)]` gate.
@@ -664,8 +673,38 @@ pub struct GraphSpec {
     pub observe_writes: Option<(kw::observe, Expr)>,
     /// The default `observe reads:` accessor expression.
     pub observe_reads: Option<(kw::observe, Expr)>,
+    /// The `default executor NAME;` declaration, if any. Already applied to
+    /// `items` by the parser (see [`apply_default_executor`]).
+    pub default_executor: Option<Ident>,
     /// The nodes, pools, and executors declared in the graph.
     pub items: Vec<Item>,
+}
+
+/// Apply the graph's default executor to nodes and pools that do not write
+/// their own `executor:` clause. Only items whose task source is a `task:` fn
+/// or a `spawn:` path/partial call are eligible; parked nodes and verbatim
+/// `spawn:` closures keep the supervisor's executor.
+pub fn apply_default_executor(items: &mut [Item], ex: &Ident) {
+    fn eligible(source: Option<&TaskSource>) -> bool {
+        match source {
+            Some(TaskSource::Shell(_)) => true,
+            Some(TaskSource::Spawn(e)) => matches!(e, Expr::Path(_) | Expr::Call(_)),
+            None => false,
+        }
+    }
+    for item in items {
+        match item {
+            Item::Node(n) if n.executor.is_none() && eligible(n.source.as_ref()) => {
+                n.executor = Some(ex.clone());
+                n.executor_defaulted = true;
+            }
+            Item::Pool(p) if p.executor.is_none() && eligible(Some(&p.source)) => {
+                p.executor = Some(ex.clone());
+                p.executor_defaulted = true;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Return the resource declarations for an item, if any.
@@ -725,6 +764,7 @@ impl Parse for GraphSpec {
         let mut observe_writes: Option<(kw::observe, Expr)> = None;
         let mut observe_reads: Option<(kw::observe, Expr)> = None;
         let mut items = Vec::new();
+        let mut default_executor: Option<Ident> = None;
         let mut current_fragment: Option<String> = None;
         while !input.is_empty() {
             if input.peek(Token![@]) {
@@ -776,18 +816,55 @@ impl Parse for GraphSpec {
                 input.parse::<kw::executor>()?;
                 let ident: Ident = input.parse()?;
                 input.parse::<Token![;]>()?;
-                items.push(Item::Executor(ExecutorItem { cfg, ident }));
+                items.push(Item::Executor(ExecutorItem {
+                    cfg,
+                    ident,
+                    default: false,
+                }));
+            } else if input.peek(Token![default]) && input.peek2(kw::executor) {
+                let k = input.parse::<Token![default]>()?;
+                input.parse::<kw::executor>()?;
+                let ident: Ident = input.parse()?;
+                input.parse::<Token![;]>()?;
+                if let Some(attr) = cfg.first() {
+                    return Err(syn::Error::new_spanned(
+                        attr,
+                        "a `default executor` cannot be `#[cfg]`-gated — every \
+                         inheriting node would reference its slot unconditionally; \
+                         gate the nodes instead",
+                    ));
+                }
+                if current_fragment.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        k,
+                        "a fragment cannot declare the graph's default executor; \
+                         declare it at the compose site",
+                    ));
+                }
+                if default_executor.is_some() {
+                    return Err(syn::Error::new_spanned(k, "duplicate `default executor`"));
+                }
+                default_executor = Some(ident.clone());
+                items.push(Item::Executor(ExecutorItem {
+                    cfg,
+                    ident,
+                    default: true,
+                }));
             } else {
                 return Err(input.error(
-                    "expected `node`, `pool`, `executor`, or `observe` (optionally \
-                     `#[cfg(...)]`-prefixed)",
+                    "expected `node`, `pool`, `executor`, `default executor`, or \
+                     `observe` (optionally `#[cfg(...)]`-prefixed)",
                 ));
             }
+        }
+        if let Some(ex) = &default_executor {
+            apply_default_executor(&mut items, ex);
         }
         Ok(GraphSpec {
             name,
             observe_writes,
             observe_reads,
+            default_executor,
             items,
         })
     }
@@ -1431,20 +1508,6 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
             ));
         }
     }
-    if let (Some((_, decls)), Some(ex)) = (&resources, &executor)
-        && let Some(l) = decls.iter().find_map(|d| d.local.as_ref())
-    {
-        return Err(syn::Error::new_spanned(
-            l,
-            format!(
-                "`local` resources cannot be combined with `executor: {ex}` — a \
-                     local slot exists to carry `!Send` values, and a node routed \
-                     through a `SpawnerSlot` (`SendSpawner`) must have a `Send` \
-                     future; run the node on the supervisor's own executor"
-            ),
-        ));
-    }
-
     let source = task_source(spawn, task)?;
 
     Ok(NodeItem {
@@ -1456,6 +1519,7 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
         pool_size,
         disabled,
         executor,
+        executor_defaulted: false,
         resources: resources.map(|(_, decls)| decls).unwrap_or_default(),
         slot_timeout,
         ack_timeout,
@@ -1575,7 +1639,7 @@ pub fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem
     {
         return Err(syn::Error::new_spanned(
             &bad.ident,
-            "`local` is not supported on take-kind `pool` resources (the single-core \
+            "`local` is not supported on take-kind `pool` resources (the one-executor \
              slot contract + per-member restore is deferred); a `shared local` entry \
              works (one pool-wide fan-out slot), or declare the take-kind `local` \
              resource on a node",
@@ -1627,19 +1691,6 @@ pub fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem
             ));
         }
     }
-    if let Some(ex) = &executor
-        && let Some(l) = resources.iter().find_map(|d| d.local.as_ref())
-    {
-        return Err(syn::Error::new_spanned(
-            l,
-            format!(
-                "`local` resources cannot be combined with `executor: {ex}` — a \
-                     local slot exists to carry `!Send` values, and a pool routed \
-                     through a `SpawnerSlot` (`SendSpawner`) must have `Send` \
-                     futures; run the pool on the supervisor's own executor"
-            ),
-        ));
-    }
     Ok(PoolItem {
         cfg,
         ident,
@@ -1649,6 +1700,7 @@ pub fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem
         policy: policy.expect("absence checked above"),
         policy_ty,
         executor,
+        executor_defaulted: false,
         resources,
         slot_timeout,
         ack_timeout,
@@ -3377,6 +3429,99 @@ mod tests {
         )
         .unwrap();
         assert_eq!(item_executor(&spec.items[0]), None);
+        assert_eq!(
+            item_executor(&spec.items[1]).map(ToString::to_string),
+            Some("HIGH".into())
+        );
+    }
+
+    #[test]
+    fn default_executor_routes_every_eligible_item() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "default executor THREAD; executor HIGH; \
+             node A = Terminate, deps: [], task: f; \
+             node B = Terminate, deps: [], executor: HIGH, task: f; \
+             node C = Pause, deps: []; \
+             node D = Terminate, deps: [], spawn: |s| { let _ = s; Ok(()) }; \
+             node E = Terminate, deps: [], spawn: g; \
+             pool P = [Terminate], deps: [], task: f, policy: p, min: 1, max: 1;",
+        )
+        .unwrap();
+        assert_eq!(spec.default_executor.as_ref().unwrap(), "THREAD");
+        let Item::Executor(x) = &spec.items[0] else {
+            panic!("executor")
+        };
+        assert!(x.default);
+        let Item::Executor(x) = &spec.items[1] else {
+            panic!("executor")
+        };
+        assert!(!x.default);
+        let ex = |i: usize| item_executor(&spec.items[i]).map(ToString::to_string);
+        let defaulted = |i: usize| match &spec.items[i] {
+            Item::Node(n) => n.executor_defaulted,
+            Item::Pool(p) => p.executor_defaulted,
+            Item::Executor(_) => false,
+        };
+        // A (`task:`) and E (`spawn:` path) inherit; B keeps its own tier.
+        assert_eq!(ex(2), Some("THREAD".into()));
+        assert!(defaulted(2));
+        assert_eq!(ex(3), Some("HIGH".into()));
+        assert!(!defaulted(3));
+        // C is parked and D spawns through a verbatim closure: the macro's own
+        // guards reject `executor:` on both, so neither inherits.
+        assert_eq!(ex(4), None);
+        assert_eq!(ex(5), None);
+        assert_eq!(ex(6), Some("THREAD".into()));
+        assert!(defaulted(6));
+        assert_eq!(ex(7), Some("THREAD".into()));
+        assert!(defaulted(7));
+    }
+
+    #[test]
+    fn default_executor_applies_across_fragment_markers() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "default executor THREAD; \
+             @fragment F; node A = Terminate, deps: [], task: f; @endfragment;",
+        )
+        .unwrap();
+        assert_eq!(
+            item_executor(&spec.items[1]).map(ToString::to_string),
+            Some("THREAD".into())
+        );
+    }
+
+    #[test]
+    fn default_executor_rejects_cfg_fragment_and_duplicate() {
+        let cases = [
+            (
+                "#[cfg(feature = \"x\")] default executor THREAD;",
+                "cannot be `#[cfg]`-gated",
+            ),
+            (
+                "@fragment F; default executor THREAD; @endfragment;",
+                "fragment cannot declare",
+            ),
+            (
+                "default executor A; default executor B;",
+                "duplicate `default executor`",
+            ),
+        ];
+        for (src, needle) in cases {
+            let err = syn::parse_str::<GraphSpec>(src)
+                .err()
+                .unwrap_or_else(|| panic!("`{src}` parsed"))
+                .to_string();
+            assert!(err.contains(needle), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn local_may_route_through_an_executor() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "executor HIGH; node A = Terminate, deps: [], executor: HIGH, task: f, \
+             resources: [R: local consume T];",
+        )
+        .expect("`local` + `executor:` is a per-slot tier check in the macro, not a parse error");
         assert_eq!(
             item_executor(&spec.items[1]).map(ToString::to_string),
             Some("HIGH".into())

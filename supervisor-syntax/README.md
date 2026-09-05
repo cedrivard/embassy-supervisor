@@ -42,8 +42,12 @@ are span-attached:
   at least 1, `beat_window:` in 1..=255.
 - Clause combinations: `task:` vs `spawn:`, clauses that require `task:`
   (`pool_size:`, `resources:`, `state:`, `exit:`, `cancel`), `cancel` with
-  `Mode::Pause`, `exit:` on a `pool`, `local` with `executor:`,
+  `Mode::Pause`, `exit:` on a `pool`,
   `ready_on_write` without `beat_timeout:` and an `observed beat` write.
+- `default executor` shape: one per graph, never `#[cfg]`-gated, never inside
+  `@fragment` markers (it resolves across them at the compose site). Whether a
+  `local` slot's declarations share one executor is checked by
+  `embassy-supervisor-macros`, not here.
 
 ## Usage
 

@@ -1,0 +1,5 @@
+error: a fragment cannot declare the graph's default executor; declare it at the compose site
+ --> tests/ui/compile_fail/default_executor_in_fragment.rs:8:22
+  |
+8 |     default executor THREAD;
+  |                      ^^^^^^

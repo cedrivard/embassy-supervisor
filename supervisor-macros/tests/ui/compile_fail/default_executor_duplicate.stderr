@@ -1,0 +1,5 @@
+error: duplicate `default executor`
+ --> tests/ui/compile_fail/default_executor_duplicate.rs:8:5
+  |
+8 |     default executor OTHER;
+  |     ^^^^^^^

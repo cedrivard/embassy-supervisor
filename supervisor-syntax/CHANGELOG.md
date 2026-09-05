@@ -7,6 +7,22 @@ This crate is pinned by exact version from `embassy-supervisor-macros`: its AST 
 internal contract between the two, not a stable public API, and it changes whenever the
 graph syntax does. Publish it before the macro crate that depends on it.
 
+## [0.4.0] - 2026-09-04
+
+Adds `default executor NAME;` and drops the `local` + `executor:` rejection.
+Requires `embassy-supervisor-macros` 0.10.0 and `embassy-supervisor-tools` 0.5.0.
+
+### Added
+
+- `default executor NAME;` item, applied to eligible nodes and pools with
+  `executor_defaulted = true`. Errors if it has `#[cfg]`, appears in a fragment, or is
+  duplicated.
+
+### Removed
+
+- Rejection of `local` combined with `executor:`. The macro crate now checks that every
+  `local` slot resolves to one executor.
+
 ## [0.3.1] - 2026-09-03
 
 Additive. `embassy-supervisor-macros = "=0.9.1"` and `embassy-supervisor-tools`
@@ -128,6 +144,8 @@ tooling that wants it.
   against a whole graph by the macro. A fragment legitimately names nodes it does not
   contain, so parsing one in isolation has to succeed.
 
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.4.0...HEAD
+[0.4.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.3.1...embassy-supervisor-syntax-v0.4.0
 [0.3.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.3.0...embassy-supervisor-syntax-v0.3.1
 [0.3.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.2.0...embassy-supervisor-syntax-v0.3.0
 [0.2.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.1.0...embassy-supervisor-syntax-v0.2.0

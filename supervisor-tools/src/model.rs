@@ -220,8 +220,10 @@ pub struct NodeModel {
     pub provides: Vec<ProvideModel>,
     /// The `disabled` marker: `Some(gates)` when present.
     pub disabled: Option<CfgTexts>,
-    /// The `executor:` name, if any.
+    /// `executor:` name, if any.
     pub executor: Option<String>,
+    /// `true` if this node inherited the graph's default executor.
+    pub executor_defaulted: bool,
     /// The `slot_timeout:` value in milliseconds.
     pub slot_timeout_ms: Option<LitValue>,
     /// The `ack_timeout:` value in milliseconds.
@@ -265,8 +267,10 @@ pub struct PoolModel {
     pub policy: ExprValue,
     /// The explicit scaling policy type, if any.
     pub policy_ty: Option<TypeValue>,
-    /// The `executor:` name, if any.
+    /// `executor:` name, if any.
     pub executor: Option<String>,
+    /// `true` if this pool inherited the graph's default executor.
+    pub executor_defaulted: bool,
     /// The `resources:` list.
     pub resources: Vec<ResourceModel>,
     /// The `slot_timeout:` value in milliseconds.
@@ -296,6 +300,8 @@ pub struct PoolModel {
 pub struct ExecutorModel {
     /// The executor name.
     pub name: String,
+    /// `true` for the graph's `default executor NAME;` declaration.
+    pub default: bool,
     /// `#[cfg(...)]` gates on the declaration.
     pub cfg: CfgTexts,
 }
@@ -417,6 +423,7 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                             .collect(),
                         disabled: n.disabled.as_ref().map(|g| cfg_texts(&g.cfg)),
                         executor: n.executor.as_ref().map(|e| e.to_string()),
+                        executor_defaulted: n.executor_defaulted,
                         slot_timeout_ms: n
                             .slot_timeout
                             .as_ref()
@@ -451,6 +458,7 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                         policy: ExprValue::new(&p.policy),
                         policy_ty: p.policy_ty.as_ref().map(TypeValue::new),
                         executor: p.executor.as_ref().map(|e| e.to_string()),
+                        executor_defaulted: p.executor_defaulted,
                         resources: p.resources.iter().map(resource_model).collect(),
                         slot_timeout_ms: p
                             .slot_timeout
@@ -471,6 +479,7 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                     }),
                     Item::Executor(x) => ItemModel::Executor(ExecutorModel {
                         name: x.ident.to_string(),
+                        default: x.default,
                         cfg: cfg_texts(&x.cfg),
                     }),
                 })

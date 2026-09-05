@@ -31,7 +31,7 @@ const PREFIX: u8 = 24;
 
 /// Number of concurrent sockets the stack can hold: one per http worker (the
 /// pool ceiling), plus one for embassy-net's internal DNS socket when the `dns`
-
+/// feature is on.
 pub const SOCKET_BUDGET: usize = crate::HTTP_MAX + cfg!(feature = "dns") as usize;
 
 pub(crate) struct StackCell(

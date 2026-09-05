@@ -672,13 +672,11 @@ fn node_spawn(
                  application, which picks its own spawner)",
             ));
         }
-        // A path or a partial call: a task fn taking `&NODE` first (plus any
-        // given args); generate `|s| { s.spawn(<task>(&NODE, ..)?); Ok(()) }`.
-        // With `executor: NAME` the glue ignores the supervisor's `Spawner` and
-        // spawns through the named `SpawnerSlot` (a `SendSpawner` the app
-        // registers at runtime): an unfilled slot fails the spawn with
-        // `SpawnError::Busy` — loud misconfiguration, not a missing task. The
-        // task future must then be `Send` (enforced by `SendSpawner::spawn`).
+        // A path or partial call: wrap the task fn as spawn glue.
+        // With `executor:` the glue spawns through the named `SpawnerSlot`; an
+        // unfilled slot fails with `SpawnError::Busy`.
+        // `SendSpawner::spawn` requires `Send` on the arguments, not the future,
+        // so any `task:` worker can route through any executor.
         (Some(e @ (Expr::Path(_) | Expr::Call(_))), executor) => {
             let mut lead: Vec<TokenStream2> = vec![quote!(&#ident)];
             lead.extend(state_arg.iter().cloned());
@@ -1026,38 +1024,75 @@ fn emit_shell(
             #slot.provide(#out_ident);
         )
     };
-    // The `cancel` arms pin the worker into the shell's own frame and hand
-    // `run_cancellable` a `Pin<&mut _>`: the shell then stores the worker's state
-    // machine ONCE, whatever rustc decides to do with the callee's arguments
-    // (rust-lang/rust#62958 doubles a future passed by value into an `async fn`,
-    // and this is static task storage, so the doubling was per node, per binary).
-    // The `pin!` lives in its own block so the worker is dropped at the same point
-    // it always was — before the restores below, which move the lent resources
-    // back out.
-    let (drive, provide_exit) = match (cancel, exit) {
-        (false, Some(ty)) => {
-            let provide = provide(ty);
-            let out_ident = out_ident(ty);
-            (quote!(let #out_ident = #call.await;), provide)
-        }
-        (false, None) => (quote!(#call.await;), quote!()),
-        (true, Some(ty)) => {
-            let provide = provide(ty);
-            let out_ident = out_ident(ty);
-            (
-                quote!(let __res = { let __fut = ::core::pin::pin!(#call); __node.run_cancellable(__fut).await };),
-                quote!(if let ::core::result::Result::Ok(#out_ident) = __res {
-                    #provide
+    // Pin the worker in the shell frame so its state is stored once. This
+    // avoids doubling it as a callee argument, which matters in static task
+    // storage.
+    // With `fault-inject` the pinned worker is wrapped in `Injected`: stall,
+    // hog and crash apply transparently. The wrapper still resolves to an
+    // `Option`, so diverging-`exit:` remains a lint error as usual.
+    let (drive, provide_exit) = if cfg!(feature = "fault-inject") {
+        match (cancel, exit) {
+            (false, Some(ty)) => {
+                let provide = provide(ty);
+                let out_ident = out_ident(ty);
+                (
+                    quote!(let __res = { let __fut = ::core::pin::pin!(#call); #cr::Injected::new(__node, __fut).await };),
+                    quote!(if let ::core::option::Option::Some(#out_ident) = __res {
+                        #provide
+                    }),
+                )
+            }
+            (false, None) => (
+                quote!({
+                    let __fut = ::core::pin::pin!(#call);
+                    let _ = #cr::Injected::new(__node, __fut).await;
                 }),
-            )
+                quote!(),
+            ),
+            (true, Some(ty)) => {
+                let provide = provide(ty);
+                let out_ident = out_ident(ty);
+                (
+                    quote!(let __res = { let __fut = ::core::pin::pin!(#call); __node.run_cancellable(#cr::Injected::new(__node, __fut)).await };),
+                    quote!(if let ::core::result::Result::Ok(::core::option::Option::Some(#out_ident)) = __res {
+                        #provide
+                    }),
+                )
+            }
+            (true, None) => (
+                quote!({
+                    let __fut = ::core::pin::pin!(#call);
+                    let _ = __node.run_cancellable(#cr::Injected::new(__node, __fut)).await;
+                }),
+                quote!(),
+            ),
         }
-        (true, None) => (
-            quote!({
-                let __fut = ::core::pin::pin!(#call);
-                let _ = __node.run_cancellable(__fut).await;
-            }),
-            quote!(),
-        ),
+    } else {
+        match (cancel, exit) {
+            (false, Some(ty)) => {
+                let provide = provide(ty);
+                let out_ident = out_ident(ty);
+                (quote!(let #out_ident = #call.await;), provide)
+            }
+            (false, None) => (quote!(#call.await;), quote!()),
+            (true, Some(ty)) => {
+                let provide = provide(ty);
+                let out_ident = out_ident(ty);
+                (
+                    quote!(let __res = { let __fut = ::core::pin::pin!(#call); __node.run_cancellable(__fut).await };),
+                    quote!(if let ::core::result::Result::Ok(#out_ident) = __res {
+                        #provide
+                    }),
+                )
+            }
+            (true, None) => (
+                quote!({
+                    let __fut = ::core::pin::pin!(#call);
+                    let _ = __node.run_cancellable(__fut).await;
+                }),
+                quote!(),
+            ),
+        }
     };
     // Record the completion (and ack any pending shutdown handshake): a worker
     // that returns on its own reads as down, not running forever, and a control
@@ -1162,10 +1197,15 @@ fn emit_node(
     )?;
     // `executor: NAME` routes the node through that SpawnerSlot; the supervisor
     // awaits the slot before spawning (see `TaskNode::with_executor`).
-    let with_exec = match &n.executor {
+    let mut with_exec = match &n.executor {
         Some(ex) => quote!( .with_executor(&#ex) ),
         None => quote!(),
     };
+    // With `fault-inject`, shelled `task:` nodes can be stalled, crashed or hogged.
+    // Hand-written `spawn:` tasks only support wedge.
+    if cfg!(feature = "fault-inject") && matches!(n.source, Some(TaskSource::Shell(_))) {
+        with_exec.extend(quote!( .with_shell() ));
+    }
     // `resources: [NAME: Type, ..]` — one `pub static NAME: ResourceSlot<Type>`
     // per entry (main moves the resource in with `NAME.provide(..)`), plus a
     // type-erased gate array wired into the node so the supervisor can await
@@ -1189,8 +1229,8 @@ fn emit_node(
                 let ty = r.ty.as_ref().expect("a typed resource kind");
                 // `local` entries use the graph-site slot type (emitted once per
                 // graph in `expand`): same provide/take protocol as `ResourceSlot`
-                // but without its `T: Send` bound, for `!Send` driver handles on a
-                // single-core system. `consume` changes only shell codegen (by-value
+                // but without its `T: Send` bound, for `!Send` driver handles local
+                // to one executor. `consume` changes only shell codegen (by-value
                 // arg, no restore) — the slot type is the same either way.
                 let slot_ty = if r.local.is_some() {
                     let local = &helpers.local_slot;
@@ -1576,10 +1616,13 @@ fn emit_pool(
     });
     let member_spawn: Vec<TokenStream2> = (0..k).map(|j| quote!(#wrapper::<#j>)).collect();
 
-    let member_with_exec = match &p.executor {
+    let mut member_with_exec = match &p.executor {
         Some(ex) => quote!( .with_executor(&#ex) ),
         None => quote!(),
     };
+    if cfg!(feature = "fault-inject") && matches!(p.source, TaskSource::Shell(_)) {
+        member_with_exec.extend(quote!( .with_shell() ));
+    }
     for r in p
         .resources
         .iter()
@@ -2090,12 +2133,12 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                 }
             }
             impl<T> #cr::ResourceGate for #local<T> {
+                // Probes without moving the value, so it is safe to call from any
+                // executor even when T is !Send.
                 fn is_filled(&self) -> bool {
                     self.slot.lock(|c| {
-                        let v = c.take();
-                        let filled = v.is_some();
-                        c.set(v);
-                        filled
+                        // SAFETY: lock held; we only read, never move.
+                        unsafe { (*c.as_ptr()).is_some() }
                     })
                 }
                 fn filled_signal(&self) -> &#signal {
@@ -2286,6 +2329,77 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                             ),
                         ));
                     }
+                }
+            }
+        }
+    }
+    // `local` slots are confined to a single executor. Every consumer and the
+    // provider must run on that executor; `#[cfg]`s are not checked.
+    {
+        let tier = |e: &Option<String>| match e {
+            Some(x) => format!("`{x}`"),
+            None => "the supervisor's executor".to_string(),
+        };
+        // slot -> (first declarer, its executor)
+        let mut homes: HashMap<String, (String, Option<String>)> = HashMap::new();
+        for item in &graph.items {
+            let Some((owner, _)) = item_ident_cfg(item) else {
+                continue;
+            };
+            let executor_text = item_executor(item).map(ToString::to_string);
+            for r in item_resources(item) {
+                let Some(marker) = &r.local else {
+                    continue;
+                };
+                match homes.get(&r.ident.to_string()) {
+                    Some((first, home)) if *home != executor_text => {
+                        return Err(syn::Error::new_spanned(
+                            marker,
+                            format!(
+                                "`{}` is `local`: every declaration must run on one \
+                                 executor (its value is only ever touched from that \
+                                 executor), but `{}` runs on {} and `{}` on {}",
+                                r.ident,
+                                first,
+                                tier(home),
+                                owner,
+                                tier(&executor_text),
+                            ),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        homes.insert(
+                            r.ident.to_string(),
+                            (owner.to_string(), executor_text.clone()),
+                        );
+                    }
+                }
+            }
+        }
+        for item in &graph.items {
+            let Item::Node(n) = item else {
+                continue;
+            };
+            let executor_text = n.executor.as_ref().map(ToString::to_string);
+            for p in &n.provides {
+                if let Some((first, home)) = homes.get(&p.ident.to_string())
+                    && *home != executor_text
+                {
+                    return Err(syn::Error::new_spanned(
+                        &p.ident,
+                        format!(
+                            "`{}` is `local`: its provider must run on the executor \
+                             of its declarations (the value is only ever touched \
+                             from that executor), but `{}` declares it on {} and \
+                             `{}` provides it on {}",
+                            p.ident,
+                            first,
+                            tier(home),
+                            n.ident,
+                            tier(&executor_text),
+                        ),
+                    ));
                 }
             }
         }
@@ -3074,7 +3188,15 @@ fn fragment_expand(input: TokenStream2) -> SynResult<TokenStream2> {
     let items = normalize_fragment_crate(spec.items);
 
     let substituted = substitute_dollar_crate(items.clone(), &quote!(__sv_fragment_crate));
-    gate::gate(&syn::parse2::<GraphSpec>(substituted)?)?;
+    let spec_parsed = syn::parse2::<GraphSpec>(substituted)?;
+    if let Some(ex) = &spec_parsed.default_executor {
+        return Err(syn::Error::new_spanned(
+            ex,
+            "a fragment cannot declare the graph's default executor; declare it at \
+             the compose site",
+        ));
+    }
+    gate::gate(&spec_parsed)?;
 
     let items = &items;
     let dollar = proc_macro2::Punct::new('$', proc_macro2::Spacing::Alone);

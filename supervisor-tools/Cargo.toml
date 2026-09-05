@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor-tools"
-version = "0.4.1"
+version = "0.5.0"
 description = "Host tools reading supervisor_graph!, supervisor_fragment! and compose_graph! declarations: Mermaid diagrams, and dataflow lints"
 edition.workspace = true
 authors.workspace = true
@@ -31,7 +31,7 @@ path = "src/bin/lint.rs"
 # The graph grammar, shared with the proc-macro so the diagram cannot drift from
 # what the macro accepts. No features: the syntax crate always parses in full,
 # and which constructs a build permits is the macro's policy, not a diagram's.
-embassy-supervisor-syntax = { version = "=0.3.1", path = "../supervisor-syntax" }
+embassy-supervisor-syntax = { version = "=0.4.0", path = "../supervisor-syntax" }
 # `span-locations` is what puts a file:line on each declaration.
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 quote = "1.0.46"
