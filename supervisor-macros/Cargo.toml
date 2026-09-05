@@ -4,7 +4,7 @@ name = "embassy-supervisor-macros"
 # version (`=x.y.z`): the generated code references doc(hidden) supervisor internals,
 # so only the tested pair is guaranteed compatible. Bump only when the macro changes;
 # the supervisor updates its pin to match.
-version = "0.9.1"
+version = "0.10.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -35,6 +35,9 @@ pool = []
 # CONSUMER'S CRATE (this is why it is opt-in and off by default). Without it, a
 # `local` marker is a span-attached compile error naming the feature.
 local-resources = []
+# Forwarded from the supervisor's `fault-inject` feature. Enables `task:` shell
+# wrapping with `Injected` and `.with_shell()`, so stall/crash/hog faults work.
+fault-inject = []
 
 # Forwarded from the supervisor's `budget` feature: enables the `divisible`
 # resource kind. Without it the marker is a compile error.
@@ -118,7 +121,7 @@ trace-hooks = ["trace"]
 [dependencies]
 # The graph grammar, shared with the diagram tool. Pinned by EXACT version: the
 # AST is an internal contract between the two crates and changes with the syntax.
-embassy-supervisor-syntax = { version = "=0.3.1", path = "../supervisor-syntax" }
+embassy-supervisor-syntax = { version = "=0.4.0", path = "../supervisor-syntax" }
 syn = { version = "3.0.4", features = ["full"] }
 quote = "1.0.46"
 proc-macro2 = "1.0.106"
@@ -159,6 +162,7 @@ embassy-supervisor = { path = "../supervisor", features = [
     "trace",
     "trace-hooks",
     "metadata-names",
+    "fault-inject",
     "budget",
     "veto",
 ] }

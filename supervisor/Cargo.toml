@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.9.0"
+version = "0.10.0"
 description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
@@ -40,7 +40,7 @@ log = { version = "0.4.33", optional = true, default-features = false }
 # `state: zeroed Type` (heap-state): `Zeroable` is the all-zero-is-valid contract.
 bytemuck = { version = "1.25.0", optional = true, default-features = false }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.9.1", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.10.0", path = "../supervisor-macros", optional = true }
 
 [features]
 # Just the graph macro: everything the supervisor can DO is opt-in, matching the
@@ -69,13 +69,14 @@ defmt = ["dep:defmt"]
 log = ["dep:log"]
 # Re-export the `supervisor_graph!` proc-macro.
 macros = ["dep:embassy-supervisor-macros"]
-# Permit the `local` resource kind (`resources: [R: local Type]` — `!Send`
-# values on a single core). OPT-IN AND OFF BY DEFAULT because it is the one
-# graph form that makes `supervisor_graph!` emit `unsafe` code into YOUR crate:
-# the graph-site local slot type carries an `unsafe impl Sync` whose soundness
-# contract (all provide/take/restore of a slot on ONE core) the application
-# owns. Without this feature a `local` marker is a compile error.
+# Permit the `local` resource kind: `resources: [R: local Type]`. Off by default
+# because it makes `supervisor_graph!` emit `unsafe impl Sync` into the
+# consumer crate; the application owns the one-executor soundness contract.
 local-resources = ["embassy-supervisor-macros?/local-resources"]
+
+# Fault injection: `TaskNode::inject(Fault::{Stall, Wedge, Crash, Hog(..)})`.
+# Applied by the shell, not requested by the worker. Adds a few atomics per node.
+fault-inject = ["embassy-supervisor-macros?/fault-inject"]
 
 # Task-asserted readiness: set_ready/clear_ready/is_ready/wait_ready on TaskNode
 # and the `ready` dep marker (`deps: [NET ready]`) — bring-up then awaits the
@@ -708,6 +709,18 @@ required-features = ["macros"]
 [[test]]
 name = "ack_timeout"
 required-features = ["macros"]
+
+# The inverted layout: the supervisor on its own executor, `default executor`
+# routing the rest to another, a `local` pair inheriting the default.
+[[test]]
+name = "inverted_tiers"
+required-features = ["macros", "local-resources"]
+
+# `fault-inject`: stall, wedge, crash and hog done to the task, observed
+# through the monitor, the ack window and the exit path.
+[[test]]
+name = "fault_inject"
+required-features = ["macros", "fault-inject", "liveness-monitor", "control", "restart", "readiness"]
 
 # Activate on a down-but-not-parked Pause node (stopped at boot) spawns a
 # real instance through the gates; a genuinely parked one resumes in place.

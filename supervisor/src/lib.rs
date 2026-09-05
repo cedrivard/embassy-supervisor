@@ -45,10 +45,15 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Timer, with_timeout};
 #[cfg(feature = "liveness")]
 use portable_atomic::AtomicBool;
-#[cfg(feature = "liveness-monitor")]
+#[cfg(any(feature = "liveness-monitor", feature = "fault-inject"))]
 use portable_atomic::AtomicU8;
 use portable_atomic::AtomicU16;
-#[cfg(any(feature = "trace", feature = "liveness", feature = "epochs"))]
+#[cfg(any(
+    feature = "trace",
+    feature = "liveness",
+    feature = "epochs",
+    feature = "fault-inject"
+))]
 use portable_atomic::AtomicU32;
 
 #[cfg(feature = "pool")]
@@ -378,6 +383,202 @@ pub async fn wait_bind() {
     BIND_REQ.wait().await
 }
 
+// ─── Fault injection (`fault-inject`) ─────────────────────────────────────
+
+/// A fault injected into a node through [`TaskNode::inject`]. The verbs act on
+/// the task, not the worker.
+///
+/// - **Stall**: stop polling the worker.
+/// - **Wedge**: hide shutdown and swallow the ack.
+/// - **Crash**: drop the worker future.
+/// - **Hog**: busy-spin the executor for the given bound.
+///
+/// Off by default. For benches, tests, and dashboards.
+#[cfg(feature = "fault-inject")]
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fault {
+    /// Healthy.
+    None,
+    /// Stop polling the worker.
+    Stall,
+    /// Hide the shutdown request and swallow the ack.
+    Wedge,
+    /// Drop the worker future; the node reads as exited.
+    Crash,
+    /// Busy-spin the executor for the given bound.
+    Hog(embassy_time::Duration),
+}
+
+#[cfg(feature = "fault-inject")]
+impl Fault {
+    /// The verb as a short lowercase name (`"stall"`, `"wedge"`, `"crash"`,
+    /// `"hog"`; `None` is `"none"`), for logs and JSON.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Fault::None => "none",
+            Fault::Stall => "stall",
+            Fault::Wedge => "wedge",
+            Fault::Crash => "crash",
+            Fault::Hog(_) => "hog",
+        }
+    }
+
+    fn encode(self) -> (u8, u32) {
+        match self {
+            Fault::None => (0, 0),
+            Fault::Stall => (1, 0),
+            Fault::Wedge => (2, 0),
+            Fault::Crash => (3, 0),
+            Fault::Hog(d) => (4, d.as_millis().min(u32::MAX as u64) as u32),
+        }
+    }
+
+    fn decode(code: u8, ms: u32) -> Self {
+        match code {
+            1 => Fault::Stall,
+            2 => Fault::Wedge,
+            3 => Fault::Crash,
+            4 => Fault::Hog(embassy_time::Duration::from_millis(ms as u64)),
+            _ => Fault::None,
+        }
+    }
+}
+
+#[cfg(all(feature = "fault-inject", feature = "defmt"))]
+impl defmt::Format for Fault {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "{}", self.as_str());
+    }
+}
+
+/// Why [`TaskNode::inject`] refused.
+#[cfg(feature = "fault-inject")]
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InjectError {
+    /// The node is a hand-written `spawn:` fn; only wedge applies.
+    NoShell,
+}
+
+#[cfg(all(feature = "fault-inject", feature = "defmt"))]
+impl defmt::Format for InjectError {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(
+            fmt,
+            "no shell: only a `task:` node can be stalled, crashed or hogged"
+        );
+    }
+}
+
+/// State for an in-progress `Hog` fault.
+#[cfg(feature = "fault-inject")]
+struct HogState {
+    grace: Timer,
+    bound: embassy_time::Duration,
+}
+
+/// Wrapper for `task:` worker futures. Returns `Some(output)` on completion,
+/// or `None` if [`Fault::Crash`] dropped the worker.
+#[cfg(feature = "fault-inject")]
+#[doc(hidden)]
+pub struct Injected<'a, F> {
+    node: &'a TaskNode,
+    inner: Option<F>,
+    hog: Option<HogState>,
+}
+
+#[cfg(feature = "fault-inject")]
+impl<'a, F: Future + Unpin> Injected<'a, F> {
+    /// Grace period before a `Hog` spin begins.
+    pub const HOG_GRACE: embassy_time::Duration = embassy_time::Duration::from_millis(250);
+
+    #[doc(hidden)]
+    pub fn new(node: &'a TaskNode, inner: F) -> Self {
+        Self {
+            node,
+            inner: Some(inner),
+            hog: None,
+        }
+    }
+}
+
+#[cfg(feature = "fault-inject")]
+impl<F: Future + Unpin> Future for Injected<'_, F> {
+    type Output = Option<F::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let node = this.node;
+        node.handle.fault_waker.register(cx.waker());
+        loop {
+            match node.fault() {
+                Fault::Stall if !node.handle.flag(flag::SHUTDOWN) => {
+                    if core::pin::pin!(node.handle.shutdown_wake.wait())
+                        .poll(cx)
+                        .is_ready()
+                    {
+                        continue;
+                    }
+                    return Poll::Pending;
+                }
+                Fault::Crash => {
+                    this.inner = None;
+                    let _ = node.handle.fault.compare_exchange(
+                        3,
+                        0,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    );
+                    warn!("supervisor: {} crashed (injected)", node.name());
+                    return Poll::Ready(None);
+                }
+                Fault::Hog(bound) => {
+                    if !matches!(&this.hog, Some(h) if h.bound == bound) {
+                        this.hog = Some(HogState {
+                            grace: Timer::after(Injected::<F>::HOG_GRACE),
+                            bound,
+                        });
+                    }
+                    let hog = this.hog.as_mut().unwrap();
+                    if Pin::new(&mut hog.grace).poll(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                    let bound = hog.bound;
+                    this.hog = None;
+                    warn!(
+                        "supervisor: {} hogging its executor for {} ms (injected)",
+                        node.name(),
+                        bound.as_millis()
+                    );
+                    let deadline = embassy_time::Instant::now() + bound;
+                    while embassy_time::Instant::now() < deadline {
+                        core::hint::spin_loop();
+                    }
+                    let _ = node.handle.fault.compare_exchange(
+                        4,
+                        0,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    );
+                }
+                _ => {}
+            }
+            break;
+        }
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Pending;
+        };
+        match Pin::new(inner).poll(cx) {
+            Poll::Ready(out) => {
+                this.inner = None;
+                Poll::Ready(Some(out))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 // ─── Health events (supervisor → app) ─────────────────────────────────────
 //
 // The reporting half of `liveness-monitor`. Deliberately a mailbox rather than
@@ -395,7 +596,7 @@ pub async fn wait_bind() {
 pub enum HealthKind {
     /// The node is still marked running but has not beaten within its
     /// `beat_timeout:` for `beat_window:` consecutive sweeps — alive but
-    /// wedged, parked on an await that will never complete. Emitted **once**
+    /// stalled, parked on an await that will never complete. Emitted **once**
     /// per stall; the next event for this node is a [`Recovered`](Self::Recovered).
     Stale {
         /// Ticks since the node's last beat when the sweep tripped.
@@ -443,7 +644,7 @@ static HEALTH_EVT: Channel<CriticalSectionRawMutex, HealthEvent, 4> = Channel::n
 /// loop {
 ///     let ev = embassy_supervisor::wait_health().await;
 ///     match ev.kind {
-///         HealthKind::Stale { ticks } => warn!("{} wedged for {} ticks", ev.node.name, ticks),
+///         HealthKind::Stale { ticks } => warn!("{} stalled for {} ticks", ev.node.name, ticks),
 ///         HealthKind::Recovered => info!("{} is beating", ev.node.name),
 ///         _ => {}
 ///     }
@@ -694,11 +895,7 @@ impl<F: Future> Future for RunCancellable<'_, F> {
         // The flag fast path covers a request that predates this future (the
         // signal is edge-triggered); a fresh `wait()` per poll is sound because
         // the `Signal` latches its value and re-registers the waker each poll.
-        if this.node.shutdown_requested()
-            || core::pin::pin!(this.node.handle.shutdown_wake.wait())
-                .poll(cx)
-                .is_ready()
-        {
+        if this.node.poll_shutdown(cx) {
             this.fut.set(None);
             if *this.ack {
                 this.node.ack_dropped();
@@ -737,11 +934,7 @@ impl<F: Future> Future for RunPausable<'_, F> {
             {
                 return Poll::Ready(Ok(out));
             }
-            if !this.node.shutdown_requested()
-                && !core::pin::pin!(this.node.handle.shutdown_wake.wait())
-                    .poll(cx)
-                    .is_ready()
-            {
+            if !this.node.poll_shutdown(cx) {
                 return Poll::Pending;
             }
             this.fut.set(None);
@@ -869,6 +1062,12 @@ mod flag {
     /// `start_node` also clears it. Unlike `BOUND_STOPPED`, a readiness flap
     /// does not release a control stop. Lifecycle-spanning: not cleared by `reset()`.
     pub const COLLATERAL: u16 = 1 << 9;
+    /// `fault-inject`: swallowed ack pending replay.
+    #[cfg(feature = "fault-inject")]
+    pub const PENDING_ACK: u16 = 1 << 10;
+    /// `fault-inject`: swallowed exit pending replay.
+    #[cfg(feature = "fault-inject")]
+    pub const PENDING_EXIT: u16 = 1 << 11;
 }
 
 /// Coordination state for one task. Embedded inside [`TaskNode`].
@@ -933,6 +1132,15 @@ pub struct TaskHandle {
     /// too wide to swap atomically.
     #[cfg(feature = "node-status")]
     status: BlockingMutex<CriticalSectionRawMutex, Cell<Option<&'static str>>>,
+    /// Encoded current fault.
+    #[cfg(feature = "fault-inject")]
+    fault: AtomicU8,
+    /// Hog spin duration in milliseconds.
+    #[cfg(feature = "fault-inject")]
+    hog_ms: AtomicU32,
+    /// Wakes the task on inject or clear.
+    #[cfg(feature = "fault-inject")]
+    fault_waker: embassy_sync::waitqueue::AtomicWaker,
     /// The executor task id currently running this node (`TaskRef::id()`, captured
     /// from the `SpawnToken` by the macro's spawn glue). `0` = unknown (not yet
     /// spawned, or a parked/closure-spawned node that never registered). Overwritten
@@ -978,6 +1186,12 @@ impl TaskHandle {
             pending_beat: AtomicBool::new(false),
             #[cfg(feature = "node-status")]
             status: BlockingMutex::new(Cell::new(None)),
+            #[cfg(feature = "fault-inject")]
+            fault: AtomicU8::new(0),
+            #[cfg(feature = "fault-inject")]
+            hog_ms: AtomicU32::new(0),
+            #[cfg(feature = "fault-inject")]
+            fault_waker: embassy_sync::waitqueue::AtomicWaker::new(),
             #[cfg(feature = "trace")]
             task_id: AtomicU32::new(0),
             #[cfg(feature = "trace")]
@@ -1024,27 +1238,45 @@ impl TaskHandle {
 
 // ─── Executor spawner slots ──────────────────────────────────────────────
 
-/// A runtime-filled slot holding the [`SendSpawner`] of an executor other than
-/// the one the supervisor runs on — an `InterruptExecutor` tier, the second
-/// core's executor, any foreign thread executor (via `Spawner::make_send()`).
+/// Runtime-filled slot holding a foreign executor's [`SendSpawner`].
 ///
-/// Declared by the `executor NAME;` item of [`supervisor_graph!`]; nodes carrying
-/// `executor: NAME` are spawned through the slot instead of the supervisor's own
-/// `Spawner`. The application fills it once at startup — before, or concurrently
-/// with, [`Supervisor::start`] (e.g. from the second core's bring-up):
+/// Declared by `executor NAME;` and filled by the app before or during
+/// [`Supervisor::start`]. The supervisor waits on [`ready`](Self::ready)
+/// before spawning a node into it; if the slot is still empty after the
+/// bounded wait, the spawn fails with [`FaultKind::ExecutorSlotEmpty`].
+///
+/// `default executor NAME;` makes `NAME` the default for nodes that do not
+/// specify an executor. This lets a supervisor running on an interrupt tier
+/// keep most of its graph in thread mode:
 ///
 /// ```ignore
-/// static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
-/// HIGH.set(EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0));
-/// sup.start(&spawner).await?;   // nodes declared `executor: HIGH` spawn on that tier
+/// supervisor_graph! {
+///     default executor THREAD;
+///     executor HIGH;
+///     node LOGGER  = Terminate, task: logger_worker;
+///     node SAMPLER = Terminate, executor: HIGH, task: sampler_worker;
+/// }
+/// THREAD.set(spawner.make_send());
 /// ```
 ///
-/// The supervisor's bring-up (`start` / `start_node` / `respawn_terminate`) awaits
-/// [`ready`](Self::ready) for a node's slot before spawning it, so a tier filled
-/// late — or from another core — is handled without a race; a slot still empty after
-/// the supervisor's bounded wait fails the spawn with [`FaultKind::ExecutorSlotEmpty`]
-/// rather than silently dropping the task. Spawned futures must be `Send` (a non-`Send`
-/// `executor:` task is a compile error at the glue).
+/// `Send` is required on the spawn arguments, not the future. A `task:` shell's
+/// arguments are always `Send`, so any `task:` worker can be routed to any tier.
+/// A `spawn:` fn's own arguments must be `Send`, so this does not compile:
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+/// use embassy_supervisor::{TaskNode, supervisor_graph};
+///
+/// #[embassy_executor::task]
+/// async fn worker(_node: &'static TaskNode, _handle: Rc<u32>) {}
+///
+/// supervisor_graph! {
+///     executor HIGH;
+///     node A = Terminate, deps: [], executor: HIGH, spawn: worker(Rc::new(1));
+/// }
+/// ```
+///
+/// What the worker then touches from that tier is the author's contract.
 pub struct SpawnerSlot {
     slot: BlockingMutex<CriticalSectionRawMutex, Cell<Option<SendSpawner>>>,
     /// Wakes a `ready()` waiter when `set` fills the slot (cross-core safe:
@@ -1394,6 +1626,9 @@ pub struct NodeCfg {
     /// no graph, which simply has no peers to answer about.
     #[cfg(feature = "data-deps")]
     graph: &'static GraphRef,
+    /// `fault-inject`: true if the node uses a `task:` shell wrapped by [`Injected`].
+    #[cfg(feature = "fault-inject")]
+    shelled: bool,
 }
 
 impl NodeCfg {
@@ -1438,7 +1673,16 @@ impl NodeCfg {
             bound_deps: &[],
             #[cfg(feature = "data-deps")]
             graph: &graph_ref::NO_GRAPH,
+            #[cfg(feature = "fault-inject")]
+            shelled: false,
         }
+    }
+
+    /// Mark the node as a `task:` shell. Only shells can be stalled, crashed or hogged.
+    #[cfg(feature = "fault-inject")]
+    pub const fn with_shell(mut self) -> Self {
+        self.shelled = true;
+        self
     }
 
     /// Route this node's spawn through the given executor [`SpawnerSlot`] (the
@@ -1724,21 +1968,80 @@ impl TaskNode {
     // Called from inside the `#[embassy_executor::task] async fn` body. The
     // whole task-side protocol is four rules (the README's "Writing supervised
 
-    /// Return `true` if the supervisor has asked this node to shut down.
+    /// True if the supervisor has asked this node to shut down.
+    /// A [`Fault::Wedge`] hides the request until cleared.
     pub fn shutdown_requested(&self) -> bool {
+        #[cfg(feature = "fault-inject")]
+        if self.fault() == Fault::Wedge {
+            return false;
+        }
         self.handle.flag(flag::SHUTDOWN)
     }
 
     /// Wait until the supervisor asks this node to shut down.
+    /// A [`Fault::Wedge`] keeps this pending until cleared.
     pub async fn wait_shutdown(&self) {
-        if self.handle.flag(flag::SHUTDOWN) {
-            return;
+        #[cfg(feature = "fault-inject")]
+        while !self.shutdown_requested() {
+            core::future::poll_fn(|cx| {
+                self.handle.fault_waker.register(cx.waker());
+                if self.shutdown_requested() {
+                    return Poll::Ready(());
+                }
+                core::pin::pin!(self.handle.shutdown_wake.wait()).poll(cx)
+            })
+            .await;
         }
-        self.handle.shutdown_wake.wait().await;
+        #[cfg(not(feature = "fault-inject"))]
+        if !self.handle.flag(flag::SHUTDOWN) {
+            self.handle.shutdown_wake.wait().await;
+        }
+    }
+
+    /// Poll the shutdown request, used by the cancel/pause drivers.
+    /// A [`Fault::Wedge`] hides the request but leaves the waker registered.
+    fn poll_shutdown(&self, cx: &mut Context<'_>) -> bool {
+        #[cfg(feature = "fault-inject")]
+        self.handle.fault_waker.register(cx.waker());
+        #[cfg(feature = "fault-inject")]
+        if self.fault() == Fault::Wedge {
+            return false;
+        }
+        self.handle.flag(flag::SHUTDOWN)
+            || core::pin::pin!(self.handle.shutdown_wake.wait())
+                .poll(cx)
+                .is_ready()
     }
 
     /// Acknowledge that this node's instance has dropped and notify waiters.
+    /// A [`Fault::Wedge`] swallows the ack until cleared.
     pub fn ack_dropped(&self) {
+        self.release_provided();
+        #[cfg(feature = "fault-inject")]
+        if self.wedge_swallows(flag::PENDING_ACK) {
+            return;
+        }
+        self.settle_dropped();
+    }
+
+    /// Swallow an ack while wedged. Returns true if the clear must deliver it.
+    #[cfg(feature = "fault-inject")]
+    fn wedge_swallows(&self, bits: u16) -> bool {
+        if self.fault() == Fault::Wedge {
+            self.handle.flag_set(bits);
+            if self.fault() == Fault::Wedge {
+                return true;
+            }
+            let prev = self.handle.flags.fetch_and(!bits, Ordering::AcqRel);
+            if prev & flag::PENDING_ACK == 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Drop what this instance provided and release its claims.
+    fn release_provided(&self) {
         if !matches!(self.cfg.mode, Mode::Pause) {
             for gate in self.cfg.provides {
                 gate.clear();
@@ -1746,6 +2049,10 @@ impl TaskNode {
             #[cfg(feature = "budget")]
             self.release_claims();
         }
+    }
+
+    /// Update flags and wakes to record the dropped instance.
+    fn settle_dropped(&self) {
         self.handle.flag_clear(flag::RUNNING);
         self.handle.flag_set(flag::DROPPED);
         self.handle.dropped_wake.signal(());
@@ -1754,6 +2061,21 @@ impl TaskNode {
         notify_bind();
         #[cfg(all(feature = "data-deps", feature = "readiness"))]
         crate::data_deps::notify_serving();
+    }
+
+    /// Deliver an ack or exit that a wedge swallowed.
+    #[cfg(feature = "fault-inject")]
+    fn replay_swallowed(&self) {
+        let pending = self
+            .handle
+            .flags
+            .fetch_and(!(flag::PENDING_ACK | flag::PENDING_EXIT), Ordering::AcqRel);
+        if pending & flag::PENDING_ACK != 0 {
+            if pending & flag::PENDING_EXIT != 0 {
+                self.handle.flag_set(flag::COMPLETED);
+            }
+            self.settle_dropped();
+        }
     }
 
     /// Give back every `divisible` share this node holds (see
@@ -1765,10 +2087,58 @@ impl TaskNode {
         }
     }
 
-    /// Mark the node as completed and then acknowledge its drop.
+    /// Mark the task as completed and acknowledge its drop.
+    /// A wedge hides this until cleared.
     pub fn mark_exited(&self) {
+        self.release_provided();
+        #[cfg(feature = "fault-inject")]
+        if self.wedge_swallows(flag::PENDING_EXIT | flag::PENDING_ACK) {
+            return;
+        }
         self.handle.flag_set(flag::COMPLETED);
-        self.ack_dropped();
+        self.settle_dropped();
+    }
+
+    /// Current injected fault, or `None` if healthy.
+    #[cfg(feature = "fault-inject")]
+    pub fn fault(&self) -> Fault {
+        Fault::decode(
+            self.handle.fault.load(Ordering::Acquire),
+            self.handle.hog_ms.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Inject a fault, or clear it with `Fault::None`.
+    /// Stall, crash and hog need a `task:` shell; wedge works on any node.
+    #[cfg(feature = "fault-inject")]
+    pub fn inject(&self, fault: Fault) -> Result<(), InjectError> {
+        if fault == Fault::None {
+            self.clear_fault();
+            return Ok(());
+        }
+        if fault != Fault::Wedge && !self.cfg.shelled {
+            return Err(InjectError::NoShell);
+        }
+        let (code, ms) = fault.encode();
+        self.handle.hog_ms.store(ms, Ordering::Relaxed);
+        self.handle.fault.store(code, Ordering::Release);
+        // Replacing a wedge releases anything it was holding back.
+        if fault != Fault::Wedge {
+            self.replay_swallowed();
+        }
+        // Wake the shell so stall or hog take effect immediately.
+        self.handle.fault_waker.wake();
+        Ok(())
+    }
+
+    /// Clear the injected fault and replay anything it withheld.
+    #[cfg(feature = "fault-inject")]
+    pub fn clear_fault(&self) {
+        self.handle.fault.swap(0, Ordering::AcqRel);
+        self.replay_swallowed();
+        // Wake any worker parked on the now-visible shutdown request.
+        // Do not re-fire `shutdown_wake`; its latch would outlive this fault.
+        self.handle.fault_waker.wake();
     }
 
     #[doc(hidden)]
@@ -1944,7 +2314,7 @@ impl TaskNode {
     }
 
     /// True when the node is running but hasn't beaten within `max_age` — the
-    /// alive-but-wedged detector (a task hogging nothing, parked on an await
+    /// alive-but-stalled detector (a task hogging nothing, parked on an await
     /// that will never complete). Not-running nodes are never stale: a stopped
     /// or completed node is *down*, which `is_running`/`has_exited` already
     /// report. Complements the `trace` stall watermark, which catches the
@@ -2199,6 +2569,9 @@ impl TaskNode {
         let stale = flag::SHUTDOWN | flag::DROPPED | flag::BUSY | flag::COMPLETED;
         #[cfg(feature = "readiness")]
         let stale = stale | flag::READY;
+        // Pending bits belong to the old instance; do not carry them forward.
+        #[cfg(feature = "fault-inject")]
+        let stale = stale | flag::PENDING_ACK | flag::PENDING_EXIT;
         self.handle.flag_clear(stale);
         #[cfg(feature = "readiness")]
         self.handle.ready_wake.reset();

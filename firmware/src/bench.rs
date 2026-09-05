@@ -5,6 +5,7 @@ const SLICE_ITERS: u32 = 50_000;
 /// Run a CPU-bound benchmark task, returning the number of slices completed
 /// before shutdown is requested.
 pub(crate) async fn bench_task(node: &'static TaskNode) -> u32 {
+    node.set_ready();
     // xorshift32: cheap, unoptimizable-away busywork (the state feeds back).
     let mut x: u32 = 0x1234_5678;
     let mut slices: u32 = 0;

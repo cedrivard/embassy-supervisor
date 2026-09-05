@@ -35,7 +35,6 @@ third-party deps are pure-embassy crates (`embassy-executor`/`-sync`/`-time`/
 - [Testing on the host](#testing-on-the-host)
 - [no_std / MSRV](#no_std--msrv)
 - [Full example](#full-example)
-- [Earlier release highlights](#earlier-release-highlights)
 - [Migration](#migration)
 - [License](#license)
 
@@ -88,7 +87,7 @@ you. It also does **not**
 catch panics: a panicking task is not captured or restarted (panic capture is off the table in a
 `forbid(unsafe_code)` no_std library — it would need unwinding or the app-global panic handler).
 Pair the supervisor with a hardware watchdog for crashes, and the `liveness` heartbeat for
-alive-but-wedged tasks.
+alive-but-stalled tasks.
 
 ## The two tiers
 
@@ -163,6 +162,7 @@ Everything else is an optional clause on those same lines:
 supervisor_graph! {
     name: IDENT;                        // optional first item: rename the GRAPH static
     executor NAME;                      // a runtime-filled spawner slot (other core / IRQ tier)
+    default executor NAME;              // ..and the tier every task:/spawn:-fn item without executor: inherits
 
     node NAME = Mode,                   // Mode: Terminate | Pause | OnDemand
         deps: [A, POOL, NET ready]      // bring-up order; `ready` also waits for set_ready()
@@ -552,6 +552,7 @@ in place), or keep the node argument and race the work yourself (one
 
 ```text
 executor NAME;                        // runtime-filled SendSpawner slot (tier / second core)
+default executor NAME;                // the slot every task:/spawn:-fn item without executor: inherits
 node NAME = Mode, deps: [A, B][, executor: EXEC], spawn: <spawn>[, disabled];
 node NAME = Mode, deps: [A, B][, executor: EXEC], task: <worker>[, pool_size: N]
     [, resources: [[#[cfg(..)]] RES: [local] [shared|consume] Type, ..]]
@@ -764,7 +765,7 @@ protocol. The kind follows from what the worker does with the value:
 | *(default)* | `&mut Type` | `restore()`d — respawn re-takes the same instance | long-lived singletons (`Output`, a reborrowable `Peri`) |
 | `consume` | `Type` **by value** (shell `take()`s) | nothing — the slot stays **empty** | resources the worker must *drop* at teardown (a driver whose `Drop` releases pins/DMA) or that go stale across a power cycle and are rebuilt each run |
 | `shared` | `Type` **by value** (shell **copies** via `get()`, `T: Copy`) | nothing — the slot **stays filled** | one handle fanned out to many consumers (`embassy_net::Stack`, a `&'static` shared-bus ref); several nodes — and whole `task:` pools — declare the SAME slot name |
-| `local` | as the kind it composes with | as the kind it composes with | `!Send` values (`RefCell`-/`NoopRawMutex`-based driver handles) on a **single core** |
+| `local` | as the kind it composes with | as the kind it composes with | `!Send` values (`RefCell`-/`NoopRawMutex`-based driver handles) that never leave the **one executor** every declaration of the slot runs on |
 | `divisible` | a `Claimant` **by value**: its own slot in the graph's `Budget<K>` | its share is **released** by the supervisor (`Pause` parks keep it) | one quantity split among N holders, where a dead holder must not strand its share |
 
 `consume` makes teardown-drop explicit and turns the wake path into "build fresh, `provide()`,
@@ -817,9 +818,16 @@ supervisor_graph! {
 `ResourceSlot` for a graph-site slot type without the `T: Send` bound, and that type
 carries an `unsafe impl Sync` — the one graph form that injects unsafe
 code, hence the explicit opt-in (same reason the `trace-hooks` symbols live at the graph
-site). Its soundness contract is: all `provide`/`take`/`restore` of a given slot happen on
-ONE core. Without the feature a `local` marker is a compile error naming it; the macro also
-rejects `local` + `executor:` (a `SendSpawner`-routed node needs a `Send` future), and a
+site). Its soundness contract is: **every touch of a slot's value happens on one
+executor.** The macro checks the half it can see — every declaration of the slot, each
+consumer's `resources:` entry and the provider's `provides:` entry, must resolve to the
+same executor, the graph's `default executor` included (any executor qualifies, a second
+core too; a mismatch is a compile error naming both declarers and their tiers). The
+provider fills and clears the slot from its own task, the consumer's shell reads and
+restores it on its executor, and the supervisor's bring-up probe is value-free, so the
+supervisor's own tier is never a party. The half the graph cannot see is yours: an
+app-side `provide()` from `main` (or anywhere outside the graph) must run on that same
+executor. Without the feature a `local` marker is a compile error naming it, and a
 consumer crate that forbids `unsafe_code` cannot use `local`.
 
 ```rust,ignore
@@ -992,12 +1000,19 @@ Declared but not started at boot; a control `Activate` starts it later (e.g. an 
 
 ### `executor NAME;` and `executor: NAME`
 
-`executor NAME;` emits a `SpawnerSlot` static; the app fills it with a `SendSpawner`
-(`InterruptExecutor::start()`, `Spawner::make_send()`), and annotated nodes spawn through it.
-`start()` awaits the slot (bounded) as part of bring-up; a slot still empty at the deadline
-fails the spawn with `FaultKind::ExecutorSlotEmpty` — loud, not silent. Constraints: `executor:` requires
-a `spawn:` fn (it cannot combine with a verbatim closure), and the routed task's future must
-be `Send`.
+`executor NAME;` declares a `SpawnerSlot` that the app fills with a `SendSpawner`.
+Nodes marked `executor: NAME` spawn through that slot. `start()` waits for the slot up
+to a bound; an empty slot fails the spawn with `FaultKind::ExecutorSlotEmpty`.
+`executor:` requires a `task:` or `spawn:` source and cannot be used with a closure.
+
+The `Send` bound applies to spawn arguments, not the future. A `task:` shell's
+arguments are always `Send`, so any `task:` worker can route. A `spawn:` fn's own
+arguments must be `Send`. Use `local` slots for tier-local values.
+
+`default executor NAME;` sets a default executor for `task:` and `spawn:` nodes and
+pools. Parked nodes and `spawn:` closures stay on the supervisor's executor. An
+explicit `executor:` wins. One per graph, not `#[cfg]`-gable. Use it to keep most of
+the graph in thread mode while the supervisor runs on an interrupt tier.
 
 ### Dependencies
 
@@ -1052,7 +1067,7 @@ member `I` takes and restores element `I` exclusively, so members never contend,
 floor comes up with only floor-many elements provided, and a lend value survives a
 shrink/regrow **on the same index** (the per-connection-worker shape). `shared`
 entries — `shared local` included — stay one fan-out slot for the whole pool; only
-take-kind `local` is rejected on pools (the single-core slot contract + per-member
+take-kind `local` is rejected on pools (the one-executor slot contract + per-member
 restore is deferred).
 A worker derives its own index from its node via
 `NAME_POOL.member_index(node) -> Option<usize>` (`None` = not a member of this pool)
@@ -1107,7 +1122,7 @@ offending token:
   across the whole graph (only `shared` entries may repeat a name, verbatim)
 - **pool `resources:` without `task:`** — the generated shell receives the values (and
   restores lend entries); a `spawn:` task fn manages its own arguments
-- **take-kind `local` on a `pool`** — the single-core slot contract + per-member restore
+- **take-kind `local` on a `pool`** — the one-executor slot contract + per-member restore
   is deferred; `shared local` is fine (one pool-wide fan-out slot)
 - **a repeated kind marker on a `resources:` entry** (`consume consume T`) — declaration bug
 - **`local` without the `local-resources` feature** — the kind emits an `unsafe impl Sync`,
@@ -1123,15 +1138,14 @@ offending token:
   A `veto` target must be a `VetoGate` with enough slots.
 - **a `shared` slot re-declared with different kinds/type** — all declarations of the same
   name must match exactly.
-- **`local` resources with `executor:`** — on a node or a pool: a local slot carries
-  `!Send` values; a `SpawnerSlot`-routed spawn needs a `Send` future
-- **`slot_timeout: 0`** — would fail every gated spawn instantly
-- **`ack_timeout: 0`** — would fault every stop before the task's first poll
-- **[`cancel`](#cancel--supervisor-unaware-workers) without `task:`** — on a node or a
-  pool: the flag rewrites how the *generated* shell calls the worker; a hand-written
-  `spawn:` fn can call `node.run_cancellable(..)` itself
-- **`cancel` with `Pause`** — the node mode or any pool member: a Pause worker must
-  survive the stop and park on `wait_resume()`, but `cancel` drops its future and
+- **a `local` slot declared on two executors** — every declaration must resolve to one
+  executor, default included; the value never leaves the tier that built it
+- **a second `default executor`, one in a fragment, or one under `#[cfg]`**
+- **`slot_timeout: 0` / `ack_timeout: 0`** — would reject every spawn or stop
+- **[`cancel`](#cancel--supervisor-unaware-workers) without `task:`** — the flag only
+  rewrites the generated shell; a hand-written `spawn:` fn can race shutdown itself
+- **`cancel` with `Pause`** — a Pause worker must survive the stop and park on
+  `wait_resume()`, but `cancel` drops its future and
   records an exit; use `Terminate`/`OnDemand`, or drive the pause by hand
 - **[`exit:`](#exit--typed-exit-values) on a worker that can never return** — the shell's
   `provide` would be dead code, so nothing could ever fill the slot and every waiter
@@ -1785,7 +1799,7 @@ The supervisor reports; the application decides. Every input is a cheap atomic l
 ```rust,ignore
 for (i, node) in GRAPH.iter_nodes() {
     let down    = !node.is_running();
-    let wedged  = node.is_stale(Duration::from_secs(1)); // `liveness`
+    let stalled = node.is_stale(Duration::from_secs(1)); // `liveness`
     let unready = !node.is_ready();                      // `readiness`
     let gen     = node.epoch();                          // `epochs`
     // GRAPH.deps_of(i) / GRAPH.dependents_of(i, &mut |d| ..) for the topology
@@ -2129,7 +2143,8 @@ HIGH.set(EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0));
 ```
 
 `SAMPLER` runs at raised priority while `LOGGER` stays on the thread executor — yet the
-dependency between them is still honored. `sampler_worker`'s future must be `Send`; if the
+dependency between them is still honored. `sampler_worker`'s future may hold whatever it
+likes (the `Send` bound is on the shell's arguments, not the future); if the
 slot is never filled, `start()` fails with `FaultKind::ExecutorSlotEmpty` after a bounded wait. A
 `task:` extra is evaluated inside the shell, i.e. on the raised-priority tier at its first
 poll — switch that node to `spawn:` when an argument must instead be snapshotted on the
@@ -2280,6 +2295,52 @@ up as its own line in the stats; register `trace::set_core_id_fn` (one line, e.g
 migration and work stealing (futures aren't `Send` across most HALs — each node lives
 where the graph puts it).
 
+### The supervisor on an interrupt tier
+
+The supervisor itself can run on an `InterruptExecutor`, with most graph nodes left in thread mode via `default executor`:
+
+```rust,ignore
+supervisor_graph! {
+    default executor THREAD;
+    executor HIGH;
+    node WATCHDOG  = Terminate, task: watchdog_worker;                  // inherits THREAD
+    node HEARTBEAT = Pause, executor: HIGH, task: heartbeat_worker;
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    THREAD.set(spawner.make_send());
+    interrupt::SWI_IRQ_1.set_priority(Priority::P1);
+    EXECUTOR_SUP.start(interrupt::SWI_IRQ_1).spawn(app_supervisor().unwrap());
+}
+
+#[embassy_executor::task]
+async fn app_supervisor() {
+    let spawner = unsafe { Spawner::for_current_executor() }.await;
+    let sup = Supervisor::new(&GRAPH);
+    loop {
+        let fault = sup.run(&spawner).await;
+        error!("supervisor: {}", fault);
+    }
+}
+```
+
+This keeps fault handling responsive even if a thread-mode task hogs its executor.
+See the [demo firmware](../firmware/README.md#executors).
+
+Five hazards when inverting:
+
+1. Shared state across tiers needs a preemption-safe lock. `local` slots enforce one
+   executor per slot, but values reached through accessors do not.
+2. `spawn:` arguments and `state:` boxes run at the supervisor's priority. `task:`
+   arguments run on the target tier.
+3. The supervisor's own work runs elevated. That is the point, and the cost.
+4. A hardware watchdog feeder on the elevated tier can mask hangs on the tier it
+   watches. Make the feed conditional on the watched tier's health.
+5. A second core cannot wake an `InterruptExecutor` directly. Embassy pends the IRQ
+   in the local NVIC only, so cross-core wakes from remote acks are lost and stall
+   the supervisor. Relay the pend through a doorbell, as the demo does.
+
 ## Composing graphs across crates
 
 `supervisor_graph!` is one closed invocation — but it does not have to be one closed
@@ -2405,6 +2466,30 @@ keep their `u32` keys either way; custom hooks narrow ids with `trace::task_key`
 `trace::executor_key`. CI's canary job builds and tests exactly that configuration, and the
 cfg goes away once the crate pins the release that ships it.
 
+## Fault injection
+
+`fault-inject` lets tests or dashboards inject faults into a node without worker
+cooperation:
+
+```rust,ignore
+HEARTBEAT.inject(Fault::Stall)?;                       // stop polling the worker
+HEARTBEAT.inject(Fault::Wedge)?;                       // hide stop, swallow ack
+HEARTBEAT.inject(Fault::Crash)?;                       // drop the future, record exit
+HEARTBEAT.inject(Fault::Hog(Duration::from_secs(3)))?; // busy-spin for 3 s
+HEARTBEAT.clear_fault();                               // replay what was withheld
+```
+
+| verb | effect | supervisor sees | recovery |
+|---|---|---|---|
+| **stall** | `task:` shell stops polling the worker | `Stale`, zero trace polls | `clear_fault` or restart |
+| **wedge** | hides stop request and swallows ack | `ShutdownTimeout`, node stays running | `clear_fault`, then the pending verb completes |
+| **crash** | drops the future, runs normal exit path | node reads as exited | restart |
+| **hog** | after 250 ms grace, busy-spins for the bound | every node on that executor stalls | the bound; longer than the watchdog feed is a reset |
+
+Stall, crash, and hog only work for `task:` shells; `spawn:` tasks return
+`InjectError::NoShell`. Wedge works everywhere. Adds one `AtomicU8`, one `AtomicU32`,
+and one `AtomicWaker` per node. The [demo firmware](../firmware/README.md#exercise-the-supervisor) exposes the verbs over HTTP.
+
 ## Cargo features
 
 | feature   | default | what it adds |
@@ -2412,10 +2497,10 @@ cfg goes away once the crate pins the release that ships it.
 | `macros`  |    ✓    | the `supervisor_graph!` graph-declaration macro |
 | `control` |         | runtime control plane (`ControlOp`, `request_control`, `apply_control`) |
 | `pool`    |         | elastic worker pools (`ElasticPool`, `run_pools`, `GRAPH.pools`) |
-| `local-resources` | | permit the `local` resource kind — ⚠ opt-in to the macro emitting a documented `unsafe impl Sync` (single-core contract) |
+| `local-resources` | | permit `local` resources: opt-in to the macro emitting `unsafe impl Sync`; the one-executor contract is checked per slot |
 | `budget` | | the `divisible` resource kind: a graph-sized `Budget<K>` of units, a `Claimant` per holder, `FairShare`/`ShrinkFastGrowSlow` policies, and a holder's share released by the supervisor when it stops — including a wedged holder that misses its ack |
 | `readiness` | | task-asserted readiness: `set_ready`/`wait_ready`/`clear_ready` + the `ready` dep marker (bring-up + pool-growth gating) |
-| `liveness` | | per-node heartbeat: `beat()` raises a flag that `ticks_since_beat() -> u32` converts using the clock read it already makes, plus `is_stale(max_age)` — alive-but-wedged detection without `trace`. A fresh spawn counts as a beat, so a node is never instantly stale. The `beat_put`/`beat_writer` verbs exist only with this on |
+| `liveness` | | per-node heartbeat: `beat()` raises a flag that `ticks_since_beat() -> u32` converts using the clock read it already makes, plus `is_stale(max_age)` — alive-but-stalled detection without `trace`. A fresh spawn counts as a beat, so a node is never instantly stale. The `beat_put`/`beat_writer` verbs exist only with this on |
 | `liveness-monitor` | | the sweep over those heartbeats: `beat_timeout:` / `beat_window:` clauses, `Supervisor::monitor`, `HealthEvent` on `wait_health()`. **Report-only** — escalation is the application's call (implies `liveness`) |
 | `epochs` | | per-node activation generation (`epoch()`, `wait_epoch_change()`), so an *already-running* dependent can notice that a provider was restarted underneath it. Pure status |
 | `coupling` | | declared dataflow: `reads:` / `writes:` naming real signal statics, and the signal-indexed queries; `Stamped<T>`, the read-side write-freshness wrapper (`age`, `read_fresh`) |
@@ -2426,8 +2511,9 @@ cfg goes away once the crate pins the release that ships it.
 | `data-deps` | `graph-ref` + `dataflow` | data-driven dependencies, both directions. Bring-up: `node.open(&SIG).await` runs the signal's own `Gated::ensure` first, `Backed<T>` (with `readiness`) starts the producer on first open and holds the reader until it is ready, and `producer_of` finds that producer through the graph by address. Teardown: `Leased<T>` + `node.lease(&SIG)` count the live holders so a producer's `drain()` waits for zero before it frees what it published. Nothing names anything; a signal that uses neither costs nothing |
 | `node-status` | | `report_status()`/`status()` — a one-line self-description per node, `sd_notify(STATUS=..)` style; shown when asked, cleared on activation, never an event |
 | `restart` | | `Supervisor::restart` — rest_for_one: cycle a node and its transitive dependents, re-gating them on the way back up (implies `control`) |
-| `bound-deps` | | the `bound` dep marker — ⚠ **the one feature that changes a documented contract**, per edge and only where you opt in: `clear_ready()` stops a `bound` dependent instead of merely deferring its next spawn, and a bring-up readiness budget spent on a `bound` edge parks the dependent (`BOUND_STOPPED`, lifted by the next `set_ready`) instead of faulting (implies `readiness` + `control`) |
+| `bound-deps` | | the `bound` dep marker: opt-in contract change where `clear_ready()` stops the dependent and a spent readiness budget parks it instead of faulting (implies `readiness` + `control`) |
 | `heap-state` | | `state: Type = expr` / `state: zeroed Type` per-activation boxed state, reclaimed on task exit — ⚠ opt-in: emits the ~6-line fallible-boxing `unsafe` helper into your crate; needs a `#[global_allocator]`; pulls `bytemuck` for `Zeroable` |
+| `fault-inject` | | `TaskNode::inject(Fault::{Stall, Wedge, Crash, Hog(..)})` / `clear_fault()` / `fault()`: faults done TO a task (the shell withholds polls, drops the future or busy-spins; the node hides a stop and swallows the ack), see [Fault injection](#fault-injection). A bench, test and demo feature |
 | `defmt`   |         | route the supervisor's logs through `defmt` — on embedded targets (`target_os = "none"`) only, where a `#[global_logger]` exists to link against; takes precedence over `log` there. On a hosted target the feature is inert and `log` is the live backend, so one feature list serves a SITL's both halves and `--all-features` host tests link with no defmt sink |
 | `log`     |         | route them through the `log` facade — the live backend on any target with an OS. `init_host_logging(LevelFilter)` (hosted targets only) installs a dependency-free stderr sink in one call, `[uptime] LEVEL target: message`; or install `env_logger` and filter with `RUST_LOG=embassy_supervisor=trace`. With **neither** backend the log macros are no-ops, so the `liveness-monitor` stale reports and every bring-up line print nothing |
 | `trace`   |         | trace-hook observability: per-node CPU time / poll counts / max-poll watermark, executor idle time, stall detection |
@@ -2499,159 +2585,6 @@ The [`firmware`](https://github.com/cedrivard/embassy-supervisor/tree/main/firmw
 repository is a complete working application on an RP2350 — networking, an HTTP control plane, an
 elastic worker pool, multi-executor tiers on both cores, trace observability, and OTA firmware
 update — all driven by this supervisor.
-
-## Earlier release highlights
-
-Condensed feature tours of past releases; the CHANGELOG is the authoritative history.
-
-### 0.4.0
-
-Ships with `embassy-supervisor-macros` 0.5.0 .
-
-The release where the graph stopped being one flat literal per binary — fragments
-compose it across crates, `name:` gives a binary several of them, and
-`start()`/`teardown()` became a repeatable cycle — on a lifecycle core that now
-**observes** what it supervises: a task's own completion is recorded, readiness is
-asserted rather than assumed, control delivery is guaranteed, and every shutdown
-outcome is a value the application can act on.
-
-- **Every outcome is a value** *(breaking)*. `stop_node`, `teardown` and
-  `apply_control` return `Result<(), ShutdownTimeout>` naming the offending node
-  (`run_pools` returns `ShutdownTimeout`), so a missed ack becomes an escalation the
-  application owns — retry, log, reset — instead of a decision made inside the
-  library; `teardown` stops the cascade at the first timeout so a still-live
-  dependent never has its dependencies pulled out from under it, and
-  `teardown_continue()` is the deliberate "hardware reset next" counterpart.
-  `request_control` is `async` and awaits mailbox capacity, with
-  `try_request_control` (`Err(ControlQueueFull)`) for ISRs and callbacks — a command
-  is now either delivered or refused, never silently lost. See
-  [Migration](#migration).
-- **Observed completion.** `mark_exited()` / `has_exited()`: a body that returns is
-  recorded as completed and its handshake acked, so a run-once task reads as
-  *finished* and a control `Activate` can respawn it. That flag is also what makes a
-  *parked* `Pause` instance distinguishable from an exited one, which is why
-  `start()` is now the universal quiescent-to-running op — reset each node, skip
-  running and detached ones, resume a parked one in place — making
-  `start()`/`teardown()` a repeatable cycle for a
-  [subordinate sub-graph](#subordinate-sub-graph-under-an-app-state-machine).
-- **Composable graphs.** `supervisor_fragment! { name: X; <items> }` lets a module or
-  a whole crate declare its slice of the graph and `compose_graph!` assembles them
-  into ONE expansion — cross-fragment deps resolve by name in either direction, every
-  compile-time pass runs over the whole composed graph, and errors are attributed to
-  the owning fragment. See [Composing graphs](#composing-graphs-across-crates).
-- **Named multi-graphs.** `name: IDENT;` as a graph's first item renames the emitted
-  static and suffixes every generated helper, so several supervisors coexist per
-  binary. The unnamed graph stays the primary (only it emits the `trace-hooks`
-  symbols) and the control mailbox is shared — run ONE driver and apply each command
-  to every supervisor. See [Multiple graphs per binary](#multiple-graphs-per-binary).
-- **`readiness` and `liveness`** *(both off by default)*. `deps: [NET ready]` holds a
-  dependent's spawn until the provider calls `set_ready()` — a real rendezvous on
-  "actually serving" (DHCP bound, registration done) rather than "spawned", bounded
-  by the dependent's `slot_timeout` and then a `SpawnError::Busy` naming the
-  not-ready dep. `beat()` + `is_stale(max_age)` catch the alive-but-wedged task an
-  ack-based check cannot see. One Signal + slice, one AtomicU32 and a beat-flag
-  byte per node (the ready flag is a bit in the packed flags word). See [Readiness rendezvous](#readiness-rendezvous-ready-dep-marker).
-- **`heap-state`** *(off by default)*. `state: Type = init_expr` or `state: zeroed
-  Type` on `task:` nodes and pool members: fallibly boxed per activation (alloc
-  failure = `SpawnError::Busy`, retryable), lent to the worker as `&mut Type`, dropped
-  on exit before restores — every activation allocates fresh, net zero across
-  respawns, while task STORAGE stays static by soundness. See [Heap and the graph](#heap-and-the-graph).
-- **Pools grew up.** Take-kind `resources:` entries become per-member slot arrays
-  (member `I` owns element `I` exclusively; a lend value survives shrink and regrow
-  on the same index), `min:`/`max:` accept const-evaluable expressions guarded by
-  const asserts, and `ElasticPool::member_index(node)` indexes per-member app state.
-- Also: [`exit: Type`](#exit--typed-exit-values) — the worker's return value lands in
-  a generated `<NODE>_EXIT` slot just before the completion is recorded;
-  `run_cancellable` / `run_cancellable_acked` as combinators; `resume_node()`, and
-  `activate`/`deactivate` now public; and `Supervisor::run(&spawner)`, which is
-  `start()` plus the pool-scaling and control loop in one call.
-
-### 0.3.3
-
-Ships with `embassy-supervisor-macros` 0.4.0 .
-
-Three `resources:` kind markers — **`consume`**, **`shared`**, **`local`** — plus
-per-node **`slot_timeout:`** and the **provider-node** pattern: hardware init is now
-fully graph-managed across every power-state transition (cold boot, dormant wake,
-deep-sleep wake), and the hand-rolled statics, `unsafe` accessors, and panic-prone
-init getters they used to require are gone.
-
-- **`consume`: drop-at-teardown / rebuild-per-cycle resources.** The worker owns the value
-  outright, so dropping it at teardown is part of the contract (a driver whose `Drop`
-  releases pins and DMA channels), and the slot stays empty afterwards — a respawn
-  fail-closes with `SpawnError::Busy` until the app `provide()`s a fresh instance, instead of
-  silently reusing a driver that went stale across a power cycle.
-- **`local`: `!Send` driver handles on a single core.** `RefCell`-/`NoopRawMutex`-based
-  handles — driver control handles, network-stack runners — can now ride `resources:`: the
-  entry's slot is a graph-site type without the `T: Send` bound (it carries a documented
-  `unsafe impl Sync` in *your* crate; single-core contract, and `local` + `executor:` is a
-  compile error). Because that injects unsafe code, `local` requires the non-default
-  `local-resources` feature (since 0.3.4).
-- **`shared`: one `Copy` handle fanned out to many consumers.** Several nodes — and whole
-  `task:` pools — declare the SAME slot name (a network-stack handle, a `&'static`
-  shared-bus ref); each spawn copies the value out non-destructively and the slot stays
-  filled. This replaces the panicking-accessor pattern (an `is-it-initialized-yet` getter
-  as a `task:` extra): a missing handle is now a gate-awaited, fail-closed
-  `SpawnError::Busy` instead of a first-poll panic.
-- **`slot_timeout:` + provider nodes.** The pre-spawn slot/gate wait is per-node tunable
-  (`slot_timeout: 5000`, `TaskNode::with_slot_timeout`), which makes an async hardware
-  builder an ordinary graph node: build, `provide()`, park; consumers rendezvous on
-  their gates — `start()` and every `respawn_terminate()` alike (the provider re-runs
-  first, in topo order). See
-  [Provider node](#provider-node--async-multi-output-construction-in-the-graph).
-- Also: per-entry `#[cfg(...)]` on `resources:` entries, and generated shells silence the
-  `unreachable_code` warning for `-> !` workers with restore-kind resources.
-
-Combined, they make a whole radio bring-up fully graph-managed — a provider node builds
-the driver objects and `provide()`s them (`RUNNER: local consume …` for the owned `!Send`
-event loop, `STACK: shared local …` for the fanned-out handle), `start()` rendezvouses,
-teardown drops them, and the next wake cycle rebuilds and re-provides. See
-[Resource kinds](#resource-kinds-local-consume-and-shared).
-
-### 0.3.2
-
-Ships with `embassy-supervisor-macros` 0.3.1 .
-
-New **`metadata-names`** feature: stamp node names into task `Metadata` independently of the
-`trace` recorders (no `_embassy_trace_*` symbols). Use it to:
-
-- **See graph node names in SystemView / a debugger** while profiling on a J-Link — enable it
-  next to embassy's `rtos-trace` and the timeline reads `NET`, `HTTP`, `OTA` instead of opaque
-  task ids, with none of the supervisor's per-poll recorder overhead.
-- **Get readable task names in a RAM dump or `defmt` task view** on a shipping build where you
-  don't want the trace layer's cost but still want to tell tasks apart in a crash log.
-
-`trace-names` is now shorthand for `trace` + `metadata-names`, so the full trace layer (with
-names) is unchanged; the name stamp is just usable on its own now.
-
-### 0.3.1
-
-Ships with `embassy-supervisor-macros` 0.3.0 .
-
-- **`task:` — generated shells.** Declare a **plain async worker fn** — possibly generic —
-  and the macro stamps its concrete `#[embassy_executor::task]` shell per declaration; a
-  `task:` pool's shell is auto-sized to the member count. No attribute boilerplate, and
-  the graph becomes the single place task plumbing lives (see
-  [`spawn:` vs `task:`](#spawn-vs-task--which-to-use) — `task:` is now the preferred form).
-- **Safe resource threading.** `resources: [NAME: Type, ..]` on a `task:` node emits a
-  `ResourceSlot<Type>` static: `main` **moves** the peripheral in with `provide()`
-  (consuming the `Peripherals` field — compile-time exclusive ownership, no `steal()`
-  inside tasks), each (re)spawn probes-then-`take()`s it (unprovided → `SpawnError::Busy`
-  out of `start()`, fail-closed), the worker receives `&mut Type`, and the shell
-  `restore()`s it on exit so a respawn re-takes the *same instance*. See
-  [`resources:`](#resources--owned-values-handed-over-at-spawn).
-- **`ResourceSlot` / `ResourceGate` API.** The slot type behind `resources:` is public and
-  usable by hand — e.g. share one slot between the generated glue and a manual
-  `take()`/`restore()` borrower elsewhere in the app; `TaskNode::with_resources` makes
-  bring-up await provisioning (bounded, then `SpawnError::Busy`).
-- **Pool structural consts.** Each `pool` also emits `NAME_MIN` / `NAME_MAX` /
-  `NAME_MEMBERS` (`usize`) for downstream const-context sizing
-  (`const SOCKET_BUDGET: usize = HTTP_MAX + 1;`) — a `const` can't read them off the
-  member `static` array.
-
-Measured on the demo firmware (RP2350, release + fat LTO): the whole feature set costs
-~1.5 KiB flash and a few dozen bytes of RAM; the generated shells add **zero**
-steady-state stack — a threaded resource travels inside the task's future.
 
 ## Migration
 

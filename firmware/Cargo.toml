@@ -23,9 +23,8 @@ license.workspace = true
 embassy-supervisor = { path = "../supervisor", features = [
     # `pool` for the HTTP worker pool; `control` arrives via `restart`.
     "pool",
-    # The pool's `NET_STACK: shared local` slot — `Stack` is `!Send`, core-0
-    # only, which is that feature's documented contract.
     "local-resources",
+    "fault-inject",
     "defmt",
     "trace-hooks",
     "trace-nested",

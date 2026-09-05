@@ -23,7 +23,9 @@ pub mod render;
 /// Rendering node lifecycle state diagrams.
 pub mod states;
 
-use embassy_supervisor_syntax::{Item, normalize_fragment_crate, substitute_dollar_crate};
+use embassy_supervisor_syntax::{
+    Item, apply_default_executor, normalize_fragment_crate, substitute_dollar_crate,
+};
 use proc_macro2::TokenStream;
 use quote::quote;
 use std::str::FromStr;
@@ -287,6 +289,9 @@ pub fn resolve(decls: Vec<Decl>) -> (Vec<Decl>, Vec<String>) {
             }
         }
         items.extend(site.spec.items.iter().cloned());
+        if let Some(ex) = &site.spec.default_executor {
+            apply_default_executor(&mut items, ex);
+        }
         let mut merged = clone_decl(site);
         merged.spec.items = items;
         merged.fragment_origins = fragment_origins;
@@ -694,6 +699,7 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                         "cfg": n.cfg,
                         "deps": n.deps.iter().map(dep_json).collect::<Vec<_>>(),
                         "executor": n.executor,
+                        "executor_defaulted": n.executor_defaulted,
                         "resources": n.resources.iter().map(res_json).collect::<Vec<_>>(),
                         "provides": n.provides.iter().map(|p| serde_json::json!({
                             "name": p.name,
@@ -730,6 +736,7 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                         "cfg": p.cfg,
                         "deps": p.deps.iter().map(dep_json).collect::<Vec<_>>(),
                         "executor": p.executor,
+                        "executor_defaulted": p.executor_defaulted,
                         "resources": p.resources.iter().map(res_json).collect::<Vec<_>>(),
                         "discover": p.discover.is_some(),
                         "discover_cfg": p.discover.clone().unwrap_or_default(),
@@ -751,6 +758,7 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                     ItemModel::Executor(x) => serde_json::json!({
                         "kind": "executor",
                         "name": x.name,
+                        "default": x.default,
                     }),
                 })
                 .collect();
@@ -2325,6 +2333,97 @@ mod tests {
             "default-executor nodes share the thread-mode box: {out}"
         );
         assert!(!out[high..end].contains("n_WATCHDOG"), "{out}");
+    }
+
+    #[test]
+    fn default_executor_nodes_box_under_its_slot() {
+        let src = r#"
+            embassy_supervisor::supervisor_graph! {
+                default executor THREAD;
+                executor HIGH;
+                node A = Terminate, task: a;
+                node B = Terminate, deps: [A], executor: HIGH, task: b;
+                node PARKED = Pause, deps: [];
+            }
+        "#;
+        let g = parse_source(src, "t.rs").unwrap().remove(0);
+        let out = render(
+            &g,
+            &Options {
+                executors: true,
+                ..Default::default()
+            },
+        );
+        let thread = out.find("[\"@THREAD\"]").expect("the @THREAD box: {out}");
+        let end = out[thread..].find("\n  end").unwrap() + thread;
+        assert!(
+            out[thread..end].contains("n_A"),
+            "A inherited the default: {out}"
+        );
+        assert!(!out[thread..end].contains("n_B"), "B keeps HIGH: {out}");
+        assert!(
+            !out[thread..end].contains("n_PARKED"),
+            "a parked node stays with the supervisor: {out}"
+        );
+        assert!(out.contains("[\"thread mode\"]"), "{out}");
+    }
+
+    #[test]
+    fn a_spliced_fragments_nodes_inherit_the_compose_sites_default_executor() {
+        let site = r#"
+            embassy_supervisor::compose_graph! {
+                fragments: [NET_FRAG],
+                graph: {
+                    default executor THREAD;
+                    executor HIGH;
+                    node APP = Terminate, deps: [NET ready], task: crate::app::run,
+                        reads: [crate::net::STACK];
+                    node HB = Pause, deps: [], executor: HIGH, task: crate::hb;
+                }
+            }
+        "#;
+        let mut decls = parse_source(FRAGMENT, "net.rs").unwrap();
+        decls.extend(parse_source(site, "main.rs").unwrap());
+        let (out, warnings) = resolve(decls);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let net = out[0]
+            .spec
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Node(n) if n.ident == "NET" => Some(n),
+                _ => None,
+            })
+            .expect("NET spliced in");
+        assert_eq!(
+            net.executor.as_ref().map(|e| e.to_string()).as_deref(),
+            Some("THREAD")
+        );
+        assert!(net.executor_defaulted);
+        let drawn = render(
+            &out[0],
+            &Options {
+                executors: true,
+                ..Default::default()
+            },
+        );
+        let thread = drawn
+            .find("[\"@THREAD\"]")
+            .expect("the @THREAD box: {drawn}");
+        let end = drawn[thread..].find("\n  end").unwrap() + thread;
+        assert!(
+            drawn[thread..end].contains("n_NET"),
+            "NET rides the default: {drawn}"
+        );
+        assert!(drawn[thread..end].contains("n_APP"), "{drawn}");
+        assert!(
+            !drawn[thread..end].contains("n_HB"),
+            "HB keeps HIGH: {drawn}"
+        );
+        assert!(
+            !drawn.contains("[\"thread mode\"]"),
+            "nothing left unrouted: {drawn}"
+        );
     }
 
     #[test]

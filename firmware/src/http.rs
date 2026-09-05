@@ -3,7 +3,7 @@ use core::fmt::Write as _;
 use alloc::string::String;
 use embassy_futures::select::{Either, select};
 use embassy_net::tcp::TcpSocket;
-use embassy_supervisor::{Aborted, ControlOp, TaskNode};
+use embassy_supervisor::{Aborted, ControlOp, Fault, InjectError, TaskNode};
 use embassy_time::Duration;
 use embedded_io_async::Write as _;
 
@@ -16,6 +16,12 @@ const KEEPALIVE_IDLE_SECS: u64 = 10;
 pub const HTTP_FLOOR: usize = 1;
 /// Maximum number of concurrent HTTP worker slots in the pool.
 pub const HTTP_CEIL: usize = 2;
+
+/// A `hog` fault's default bound.
+const HOG_DEFAULT_MS: u64 = 3000;
+/// A `hog` fault's ceiling. The thread executor also runs the watchdog feeder,
+/// so a hog must not outlast the 8 s bootloader watchdog feed.
+const HOG_MAX_MS: u64 = 6000;
 
 /// Counters tracked for each HTTP worker task.
 pub struct WorkerStats {
@@ -39,9 +45,9 @@ embassy_supervisor::supervisor_fragment! {
 const INDEX_HTML: &str = "<!doctype html><meta charset=utf-8><title>task supervisor</title>\
 <style>body{font-family:monospace;background:#111;color:#0f0;padding:1em}\
 table{border-collapse:collapse}td,th{border:1px solid #333;padding:4px 8px;text-align:left}\
-button,input{font-family:inherit;background:#1a1a1a;color:#0f0;border:1px solid #0a0}\
-button{cursor:pointer}</style>\
-<h1>task supervisor</h1><div id=heap></div><table id=t></table>\
+button,input,select{font-family:inherit;background:#1a1a1a;color:#0f0;border:1px solid #0a0}\
+option{background:#1a1a1a;color:#0f0}button,select{cursor:pointer}</style>\
+<h1>task supervisor</h1><div id=heap></div><div id=lf></div><table id=t></table>\
 <h3>heartbeat</h3>\
 <input id=hbms type=number value=500 style=width:5em> ms \
 <button onclick=\"hb(hbms.value)\">blink</button> \
@@ -51,6 +57,13 @@ button{cursor:pointer}</style>\
 async function ctl(n,o){await fetch('/api/control?node='+n+'&op='+o,{method:'POST'});\
 load();setTimeout(load,400);}\
 async function hb(ms){await fetch('/api/heartbeat?ms='+ms,{method:'POST'});}\
+async function flt(n,k){if(!k)return;await fetch('/api/fault?node='+n+'&kind='+k,{method:'POST'});\
+load();setTimeout(load,400);}\
+/* the same verbs as the playground's menu, plus a bounded hog */\
+const fmenu=n=>'<select onchange=\"flt(\\''+n+'\\',this.value);this.value=\\'\\';this.blur()\">'+\
+'<option value=\"\">⚡</option><option value=stall>stall (stop polling)</option>'+\
+'<option value=wedge>wedge (no shutdown ack)</option><option value=crash>crash (abrupt exit)</option>'+\
+'<option value=hog>hog 3 s</option><option value=clear>clear fault</option></select>';\
 /* trace counters are raw wrapping u32 ticks: keep the previous sample and diff \
 (>>>0 = wrap-safe) to turn them into rates; max_poll converts via tick_hz. */\
 let prev=null;const sub=(a,b)=>(a-b)>>>0;\
@@ -65,6 +78,7 @@ hd+=' | executor '+(e.id>>>0).toString(16)+': '+busy.toFixed(1)+'% busy ('+\
 poll.toFixed(1)+'% in-poll, '+Math.max(0,busy-poll).toFixed(1)+'% overhead, '+\
 Math.round(sub(e.polls,p.p)/(dt/d.tick_hz))+' polls/s)';}}\
 document.getElementById('heap').textContent=hd;\
+document.getElementById('lf').textContent=d.last_fault?'last supervisor fault: '+d.last_fault:'';\
 const cpu=(n,tk)=>(!prev||prev.m[n]==null)?'-':\
 (100*sub(tk,prev.m[n])/sub(d.now_ticks,prev.now)).toFixed(1)+'%';\
 const us=t=>Math.round(t*1e6/d.tick_hz)+'us';\
@@ -78,16 +92,20 @@ pool.e=(pool.e+t.exec_ticks)>>>0;pool.mp=Math.max(pool.mp,t.max_poll_ticks);cont
 let st=t.detached?'detached':t.disabled?'disabled':t.collateral?'held':\
 t.bound_stopped?'link-stopped':\
 t.running?(t.ready===false?'up (not ready)':t.busy?'busy':'running'):'stopped';\
+if(t.fault)st+=' ⚡'+t.fault;\
 let pause=t.mode=='pause';let act=t.disabled||!t.running;\
 let op=act?(pause?'resume':'start'):(pause?'pause':'stop');\
 h+='<tr><td>'+t.name+'<td>'+t.mode+'<td>'+st+'<td>'+t.epoch+'<td>'+cpu(t.name,t.exec_ticks)+\
 '<td>'+us(t.max_poll_ticks)+'<td>'+t.deps.join(',')+\
 '<td>'+(t.detached?'':'<button onclick=\"ctl(\\''+t.name+'\\',\\''+op+'\\')\">'+op+'</button>'+\
-'<button onclick=\"ctl(\\''+t.name+'\\',\\'restart\\')\">restart</button>');}\
+'<button onclick=\"ctl(\\''+t.name+'\\',\\'restart\\')\">restart</button>'+fmenu(t.name));}\
 if(pool){let op=pool.dis?'start':'stop';\
 h+='<tr><td>http (pool)<td>elastic<td>'+pool.r+'/'+pool.n+' up, '+pool.b+' busy<td>-<td>'+\
 cpu('_pool',pool.e)+'<td>'+us(pool.mp)+'<td>'+pool.deps.join(',')+\
-'<td><button onclick=\"ctl(\\'http0\\',\\''+op+'\\')\">'+op+'</button>';}\
+'<td><button onclick=\"ctl(\\'http0\\',\\''+op+'\\')\">'+op+'</button>'+fmenu('http0');}\
+/* an open menu lives in this table: rewriting it would close the menu, so \
+hold the redraw while one has focus (the choice blurs it and redraws) */\
+const ae=document.activeElement;if(ae&&ae.tagName=='SELECT'&&ae.closest('#t'))return;\
 document.getElementById('t').innerHTML=h;\
 let m={};for(let t of d.tasks)m[t.name]=t.exec_ticks;if(pool)m['_pool']=pool.e;\
 let x={};for(let e of d.executors||[])x[e.id]={i:e.idle_ticks,e:e.exec_ticks,p:e.polls};\
@@ -193,6 +211,10 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &'st
                 let body = handle_heartbeat(p, node);
                 send(socket, "application/json", &body, keep).await;
             }
+            ("POST", p) if p.starts_with("/api/fault") => {
+                let body = handle_fault(p);
+                send(socket, "application/json", &body, keep).await;
+            }
             ("POST", p) if p.starts_with("/api/ota") => {
                 match crate::ota::set_target(query(p, "ip="), query(p, "port="), query(p, "path="))
                 {
@@ -282,12 +304,19 @@ fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
 fn build_tasks_json(json: &mut String) {
     let _ = write!(
         json,
-        "{{\"heap_free\":{},\"heap_total\":{},\"tick_hz\":{},\"now_ticks\":{},\"executors\":[",
+        "{{\"heap_free\":{},\"heap_total\":{},\"tick_hz\":{},\"now_ticks\":{},",
         crate::heap::free_bytes(),
         crate::heap::HEAP_SIZE,
         embassy_time::TICK_HZ,
         embassy_time::Instant::now().as_ticks() as u32,
     );
+    match crate::LAST_FAULT.lock(|c| c.get()) {
+        Some((node, kind)) => {
+            let _ = write!(json, "\"last_fault\":\"{node}: {kind}\",");
+        }
+        None => json.push_str("\"last_fault\":null,"),
+    }
+    json.push_str("\"executors\":[");
     let mut first = true;
     for id in embassy_supervisor::trace::executors() {
         if id == 0 {
@@ -348,6 +377,12 @@ fn write_task(json: &mut String, node: &'static TaskNode, deps: &'static [u8]) {
         node.poll_count(),
         node.max_poll_ticks()
     );
+    match node.fault() {
+        Fault::None => json.push_str("\"fault\":null,"),
+        f => {
+            let _ = write!(json, "\"fault\":\"{}\",", f.as_str());
+        }
+    }
     match node.status() {
         Some(s) => {
             let _ = write!(json, "\"status\":\"{s}\",\"deps\":[");
@@ -400,6 +435,53 @@ fn handle_control(path: &str) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+/// `POST /api/fault?node=NAME&kind=KIND[&ms=N]`. Inject a fault or clear it.
+/// `hog` takes an optional bound in ms, capped at `HOG_MAX_MS`.
+fn handle_fault(path: &str) -> String {
+    let node_name = query(path, "node=");
+    let kind = query(path, "kind=");
+    let node = crate::GRAPH
+        .nodes
+        .iter()
+        .copied()
+        .flatten()
+        .find(|n| n.name() == node_name);
+    let fault = match kind {
+        "stall" => Some(Fault::Stall),
+        "wedge" => Some(Fault::Wedge),
+        "crash" => Some(Fault::Crash),
+        "hog" => {
+            let ms = query(path, "ms=")
+                .parse::<u64>()
+                .unwrap_or(HOG_DEFAULT_MS)
+                .min(HOG_MAX_MS);
+            Some(Fault::Hog(Duration::from_millis(ms)))
+        }
+        "clear" => Some(Fault::None),
+        _ => None,
+    };
+    let mut out = String::with_capacity(96);
+    match (node, fault) {
+        (Some(node), Some(fault)) => match node.inject(fault) {
+            Ok(()) => {
+                let _ = write!(
+                    out,
+                    "{{\"accepted\":true,\"node\":\"{}\",\"kind\":\"{}\"}}",
+                    node.name(),
+                    kind
+                );
+            }
+            Err(InjectError::NoShell) => {
+                out.push_str("{\"accepted\":false,\"error\":\"no shell\"}");
+            }
+            #[allow(unreachable_patterns)]
+            Err(_) => out.push_str("{\"accepted\":false,\"error\":\"refused\"}"),
+        },
+        _ => out.push_str("{\"accepted\":false,\"error\":\"unknown node or kind\"}"),
+    }
+    out
 }
 
 fn handle_heartbeat(path: &str, node: &'static TaskNode) -> String {

@@ -18,9 +18,9 @@ a dependency cycle is a compile error wherever its two ends are declared.
 
 <!-- supervisor-mermaid:start -->
 ```mermaid
-%% runtime coupling — compose_graph!  (/home/cedric/DEV/embassy-supervisor-cc/firmware/src/main.rs:19)
+%% runtime coupling — compose_graph!  (/home/cedric/DEV/embassy-supervisor/firmware/src/main.rs:19)
 flowchart TD
-  accDescr: supervisor task graph declared at /home/cedric/DEV/embassy-supervisor-cc/firmware/src/main.rs:19
+  accDescr: supervisor task graph declared at firmware/src/main.rs:19
   subgraph f_NET_FRAG["NET_FRAG"]
     direction TD
     n_NET["NET<br/>Terminate · task"]
@@ -41,9 +41,9 @@ flowchart TD
   n_HTTP -. "spawn" .-> n_OTA_CONFIRM
   n_NET -. "spawn · ready" .-> n_OTA_CONFIRM
 
-  s_crate__net__STACK[/"crate::net::STACK"/]
+  s_crate__net__STACK[/"STACK"/]
   n_NET -- "discovered" --> s_crate__net__STACK
-  s_heartbeat__PERIOD_MS[/"heartbeat::PERIOD_MS"/]
+  s_heartbeat__PERIOD_MS[/"PERIOD_MS"/]
   n_HTTP -- "discovered" --> s_heartbeat__PERIOD_MS
   s_crate__net__STACK -- "discovered" --> n_OTA
   s_crate__net__STACK -- "gated" --> n_OTA_CONFIRM
@@ -79,22 +79,35 @@ an HTTP/1.1 keep-alive server, and the pool grows under concurrent load.
 
 ### Executors
 
-Three executors, all driven by the one core-0 supervisor. A node's placement
-is a one-line `executor:` field in the graph:
+Four executors. The supervisor runs on its own interrupt tier, above everything
+it polices; the graph's `default executor THREAD;` line puts every node that
+says nothing else in thread mode, and a node's placement is otherwise one
+`executor:` field:
 
 | Graph slot | Executor | Runs | Nodes |
 |---|---|---|---|
-| *(default)* | core-0 thread executor (`#[embassy_executor::main]`) | thread mode, core 0 | `watchdog`, `net`, `http0..1`, `ota`, `ota-confirm`, the supervisor task |
+| *(the supervisor's own)* | `InterruptExecutor` on `SWI_IRQ_1` at priority P1 | preempts both tiers below; below the hardware handlers at P0 | the supervisor task only (the `trace-self` "supervisor" row) |
 | `HIGH` | `InterruptExecutor` on `SWI_IRQ_0` at priority P2 | preempts the thread executor | `heartbeat` |
+| `THREAD` *(the graph default)* | core-0 thread executor (`#[embassy_executor::main]`, published with `spawner.make_send()`) | thread mode, core 0 | `watchdog`, `net`, `http0..1`, `ota`, `ota-confirm` |
 | `CORE1` | thread executor on core 1 (`spawn_core1`; publishes a `SendSpawner` into the slot) | core 1 | `bench` |
 
+The supervisor runs on its own interrupt tier at priority P1, so it keeps
+reporting even when the thread executor is hogged. The watchdog stays in thread
+mode because an unconditional feed would mask the hang it is meant to catch.
+The `NET_STACK: shared local` slot is legal on `THREAD` because both `net` and
+`http` declare it on the default executor. `OTA` and `ota-confirm` share the
+same stack through internal accessors, so they also stay on `THREAD`.
+Because the supervisor is on an interrupt tier, a stop ack for `bench` on core
+1 would be pended in core 1's NVIC and lost. `main.rs` relays it: the SWI
+handlers ring core 0's doorbell when they run on core 1, and core 0's
+`SIO_IRQ_BELL` handler re-pends the tier's IRQ.
 ### Nodes
 
 | Node | Mode | Deps | Executor | Boot state | What it demonstrates |
 |---|---|---|---|---|---|
 | `watchdog` | Terminate | none | thread | started | Detached daemon: feeds the bootloader's 8 s rollback watchdog every 2 s; detached, so no cascade or respawn ever stops it. Warns on trace stalls (any poll over 100 ms) and logs liveness events. |
 | `net` | Terminate | none | thread | started | Reclaimable subsystem: heap-allocates every USB and network buffer on start (~16 KB total), frees them on stop. Root of the data plane: stopping it tears `http` and `ota` down first, then returns the heap. USB peripheral threaded from `main` via `resources:`; restored on stop, re-taken on restart, no `steal()`. |
-| `heartbeat` | Pause | none | `HIGH` | started | Pause/Resume with a retained resource: the task parks, keeps its LED pin, resumes the same future. Generic worker over embedded-hal's `StatefulOutputPin`; the graph's `task:` clause stamps the concrete `#[task]` shell. Beats on each blink edge (`beat_timeout: 15000`); steady states beat every 5 s. Live stall observer: on the `HIGH` tier it still runs while the thread executor is wedged, so it names the culprit during the wedge. Runtime blink parameter (`POST /api/heartbeat?ms=`), consumed through a fully private cell whose coupling is derived by `discover`. |
+| `heartbeat` | Pause | none | `HIGH` | started | Pause/Resume demo: parks and keeps its LED pin. Blinks the LED (beat every 15 s), survives thread-tier stalls because it is on `HIGH`, and exposes `POST /api/heartbeat?ms=` to change the blink period. |
 | `http0` | Terminate | `net ready` | thread | started | Pool floor: always on while `net` is up. Stopping the floor seeds a whole-pool stop. |
 | `http1` | OnDemand | `net ready` | thread | stopped | Elastic burst worker: the pool (`min: 1, max: 2`, `DeferredShrink` with a 4 s cooldown) grows it when every running worker is busy, shrinks it after the cooldown. Each worker owns one socket and heap I/O buffers, so scaling stays inside the fixed `StackResources` socket budget. |
 | `ota` | Terminate | `net ready` | thread | **disabled** | Control-started update path: detaches itself (uninterruptible), drains the pool and `net`, decodes a zstd image into DFU, arms the swap, resets. FLASH threaded from `main` via `resources:`; `mark_booted` (the `ota-confirm` path) borrows the same slot manually with `take()`/`restore()`, so the two FLASH users exclude each other at runtime. Reports its phase via `report_status`. |
@@ -113,7 +126,9 @@ is a one-line `executor:` field in the graph:
 | Generated task shells (`task:`) | every node and the pool declared with `task:`; the only hand-written `#[task]` is the supervisor task itself |
 | Safe resource threading (`resources:`) | every peripheral moved from `main`; zero `steal()` in the firmware |
 | Control-started nodes | `ota` and `bench` are disabled at boot, started by control |
-| Multi-executor tier | `heartbeat` on the `HIGH` `InterruptExecutor` (SWI_IRQ_0 @ P2) |
+| Multi-executor tier | `heartbeat` on the `HIGH` `InterruptExecutor` (SWI_IRQ_0 @ P2); the supervisor itself on `SWI_IRQ_1` @ P1 |
+| `default executor` | `THREAD`: the thread executor published from `main`, inherited by every node and fragment that names no tier |
+| Fault injection (`fault-inject`) | `POST /api/fault`, the dashboard's ⚡ menu: stall, wedge, crash or hog any `task:` node |
 | Multi-core placement | `bench` on `CORE1` via the graph's spawner slot |
 | Socket budgeting | the pool scales within the fixed `StackResources` budget |
 | Heap budgeting | `ota` drains `http` and `net` to free the arena for the decode |
@@ -238,6 +253,7 @@ embassy-supervisor = { path = "../supervisor", features = [
     "readiness", "liveness", "liveness-monitor",
     "epochs", "dataflow", "data-deps", "node-status",
     "restart", "bound-deps", "heap-state",
+    "fault-inject",                                    # the dashboard's ⚡ menu
 ] }
 ```
 
@@ -322,6 +338,28 @@ xdg-open http://10.42.0.61/             # task view + stop/start/pause/resume/re
   curl -XPOST 'http://10.42.0.61/api/control?node=heartbeat&op=pause'
   curl -XPOST 'http://10.42.0.61/api/control?node=heartbeat&op=resume'
   ```
+- **Fault injection:** the dashboard's ⚡ menu, or `POST /api/fault?node=NAME&kind=stall|wedge|crash|hog|clear`. The worker does not know it exists.
+  - **stall:** stop polling the node. The LED freezes and a stale report fires. `clear` resumes polling.
+  - **wedge:** hide the next pause ack so the 2 s window expires. `clear` lets the ack through.
+  - **crash:** drop the worker future cleanly. Restart the node to bring it back.
+  - **hog:** spin a task for the requested milliseconds. Hogging `heartbeat` starves the `HIGH` tier and everything below it; hogging `http0` starves the thread tier.
+
+    ```sh
+    curl -XPOST 'http://10.42.0.61/api/fault?node=heartbeat&kind=stall'
+    curl -XPOST 'http://10.42.0.61/api/fault?node=heartbeat&kind=clear'
+
+    curl -XPOST 'http://10.42.0.61/api/fault?node=heartbeat&kind=wedge'
+    curl -XPOST 'http://10.42.0.61/api/control?node=heartbeat&op=pause'
+    curl -XPOST 'http://10.42.0.61/api/fault?node=heartbeat&kind=clear'
+    curl -XPOST 'http://10.42.0.61/api/control?node=heartbeat&op=resume'
+
+    curl -XPOST 'http://10.42.0.61/api/control?node=bench&op=start'
+    curl -XPOST 'http://10.42.0.61/api/fault?node=bench&kind=crash'
+    curl -XPOST 'http://10.42.0.61/api/control?node=bench&op=restart'
+
+    curl -XPOST 'http://10.42.0.61/api/fault?node=heartbeat&kind=hog'
+    curl -XPOST 'http://10.42.0.61/api/fault?node=http0&kind=hog&ms=2000'
+    ```
 
 ## Reading `/api/tasks`
 
@@ -387,11 +425,11 @@ bound_stopped, epoch, exec_ticks, polls, max_poll_ticks, status, deps`.
   seen, the "never yields" watermark. Healthy is hundreds of us; many-ms
   values mean the task ran without an `.await` and starved its executor for
   that long. It is the after-the-fact twin of `stalled_task()`, which this
-  firmware also uses live: `heartbeat` (on the `HIGH` tier, naming a wedging
-  task while it wedges) and `watchdog` (watermark warnings each feed cycle).
+  firmware also uses live: `heartbeat` (on the `HIGH` tier, naming a hogging
+  task while it hogs) and `watchdog` (watermark warnings each feed cycle).
 - Concerning: `max_poll_ticks` well past 1 ms; one task's CPU% approaching
   its executor's whole busy%; `running=true` with `polls` frozen across
-  samples (a wedged task, which a node with `beat_timeout:` gets reported
+  samples (a stalled task, which a node with `beat_timeout:` gets reported
   for you).
 
 ### Note on RP2350
@@ -471,10 +509,8 @@ ota-confirm    0.00%          0          0.0         29.0
 watchdog       0.00%          5         43.8         56.0
 ```
 
-The executor ids are addresses; that is how you tell the three apart:
-`2007ffe8` is core 0's thread executor (net, http, watchdog), `200093e0` the
-`HIGH` interrupt tier (heartbeat), `200003e0` core 1's executor (bench,
-disabled here, hence 0 polls).
+Executor ids are addresses. Use the running nodes and the stall warning's
+tier name to map each id to one of the four executors.
 
 Good looks like: `non-200 0`, `malformed/truncated 0`, `counter regressions
 0`; `body max` comfortably below the worker's 2560-byte TX buffer minus

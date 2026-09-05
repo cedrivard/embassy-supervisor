@@ -1,0 +1,5 @@
+error: `S` is `local`: every declaration must run on one executor (its value is only ever touched from that executor), but `FANS` runs on `HIGH` and `USER` on the supervisor's executor
+  --> tests/ui/compile_fail_local/local_pool_tier_mismatch.rs:19:31
+   |
+19 |         resources: [S: shared local LocalHandle];
+   |                               ^^^^^

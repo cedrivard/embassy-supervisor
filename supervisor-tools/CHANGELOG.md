@@ -3,6 +3,16 @@
 All notable changes to `embassy-supervisor-tools` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] - 2026-09-04
+
+Pins `embassy-supervisor-syntax` 0.4.0.
+
+### Added
+
+- `default executor`: added `default` and `executor_defaulted` flags to the JSON model.
+  `--executors` now nests inheriting nodes under their slot and omits `@NAME` from their
+  labels, since the inherited tier is shown once at the top of the graph.
+
 ## [0.4.1] - 2026-09-03
 
 Pins `embassy-supervisor-syntax = "=0.3.1"`.
@@ -48,6 +58,8 @@ Pins `embassy-supervisor-syntax = "=0.3.0"`.
 
 Baseline for this changelog.
 
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.5.0...HEAD
+[0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.4.1...embassy-supervisor-tools-v0.5.0
 [0.4.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.4.0...embassy-supervisor-tools-v0.4.1
 [0.4.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.3.0...embassy-supervisor-tools-v0.4.0
 [0.3.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.2.0...embassy-supervisor-tools-v0.3.0

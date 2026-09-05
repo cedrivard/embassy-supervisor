@@ -4,6 +4,39 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-09-04
+
+Adds a graph-level default executor, fault injection, and a stricter `local`
+resource invariant. Companion crate versions: macros 0.10.0, syntax 0.4.0,
+tools 0.5.0.
+
+### Added
+
+- `default executor NAME;` sets a default executor for all `task:` and `spawn:`
+  nodes and pools. An explicit `executor:` override still wins. One per graph,
+  not `#[cfg]`-gable. See the README for usage on interrupt tiers.
+- `fault-inject` feature adds `TaskNode::inject(Fault)`, `clear_fault()`, and
+  `fault()` with `Fault::{Stall, Wedge, Crash, Hog(Duration)}`. The `task:` shell
+  intercepts polls for stall, crash, and hog faults. Wedge hides shutdown
+  requests and swallows acks until cleared or replaced. Hand-written `spawn:`
+  tasks only support wedge. Adds one `AtomicU8`, one `AtomicU32`, and one
+  `AtomicWaker` per node. Off by default.
+
+### Changed
+
+- `local` resources are now local to the node's executor, not the supervisor.
+  The `local` + `executor:` rejection is removed; instead, the macro checks that
+  every `local` slot resolves to one executor. Bring-up now peeks the slot
+  without moving the value.
+- `wait_shutdown()` re-checks the request after a wake when `fault-inject` is
+  enabled. Unchanged otherwise.
+
+### Fixed
+
+- Fixed docs: the `Send` bound applies to spawn arguments, not the routed future
+  itself. `SpawnerSlot`'s rustdoc now explains this with a `compile_fail`
+  doctest.
+
 ## [0.9.0] - 2026-09-03
 
 One waker per budget slot, and the crates point at the documentation site.
@@ -1125,7 +1158,8 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.9.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.10.0...HEAD
+[0.10.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.9.0...embassy-supervisor-v0.10.0
 [0.9.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.8.1...embassy-supervisor-v0.9.0
 [0.8.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.8.0...embassy-supervisor-v0.8.1
 [0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.7.0...embassy-supervisor-v0.8.0

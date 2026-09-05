@@ -947,7 +947,10 @@ fn node_label(n: &NodeItem, show_cfg: bool) -> String {
     if let Some(size) = &n.pool_size {
         facts.push(format!("×{size}"));
     }
-    if let Some(e) = &n.executor {
+    // Only show explicit executors; inherited tiers use the banner.
+    if let Some(e) = &n.executor
+        && !n.executor_defaulted
+    {
         facts.push(format!("@{e}"));
     }
     if let Some(bt) = &n.beat_timeout {
@@ -977,7 +980,9 @@ fn pool_label(p: &PoolItem, show_cfg: bool) -> String {
         body_kind(Some(&p.source)),
     ];
     facts.push(format!("{}..{}", tail(&p.min), tail(&p.max)));
-    if let Some(e) = &p.executor {
+    if let Some(e) = &p.executor
+        && !p.executor_defaulted
+    {
         facts.push(format!("@{e}"));
     }
     if p.cancel {

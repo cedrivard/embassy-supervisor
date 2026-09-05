@@ -1,0 +1,5 @@
+error: a `default executor` cannot be `#[cfg]`-gated — every inheriting node would reference its slot unconditionally; gate the nodes instead
+ --> tests/ui/compile_fail/default_executor_cfg.rs:7:5
+  |
+7 |     #[cfg(feature = "tiers")]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
