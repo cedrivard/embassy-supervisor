@@ -81,7 +81,9 @@ async fn driver(spawner: Spawner) {
         "DEP is bound-stopped (a bound provider withdrew)"
     );
 
-    sup.activate(&PARK, &spawner).await;
+    sup.activate(&PARK, &spawner)
+        .await
+        .expect("resume bound provider PARK");
     settle().await;
     sup.apply_bind(&spawner).await.expect("bind cascade");
     settle().await;

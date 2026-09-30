@@ -145,7 +145,9 @@ async fn driver(spawner: Spawner) {
         !UPLOAD.is_running() && !WIFI.is_running(),
         "the sub-graph supervisor cannot see the app graph's nodes"
     );
-    app.activate(&UPLOAD, &spawner).await;
+    app.activate(&UPLOAD, &spawner)
+        .await
+        .expect("activate app upload dependencies");
     settle(|| UPLOAD_SPAWNS.load(Ordering::SeqCst) == 1).await;
     assert!(
         WIFI.is_running() && UPLOAD.is_running(),

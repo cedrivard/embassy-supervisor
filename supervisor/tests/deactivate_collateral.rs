@@ -76,7 +76,9 @@ async fn driver(spawner: Spawner) {
     // Activate LINK: MID revives, the members become grow candidates again
     // (released, not started — demand regrows OnDemand), and DIAMOND stays
     // held because ROOT is still disabled.
-    sup.activate(&LINK, &spawner).await;
+    sup.activate(&LINK, &spawner)
+        .await
+        .expect("activate LINK and release collateral");
     settle(|| LINK.is_running() && MID.is_running()).await;
     assert!(MID.is_running() && !MID.is_collateral());
     assert!(!CREW[0].is_collateral() && !CREW[1].is_collateral());
@@ -91,20 +93,26 @@ async fn driver(spawner: Spawner) {
     );
 
     // Activate ROOT: the last disabled ancestor is gone, DIAMOND revives.
-    sup.activate(&ROOT, &spawner).await;
+    sup.activate(&ROOT, &spawner)
+        .await
+        .expect("activate ROOT and revive diamond");
     settle(|| DIAMOND.is_running()).await;
     assert!(DIAMOND.is_running() && !DIAMOND.is_collateral());
 
     // A node deactivated in its own right survives its ancestor's cycle.
     sup.deactivate(&MID).await.expect("deactivate MID");
     sup.deactivate(&LINK).await.expect("deactivate LINK again");
-    sup.activate(&LINK, &spawner).await;
+    sup.activate(&LINK, &spawner)
+        .await
+        .expect("reactivate LINK without MID");
     settle(|| LINK.is_running()).await;
     assert!(
         MID.is_disabled() && !MID.is_running(),
         "a direct deactivation is not undone by the ancestor's activate"
     );
-    sup.activate(&MID, &spawner).await;
+    sup.activate(&MID, &spawner)
+        .await
+        .expect("activate directly disabled MID");
     settle(|| MID.is_running()).await;
     assert!(MID.is_running());
 
@@ -113,7 +121,9 @@ async fn driver(spawner: Spawner) {
     sup.deactivate(&CREW[0]).await.expect("deactivate member");
     assert!(CREW[0].is_disabled() && CREW[1].is_disabled());
     assert!(matches!(CREW_POOL.evaluate(now), PoolAction::None));
-    sup.activate(&CREW[0], &spawner).await;
+    sup.activate(&CREW[0], &spawner)
+        .await
+        .expect("activate CREW pool demand");
     assert!(!CREW[0].is_disabled() && !CREW[1].is_disabled());
     assert!(matches!(CREW_POOL.evaluate(now), PoolAction::Start(_)));
 

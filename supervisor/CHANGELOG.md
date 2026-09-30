@@ -4,6 +4,24 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-09-30
+
+Returns activation faults to callers and the control driver. Companion crate
+versions remain macros 0.10.0, syntax 0.4.0, and tools 0.5.0.
+
+### Changed
+
+- **Breaking:** `Supervisor::activate()` now returns `Result<(), NodeFault>`.
+  Migrate direct calls to `.await?` or explicit result handling. The existing
+  best-effort wave still completes and returns the first startup fault, without
+  rolling back successful starts or adding retries. Already-running nodes are
+  skipped; `OnDemand` members remain deferred to demand. Pool scaling is requested
+  even when activation returns an error.
+- `apply_control(ControlOp::Activate)` now returns activation faults, allowing
+  `run()` to report them. Mailbox acceptance confirms only that a request was
+  queued. Restart behavior is unchanged: shutdown timeouts propagate, while
+  startup faults are logged and ignored.
+
 ## [0.10.0] - 2026-09-04
 
 Adds a graph-level default executor, fault injection, and a stricter `local`
@@ -1158,7 +1176,8 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.10.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.11.0...HEAD
+[0.11.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.10.0...embassy-supervisor-v0.11.0
 [0.10.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.9.0...embassy-supervisor-v0.10.0
 [0.9.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.8.1...embassy-supervisor-v0.9.0
 [0.8.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.8.0...embassy-supervisor-v0.8.1

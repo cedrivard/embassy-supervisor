@@ -93,8 +93,12 @@ async fn driver(spawner: Spawner) {
     PHASE.store(2, Ordering::SeqCst);
 
     arm_pass();
-    sup.activate(&CONS, &spawner).await;
-    sup.activate(&PROD, &spawner).await;
+    sup.activate(&CONS, &spawner)
+        .await
+        .expect("activate consumer");
+    sup.activate(&PROD, &spawner)
+        .await
+        .expect("activate producer");
     while !CONS_HOLDS.load(Ordering::SeqCst) {
         embassy_futures::yield_now().await;
     }

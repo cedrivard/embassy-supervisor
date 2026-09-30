@@ -276,7 +276,7 @@ The full verb surface, with signatures (every error type is `Debug` — `.unwrap
 | `start_node` | `async fn(&self, &'static TaskNode, &Spawner) -> Result<(), NodeFault>` |
 | `stop_node` | `async fn(&self, &'static TaskNode) -> Result<(), NodeFault>` — awaits the ack |
 | `resume_node` | `fn(&self, &'static TaskNode)` — sync, `Pause` nodes only |
-| `activate` | `async fn(&self, &'static TaskNode, &Spawner)` — cascade; spawn errors deliberately swallowed |
+| `activate` | `async fn(&self, &'static TaskNode, &Spawner) -> Result<(), NodeFault>` — best-effort cascade; returns the first startup fault |
 | `deactivate` | `async fn(&self, &'static TaskNode) -> Result<(), NodeFault>` — cascade |
 | `apply_control` | `async fn(&self, ControlCommand, &Spawner) -> Result<(), NodeFault>` |
 | `run_pools` | `async fn(&self, &Spawner) -> NodeFault` — completes only on error |
@@ -300,7 +300,20 @@ All of these are importable from the crate root (`embassy_supervisor::try_reques
 `embassy_supervisor::ControlOp`, …); a `NodeFault`'s fields are
 `pub node: &'static TaskNode` and `pub kind: FaultKind`.
 
+Mailbox acceptance is not execution success: `request_control` waits only until the
+command can be queued, and `try_request_control` reports only queue capacity.
+`apply_control` propagates Activate's startup fault, and the `run` driver returns
+that fault to its caller. Restart keeps its distinct control policy: `apply_control`
+returns its shutdown timeout but logs and absorbs its startup faults; a direct
+`restart` call returns those faults.
+
 activate walks up through dependencies; deactivate walks down through dependents. They are opposites, but they compose symmetrically over a subtree.
+
+`activate` completes its best-effort startup wave before returning the first
+`NodeFault` encountered, or `Ok(())` if no startup fails. It does not roll back
+successful starts: an error can leave a partially running graph. Already-running
+nodes are skipped, and an activation that selects no work succeeds. Handle the
+result with `.await?` or explicit error handling.
 
 A deactivate call marks only the seed node as disabled. The seed is the target node, or the whole pool if the target is a pool member. Dependents are marked as collateral instead. Collateral blocks automatic bring-up just like disabled, but `activate` clears it once no disabled node remains anywhere in the dependent's transitive dependencies. Any Terminate or Pause dependents released this way restart in the same wave.
 
@@ -1932,7 +1945,7 @@ phase must be drivable from anywhere via `request_control` through the shared ma
 ```rust,ignore
 State::Upload => {
     WIFI_HW.provide(build_wifi(&mut ctx));
-    sup.activate(&UPLOAD, &spawner).await;            // WIFI -> NET -> UPLOAD
+    sup.activate(&UPLOAD, &spawner).await?;           // WIFI -> NET -> UPLOAD
     let next = upload_screen(&mut ctx).await;
     sup.deactivate(&WIFI).await?;                    // UPLOAD -> NET -> WIFI
     next
@@ -2253,7 +2266,7 @@ dependencies is down (or, with `readiness`, while a `ready`-marked dep is un-rea
 
 **The whole driver is one call** when you don't need extra select arms:
 `sup.run(&spawner).await` = `start()` + drive pools and control forever, returning a
-`NodeFault` only on error (bring-up spawn failure, or a missed shutdown ack) — every arm
+`NodeFault` only on error (startup or control Activate failure, or a missed shutdown ack) — every arm
 an app-level escalation, typically `panic!` into a hardware-watchdog reset. Apps that
 select their own wake sources into the loop keep writing
 `select(sup.run_pools(&spawner), wait_control())` + `apply_control` by hand.

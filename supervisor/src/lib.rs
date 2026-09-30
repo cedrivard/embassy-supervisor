@@ -698,8 +698,9 @@ const READY_PROBE_DIVISOR: u64 = 8;
 ///
 /// Every way bring-up or teardown can fail is about one node, so one type says
 /// so — the same `{ node, kind }` shape as [`HealthEvent`].
-/// It is what [`Supervisor::start`], [`Supervisor::teardown`],
-/// [`Supervisor::run`] and [`Supervisor::restart`] all return.
+/// It is what [`Supervisor::start`], [`Supervisor::teardown`] and
+/// [`Supervisor::run`] return, as well as `Supervisor::activate` (`control`)
+/// and `Supervisor::restart` (`restart`) when those features are enabled.
 ///
 /// [`Display`](core::fmt::Display) is unconditional, so an application logging
 /// through anything other than `defmt` can render one without matching on
@@ -3660,6 +3661,10 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     }
 
     /// Apply a control command to the requested node.
+    ///
+    /// Activate propagates the first startup fault after completing its best-effort
+    /// wave, including through the control driver. Restart propagates shutdown
+    /// timeouts but logs and absorbs its startup faults.
     pub async fn apply_control(
         &self,
         cmd: ControlCommand,
@@ -3667,10 +3672,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     ) -> Result<(), NodeFault> {
         match cmd.op {
             ControlOp::Deactivate => self.deactivate(cmd.node).await,
-            ControlOp::Activate => {
-                self.activate(cmd.node, spawner).await;
-                Ok(())
-            }
+            ControlOp::Activate => self.activate(cmd.node, spawner).await,
             #[cfg(feature = "restart")]
             ControlOp::Restart => match self.restart(cmd.node, spawner).await {
                 Ok(()) => Ok(()),
@@ -3727,11 +3729,20 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         .await
     }
 
-    /// Bring `target` (and its pool, and every transitive dependency) up, in
-    /// topological order so each dependency starts before its dependent — the
-    /// cascading "turn this subsystem on" verb, and the entry half of the
-    /// subordinate sub-graph pattern's one-graph variant: `activate` on a
-    pub async fn activate(&self, target: &'static TaskNode, spawner: &Spawner) {
+    /// Bring `target`, its pool and every transitive dependency up in topological
+    /// order, clearing their disabled latches and reviving eligible collateral
+    /// dependents. Running and detached nodes are skipped; parked Pause nodes
+    /// resume in place. OnDemand nodes remain deferred to pool demand.
+    ///
+    /// Completes the best-effort startup wave and returns its first [`NodeFault`],
+    /// or `Ok(())` if no eligible work fails (including when no work is selected).
+    /// A failure does not roll back successful starts: the graph may be partially
+    /// running. Pool scaling is requested even when startup returns a fault.
+    pub async fn activate(
+        &self,
+        target: &'static TaskNode,
+        spawner: &Spawner,
+    ) -> Result<(), NodeFault> {
         let mut set = [false; N];
         self.seed(target, &mut set);
 
@@ -3774,7 +3785,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             }
         }
 
-        let _ = self
+        let r = self
             .start_nodes(
                 spawner,
                 &mut |j, node| {
@@ -3792,6 +3803,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         if Self::has(shape::POOLS) {
             request_scale();
         }
+        r
     }
 }
 

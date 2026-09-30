@@ -47,7 +47,9 @@ async fn driver(spawner: Spawner) {
     assert!(!SENSOR.is_running() && SPAWNS.load(Ordering::SeqCst) == 0);
 
     // First Activate: down and not parked, so the wave takes the spawn path.
-    sup.activate(&SENSOR, &spawner).await;
+    sup.activate(&SENSOR, &spawner)
+        .await
+        .expect("activate stopped sensor");
     settle(|| SPAWNS.load(Ordering::SeqCst) == 1).await;
     assert!(SENSOR.is_running(), "a real instance, not a ghost");
 
@@ -56,7 +58,9 @@ async fn driver(spawner: Spawner) {
     assert!(!SENSOR.is_running());
 
     // ...and the next Activate resumes it in place: no second spawn.
-    sup.activate(&SENSOR, &spawner).await;
+    sup.activate(&SENSOR, &spawner)
+        .await
+        .expect("resume parked sensor");
     settle(|| RESUMES.load(Ordering::SeqCst) == 1).await;
     assert_eq!(
         RESUMES.load(Ordering::SeqCst),

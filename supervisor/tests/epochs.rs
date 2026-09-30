@@ -97,7 +97,9 @@ async fn driver(spawner: Spawner) {
     sup.deactivate(&PARKED).await.expect("pause parked");
     assert!(!PARKED.is_running());
     assert_eq!(PARKED.epoch(), 1, "pausing does not bump");
-    sup.activate(&PARKED, &spawner).await;
+    sup.activate(&PARKED, &spawner)
+        .await
+        .expect("resume PARKED activation epoch");
     assert_eq!(
         PARKED.epoch(),
         2,
