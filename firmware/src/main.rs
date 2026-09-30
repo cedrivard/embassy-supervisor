@@ -183,8 +183,8 @@ async fn app_supervisor() {
     let spawner = unsafe { Spawner::for_current_executor() }.await;
     let sup = embassy_supervisor::Supervisor::new(&GRAPH);
     loop {
-        // `run` returns on `ShutdownTimeout` (a wedged node). Report it and
-        // re-enter; the wedged node stays marked running until it acks.
+        // `run` returns startup/activation faults or a shutdown timeout. Report
+        // and re-enter; a wedged node stays marked running until it acks.
         let fault = sup.run(&spawner).await;
         defmt::error!("supervisor: {}", fault);
         record_fault(&fault);

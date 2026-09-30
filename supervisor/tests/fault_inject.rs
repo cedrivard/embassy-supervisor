@@ -280,7 +280,9 @@ async fn driver(spawner: Spawner) {
     assert!(matches!(err.kind, FaultKind::ShutdownTimeout), "{err}");
     PAUSER.clear_fault();
     settle("#4", || !PAUSER.is_running()).await;
-    SUP.activate(&PAUSER, &spawner).await;
+    SUP.activate(&PAUSER, &spawner)
+        .await
+        .expect("resume PAUSER after cleared fault");
     settle("#5", || PAUSER.is_running()).await;
     SUP.deactivate(&PAUSER)
         .await

@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.10.0"
+version = "0.11.0"
 description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
@@ -134,9 +134,8 @@ bound-deps = ["readiness", "control", "embassy-supervisor-macros?/bound-deps"]
 # Distinct from `deactivate` + `activate`, which is the closest existing
 # composition but wrong for this: that pair also clears `disabled` on the
 # target's transitive *dependencies* (silently re-enabling nodes someone
-# deliberately stopped), swallows per-node spawn errors, and leaves `disabled`
-# latched across the two calls where concurrent observers and the pool policy
-# can see it.
+# deliberately stopped), and leaves `disabled` latched across the two calls
+# where concurrent observers and the pool policy can see it.
 #
 # Adds `ControlOp::Restart`, so the verb is reachable from the control mailbox.
 #
@@ -726,6 +725,11 @@ required-features = ["macros", "fault-inject", "liveness-monitor", "control", "r
 # real instance through the gates; a genuinely parked one resumes in place.
 [[test]]
 name = "activate_pause"
+required-features = ["macros", "control"]
+
+# Activation returns the first startup fault without abandoning eligible peers.
+[[test]]
+name = "activate_errors"
 required-features = ["macros", "control"]
 
 # The same shape through the cascading verbs: `deactivate` and `restart`'s
