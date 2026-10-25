@@ -156,7 +156,7 @@ jobs:
           else
             printf '\n[patch.crates-io]\nembassy-executor = { git = "https://github.com/embassy-rs/embassy" }\nembassy-executor-timer-queue = { git = "https://github.com/embassy-rs/embassy" }\n' >> Cargo.toml
           fi
-          cargo update -p embassy-executor -p embassy-time-queue-utils
+          cargo update -p embassy-executor -p embassy-time-queue-utils -p syn@3
           test "$(grep -c 'name = "embassy-executor-timer-queue"' Cargo.lock)" = 1
       - run: cargo build -p embassy-supervisor --target $HOST --features trace-hooks,trace-names
       - run: cargo test -p embassy-supervisor --target $HOST --features macros,trace-hooks,trace-names,trace-nested,trace-self
