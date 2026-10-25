@@ -23,7 +23,7 @@ flowchart TD
   accDescr: supervisor task graph declared at firmware/src/main.rs:23
   subgraph f_NET_FRAG["NET_FRAG"]
     direction TD
-    n_NET["NET<br/>Terminate · task"]
+    n_NET["NET<br/>Terminate · task · restarts 3/60000ms <small>cfg(feature = #quot;restart-intensity#quot;)</small>"]
   end
   subgraph f_HTTP_FRAG["HTTP_FRAG"]
     direction TD
@@ -32,7 +32,7 @@ flowchart TD
   n_WATCHDOG["WATCHDOG<br/>Terminate · task"]
   n_HEARTBEAT["HEARTBEAT<br/>Pause · task · @HIGH · beat 15000"]
   n_OTA["OTA<br/>Terminate · task"]
-  n_BENCH["BENCH<br/>Terminate · task · @CORE1 · disabled <small>cfg(not (feature = #quot;enabled-if#quot;))</small>"]
+  n_BENCH["BENCH<br/>Terminate · task · @CORE1 · if bench_enabled <small>cfg(feature = #quot;enabled-if#quot;)</small> · disabled <small>cfg(not (feature = #quot;enabled-if#quot;))</small>"]
   n_OTA_CONFIRM["OTA_CONFIRM<br/>Terminate · task"]
 
   n_NET -. "spawn · ready" .-> n_HTTP
@@ -255,9 +255,9 @@ cargo build --release -p firmware --features dns
 cargo build --release -p firmware --no-default-features   # none of the five
 ```
 
-The five default features exist so each one's cost can be measured on its
-own; see [Footprint](#footprint). `--no-default-features` builds the firmware
-without any of them, behaving as before they were added.
+Each of the five default features can be turned off on its own.
+`--no-default-features` builds the firmware without any of them, behaving as
+before they were added.
 
 ### Supervisor features this firmware enables
 

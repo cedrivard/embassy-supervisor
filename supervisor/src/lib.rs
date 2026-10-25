@@ -771,7 +771,7 @@ static LIFECYCLE_DROPPED: AtomicU32 = AtomicU32::new(0);
 /// scaling, bound-dep cascades — posts one event. The queue holds 8; while it
 /// is full further events are dropped and counted
 /// ([`lifecycle_events_dropped`]), so a consumer started after a large
-/// bring-up sees the tail of it, not the head.
+/// bring-up sees the head of it, not the tail.
 ///
 /// ```ignore
 /// loop {

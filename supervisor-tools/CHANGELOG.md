@@ -3,6 +3,19 @@
 All notable changes to `embassy-supervisor-tools` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0] - 2026-10-24
+
+Pins `embassy-supervisor-syntax` 0.5.0.
+
+### Added
+
+- `enabled_if:` and `restart_budget:` reach the typed model
+  (`NodeModel::enabled_if: Option<EnabledIfModel>`,
+  `NodeModel::restart_budget: Option<RestartBudgetModel>`), the JSON model
+  (`enabled_if` as the predicate's text, `restart_budget` as `{max, window_ms}`,
+  each with a `*_cfg` list) and the diagrams (`if PREDICATE` and
+  `restarts MAX/WINDOWms` node facts, with any `#[cfg]` predicate).
+
 ## [0.6.0] - 2026-10-24
 
 ### Changed
@@ -71,7 +84,8 @@ Pins `embassy-supervisor-syntax = "=0.3.0"`.
 
 Baseline for this changelog.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.6.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.7.0...HEAD
+[0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.6.0...embassy-supervisor-tools-v0.7.0
 [0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.5.0...embassy-supervisor-tools-v0.6.0
 [0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.4.1...embassy-supervisor-tools-v0.5.0
 [0.4.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.4.0...embassy-supervisor-tools-v0.4.1

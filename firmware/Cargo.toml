@@ -122,8 +122,8 @@ cortex-m-rt = "0.7"
 
 [features]
 # The five opt-in supervisor features this demo exercises, each a separate
-# flag so its footprint is measurable on its own (README "Footprint"); all on
-# by default so `cargo run -p firmware` demonstrates everything.
+# flag so it can be turned off on its own; all on by default so
+# `cargo run -p firmware` demonstrates everything.
 default = ["lifecycle-sink", "breadcrumb", "feed-gate", "restart-intensity", "enabled-if"]
 # The supervisor's lifecycle sink logs every transition and records it in the
 # ring behind `GET /api/events`.

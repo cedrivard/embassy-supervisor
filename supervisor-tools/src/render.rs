@@ -957,6 +957,18 @@ fn node_label(n: &NodeItem, show_cfg: bool) -> String {
     if let Some(r) = &n.ready_on_write {
         facts.push(gated_fact("ready_on_write".to_string(), &r.cfg, show_cfg));
     }
+    if let Some(e) = &n.enabled_if {
+        let pred = tail(&e.value);
+        facts.push(gated_fact(format!("if {pred}"), &e.cfg, show_cfg));
+    }
+    if let Some(b) = &n.restart_budget {
+        let (max, ms) = &b.value;
+        facts.push(gated_fact(
+            format!("restarts {max}/{ms}ms"),
+            &b.cfg,
+            show_cfg,
+        ));
+    }
     if let Some(d) = &n.disabled
         && let Some(c) = cfg_note(&d.cfg, show_cfg)
     {

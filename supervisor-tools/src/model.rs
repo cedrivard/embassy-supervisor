@@ -199,6 +199,26 @@ pub struct StateModel {
     pub init: String,
 }
 
+/// An `enabled_if:` clause.
+#[derive(Clone)]
+pub struct EnabledIfModel {
+    /// `#[cfg(...)]` gates on the clause.
+    pub cfg: CfgTexts,
+    /// The predicate expression (coercible to `fn() -> bool`).
+    pub predicate: ExprValue,
+}
+
+/// A `restart_budget: MAX in WINDOW_MS` clause.
+#[derive(Clone)]
+pub struct RestartBudgetModel {
+    /// `#[cfg(...)]` gates on the clause.
+    pub cfg: CfgTexts,
+    /// Restarts allowed inside one window.
+    pub max: LitValue,
+    /// The window length in milliseconds.
+    pub window_ms: LitValue,
+}
+
 /// A `node NAME = Mode, ...;` declaration, fully mapped.
 #[derive(Clone)]
 pub struct NodeModel {
@@ -232,6 +252,10 @@ pub struct NodeModel {
     pub beat_window: Option<LitValue>,
     /// The `ready_on_write` marker: `Some(gates)` when present.
     pub ready_on_write: Option<CfgTexts>,
+    /// The `enabled_if:` clause, if any.
+    pub enabled_if: Option<EnabledIfModel>,
+    /// The `restart_budget:` clause, if any.
+    pub restart_budget: Option<RestartBudgetModel>,
     /// The `reads:` list.
     pub reads: Vec<SignalModel>,
     /// The `writes:` list.
@@ -438,6 +462,15 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                             .as_ref()
                             .map(|g| LitValue::new(cfg_texts(&g.cfg), &g.value)),
                         ready_on_write: n.ready_on_write.as_ref().map(|g| cfg_texts(&g.cfg)),
+                        enabled_if: n.enabled_if.as_ref().map(|g| EnabledIfModel {
+                            cfg: cfg_texts(&g.cfg),
+                            predicate: ExprValue::new(&g.value),
+                        }),
+                        restart_budget: n.restart_budget.as_ref().map(|g| RestartBudgetModel {
+                            cfg: cfg_texts(&g.cfg),
+                            max: LitValue::new(cfg_texts(&g.cfg), &g.value.0),
+                            window_ms: LitValue::new(cfg_texts(&g.cfg), &g.value.1),
+                        }),
                         reads: n.reads.iter().map(signal_model).collect(),
                         writes: n.writes.iter().map(signal_model).collect(),
                         exit: n.exit.as_ref().map(TypeValue::new),

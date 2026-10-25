@@ -724,6 +724,13 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                         "beat_window_cfg": lit_cfg(&n.beat_window),
                         "ready_on_write": n.ready_on_write.is_some(),
                         "ready_on_write_cfg": n.ready_on_write.clone().unwrap_or_default(),
+                        "enabled_if": n.enabled_if.as_ref().map(|e| e.predicate.text.clone()),
+                        "enabled_if_cfg": n.enabled_if.as_ref().map(|e| e.cfg.clone()).unwrap_or_default(),
+                        "restart_budget": n.restart_budget.as_ref().map(|b| serde_json::json!({
+                            "max": b.max.as_u64(),
+                            "window_ms": b.window_ms.as_u64(),
+                        })),
+                        "restart_budget_cfg": n.restart_budget.as_ref().map(|b| b.cfg.clone()).unwrap_or_default(),
                         "exit": n.exit.as_ref().map(|t| t.text.clone()),
                         "state": state_json(&n.state),
                         "cancel": n.cancel,
@@ -2259,6 +2266,55 @@ mod tests {
         let out = render(&d[0], &Options::default());
         assert!(
             out.contains("ready · <small>cfg(feature = #quot;x#quot;)</small>"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn start_conditions_and_restart_budgets_reach_the_model_json_and_diagram() {
+        let src = r#"
+            embassy_supervisor::supervisor_graph! {
+                node A = Terminate, task: f,
+                    enabled_if: crate::settings::radio_on,
+                    #[cfg(feature = "x")] restart_budget: 3 in 60000;
+                node B = Terminate, task: g;
+            }
+        "#;
+        let d = parse_source(src, "t.rs").unwrap();
+
+        let full = full_model(&d);
+        let model::ItemModel::Node(a) = &full.graphs[0].items[0] else {
+            panic!("node")
+        };
+        let e = a.enabled_if.as_ref().unwrap();
+        assert_eq!(
+            e.predicate.text.replace(' ', ""),
+            "crate::settings::radio_on"
+        );
+        assert!(e.cfg.is_empty());
+        let b = a.restart_budget.as_ref().unwrap();
+        assert_eq!(
+            (b.max.as_u64(), b.window_ms.as_u64()),
+            (Some(3), Some(60000))
+        );
+        assert_eq!(b.cfg, ["feature=\"x\""]);
+
+        let j = model_json(&d, &[]);
+        let a = &j["graphs"][0]["items"][0];
+        assert_eq!(
+            a["enabled_if"].as_str().unwrap().replace(' ', ""),
+            "crate::settings::radio_on"
+        );
+        assert_eq!(a["restart_budget"]["max"], 3);
+        assert_eq!(a["restart_budget"]["window_ms"], 60000);
+        assert_eq!(a["restart_budget_cfg"][0], "feature=\"x\"");
+        let b = &j["graphs"][0]["items"][1];
+        assert!(b["enabled_if"].is_null() && b["restart_budget"].is_null());
+
+        let out = render(&d[0], &Options::default());
+        assert!(out.contains("if radio_on"), "{out}");
+        assert!(
+            out.contains("restarts 3/60000ms <small>cfg(feature = #quot;x#quot;)</small>"),
             "{out}"
         );
     }
