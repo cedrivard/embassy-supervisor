@@ -944,9 +944,6 @@ fn shape(id: &str, item: &Item, opts: &Options) -> String {
 
 fn node_label(n: &NodeItem, show_cfg: bool) -> String {
     let mut facts = vec![n.mode.to_string(), body_kind(n.source.as_ref())];
-    if let Some(size) = &n.pool_size {
-        facts.push(format!("×{size}"));
-    }
     // Only show explicit executors; inherited tiers use the banner.
     if let Some(e) = &n.executor
         && !n.executor_defaulted

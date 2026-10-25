@@ -7,6 +7,25 @@ This crate is pinned by exact version from `embassy-supervisor-macros`: its AST 
 internal contract between the two, not a stable public API, and it changes whenever the
 graph syntax does. Publish it before the macro crate that depends on it.
 
+## [0.5.0] - 2026-10-24
+
+Adds two node-only clauses and removes `pool_size:`. Requires
+`embassy-supervisor-macros` 0.11.0 and `embassy-supervisor-tools` 0.6.0.
+
+### Added
+
+- `enabled_if: <Expr>` node clause, stored as `NodeItem::enabled_if`: an expression
+  coercible to `fn() -> bool`, normally a path. Duplicates are rejected.
+- `restart_budget: MAX in WINDOW_MS` node clause, stored as
+  `NodeItem::restart_budget`. `MAX` must be in 1..=65535 and `WINDOW_MS` at least 1;
+  a missing `in` or a duplicate clause is rejected.
+- Both clauses accept a `#[cfg(...)]` gate; the node clause-gate error lists them.
+
+### Removed
+
+- `NodeItem::pool_size` and the `pool_size:` node clause. Writing it is an error that
+  says the clause was removed (task shells are resident).
+
 ## [0.4.0] - 2026-09-04
 
 Adds `default executor NAME;` and drops the `local` + `executor:` rejection.
@@ -144,7 +163,8 @@ tooling that wants it.
   against a whole graph by the macro. A fragment legitimately names nodes it does not
   contain, so parsing one in isolation has to succeed.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.4.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.5.0...HEAD
+[0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.4.0...embassy-supervisor-syntax-v0.5.0
 [0.4.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.3.1...embassy-supervisor-syntax-v0.4.0
 [0.3.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.3.0...embassy-supervisor-syntax-v0.3.1
 [0.3.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.2.0...embassy-supervisor-syntax-v0.3.0

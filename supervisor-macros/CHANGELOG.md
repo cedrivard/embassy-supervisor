@@ -6,6 +6,37 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.11.0] - 2026-10-24
+
+Pins `embassy-supervisor-syntax` 0.5.0.
+
+### Added
+
+- `enabled_if: <fn() -> bool>` node clause, emitted as `.with_enabled_if(..)`. Needs the
+  `enabled-if` feature (forwarded from the supervisor's feature of the same name);
+  without it the clause is a span-attached compile error.
+- `restart_budget: MAX in WINDOW_MS` node clause, emitted as
+  `.with_restart_budget(MAXu16, Duration::from_millis(WINDOW_MS))`. Needs the
+  `restart-intensity` feature (forwarded likewise); without it the clause is a
+  span-attached compile error.
+- Both clauses accept a `#[cfg(...)]` gate. A gated clause in a build without its
+  feature emits a `compile_error!` under the same gate.
+- One executor fence per `executor NAME;`: a `__sv_fence` task (pool sized to the
+  executor count) and `SpawnerSlot::with_fence` on each slot static.
+
+### Changed
+
+- `task:` shells are resident: the body loops over activations and parks between them
+  (`__sv_park`); the spawn glue spawns the shell on the first activation and restarts it
+  (`__sv_start`) after that. A `state:` box crosses through a per-node (per-member for
+  pools) `ResourceSlot` handoff instead of a task argument, so the state type must be
+  `Send`. A resource that comes up empty ends the activation instead of the task.
+
+### Removed
+
+- `pool_size:` on nodes, with the restrictions that came with it (`pool_size > 1` with
+  lend/consume/divisible resources).
+
 ## [0.10.0] - 2026-09-04
 
 Pins `embassy-supervisor-syntax` 0.4.0.
@@ -542,7 +573,8 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.10.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.11.0...HEAD
+[0.11.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.10.0...embassy-supervisor-macros-v0.11.0
 [0.10.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.9.1...embassy-supervisor-macros-v0.10.0
 [0.9.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.9.0...embassy-supervisor-macros-v0.9.1
 [0.9.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.8.0...embassy-supervisor-macros-v0.9.0

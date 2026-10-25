@@ -43,6 +43,8 @@ pub mod kw {
     syn::custom_keyword!(ack_timeout);
     syn::custom_keyword!(beat_timeout);
     syn::custom_keyword!(beat_window);
+    syn::custom_keyword!(enabled_if);
+    syn::custom_keyword!(restart_budget);
     syn::custom_keyword!(reads);
     syn::custom_keyword!(writes);
     syn::custom_keyword!(observe);
@@ -549,8 +551,6 @@ pub struct NodeItem {
     pub deps: Vec<Dep>,
     /// The task source, if any (`spawn:` or `task:`).
     pub source: Option<TaskSource>,
-    /// The generated task pool size, if specified.
-    pub pool_size: Option<LitInt>,
     /// The `resources:` list.
     pub resources: Vec<ResourceDecl>,
     /// The `disabled` marker, if present, with any `#[cfg(...)]` gate.
@@ -568,6 +568,11 @@ pub struct NodeItem {
     pub beat_timeout: Option<Gated<kw::beat_timeout, LitInt>>,
     /// The `beat_window:` value, with any `#[cfg(...)]` gate.
     pub beat_window: Option<Gated<kw::beat_window, LitInt>>,
+    /// The `enabled_if:` predicate (an expression coercible to
+    /// `fn() -> bool`), with any `#[cfg(...)]` gate.
+    pub enabled_if: Option<Gated<kw::enabled_if, Expr>>,
+    /// The `restart_budget: MAX in WINDOW_MS` pair, with any `#[cfg(...)]` gate.
+    pub restart_budget: Option<Gated<kw::restart_budget, (LitInt, LitInt)>>,
     /// The `ready_on_write` marker, if present, with any `#[cfg(...)]` gate.
     pub ready_on_write: Option<Gated<Ident>>,
     /// The `reads:` signal list.
@@ -957,6 +962,8 @@ fn parse_clause_cfg(input: ParseStream, host: ClauseHost) -> SynResult<Vec<Attri
             common
                 || input.peek(kw::beat_timeout)
                 || input.peek(kw::beat_window)
+                || input.peek(kw::enabled_if)
+                || input.peek(kw::restart_budget)
                 || input.peek(kw::ready_on_write)
                 || input.peek(kw::disabled)
         }
@@ -966,7 +973,8 @@ fn parse_clause_cfg(input: ParseStream, host: ClauseHost) -> SynResult<Vec<Attri
         return Err(input.error(match host {
             ClauseHost::Node => {
                 "`#[cfg(...)]` may only gate `slot_timeout:`, `ack_timeout:`, \
-                 `beat_timeout:`, `beat_window:`, `ready_on_write`, `disabled`, \
+                 `beat_timeout:`, `beat_window:`, `enabled_if:`, `restart_budget:`, \
+                 `ready_on_write`, `disabled`, \
                  or `discover` — gate the whole node, or a single entry inside \
                  `deps:`/`resources:`/`reads:`/`writes:`/`dataflow:`/`provides:`, \
                  for anything structural"
@@ -1179,10 +1187,11 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
     let mut deps: Option<Vec<Dep>> = None;
 
     let mut common = CommonClauses::default();
-    let mut pool_size = None;
     let mut disabled: Option<Gated<kw::disabled>> = None;
     let mut beat_timeout = None;
     let mut beat_window = None;
+    let mut enabled_if = None;
+    let mut restart_budget = None;
     let mut ready_on_write: Option<Gated<Ident>> = None;
     let mut exit: Option<(kw::exit, syn::Type)> = None;
     let mut provides: Vec<ProvideDecl> = Vec::new();
@@ -1204,9 +1213,13 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
             }
             deps = Some(parse_dep_list(input)?);
         } else if input.peek(kw::pool_size) {
-            input.parse::<kw::pool_size>()?;
-            input.parse::<Token![:]>()?;
-            pool_size = Some(input.parse::<LitInt>()?);
+            let k = input.parse::<kw::pool_size>()?;
+            return Err(syn::Error::new_spanned(
+                k,
+                "`pool_size:` was removed: a `task:` shell is resident (spawned once, \
+                 restarted in place), so a node never needs a second task slot — \
+                 delete the clause",
+            ));
         } else if input.peek(kw::disabled) {
             let k = input.parse::<kw::disabled>()?;
             if disabled.is_some() {
@@ -1252,6 +1265,51 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
                 kw: k,
                 value: input.parse::<LitInt>()?,
             });
+        } else if input.peek(kw::enabled_if) {
+            let k = input.parse::<kw::enabled_if>()?;
+            input.parse::<Token![:]>()?;
+            if enabled_if.is_some() {
+                return Err(dup_clause(&k, "enabled_if"));
+            }
+            enabled_if = Some(Gated {
+                cfg: clause_cfg,
+                kw: k,
+                value: input.parse::<Expr>()?,
+            });
+        } else if input.peek(kw::restart_budget) {
+            let k = input.parse::<kw::restart_budget>()?;
+            input.parse::<Token![:]>()?;
+            if restart_budget.is_some() {
+                return Err(dup_clause(&k, "restart_budget"));
+            }
+            let max: LitInt = input.parse()?;
+            input.parse::<Token![in]>()?;
+            let window: LitInt = input.parse()?;
+            let max_n = max.base10_parse::<u64>()?;
+            if max_n == 0 {
+                return Err(syn::Error::new_spanned(
+                    &max,
+                    "`restart_budget:` max must be at least 1 — omit the clause \
+                     to leave restarts unbudgeted",
+                ));
+            }
+            if max_n > u64::from(u16::MAX) {
+                return Err(syn::Error::new_spanned(
+                    &max,
+                    "`restart_budget:` max must fit a u16 (at most 65535)",
+                ));
+            }
+            if window.base10_parse::<u64>()? == 0 {
+                return Err(syn::Error::new_spanned(
+                    &window,
+                    "`restart_budget:` window must be at least 1 (milliseconds)",
+                ));
+            }
+            restart_budget = Some(Gated {
+                cfg: clause_cfg,
+                kw: k,
+                value: (max, window),
+            });
         } else if input.peek(kw::exit) {
             let k = input.parse::<kw::exit>()?;
             input.parse::<Token![:]>()?;
@@ -1291,9 +1349,9 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
             provides_kw = Some(k);
         } else {
             return Err(input.error(format!(
-                "expected {COMMON_CLAUSE_NAMES}, `deps:`, `pool_size:`, \
-                 `beat_timeout:`, `beat_window:`, `ready_on_write`, `exit:`, \
-                 `provides:`, or `disabled`"
+                "expected {COMMON_CLAUSE_NAMES}, `deps:`, \
+                 `beat_timeout:`, `beat_window:`, `enabled_if:`, `restart_budget:`, \
+                 `ready_on_write`, `exit:`, `provides:`, or `disabled`"
             )));
         }
     }
@@ -1430,13 +1488,6 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
         }
     }
 
-    if let (Some(ps), None) = (&pool_size, &task) {
-        return Err(syn::Error::new_spanned(
-            ps,
-            "`pool_size:` requires `task:` — a `spawn:` task fn sets its own \
-             `#[embassy_executor::task(pool_size = ...)]`",
-        ));
-    }
     if let Some((k, decls)) = &resources {
         if task.is_none() {
             return Err(syn::Error::new_spanned(
@@ -1460,14 +1511,6 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
                 ));
             }
         }
-    }
-    if let Some(ps) = &pool_size
-        && ps.base10_parse::<usize>()? == 0
-    {
-        return Err(syn::Error::new_spanned(
-            ps,
-            "`pool_size:` must be at least 1",
-        ));
     }
     if let Some((k, _, _)) = &state
         && task.is_none()
@@ -1516,7 +1559,6 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
         mode,
         deps: deps.unwrap_or_default(),
         source,
-        pool_size,
         disabled,
         executor,
         executor_defaulted: false,
@@ -1525,6 +1567,8 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
         ack_timeout,
         beat_timeout,
         beat_window,
+        enabled_if,
+        restart_budget,
         ready_on_write,
         reads,
         writes,
@@ -3080,12 +3124,64 @@ mod tests {
     }
 
     #[test]
+    fn enabled_if_and_restart_budget_accepted() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], enabled_if: crate::settings::lora_on, \
+             restart_budget: 3 in 10000, slot_timeout: 200;\n\
+             node B = Terminate, restart_budget: 65535 in 1, enabled_if: on;",
+        )
+        .expect("both clauses parse");
+        let Item::Node(a) = &spec.items[0] else {
+            unreachable!()
+        };
+        let e = &a.enabled_if.as_ref().unwrap().value;
+        assert_eq!(
+            quote::ToTokens::to_token_stream(e)
+                .to_string()
+                .replace(' ', ""),
+            "crate::settings::lora_on"
+        );
+        let (max, window) = &a.restart_budget.as_ref().unwrap().value;
+        assert_eq!(max.base10_parse::<u16>().unwrap(), 3);
+        assert_eq!(window.base10_parse::<u64>().unwrap(), 10000);
+        assert!(a.slot_timeout.is_some(), "the expr stops at the comma");
+    }
+
+    #[test]
+    fn restart_budget_validated() {
+        for (src, needle) in [
+            (
+                "node A = Terminate, deps: [], restart_budget: 0 in 100;",
+                "`restart_budget:` max must be at least 1",
+            ),
+            (
+                "node A = Terminate, deps: [], restart_budget: 65536 in 100;",
+                "`restart_budget:` max must fit a u16",
+            ),
+            (
+                "node A = Terminate, deps: [], restart_budget: 3 in 0;",
+                "`restart_budget:` window must be at least 1 (milliseconds)",
+            ),
+            (
+                "node A = Terminate, deps: [], restart_budget: 3 100;",
+                "expected `in`",
+            ),
+        ] {
+            match syn::parse_str::<GraphSpec>(src) {
+                Ok(_) => panic!("accepted: {src}"),
+                Err(err) => assert!(err.to_string().contains(needle), "{src}: {err}"),
+            }
+        }
+    }
+
+    #[test]
     fn cfg_gated_clauses() {
         const P: &str = "#[cfg(feature = \"x\")]";
         let spec = syn::parse_str::<GraphSpec>(&format!(
             "node A = Terminate, deps: [], task: w, discover, \
              {P} slot_timeout: 100, {P} ack_timeout: 200, \
-             {P} beat_timeout: 100, {P} beat_window: 3, {P} disabled;\n\
+             {P} beat_timeout: 100, {P} beat_window: 3, {P} disabled, \
+             {P} enabled_if: crate::on, {P} restart_budget: 3 in 1000;\n\
              node B = Terminate, deps: [], task: w, {P} discover, \
              provides: [{P} R1, R2];",
         ))
@@ -3097,6 +3193,8 @@ mod tests {
         assert_eq!(a.ack_timeout.as_ref().unwrap().cfg.len(), 1);
         assert_eq!(a.beat_timeout.as_ref().unwrap().cfg.len(), 1);
         assert_eq!(a.beat_window.as_ref().unwrap().cfg.len(), 1);
+        assert_eq!(a.enabled_if.as_ref().unwrap().cfg.len(), 1);
+        assert_eq!(a.restart_budget.as_ref().unwrap().cfg.len(), 1);
         assert_eq!(a.disabled.as_ref().unwrap().cfg.len(), 1);
         assert!(
             a.discover.as_ref().unwrap().cfg.is_empty(),
@@ -3129,7 +3227,6 @@ mod tests {
             "exit: u32",
             "state: u32 = 0",
             "cancel",
-            "pool_size: 2",
             "deps: [X]",
             "resources: [R: u32]",
             "reads: [crate::S]",
@@ -3238,6 +3335,15 @@ mod tests {
                 "duplicate `beat_window:` clause",
             ),
             (
+                "node A = Terminate, deps: [], enabled_if: crate::a, enabled_if: crate::b;",
+                "duplicate `enabled_if:` clause",
+            ),
+            (
+                "node A = Terminate, deps: [], restart_budget: 3 in 100, \
+                 restart_budget: 4 in 100;",
+                "duplicate `restart_budget:` clause",
+            ),
+            (
                 "node A = Terminate, deps: [], disabled, disabled;",
                 "duplicate `disabled` marker",
             ),
@@ -3288,7 +3394,13 @@ mod tests {
         assert_eq!(p.slot_timeout.as_ref().unwrap().cfg.len(), 1);
         assert_eq!(p.ack_timeout.as_ref().unwrap().cfg.len(), 1);
 
-        for clause in ["policy: Pol::new()", "min: 1", "beat_timeout: 100"] {
+        for clause in [
+            "policy: Pol::new()",
+            "min: 1",
+            "beat_timeout: 100",
+            "enabled_if: crate::on",
+            "restart_budget: 3 in 100",
+        ] {
             match syn::parse_str::<GraphSpec>(&format!(
                 "pool P = [Terminate], deps: [], task: w, {P} {clause};"
             )) {

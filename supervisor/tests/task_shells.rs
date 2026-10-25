@@ -45,8 +45,7 @@ async fn pool_worker(node: &'static TaskNode) {
 
 supervisor_graph! {
     node FAST = Terminate, deps: [], task: worker::<Fast>(1);
-    // `pool_size: 2` exercises the knob end-to-end (shell TaskPool of 2).
-    node SLOW = Terminate, deps: [FAST], task: worker::<Slow>(1), pool_size: 2;
+    node SLOW = Terminate, deps: [FAST], task: worker::<Slow>(1);
     pool CRUNCH = [Terminate, OnDemand], deps: [],
         task: pool_worker,
         policy: DeferredShrink::new(embassy_time::Duration::from_secs(1)),

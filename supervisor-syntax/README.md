@@ -15,7 +15,8 @@ syntax does. Depend on it directly only if you are willing to track it.
 
 **Feature gating.** This crate carries no features and accepts the grammar in
 full: `ready`/`bound` dep markers, `observed`/`beat`/`via`, `discover`,
-`dataflow:`, `local`, `state:`, `beat_timeout:`, `ready_on_write` always parse.
+`dataflow:`, `local`, `state:`, `beat_timeout:`, `enabled_if:`, `restart_budget:`,
+`ready_on_write` always parse.
 Whether a build permits a construct is policy, applied by the caller:
 `embassy-supervisor-macros` rejects gated constructs in its `gate` pass. Every
 gated construct keeps the `Ident` or literal its rejection points at, so those
@@ -38,10 +39,11 @@ are span-attached:
   and `&ARR[0]` share an address, so nothing downstream could tell them apart).
 - Marker shape: `bound` without `ready`, `beat`/`via` without `observed`, a
   bare `beat` entry, `beat` on a `reads:` entry.
-- Numeric ranges: `slot_timeout:`/`ack_timeout:`/`beat_timeout:`/`pool_size:`
-  at least 1, `beat_window:` in 1..=255.
+- Numeric ranges: `slot_timeout:`/`ack_timeout:`/`beat_timeout:`
+  at least 1, `beat_window:` in 1..=255, `restart_budget: MAX in WINDOW_MS` with
+  `MAX` in 1..=65535 and `WINDOW_MS` at least 1.
 - Clause combinations: `task:` vs `spawn:`, clauses that require `task:`
-  (`pool_size:`, `resources:`, `state:`, `exit:`, `cancel`), `cancel` with
+  (`resources:`, `state:`, `exit:`, `cancel`), the removed `pool_size:`, `cancel` with
   `Mode::Pause`, `exit:` on a `pool`,
   `ready_on_write` without `beat_timeout:` and an `observed beat` write.
 - `default executor` shape: one per graph, never `#[cfg]`-gated, never inside

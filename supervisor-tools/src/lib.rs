@@ -544,7 +544,7 @@ fn bound_fns(decl: &Decl) -> Vec<(String, String, Option<String>)> {
                     _ => None,
                 }
             }
-            if let Some((f, h)) = segments(e).and_then(&split) {
+            if let Some((f, h)) = segments(e).and_then(split) {
                 wanted.push((name.clone(), f, h));
             }
         }
@@ -714,7 +714,6 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                         "disabled_cfg": n.disabled.clone().unwrap_or_default(),
                         "parked": n.task.is_none(),
                         "task": n.task.as_ref().map(task_json),
-                        "pool_size": lit_json(&n.pool_size),
                         "slot_timeout_ms": lit_json(&n.slot_timeout_ms),
                         "slot_timeout_cfg": lit_cfg(&n.slot_timeout_ms),
                         "ack_timeout_ms": lit_json(&n.ack_timeout_ms),
@@ -2632,7 +2631,7 @@ mod tests {
     const FULL_GRAPH: &str = r#"
         embassy_supervisor::supervisor_graph! {
             name: RIG;
-            node GNSS = Terminate, task: crate::gnss_task, pool_size: 2,
+            node GNSS = Terminate, task: crate::gnss_task,
                 slot_timeout: 5000, ack_timeout: 100,
                 beat_timeout: 500, beat_window: 2, ready_on_write,
                 exit: Result<(), FixError>, state: u32 = 7, cancel,
@@ -2666,7 +2665,6 @@ mod tests {
             panic!("node")
         };
         assert_eq!(raw.task.as_ref().unwrap().kind, TaskKind::Spawn);
-        assert_eq!(n.pool_size.as_ref().unwrap().as_u64(), Some(2));
         assert_eq!(n.slot_timeout_ms.as_ref().unwrap().as_u64(), Some(5000));
         assert_eq!(n.ack_timeout_ms.as_ref().unwrap().as_u64(), Some(100));
         assert_eq!(n.beat_timeout_ms.as_ref().unwrap().as_u64(), Some(500));
@@ -2742,10 +2740,6 @@ mod tests {
             n.beat_window.as_ref().unwrap().as_u64()
         );
         assert_eq!(j["ready_on_write"], n.ready_on_write.is_some());
-        assert_eq!(
-            j["pool_size"].as_u64(),
-            n.pool_size.as_ref().unwrap().as_u64()
-        );
         assert_eq!(j["task"]["kind"], "task");
         assert_eq!(m["graphs"][0]["items"][2]["task"]["kind"], "spawn");
         assert_eq!(j["task"]["path"], n.task.as_ref().unwrap().path);

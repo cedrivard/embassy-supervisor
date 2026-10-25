@@ -200,6 +200,16 @@ once with the `supervisor_graph!` macro; the supervisor does the rest:
   declaration cannot drift from the code.
 - **Trace observability (feature-gated)** — per-task CPU ticks, poll counts, and per-executor
   idle/in-poll stats, with zero cost when the features are off.
+- **Lifecycle events (feature-gated)** — a lossy queue of every start, resume, stop, exit and
+  fault the supervisor drives, named by node, for logs, dashboards and telemetry.
+- **Bring-up breadcrumb (feature-gated)** — the last lifecycle phase per node plus one packed
+  word to stash across a reset, so the next boot can name the node that hung bring-up.
+- **Watchdog feed gate** — `GRAPH.all_fresh()` turns `beat_timeout:` policing into one
+  `bool`, so the hardware watchdog is fed only while every policed node is beating.
+- **Restart intensity (feature-gated)** — `restart_budget: 3 in 60000` turns a crash loop into a
+  `RestartStorm` fault the app must handle, instead of an endless restart cycle.
+- **Settings-gated bring-up (feature-gated)** — `enabled_if: crate::settings::lora_on` decides at
+  `start()` whether a node comes up, latching the same `disabled` state as the static marker.
 
 ```rust
 use embassy_supervisor::{supervisor_graph, Supervisor};

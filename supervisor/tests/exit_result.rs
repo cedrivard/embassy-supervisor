@@ -8,7 +8,7 @@ use embassy_sync::signal::Signal;
 use embassy_time::MockDriver;
 
 supervisor_graph! {
-    node SCORE = Terminate, deps: [], task: score_worker, pool_size: 2, exit: u32;
+    node SCORE = Terminate, deps: [], task: score_worker, exit: u32;
     node SERVE = Terminate, deps: [], task: serve_worker, exit: Result<u32, Aborted>, disabled;
 }
 

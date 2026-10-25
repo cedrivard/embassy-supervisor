@@ -22,7 +22,7 @@ async fn plain_worker(_node: &'static TaskNode) {}
 
 supervisor_graph! {
     node FAST = Terminate, deps: [], task: ticker::<Fast>(7);
-    node SLOW = Pause, deps: [FAST], task: ticker::<Slow>(9), pool_size: 2;
+    node SLOW = Pause, deps: [FAST], task: ticker::<Slow>(9);
     node BARE = Terminate, deps: [], task: plain_worker;
     #[cfg(any())] 
     node GATED = Terminate, deps: [], task: ticker::<Fast>(0);

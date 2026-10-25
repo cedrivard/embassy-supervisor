@@ -38,11 +38,18 @@ jobs:
       - run: cargo test -p embassy-supervisor --target $HOST --no-default-features
       - run: cargo test -p embassy-supervisor --target $HOST --all-features
       - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,trace-hooks
+      # The lifecycle-observability features together, without the rest of the
+      # crate: events, breadcrumb, the watchdog gate, restart budget, enabled_if.
+      - run: cargo test -p embassy-supervisor --target $HOST --features lifecycle-events,breadcrumb,restart-intensity,enabled-if,liveness-monitor,control
+      # The sink alone, without the queue, so `lifecycle_sink` runs sink-only.
+      - run: cargo test -p embassy-supervisor --target $HOST --features macros,lifecycle-sink,control
       # `supervisor_graph!` UI tests (trybuild): compile-fail cases lock the macro's
       # error contracts (cycle, unknown dep, ...); compile-pass cases run the generated
       # graph. Host-only — trybuild compiles real graphs — so `--target $HOST`.
       - run: cargo test -p embassy-supervisor-macros --target $HOST
       - run: cargo test -p embassy-supervisor-macros --target $HOST --all-features
+      - run: cargo test -p embassy-supervisor-macros --target $HOST --features restart-intensity
+      - run: cargo test -p embassy-supervisor-macros --target $HOST --features enabled-if
 
       # The graph grammar itself, which both the proc-macro and the diagram tool
       # parse with. It has no features: it always accepts the full syntax.
@@ -111,7 +118,10 @@ jobs:
                    data-deps macros,data-deps data-deps,readiness \
                    budget macros,budget budget,pool,macros,control \
                    veto macros,veto veto,coupling-observe,macros,pool \
-                   control,pool,macros,readiness,liveness,epochs,liveness-monitor,coupling,restart,bound-deps,budget,veto; do
+                   lifecycle-events lifecycle-sink lifecycle-events,lifecycle-sink breadcrumb lifecycle-events,breadcrumb \
+                   restart-intensity macros,restart-intensity enabled-if macros,enabled-if \
+                   lifecycle-events,breadcrumb,restart-intensity,enabled-if,liveness-monitor,macros \
+                   control,pool,macros,readiness,liveness,epochs,liveness-monitor,coupling,restart,bound-deps,budget,veto,lifecycle-events,lifecycle-sink,breadcrumb,restart-intensity,enabled-if; do
             echo "::group::features=[${f:-none}]"
             cargo check -p embassy-supervisor --no-default-features ${f:+--features "$f"}
             echo "::endgroup::"

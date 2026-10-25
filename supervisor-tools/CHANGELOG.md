@@ -3,6 +3,19 @@
 All notable changes to `embassy-supervisor-tools` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] - 2026-10-24
+
+### Changed
+
+- Pins `embassy-supervisor-syntax` 0.5.0. Its new `enabled_if:` and `restart_budget:`
+  node clauses parse in declarations read from source but are not yet part of the
+  JSON model or the diagrams.
+
+### Removed
+
+- The `pool_size` field of the JSON node model and the `×N` node-label fact, with the
+  clause.
+
 ## [0.5.0] - 2026-09-04
 
 Pins `embassy-supervisor-syntax` 0.4.0.
@@ -58,7 +71,8 @@ Pins `embassy-supervisor-syntax = "=0.3.0"`.
 
 Baseline for this changelog.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.5.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.6.0...HEAD
+[0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.5.0...embassy-supervisor-tools-v0.6.0
 [0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.4.1...embassy-supervisor-tools-v0.5.0
 [0.4.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.4.0...embassy-supervisor-tools-v0.4.1
 [0.4.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.3.0...embassy-supervisor-tools-v0.4.0

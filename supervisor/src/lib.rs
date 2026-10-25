@@ -39,20 +39,30 @@ use embassy_executor::{SendSpawner, SpawnError, Spawner};
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-#[cfg(any(feature = "control", feature = "liveness-monitor"))]
+#[cfg(any(
+    feature = "control",
+    feature = "liveness-monitor",
+    feature = "lifecycle-events"
+))]
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Timer, with_timeout};
-#[cfg(feature = "liveness")]
 use portable_atomic::AtomicBool;
-#[cfg(any(feature = "liveness-monitor", feature = "fault-inject"))]
+#[cfg(any(
+    feature = "liveness-monitor",
+    feature = "fault-inject",
+    feature = "breadcrumb"
+))]
 use portable_atomic::AtomicU8;
 use portable_atomic::AtomicU16;
 #[cfg(any(
     feature = "trace",
     feature = "liveness",
     feature = "epochs",
-    feature = "fault-inject"
+    feature = "fault-inject",
+    feature = "lifecycle-events",
+    feature = "breadcrumb",
+    feature = "restart-intensity"
 ))]
 use portable_atomic::AtomicU32;
 
@@ -676,6 +686,337 @@ fn emit_health(ev: HealthEvent) {
     }
 }
 
+// ─── Lifecycle events & breadcrumb ──────────────────────────────────────
+
+/// What happened to a node, in a [`LifecycleEvent`].
+///
+/// `#[non_exhaustive]`: new transitions may be added without a breaking
+/// change.
+#[cfg(any(feature = "lifecycle-events", feature = "lifecycle-sink"))]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug)]
+pub enum LifecycleKind {
+    /// A fresh instance was spawned — or, for a node the application spawns
+    /// itself (no `spawn`), marked running.
+    Started,
+    /// A parked `Pause` instance was resumed in place.
+    Resumed,
+    /// The supervisor signalled the node to stop.
+    StopRequested,
+    /// The node acknowledged a stop without its body returning: a `Pause`
+    /// instance parked on `wait_resume()`, or a hand-written `ack_dropped()`.
+    Stopped,
+    /// The node acknowledged a stop by its body returning
+    /// ([`TaskNode::mark_exited`], which every `task:` shell calls): the
+    /// instance is gone. Only observed on a supervisor stop path — a body that
+    /// returns on its own, unasked, is not evented (the supervisor is not
+    /// watching it; [`TaskNode::has_exited`] reads it).
+    Exited,
+    /// A lifecycle step failed for this node: the same [`FaultKind`] the verb
+    /// returns (or, on a best-effort wave, logs).
+    Faulted(FaultKind),
+}
+
+#[cfg(any(feature = "lifecycle-events", feature = "lifecycle-sink"))]
+impl LifecycleKind {
+    /// Stable lower-case wire name (`"started"`, `"resumed"`,
+    /// `"stop_requested"`, `"stopped"`, `"exited"`, `"faulted"`), for logs and
+    /// JSON.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            LifecycleKind::Started => "started",
+            LifecycleKind::Resumed => "resumed",
+            LifecycleKind::StopRequested => "stop_requested",
+            LifecycleKind::Stopped => "stopped",
+            LifecycleKind::Exited => "exited",
+            LifecycleKind::Faulted(_) => "faulted",
+        }
+    }
+}
+
+#[cfg(all(
+    any(feature = "lifecycle-events", feature = "lifecycle-sink"),
+    feature = "defmt"
+))]
+impl defmt::Format for LifecycleKind {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "{}", self.as_str());
+    }
+}
+
+/// One lifecycle transition, delivered through `wait_lifecycle`
+/// (`lifecycle-events`) or the `set_lifecycle_sink` callback (`lifecycle-sink`).
+#[cfg(any(feature = "lifecycle-events", feature = "lifecycle-sink"))]
+#[derive(Clone, Copy, Debug)]
+pub struct LifecycleEvent {
+    /// The node the transition is about.
+    pub node: &'static TaskNode,
+    /// What happened.
+    pub kind: LifecycleKind,
+}
+
+/// Supervisor → app lifecycle queue. Lossy on purpose, like the health
+/// mailbox: the waves run on the supervisor task, which must never park behind
+/// a slow or absent consumer. One consumer.
+#[cfg(feature = "lifecycle-events")]
+static LIFECYCLE_EVT: Channel<CriticalSectionRawMutex, LifecycleEvent, 8> = Channel::new();
+
+/// Events [`emit_lifecycle`] dropped on a full queue, wrapping.
+#[cfg(feature = "lifecycle-events")]
+static LIFECYCLE_DROPPED: AtomicU32 = AtomicU32::new(0);
+
+/// Await the next lifecycle transition.
+///
+/// Every transition the supervisor drives — waves, single-node verbs, pool
+/// scaling, bound-dep cascades — posts one event. The queue holds 8; while it
+/// is full further events are dropped and counted
+/// ([`lifecycle_events_dropped`]), so a consumer started after a large
+/// bring-up sees the tail of it, not the head.
+///
+/// ```ignore
+/// loop {
+///     let ev = embassy_supervisor::wait_lifecycle().await;
+///     info!("{} {}", ev.node.name(), ev.kind.as_str());
+/// }
+/// ```
+#[cfg(feature = "lifecycle-events")]
+pub async fn wait_lifecycle() -> LifecycleEvent {
+    LIFECYCLE_EVT.receive().await
+}
+
+/// Non-blocking [`wait_lifecycle`], for a consumer that polls.
+#[cfg(feature = "lifecycle-events")]
+pub fn try_wait_lifecycle() -> Option<LifecycleEvent> {
+    LIFECYCLE_EVT.try_receive().ok()
+}
+
+/// Total lifecycle events dropped because the queue was full (wrapping).
+/// Sample it beside the events to know whether the sequence has holes.
+#[cfg(feature = "lifecycle-events")]
+pub fn lifecycle_events_dropped() -> u32 {
+    LIFECYCLE_DROPPED.load(Ordering::Relaxed)
+}
+
+/// A lifecycle callback; see [`set_lifecycle_sink`].
+#[cfg(feature = "lifecycle-sink")]
+pub type LifecycleSink = fn(LifecycleEvent);
+
+/// The callback [`set_lifecycle_sink`] installed.
+#[cfg(feature = "lifecycle-sink")]
+static LIFECYCLE_SINK: BlockingMutex<CriticalSectionRawMutex, Cell<Option<LifecycleSink>>> =
+    BlockingMutex::new(Cell::new(None));
+
+/// Have every lifecycle transition call `sink`, synchronously, at the moment
+/// the supervisor drives it. Replaces any previous sink.
+///
+/// The push-side alternative to the `wait_lifecycle` queue
+/// (`lifecycle-events`), for an app that only records or logs events: no
+/// queue, no consumer task, nothing dropped, and a timestamp taken inside
+/// `sink` is the transition's own. The price is the calling context: `sink`
+/// runs on the supervisor task, inside the wave or verb that made the
+/// transition — on whatever executor (an interrupt executor, another core)
+/// that task runs on. Keep it short and non-blocking: a ring-buffer write or
+/// a log line, never a lock another task may hold for long. Events before the
+/// first call are not delivered. With `lifecycle-events` on too, every event
+/// reaches both.
+///
+/// ```ignore
+/// fn record(ev: LifecycleEvent) {
+///     info!("{} {}", ev.node.name(), ev.kind.as_str());
+/// }
+/// embassy_supervisor::set_lifecycle_sink(record);
+/// ```
+#[cfg(feature = "lifecycle-sink")]
+pub fn set_lifecycle_sink(sink: LifecycleSink) {
+    LIFECYCLE_SINK.lock(|c| c.set(Some(sink)));
+}
+
+/// Deliver one event to whichever observers are compiled in. Never blocks:
+/// the queue counts a full slot as dropped.
+#[cfg(any(feature = "lifecycle-events", feature = "lifecycle-sink"))]
+fn emit_lifecycle(ev: LifecycleEvent) {
+    #[cfg(feature = "lifecycle-sink")]
+    if let Some(sink) = LIFECYCLE_SINK.lock(|c| c.get()) {
+        sink(ev);
+    }
+    #[cfg(feature = "lifecycle-events")]
+    if LIFECYCLE_EVT.try_send(ev).is_err() {
+        LIFECYCLE_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The last lifecycle phase a node passed through ([`TaskNode::crumb`]), and
+/// the phase field of [`crumb_word`].
+#[cfg(feature = "breadcrumb")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum CrumbPhase {
+    /// Never touched by a supervisor since boot.
+    Idle = 0,
+    /// Picked for bring-up: gates (executor slot, resources, ready deps) are
+    /// being waited on, or the spawn is in progress.
+    Spawning = 1,
+    /// Spawned (or, without a `spawn`, marked running).
+    Started = 2,
+    /// Signalled to stop; the ack has not arrived.
+    StopSignalled = 3,
+    /// Acknowledged its stop (parked or exited).
+    Stopped = 4,
+    /// A lifecycle step faulted (gate timeout, spawn failure, missed ack).
+    Faulted = 5,
+    /// A parked `Pause` instance was resumed.
+    Resumed = 6,
+}
+
+#[cfg(feature = "breadcrumb")]
+impl CrumbPhase {
+    const fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => CrumbPhase::Idle,
+            1 => CrumbPhase::Spawning,
+            2 => CrumbPhase::Started,
+            3 => CrumbPhase::StopSignalled,
+            4 => CrumbPhase::Stopped,
+            5 => CrumbPhase::Faulted,
+            6 => CrumbPhase::Resumed,
+            _ => return None,
+        })
+    }
+
+    /// Stable lower-case wire name, for logs and JSON.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CrumbPhase::Idle => "idle",
+            CrumbPhase::Spawning => "spawning",
+            CrumbPhase::Started => "started",
+            CrumbPhase::StopSignalled => "stop_signalled",
+            CrumbPhase::Stopped => "stopped",
+            CrumbPhase::Faulted => "faulted",
+            CrumbPhase::Resumed => "resumed",
+        }
+    }
+}
+
+#[cfg(all(feature = "breadcrumb", feature = "defmt"))]
+impl defmt::Format for CrumbPhase {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "{}", self.as_str());
+    }
+}
+
+/// The binary-wide last crumb: `0x8000_0000 | phase << 16 | slot`. 0 = none.
+#[cfg(feature = "breadcrumb")]
+static LAST_CRUMB: AtomicU32 = AtomicU32::new(0);
+
+/// Slot field of a crumb word whose node is not in the driving graph.
+#[cfg(feature = "breadcrumb")]
+const CRUMB_NO_SLOT: u16 = u16::MAX;
+
+/// The most recent lifecycle transition any supervisor drove, as one word:
+/// bit 31 = valid, bits 16..24 = [`CrumbPhase`], bits 0..16 = the node's slot
+/// index in its graph (`GRAPH.nodes[i]`). 0 until the first transition.
+///
+/// Fixed-size on purpose: stash it in no-init RAM or a watchdog scratch
+/// register from the feeder or the panic handler, and [`decode_crumb`] it on
+/// the next boot to name the node and phase a reset interrupted (a bring-up
+/// that hung in `Spawning`, a teardown stuck in `StopSignalled`).
+///
+/// Last writer wins across graphs and concurrent waves, and a multi-graph
+/// binary cannot tell from the word which graph's slot it is. The per-node
+/// [`TaskNode::crumb`] is the authoritative dump:
+/// `GRAPH.nodes.iter().flatten().map(|n| (n.name(), n.crumb()))`.
+#[cfg(feature = "breadcrumb")]
+pub fn crumb_word() -> u32 {
+    LAST_CRUMB.load(Ordering::Relaxed)
+}
+
+/// Split a [`crumb_word`] into its phase and slot index; `None` for 0 (no
+/// transition yet) or a word that is not a crumb. A slot of `u16::MAX` means
+/// the node was driven through a supervisor whose graph does not contain it.
+#[cfg(feature = "breadcrumb")]
+pub const fn decode_crumb(word: u32) -> Option<(CrumbPhase, u16)> {
+    if word & 0x8000_0000 == 0 || word & 0x7F00_0000 != 0 {
+        return None;
+    }
+    match CrumbPhase::from_u8((word >> 16) as u8) {
+        Some(phase) => Some((phase, word as u16)),
+        None => None,
+    }
+}
+
+/// One supervisor-driven transition, fanned out to whichever observers are
+/// compiled in (lifecycle events, breadcrumb). With neither, `note` is empty.
+// The fault payload is read only by the event queue.
+#[cfg_attr(
+    not(any(feature = "lifecycle-events", feature = "lifecycle-sink")),
+    allow(dead_code)
+)]
+#[derive(Clone, Copy)]
+enum Transition {
+    Spawning,
+    Started,
+    Resumed,
+    StopRequested,
+    Stopped,
+    Exited,
+    Faulted(FaultKind),
+}
+
+/// Record `t` for `node` at graph slot `slot` (`None`: not in this graph).
+#[inline(always)]
+fn note(node: &'static TaskNode, slot: Option<usize>, t: Transition) {
+    #[cfg(feature = "breadcrumb")]
+    {
+        let phase = match t {
+            Transition::Spawning => CrumbPhase::Spawning,
+            Transition::Started => CrumbPhase::Started,
+            Transition::Resumed => CrumbPhase::Resumed,
+            Transition::StopRequested => CrumbPhase::StopSignalled,
+            Transition::Stopped | Transition::Exited => CrumbPhase::Stopped,
+            Transition::Faulted(_) => CrumbPhase::Faulted,
+        };
+        node.handle.crumb.store(phase as u8, Ordering::Relaxed);
+        let slot = slot.map_or(CRUMB_NO_SLOT, |i| i as u16);
+        LAST_CRUMB.store(
+            0x8000_0000 | (phase as u32) << 16 | u32::from(slot),
+            Ordering::Relaxed,
+        );
+    }
+    #[cfg(any(feature = "lifecycle-events", feature = "lifecycle-sink"))]
+    {
+        let kind = match t {
+            Transition::Spawning => None,
+            Transition::Started => Some(LifecycleKind::Started),
+            Transition::Resumed => Some(LifecycleKind::Resumed),
+            Transition::StopRequested => Some(LifecycleKind::StopRequested),
+            Transition::Stopped => Some(LifecycleKind::Stopped),
+            Transition::Exited => Some(LifecycleKind::Exited),
+            Transition::Faulted(k) => Some(LifecycleKind::Faulted(k)),
+        };
+        if let Some(kind) = kind {
+            emit_lifecycle(LifecycleEvent { node, kind });
+        }
+    }
+    #[cfg(not(feature = "breadcrumb"))]
+    let _ = slot;
+    #[cfg(not(any(
+        feature = "lifecycle-events",
+        feature = "lifecycle-sink",
+        feature = "breadcrumb"
+    )))]
+    let _ = (node, t);
+}
+
+/// The resolve-side transition for an acked node: its body returned, or it
+/// only acknowledged (parked / hand-written ack).
+fn acked(node: &TaskNode) -> Transition {
+    if node.has_exited() {
+        Transition::Exited
+    } else {
+        Transition::Stopped
+    }
+}
+
 /// Default per-node timeout for `wait_dropped` (`ack_timeout:` in the graph
 /// overrides it per node). A task that doesn't ack within its window is a bug
 /// (a body that never notices the stop) or a wedge; the shutdown paths
@@ -742,6 +1083,12 @@ pub enum FaultKind {
     /// It is still marked running; the sane escalations are app-level. Its
     /// `divisible` shares, if any, have been released on its behalf.
     ShutdownTimeout,
+    /// [`Supervisor::restart`] was refused: the node already used its
+    /// `restart_budget:` inside the current window. Nothing was stopped; the
+    /// node keeps running as it was. A crash loop the app has to see, which is
+    /// why `apply_control`'s Restart arm propagates it.
+    #[cfg(feature = "restart-intensity")]
+    RestartStorm,
 }
 
 impl core::fmt::Display for NodeFault {
@@ -777,6 +1124,10 @@ impl core::fmt::Display for NodeFault {
             }
             FaultKind::ShutdownTimeout => {
                 write!(f, "{}: missed its shutdown ack", self.node.name())
+            }
+            #[cfg(feature = "restart-intensity")]
+            FaultKind::RestartStorm => {
+                write!(f, "{}: restart budget exhausted", self.node.name())
             }
         }
     }
@@ -816,6 +1167,10 @@ impl defmt::Format for NodeFault {
             }
             FaultKind::ShutdownTimeout => {
                 defmt::write!(fmt, "{}: missed its shutdown ack", self.node.name())
+            }
+            #[cfg(feature = "restart-intensity")]
+            FaultKind::RestartStorm => {
+                defmt::write!(fmt, "{}: restart budget exhausted", self.node.name())
             }
         }
     }
@@ -1069,6 +1424,15 @@ mod flag {
     /// `fault-inject`: swallowed exit pending replay.
     #[cfg(feature = "fault-inject")]
     pub const PENDING_EXIT: u16 = 1 << 11;
+    /// A resident `task:` shell is spawned for this node: it never returns,
+    /// and the spawn glue restarts it in place instead of spawning again. Set
+    /// once by the glue after the first spawn; never cleared.
+    pub const RESIDENT: u16 = 1 << 12;
+    /// The resident shell finished an activation (worker returned, resources
+    /// restored, exit recorded) and is parked for the next start. Set by the
+    /// shell as its last act; cleared by the glue's start. Not cleared by
+    /// `reset()`.
+    pub const IDLE: u16 = 1 << 13;
 }
 
 /// Coordination state for one task. Embedded inside [`TaskNode`].
@@ -1090,7 +1454,10 @@ pub struct TaskHandle {
     /// Wake source for `wait_dropped()`. Fired by `ack_dropped()`.
     dropped_wake: Signal<CriticalSectionRawMutex, ()>,
     /// Wake source for `wait_resume()` on Pause-mode tasks. Fired by
-    /// `signal_resume()`.
+    /// `signal_resume()`. Also the resident shell's start signal: the shell
+    /// parks on it only after its worker returned, and a worker parks on it
+    /// only while running, so the two waits never overlap. The shell re-checks
+    /// `IDLE` after waking, so a stale latch cannot start it.
     resume_wake: Signal<CriticalSectionRawMutex, ()>,
     /// Wake source for `wait_ready()`. Latching; the supervisor's bring-up is
     /// the only pre-fill waiter (single-waiter Signal semantics).
@@ -1162,6 +1529,18 @@ pub struct TaskHandle {
     /// which a live check cannot do from the blocked executor itself.
     #[cfg(feature = "trace")]
     max_poll_ticks: AtomicU32,
+    /// The last [`CrumbPhase`] this node passed through, as its `repr(u8)`.
+    /// Relaxed everywhere: a diagnostic, never a synchronisation point.
+    #[cfg(feature = "breadcrumb")]
+    crumb: AtomicU8,
+    /// Explicit restarts of this node inside the current budget window.
+    /// Written only by the supervisor task (`Supervisor::restart`).
+    #[cfg(feature = "restart-intensity")]
+    restarts: AtomicU16,
+    /// Instant ticks (truncated, wrapping — the `last_beat` convention) at
+    /// which the current budget window opened.
+    #[cfg(feature = "restart-intensity")]
+    restart_window_start: AtomicU32,
 }
 
 impl TaskHandle {
@@ -1201,6 +1580,12 @@ impl TaskHandle {
             polls: AtomicU32::new(0),
             #[cfg(feature = "trace")]
             max_poll_ticks: AtomicU32::new(0),
+            #[cfg(feature = "breadcrumb")]
+            crumb: AtomicU8::new(CrumbPhase::Idle as u8),
+            #[cfg(feature = "restart-intensity")]
+            restarts: AtomicU16::new(0),
+            #[cfg(feature = "restart-intensity")]
+            restart_window_start: AtomicU32::new(0),
         }
     }
 
@@ -1278,12 +1663,36 @@ impl TaskHandle {
 /// ```
 ///
 /// What the worker then touches from that tier is the author's contract.
+///
+/// # The executor fence
+///
+/// A `spawn:` task that acks its stop is still inside its final poll when the
+/// supervisor — on a higher-priority tier, or another core — wakes for the ack,
+/// and its task slot frees only once that poll returns. Spawning again then
+/// fails `Busy`. The supervisor does not spin or sleep on it: it asks the slot's
+/// **fence**, a resident task on the same executor, for one pass. An executor
+/// polls one task at a time, so by the time the fence runs, the old task's poll
+/// is over and its slot is free. `supervisor_graph!` gives every `executor NAME;`
+/// a fence ([`with_fence`](Self::with_fence)); `set` spawns it onto the tier.
 pub struct SpawnerSlot {
     slot: BlockingMutex<CriticalSectionRawMutex, Cell<Option<SendSpawner>>>,
     /// Wakes a `ready()` waiter when `set` fills the slot (cross-core safe:
     /// `Signal` is critical-section based and latches).
     filled: Signal<CriticalSectionRawMutex, ()>,
+    /// Spawns this slot's fence onto the tier (`supervisor_graph!` emits it).
+    fence: Option<FenceSpawn>,
+    /// The fence task is spawned and parked on `fence_req`.
+    fence_up: AtomicBool,
+    /// Supervisor → fence: run one pass. Latching, so concurrent requests
+    /// coalesce into one pass, which serves them all.
+    fence_req: Signal<CriticalSectionRawMutex, ()>,
+    /// Completed fence passes, wrapping. A waiter compares for inequality.
+    passes: AtomicU16,
 }
+
+/// Spawns a [`SpawnerSlot`]'s executor fence onto the given spawner; see
+/// [`SpawnerSlot::with_fence`].
+pub type FenceSpawn = fn(SendSpawner, &'static SpawnerSlot) -> Result<(), SpawnError>;
 
 impl SpawnerSlot {
     /// An empty slot (`const` — it lives in a `static` the macro emits).
@@ -1291,14 +1700,36 @@ impl SpawnerSlot {
         Self {
             slot: BlockingMutex::new(Cell::new(None)),
             filled: Signal::new(),
+            fence: None,
+            fence_up: AtomicBool::new(false),
+            fence_req: Signal::new(),
+            passes: AtomicU16::new(0),
         }
     }
 
-    /// Fill the slot (last set wins) and wake a [`ready`](Self::ready) waiter.
-    /// Call before [`Supervisor::start`] — or from the other core's bring-up,
-    /// with the supervisor awaiting `ready()`.
-    pub fn set(&self, spawner: SendSpawner) {
+    /// Give the slot an executor fence (see the type docs): `spawn` spawns
+    /// a task on the given spawner that runs [`__sv_fence_loop`](Self::__sv_fence_loop)
+    /// for this slot. Emitted by [`supervisor_graph!`] for every `executor NAME;`.
+    /// A slot without one has no pass to offer: a `Busy` respawn then retries
+    /// on the next gate event or at the deadline.
+    pub const fn with_fence(mut self, spawn: FenceSpawn) -> Self {
+        self.fence = Some(spawn);
+        self
+    }
+
+    /// Fill the slot (last set wins), spawn its fence onto the tier on first
+    /// fill, and wake a [`ready`](Self::ready) waiter. Call before
+    /// [`Supervisor::start`] — or from the other core's bring-up, with the
+    /// supervisor awaiting `ready()`.
+    pub fn set(&'static self, spawner: SendSpawner) {
         self.slot.lock(|c| c.set(Some(spawner)));
+        if let Some(spawn) = self.fence
+            && !self.fence_up.swap(true, Ordering::AcqRel)
+            && spawn(spawner, self).is_err()
+        {
+            warn!("supervisor: executor fence could not be spawned");
+            self.fence_up.store(false, Ordering::Release);
+        }
         self.filled.signal(());
         __sv_gate_event();
     }
@@ -1324,6 +1755,31 @@ impl SpawnerSlot {
             // `Signal` latches: a `set()` racing between the check above and
             // this wait still wakes us.
             self.filled.wait().await;
+        }
+    }
+
+    /// Ask the fence for one pass. `false` if this slot has no running fence.
+    fn request_pass(&self) -> bool {
+        if !self.fence_up.load(Ordering::Acquire) {
+            return false;
+        }
+        self.fence_req.signal(());
+        true
+    }
+
+    fn passes(&self) -> u16 {
+        self.passes.load(Ordering::Acquire)
+    }
+
+    /// The fence task's body: wait for a request, count the pass, wake the
+    /// supervisor. Being polled at all is the pass: every task polled before it
+    /// on this executor has returned from its poll.
+    #[doc(hidden)]
+    pub async fn __sv_fence_loop(&self) -> ! {
+        loop {
+            self.fence_req.wait().await;
+            self.passes.fetch_add(1, Ordering::AcqRel);
+            __sv_gate_event();
         }
     }
 }
@@ -1630,6 +2086,14 @@ pub struct NodeCfg {
     /// `fault-inject`: true if the node uses a `task:` shell wrapped by [`Injected`].
     #[cfg(feature = "fault-inject")]
     shelled: bool,
+    /// `enabled_if:` in the graph: a predicate [`Supervisor::start`] evaluates
+    /// once per whole-graph start; `false` latches the node `disabled`.
+    #[cfg(feature = "enabled-if")]
+    enabled_if: Option<fn() -> bool>,
+    /// `restart_budget: MAX in WINDOW_MS` in the graph: at most `MAX` explicit
+    /// [`Supervisor::restart`]s of this node per window.
+    #[cfg(feature = "restart-intensity")]
+    restart_budget: Option<(u16, embassy_time::Duration)>,
 }
 
 impl NodeCfg {
@@ -1676,7 +2140,40 @@ impl NodeCfg {
             graph: &graph_ref::NO_GRAPH,
             #[cfg(feature = "fault-inject")]
             shelled: false,
+            #[cfg(feature = "enabled-if")]
+            enabled_if: None,
+            #[cfg(feature = "restart-intensity")]
+            restart_budget: None,
         }
+    }
+
+    /// Gate this node's whole-graph bring-up on `enabled` (`enabled_if:` in
+    /// the graph). [`Supervisor::start`] calls it once per call, before the
+    /// wave, for a node that is down (running and detached nodes are left
+    /// alone); a
+    /// `false` latches the node `disabled`, exactly as the graph's `disabled`
+    /// marker would — dashboards see it, and `activate`/`start_node` still
+    /// override it. A `true` never clears a latch (a manual `deactivate`
+    /// survives), and `respawn_terminate` and the control verbs do not
+    /// re-evaluate it. `const` and chainable in a `static` initializer;
+    /// emitted by [`supervisor_graph!`].
+    #[cfg(feature = "enabled-if")]
+    pub const fn with_enabled_if(mut self, enabled: fn() -> bool) -> Self {
+        self.enabled_if = Some(enabled);
+        self
+    }
+
+    /// Allow at most `max` explicit [`Supervisor::restart`]s of this node
+    /// within `window` (`restart_budget: MAX in WINDOW_MS` in the graph); the
+    /// next one inside the window fails with [`FaultKind::RestartStorm`]
+    /// without stopping anything. `max` 0 is treated as 1. Windows longer
+    /// than `u32::MAX / 2` ticks (~35 min at a 1 MHz tick) are capped there.
+    /// `const` and chainable in a `static` initializer; emitted by
+    /// [`supervisor_graph!`].
+    #[cfg(feature = "restart-intensity")]
+    pub const fn with_restart_budget(mut self, max: u16, window: embassy_time::Duration) -> Self {
+        self.restart_budget = Some((if max == 0 { 1 } else { max }, window));
+        self
     }
 
     /// Mark the node as a `task:` shell. Only shells can be stalled, crashed or hogged.
@@ -1907,6 +2404,21 @@ impl TaskNode {
     #[cfg(feature = "liveness-monitor")]
     pub const fn beat_window(&self) -> u8 {
         self.cfg.beat_window
+    }
+
+    /// The node's `restart_budget:` as `(max, window)`, or `None` when its
+    /// restarts are unlimited. See [`NodeCfg::with_restart_budget`].
+    #[cfg(feature = "restart-intensity")]
+    pub const fn restart_budget(&self) -> Option<(u16, embassy_time::Duration)> {
+        self.cfg.restart_budget
+    }
+
+    /// The last lifecycle phase a supervisor drove this node through —
+    /// [`CrumbPhase::Idle`] if none has yet. Relaxed: a diagnostic snapshot,
+    /// not a synchronisation point. See [`crumb_word`] for the postmortem use.
+    #[cfg(feature = "breadcrumb")]
+    pub fn crumb(&self) -> CrumbPhase {
+        CrumbPhase::from_u8(self.handle.crumb.load(Ordering::Relaxed)).unwrap_or(CrumbPhase::Idle)
     }
 
     /// The signals this node declares it consumes (`reads:`).
@@ -2453,6 +2965,51 @@ impl TaskNode {
         self.handle.flag_put(flag::DETACHED, detached);
     }
 
+    /// `true` unless a resident shell is still finishing its last activation.
+    /// The supervisor gates a respawn on it, so a new activation never shares
+    /// flags with the previous one's epilogue.
+    pub(crate) fn is_settled(&self) -> bool {
+        let f = self.handle.flags.load(Ordering::Acquire);
+        f & flag::RESIDENT == 0 || f & flag::IDLE != 0
+    }
+
+    /// Spawn glue: is a resident shell already running for this node? `Ok(true)`
+    /// — parked, restart it in place with [`__sv_start`](Self::__sv_start);
+    /// `Ok(false)` — not spawned yet; `Err(Busy)` — still finishing.
+    #[doc(hidden)]
+    pub fn __sv_resident(&self) -> Result<bool, SpawnError> {
+        let f = self.handle.flags.load(Ordering::Acquire);
+        match (f & flag::RESIDENT != 0, f & flag::IDLE != 0) {
+            (false, _) => Ok(false),
+            (true, true) => Ok(true),
+            (true, false) => Err(SpawnError::Busy),
+        }
+    }
+
+    /// Spawn glue: the shell was spawned; later activations restart it.
+    #[doc(hidden)]
+    pub fn __sv_mark_resident(&self) {
+        self.handle.flag_set(flag::RESIDENT);
+    }
+
+    /// Spawn glue: start the next activation of a parked resident shell.
+    #[doc(hidden)]
+    pub fn __sv_start(&self) {
+        self.handle.flag_clear(flag::IDLE);
+        self.handle.resume_wake.signal(());
+    }
+
+    /// Resident shell: the activation is over (everything it lent is back, its
+    /// exit is recorded). Publish that, then park until the next start.
+    #[doc(hidden)]
+    pub async fn __sv_park(&self) {
+        self.handle.flag_set(flag::IDLE);
+        __sv_gate_event();
+        while self.handle.flag(flag::IDLE) {
+            self.handle.resume_wake.wait().await;
+        }
+    }
+
     /// Return `true` if the node is detached from automatic lifecycle management.
     pub fn is_detached(&self) -> bool {
         self.handle.flag(flag::DETACHED)
@@ -2799,6 +3356,43 @@ impl<const N: usize, T: Topology<N>> Graph<N, T> {
             }
         }
     }
+
+    /// Every policed node that is currently stale: it declares
+    /// `beat_timeout:`, is running and not detached, and has not beaten within
+    /// that budget. Empty means [`all_fresh`](Self::all_fresh).
+    ///
+    /// Synchronous — atomics plus one clock read per policed node — so it can
+    /// sit in the feeder of a hardware watchdog. Like the monitor's sweep it
+    /// grants a pending `beat()` as it looks. A node without `beat_timeout:`
+    /// never appears, and neither does a stopped, paused or detached one.
+    #[cfg(feature = "liveness-monitor")]
+    pub fn stale_nodes(&self) -> impl Iterator<Item = &'static TaskNode> + '_ {
+        self.nodes.iter().flatten().copied().filter(|n| {
+            n.beat_timeout()
+                .is_some_and(|budget| !n.is_detached() && n.is_stale(budget))
+        })
+    }
+
+    /// `true` when no policed node is stale ([`stale_nodes`](Self::stale_nodes)
+    /// is empty): the AND-gate for a hardware watchdog feed. Feed only while it
+    /// holds, and a node that stops beating resets the chip instead of being
+    /// kept alive by an unconditional feeder:
+    ///
+    /// ```ignore
+    /// loop {
+    ///     if GRAPH.all_fresh() {
+    ///         wd.feed(Duration::from_secs(8));
+    ///     }
+    ///     Timer::after_secs(2).await;
+    /// }
+    /// ```
+    ///
+    /// Unlike [`Supervisor::monitor`], it has no `beat_window:` hysteresis:
+    /// size the hardware timeout to cover the jitter the window would absorb.
+    #[cfg(feature = "liveness-monitor")]
+    pub fn all_fresh(&self) -> bool {
+        self.stale_nodes().next().is_none()
+    }
 }
 
 // ─── Supervisor ──────────────────────────────────────────────────────────
@@ -2830,6 +3424,42 @@ pub struct Supervisor<const N: usize, T: Topology<N> = Ordered<N, { shape::ALL }
     /// one of its nodes.
     #[cfg(feature = "trace")]
     graph_ref: &'static GraphRef,
+}
+
+/// Wait until `cond` holds or `deadline` passes, re-checking on every gate
+/// event (slot fills, readiness, a resident shell parking, a fence pass).
+/// Returns the final `cond`.
+async fn wait_gate_until(deadline: embassy_time::Instant, mut cond: impl FnMut() -> bool) -> bool {
+    loop {
+        if cond() {
+            return true;
+        }
+        if embassy_time::Instant::now() >= deadline {
+            return false;
+        }
+        let _ = select(GATE_EVT.wait(), Timer::at(deadline)).await;
+    }
+}
+
+/// One pass of the executor `node` spawns on, after a `Busy` spawn: its slot's
+/// fence when it has one, else — the node spawns on the supervisor's own
+/// executor — a yield, which lets every queued task finish its poll first. A
+/// slot without a fence has no pass to offer; the retry then waits for the
+/// next gate event or the deadline.
+async fn executor_pass(node: &'static TaskNode, deadline: embassy_time::Instant) {
+    match node.cfg.spawn_slot {
+        Some(slot) => {
+            // Snapshot before requesting: a fence on another core may finish
+            // the pass before we read `passes` again.
+            let seen = slot.passes();
+            if slot.request_pass() {
+                wait_gate_until(deadline, || slot.passes() != seen).await;
+            } else {
+                let _ = select(GATE_EVT.wait(), Timer::at(deadline)).await;
+            }
+        }
+        None => embassy_futures::yield_now().await,
+    }
 }
 
 async fn await_spawn_slot(node: &'static TaskNode) -> Result<(), NodeFault> {
@@ -2912,6 +3542,24 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         (0..N).map(|k| self.topo.order_at(k) as usize)
     }
 
+    /// Slot of `node` in this supervisor's graph (pointer identity).
+    #[cfg(any(feature = "control", feature = "pool", feature = "breadcrumb"))]
+    fn index_of(&self, node: &'static TaskNode) -> Option<usize> {
+        self.nodes
+            .iter()
+            .position(|n| n.is_some_and(|x| core::ptr::eq(x, node)))
+    }
+
+    /// [`note`] for a single-node verb, which has the node but not its slot.
+    #[inline(always)]
+    fn note_verb(&self, node: &'static TaskNode, t: Transition) {
+        #[cfg(feature = "breadcrumb")]
+        let slot = self.index_of(node);
+        #[cfg(not(feature = "breadcrumb"))]
+        let slot = None;
+        note(node, slot, t);
+    }
+
     /// The pre-spawn gate sequence — executor slot, resource gates, `ready`
     /// deps — with each wait compiled out when the graph's shape lacks the
     async fn await_gates(node: &'static TaskNode) -> Result<(), NodeFault> {
@@ -2945,6 +3593,20 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         if let Some(node) = self.graph_ref.self_node() {
             node.set_task_id(trace::current_task_id().await);
             node.handle.flag_set(flag::RUNNING | flag::DETACHED);
+        }
+
+        // `enabled_if:` decides whether a down node comes up; a running or
+        // self-managed instance is left alone (and unlatched).
+        #[cfg(feature = "enabled-if")]
+        for node in self.nodes.iter().flatten() {
+            if let Some(enabled) = node.cfg.enabled_if
+                && !node.is_running()
+                && !node.is_detached()
+                && !enabled()
+            {
+                info!("supervisor: {} disabled by enabled_if", node.name());
+                node.set_disabled(true);
+            }
         }
 
         self.start_nodes(
@@ -3022,6 +3684,9 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
 
     #[cfg(feature = "liveness-monitor")]
     /// Monitor node liveness beats and restart nodes that miss deadlines.
+    ///
+    /// To make a hardware watchdog honour the same policing, gate its feed on
+    /// [`Graph::all_fresh`] rather than feeding unconditionally.
     pub async fn monitor(&self) -> core::convert::Infallible {
         if !Self::has(shape::BEATS)
             || !self
@@ -3103,8 +3768,8 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         node: &'static TaskNode,
         spawner: &Spawner,
     ) -> Result<(), NodeFault> {
-        node.reset();
         node.handle.flag_clear(flag::COLLATERAL);
+        self.note_verb(node, Transition::Spawning);
         if let Some(spawn) = node.cfg.spawn {
             match Self::await_gates(node).await {
                 Ok(()) => {}
@@ -3121,29 +3786,59 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                         node.handle.flag_set(flag::BOUND_STOPPED);
                         return Ok(());
                     }
+                    self.note_verb(node, Transition::Faulted(_fault.kind));
                     return Err(_fault);
                 }
             }
-            let mut result = spawn(*spawner);
-            if result.is_err() {
-                // A just-stopped instance's storage frees one executor pass
-                embassy_futures::yield_now().await;
-                result = spawn(*spawner);
+            let deadline = embassy_time::Instant::now() + node.slot_timeout();
+            if let Err(err) = Self::spawn_settled(node, spawn, spawner, deadline).await {
+                let kind = FaultKind::Spawn(err);
+                self.note_verb(node, Transition::Faulted(kind));
+                return Err(NodeFault { node, kind });
             }
-            result.map_err(|err| NodeFault {
-                node,
-                kind: FaultKind::Spawn(err),
-            })?;
+        } else {
+            node.reset();
         }
         node.set_running(true);
         #[cfg(feature = "bound-deps")]
         node.handle.flag_clear(flag::BOUND_STOPPED);
+        self.note_verb(node, Transition::Started);
         info!("supervisor: started {}", node.name());
         Ok(())
     }
 
+    /// Spawn `node` once its previous instance has let go, without spinning or
+    /// sleeping: a resident shell is awaited until it parks (`is_settled`), and
+    /// a `spawn:` task still inside its final poll is waited out with one pass
+    /// of its executor's fence (see [`SpawnerSlot`]) per `Busy`. Bounded by
+    /// `deadline`. The reset sits immediately before each attempt, with no await
+    /// in between: a successful spawn implies the previous instance finished,
+    /// so nothing it wrote late survives into the new one.
+    async fn spawn_settled(
+        node: &'static TaskNode,
+        spawn: fn(Spawner) -> Result<(), SpawnError>,
+        spawner: &Spawner,
+        deadline: embassy_time::Instant,
+    ) -> Result<(), SpawnError> {
+        if !wait_gate_until(deadline, || node.is_settled()).await {
+            return Err(SpawnError::Busy);
+        }
+        loop {
+            node.reset();
+            let err = match spawn(*spawner) {
+                Ok(()) => return Ok(()),
+                Err(err) => err,
+            };
+            if embassy_time::Instant::now() >= deadline {
+                return Err(err);
+            }
+            executor_pass(node, deadline).await;
+        }
+    }
+
     async fn shutdown_and_wait(&self, node: &'static TaskNode) -> Result<(), NodeFault> {
         node.signal_shutdown();
+        self.note_verb(node, Transition::StopRequested);
         self.await_ack(node).await
     }
 
@@ -3163,12 +3858,14 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             if Self::has(shape::CLAIMS) {
                 node.release_claims();
             }
+            self.note_verb(node, Transition::Faulted(FaultKind::ShutdownTimeout));
             return Err(NodeFault {
                 node,
                 kind: FaultKind::ShutdownTimeout,
             });
         }
         node.set_running(false);
+        self.note_verb(node, acked(node));
         Ok(())
     }
 
@@ -3219,9 +3916,9 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                 if held {
                     continue;
                 }
-                self.nodes[j]
-                    .expect("a chosen slot is occupied")
-                    .signal_shutdown();
+                let node = self.nodes[j].expect("a chosen slot is occupied");
+                node.signal_shutdown();
+                note(node, Some(j), Transition::StopRequested);
                 signaled[j] = ((embassy_time::Instant::now() - epoch).as_millis())
                     .min(UNSIGNALED as u64 - 1) as u32;
             }
@@ -3234,6 +3931,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                 let node = self.nodes[j].expect("a chosen slot is occupied");
                 if node.has_dropped() {
                     node.set_running(false);
+                    note(node, Some(j), acked(node));
                     resolved[j] = true;
                     progress = true;
                 }
@@ -3267,6 +3965,11 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                 if Self::has(shape::CLAIMS) {
                     node.release_claims();
                 }
+                note(
+                    node,
+                    Some(j),
+                    Transition::Faulted(FaultKind::ShutdownTimeout),
+                );
                 let fault = NodeFault {
                     node,
                     kind: FaultKind::ShutdownTimeout,
@@ -3312,7 +4015,9 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         loop {
             let mut progress = false;
             let mut waiting = false;
-            let mut respawn_wait = false;
+            // A `Busy` spawn on the supervisor's own executor: a yield is the
+            // pass that lets the previous instance's final poll return.
+            let mut own_pass = false;
             'nodes: for j in self.order_iter() {
                 if !pending[j] {
                     continue;
@@ -3346,20 +4051,23 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                             info!("supervisor: resuming {} in place", node.name());
                             node.signal_resume();
                             node.set_running(true);
+                            note(node, Some(j), Transition::Resumed);
                             #[cfg(feature = "bound-deps")]
                             node.handle.flag_clear(flag::BOUND_STOPPED);
                             pending[j] = false;
                             progress = true;
                             continue;
                         }
-                        node.reset();
+                        note(node, Some(j), Transition::Spawning);
                         info!("supervisor: spawning {} ({})", node.name(), node.mode());
                         now
                     }
                 };
                 let Some(spawn) = node.cfg.spawn else {
                     // A parked node the app spawns itself; only marked.
+                    node.reset();
                     node.set_running(true);
+                    note(node, Some(j), Transition::Started);
                     pending[j] = false;
                     progress = true;
                     continue;
@@ -3375,6 +4083,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                         return Ok(true);
                     }
                     let fault = NodeFault { node, kind };
+                    note(node, Some(j), Transition::Faulted(kind));
                     if !keep_going {
                         return Err(fault);
                     }
@@ -3422,6 +4131,13 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                     }
                     None => None,
                 };
+                // A resident shell still finishing its last activation.
+                let blocked = match blocked {
+                    None if !node.is_settled() => {
+                        Some(unsatisfied(FaultKind::Spawn(SpawnError::Busy))?)
+                    }
+                    b => b,
+                };
                 match blocked {
                     Some(true) => {
                         waiting = true;
@@ -3434,10 +4150,20 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                     }
                     None => {}
                 }
+                // Reset immediately before the attempt: a spawn that succeeds
+                // proves the previous instance finished, so nothing it wrote
+                // late survives into this one.
+                node.reset();
                 if let Err(err) = spawn(*spawner) {
-                    // A respawn can catch the previous instance's storage
+                    // A respawn can catch the previous instance still inside its
+                    // final poll: wait one pass of its executor, not a timer.
                     if unsatisfied(FaultKind::Spawn(err))? {
-                        respawn_wait = true;
+                        match node.cfg.spawn_slot {
+                            Some(slot) => {
+                                let _ = slot.request_pass();
+                            }
+                            None => own_pass = true,
+                        }
                         waiting = true;
                     } else {
                         pending[j] = false;
@@ -3446,6 +4172,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                     continue;
                 }
                 node.set_running(true);
+                note(node, Some(j), Transition::Started);
                 #[cfg(feature = "bound-deps")]
                 node.handle.flag_clear(flag::BOUND_STOPPED);
                 pending[j] = false;
@@ -3457,7 +4184,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             if progress {
                 continue;
             }
-            if respawn_wait {
+            if own_pass {
                 embassy_futures::yield_now().await;
                 continue;
             }
@@ -3540,6 +4267,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         info!("supervisor: resuming {}", node.name());
         node.signal_resume();
         node.set_running(true);
+        self.note_verb(node, Transition::Resumed);
     }
 
     /// Signal every **parked** Pause-mode node to resume. Cheap and synchronous —
@@ -3568,6 +4296,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                 info!("supervisor: resuming {}", node.name());
                 node.signal_resume();
                 node.set_running(true);
+                note(node, Some(j), Transition::Resumed);
             }
         }
     }
@@ -3592,12 +4321,6 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
 
 #[cfg(any(feature = "control", feature = "pool"))]
 impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
-    fn index_of(&self, node: &'static TaskNode) -> Option<usize> {
-        self.nodes
-            .iter()
-            .position(|n| n.is_some_and(|x| core::ptr::eq(x, node)))
-    }
-
     /// Whether every dependency of `node` is currently running, resolved through
     /// the graph's index table. The pool driver checks this before growing a
     #[cfg(feature = "pool")]
@@ -3664,7 +4387,9 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     ///
     /// Activate propagates the first startup fault after completing its best-effort
     /// wave, including through the control driver. Restart propagates shutdown
-    /// timeouts but logs and absorbs its startup faults.
+    /// timeouts (and, with `restart-intensity`, a refused
+    /// [`RestartStorm`](FaultKind::RestartStorm)) but logs and absorbs its
+    /// startup faults.
     pub async fn apply_control(
         &self,
         cmd: ControlCommand,
@@ -3677,6 +4402,8 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             ControlOp::Restart => match self.restart(cmd.node, spawner).await {
                 Ok(()) => Ok(()),
                 Err(e) if matches!(e.kind, FaultKind::ShutdownTimeout) => Err(e),
+                #[cfg(feature = "restart-intensity")]
+                Err(e) if matches!(e.kind, FaultKind::RestartStorm) => Err(e),
                 Err(e) => {
                     let node = e.node;
                     warn!(
@@ -3888,6 +4615,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                     node.reset();
                     node.signal_resume();
                     node.set_running(true);
+                    note(node, Some(j), Transition::Resumed);
                     node.handle.flag_clear(flag::BOUND_STOPPED);
                 }
                 Mode::Pause => {}
@@ -3907,11 +4635,51 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
 #[cfg(feature = "restart")]
 impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     /// Restart the target node and all of its dependents.
+    ///
+    /// With `restart-intensity`, a target carrying `restart_budget: MAX in
+    /// WINDOW_MS` is checked first: the MAX+1th restart inside the window
+    /// returns [`FaultKind::RestartStorm`] before anything is stopped. Only
+    /// this verb's *target* is counted — dependents cycled with it, and
+    /// `activate`, never are. The window opens at the first counted restart
+    /// and a restart after it closes opens a fresh one.
     pub async fn restart(
         &self,
         target: &'static TaskNode,
         spawner: &Spawner,
     ) -> Result<(), NodeFault> {
+        #[cfg(feature = "restart-intensity")]
+        if let Some((max, window)) = target.restart_budget() {
+            // Load/store without RMW: only the supervisor task calls
+            // `restart`, so these two atomics have a single writer.
+            let h = &target.handle;
+            let now = embassy_time::Instant::now().as_ticks() as u32;
+            // Wrap-safe cap on the truncated-tick window (~35 min at 1 MHz).
+            let window_ticks = window.as_ticks().min(u64::from(u32::MAX / 2)) as u32;
+            let start = h.restart_window_start.load(Ordering::Relaxed);
+            let count = h.restarts.load(Ordering::Relaxed);
+            if count == 0 || now.wrapping_sub(start) > window_ticks {
+                h.restart_window_start.store(now, Ordering::Relaxed);
+                h.restarts.store(1, Ordering::Relaxed);
+            } else if count >= max {
+                warn!(
+                    "supervisor: {} restart budget exhausted ({} in window)",
+                    target.name(),
+                    max
+                );
+                #[cfg(any(feature = "lifecycle-events", feature = "lifecycle-sink"))]
+                emit_lifecycle(LifecycleEvent {
+                    node: target,
+                    kind: LifecycleKind::Faulted(FaultKind::RestartStorm),
+                });
+                return Err(NodeFault {
+                    node: target,
+                    kind: FaultKind::RestartStorm,
+                });
+            } else {
+                h.restarts.store(count + 1, Ordering::Relaxed);
+            }
+        }
+
         let mut set = [false; N];
         self.seed(target, &mut set);
         self.collect_dependents(&mut set);

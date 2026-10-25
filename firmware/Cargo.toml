@@ -121,7 +121,24 @@ cortex-m = "0.7"
 cortex-m-rt = "0.7"
 
 [features]
-default = []
+# The five opt-in supervisor features this demo exercises, each a separate
+# flag so its footprint is measurable on its own (README "Footprint"); all on
+# by default so `cargo run -p firmware` demonstrates everything.
+default = ["lifecycle-sink", "breadcrumb", "feed-gate", "restart-intensity", "enabled-if"]
+# The supervisor's lifecycle sink logs every transition and records it in the
+# ring behind `GET /api/events`.
+lifecycle-sink = ["embassy-supervisor/lifecycle-sink"]
+# `watchdog` stashes `crumb_word()` in watchdog scratch 6 every pass; the next
+# boot logs it and `/api/tasks` reports it as `prev_crumb`.
+breadcrumb = ["embassy-supervisor/breadcrumb"]
+# Demo-only (no supervisor feature): feed the hardware watchdog only while
+# `GRAPH.all_fresh()`, so a stale `heartbeat` resets the chip.
+feed-gate = []
+# `net` declares `restart_budget: 3 in 60000`.
+restart-intensity = ["embassy-supervisor/restart-intensity"]
+# `bench` comes up at boot when the scratch-5 boot flag says so
+# (`POST /api/bootflag`, `POST /api/reboot`).
+enabled-if = ["embassy-supervisor/enabled-if"]
 # Resolve OTA targets by hostname through a real DNS socket.
 #
 # Off by default because this demo's OTA target is always a literal IPv4, and

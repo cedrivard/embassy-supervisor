@@ -1,4 +1,4 @@
-error: expected `task:`, `spawn:`, `executor:`, `resources:`, `reads:`, `writes:`, `discover`, `dataflow:`, `state:`, `slot_timeout:`, `ack_timeout:`, `cancel`, `deps:`, `pool_size:`, `beat_timeout:`, `beat_window:`, `ready_on_write`, `exit:`, `provides:`, or `disabled`
+error: expected `task:`, `spawn:`, `executor:`, `resources:`, `reads:`, `writes:`, `discover`, `dataflow:`, `state:`, `slot_timeout:`, `ack_timeout:`, `cancel`, `deps:`, `beat_timeout:`, `beat_window:`, `enabled_if:`, `restart_budget:`, `ready_on_write`, `exit:`, `provides:`, or `disabled`
  --> tests/ui/compile_fail/missing_keyword.rs:5:35
   |
 5 |     node A = Terminate, deps: [], oops;

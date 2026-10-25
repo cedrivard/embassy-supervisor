@@ -1,0 +1,5 @@
+error: `pool_size:` was removed: a `task:` shell is resident (spawned once, restarted in place), so a node never needs a second task slot — delete the clause
+ --> tests/ui/compile_fail/pool_size_removed.rs:7:49
+  |
+7 |     node A = Terminate, deps: [], task: worker, pool_size: 2;
+  |                                                 ^^^^^^^^^

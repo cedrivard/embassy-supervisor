@@ -40,7 +40,7 @@ async fn app_worker(node: &'static TaskNode, port: u16) {
 supervisor_fragment! {
     name: NET_FRAG;
     node NET = Terminate, deps: [], task: $crate::net_worker;
-    node ONESHOT = Terminate, deps: [], task: $crate::oneshot_worker, pool_size: 2;
+    node ONESHOT = Terminate, deps: [], task: $crate::oneshot_worker;
 }
 
 supervisor_fragment! {

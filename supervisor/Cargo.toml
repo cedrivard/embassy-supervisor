@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.11.0"
+version = "0.12.0"
 description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
@@ -40,7 +40,7 @@ log = { version = "0.4.33", optional = true, default-features = false }
 # `state: zeroed Type` (heap-state): `Zeroable` is the all-zero-is-valid contract.
 bytemuck = { version = "1.25.0", optional = true, default-features = false }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.10.0", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.11.0", path = "../supervisor-macros", optional = true }
 
 [features]
 # Just the graph macro: everything the supervisor can DO is opt-in, matching the
@@ -144,6 +144,50 @@ bound-deps = ["readiness", "control", "embassy-supervisor-macros?/bound-deps"]
 # it with the application's failsafe logic; do not wire it blindly to a
 # `liveness-monitor` event.
 restart = ["control"]
+
+# Restart-intensity guardrail (Erlang/OTP's `intensity`/`period`, per node):
+# the `restart_budget: MAX in WINDOW_MS` node clause. `Supervisor::restart`
+# counts the explicit restarts of its *target* (dependents cycled as
+# collateral and `activate` never count) and refuses the MAX+1th inside the
+# window with `FaultKind::RestartStorm`, before stopping anything — the node
+# keeps running as it was. `apply_control`'s Restart arm PROPAGATES that fault
+# (it otherwise absorbs startup faults), so the driver loop hands it to the
+# app: a guardrail the app must see. Windows cap at u32::MAX/2 ticks (~35 min
+# at a 1 MHz tick). Costs an AtomicU16 + AtomicU32 per node and a flash word in
+# the node's config.
+restart-intensity = ["restart", "embassy-supervisor-macros?/restart-intensity"]
+
+# Settings-gated bring-up: the `enabled_if: <fn() -> bool>` node clause.
+# `Supervisor::start` calls each predicate once, before the wave; `false`
+# latches the node's `disabled` flag exactly as the graph's `disabled` marker
+# would (dashboards see it, `activate`/`start_node` still override). `true`
+# never clears a latch, so a manual `deactivate` survives; `respawn_terminate`
+# and the control verbs do not re-evaluate. Costs one fn pointer per node in
+# flash and one call per node per `start()`.
+enabled-if = ["embassy-supervisor-macros?/enabled-if"]
+
+# Consumable lifecycle-event queue: `wait_lifecycle()` / `try_wait_lifecycle()`
+# deliver `LifecycleEvent { node, kind }` for every transition the supervisor
+# drives (Started, Resumed, StopRequested, Stopped, Exited, Faulted). Lossy on
+# purpose, like the health mailbox: the supervisor never parks behind a slow
+# consumer; `lifecycle_events_dropped()` counts what fell off an 8-slot queue.
+# Costs one 8-slot channel + one AtomicU32, and one `try_send` per transition.
+lifecycle-events = []
+
+# Push-side lifecycle events: `set_lifecycle_sink(fn(LifecycleEvent))` has
+# every transition call the app's callback synchronously, on the supervisor
+# task. For an app that only records or logs: no queue, no consumer task,
+# nothing dropped, exact timestamps. Costs one fn pointer (4 B on 32-bit) and
+# one critical section per transition. Combinable with `lifecycle-events`.
+lifecycle-sink = []
+
+# Crash-persistent bring-up breadcrumb: a per-node `crumb()` phase byte plus
+# one global `crumb_word()` (phase + node index) updated with relaxed stores at
+# every lifecycle transition. Stash the word in no-init RAM or a watchdog
+# scratch register from the feeder or panic handler, and `decode_crumb` names
+# the node and phase a reset interrupted. Costs one AtomicU8 per node + one
+# AtomicU32, and one relaxed store pair per transition.
+breadcrumb = []
 
 # Declared dataflow coupling: the `reads:` / `writes:` node clauses naming the
 # ACTUAL signal statics, plus the signal-indexed queries (`writers_of`,
@@ -930,4 +974,57 @@ required-features = ["macros", "control", "pool", "readiness", "bound-deps"]
 # `Flat` (the waves fold to plain index loops on it).
 [[test]]
 name = "flat_topology"
+required-features = ["macros"]
+
+# The lifecycle-event queue: one event per driven transition in dependency
+# order, Stopped (parked) vs Exited (body returned), a missed ack as Faulted,
+# and the lossy 8-slot queue counting what it drops.
+[[test]]
+name = "lifecycle_events"
+required-features = ["macros", "lifecycle-events", "control"]
+
+# The lifecycle sink: called in transition order for every driven transition,
+# with no capacity limit, and alongside the queue when both features are on.
+[[test]]
+name = "lifecycle_sink"
+required-features = ["macros", "lifecycle-sink", "control"]
+
+# The breadcrumb: per-node crumb phases, the global word naming the last
+# transition's node and phase, and a wave stuck on a gate reading `Spawning`.
+[[test]]
+name = "breadcrumb"
+required-features = ["macros", "breadcrumb", "control"]
+
+# The watchdog feed gate: `all_fresh`/`stale_nodes` flip with a policed
+# node's beat budget and ignore unpoliced and stopped nodes.
+[[test]]
+name = "watchdog_gate"
+required-features = ["macros", "liveness-monitor", "control"]
+
+# `restart_budget:`: the storm fault inside the window (nothing stopped), a
+# fresh window afterwards, budget-less nodes unlimited, and the control path
+# propagating the storm.
+[[test]]
+name = "restart_intensity"
+required-features = ["macros", "restart-intensity"]
+
+# `enabled_if:`: a false predicate latches `disabled` at start, `activate`
+# overrides it, running nodes are not re-evaluated, and a true predicate
+# never clears a manual latch.
+[[test]]
+name = "enabled_if"
+required-features = ["macros", "enabled-if", "control"]
+
+# Resident `task:` shells: a restart issued while the previous activation is
+# still between its worker's ack and the shell's epilogue waits for the shell
+# to park, and the new activation inherits none of the old one's flags.
+[[test]]
+name = "resident_shell"
+required-features = ["macros", "restart"]
+
+# The executor fence: a `spawn:` task on another executor that acks but still
+# holds its slot is respawned once it returns (one fence pass per Busy, no
+# timer), and faults `Spawn` if it never returns within slot_timeout.
+[[test]]
+name = "executor_fence"
 required-features = ["macros"]

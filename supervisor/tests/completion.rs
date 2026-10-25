@@ -6,7 +6,7 @@ use embassy_supervisor::{ControlCommand, ControlOp, Supervisor, TaskNode, superv
 use embassy_time::MockDriver;
 
 supervisor_graph! {
-    node ONESHOT = Terminate, deps: [], task: oneshot_worker, pool_size: 2;
+    node ONESHOT = Terminate, deps: [], task: oneshot_worker;
     node ACKED = Terminate, deps: [], spawn: acked_task;
     node WEDGED = Terminate, deps: [], spawn: wedged_task;
 }

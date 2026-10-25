@@ -184,6 +184,12 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &'st
                 build_tasks_json(&mut body);
                 send(socket, "application/json", &body, keep).await;
             }
+            #[cfg(feature = "lifecycle-sink")]
+            ("GET", "/api/events") => {
+                let mut body = String::with_capacity(1280);
+                build_events_json(&mut body);
+                send(socket, "application/json", &body, keep).await;
+            }
             ("GET", "/api/bench") => {
                 let mut body = String::with_capacity(48);
                 match crate::BENCH_EXIT.take() {
@@ -235,6 +241,29 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &'st
                         send(socket, "application/json", &out, keep).await;
                     }
                 }
+            }
+            #[cfg(feature = "enabled-if")]
+            ("POST", p) if p.starts_with("/api/bootflag") => {
+                let body = match query(p, "bench=") {
+                    "on" => {
+                        crate::bootflag::set_bench(true);
+                        "{\"accepted\":true,\"bench\":\"on\"}"
+                    }
+                    "off" => {
+                        crate::bootflag::set_bench(false);
+                        "{\"accepted\":true,\"bench\":\"off\"}"
+                    }
+                    _ => "{\"accepted\":false,\"error\":\"bench must be on or off\"}",
+                };
+                send(socket, "application/json", body, keep).await;
+            }
+            #[cfg(feature = "enabled-if")]
+            ("POST", p) if p.starts_with("/api/reboot") => {
+                // Answer first: the reset lands as soon as the watchdog task runs.
+                send(socket, "application/json", "{\"accepted\":true}", false).await;
+                let _ = socket.flush().await;
+                crate::watchdog::REBOOT.signal(());
+                return;
             }
             _ => {
                 let _ = socket
@@ -316,6 +345,18 @@ fn build_tasks_json(json: &mut String) {
         }
         None => json.push_str("\"last_fault\":null,"),
     }
+    #[cfg(feature = "breadcrumb")]
+    {
+        let prev = crate::PREV_CRUMB.load(core::sync::atomic::Ordering::Relaxed);
+        let _ = write!(json, "\"prev_crumb\":{prev},");
+        if let Some((node, phase)) = crate::decode_crumb(prev) {
+            let _ = write!(
+                json,
+                "\"prev_crumb_node\":\"{node}\",\"prev_crumb_phase\":\"{}\",",
+                phase.as_str()
+            );
+        }
+    }
     json.push_str("\"executors\":[");
     let mut first = true;
     for id in embassy_supervisor::trace::executors() {
@@ -353,6 +394,104 @@ fn build_tasks_json(json: &mut String) {
         }
         write_task(json, node, &[]);
     }
+    json.push_str("]}");
+}
+
+/// The last 16 lifecycle events as `(node, tick, kind)`, overwritten
+/// oldest-first. Written by the supervisor's lifecycle sink
+/// ([`record_lifecycle`]), read by `/api/events`. 12 B per entry: the node is
+/// a pointer and the kind an index into [`KINDS`]; both names are looked up
+/// when the JSON is written.
+#[cfg(feature = "lifecycle-sink")]
+struct EventRing {
+    events: [Option<(&'static TaskNode, u32, u8)>; 16],
+    next: usize,
+}
+
+#[cfg(feature = "lifecycle-sink")]
+static EVENTS: embassy_sync::blocking_mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    core::cell::RefCell<EventRing>,
+> = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(EventRing {
+    events: [None; 16],
+    next: 0,
+}));
+
+/// Wire names of the ring's kind codes. `LifecycleKind` is `#[non_exhaustive]`:
+/// a variant this build does not know is stored as `unknown`.
+#[cfg(feature = "lifecycle-sink")]
+const KINDS: [&str; 7] = [
+    "started",
+    "resumed",
+    "stop_requested",
+    "stopped",
+    "exited",
+    "faulted",
+    "unknown",
+];
+
+/// The lifecycle sink (`set_lifecycle_sink` in `app_supervisor`): log the
+/// event and record it, stamped now, for `/api/events`. Runs on the supervisor
+/// task (the P1 interrupt executor), inside the transition: a log line and
+/// one critical section, nothing that can wait.
+#[cfg(feature = "lifecycle-sink")]
+pub(crate) fn record_lifecycle(ev: embassy_supervisor::LifecycleEvent) {
+    use embassy_supervisor::LifecycleKind as K;
+    let tick = embassy_time::Instant::now().as_ticks() as u32;
+    let code = match ev.kind {
+        K::Started => 0,
+        K::Resumed => 1,
+        K::StopRequested => 2,
+        K::Stopped => 3,
+        K::Exited => 4,
+        K::Faulted(kind) => {
+            defmt::warn!(
+                "lifecycle: {}",
+                embassy_supervisor::NodeFault {
+                    node: ev.node,
+                    kind
+                }
+            );
+            5
+        }
+        _ => 6,
+    };
+    if code != 5 {
+        defmt::info!("lifecycle: {} {}", ev.node.name(), ev.kind);
+    }
+    EVENTS.lock(|r| {
+        let mut r = r.borrow_mut();
+        let i = r.next;
+        r.events[i] = Some((ev.node, tick, code));
+        r.next = (i + 1) % r.events.len();
+    });
+}
+
+/// `GET /api/events`: the ring newest-first.
+#[cfg(feature = "lifecycle-sink")]
+fn build_events_json(json: &mut String) {
+    let _ = write!(
+        json,
+        "{{\"tick_hz\":{},\"now_ticks\":{},\"events\":[",
+        embassy_time::TICK_HZ,
+        embassy_time::Instant::now().as_ticks() as u32,
+    );
+    EVENTS.lock(|r| {
+        let r = r.borrow();
+        let n = r.events.len();
+        let newest_first = (1..=n).filter_map(|k| r.events[(r.next + n - k) % n]);
+        for (j, (node, tick, code)) in newest_first.enumerate() {
+            if j > 0 {
+                json.push(',');
+            }
+            let _ = write!(
+                json,
+                "{{\"node\":\"{}\",\"kind\":\"{}\",\"tick\":{tick}}}",
+                node.name(),
+                KINDS[code as usize]
+            );
+        }
+    });
     json.push_str("]}");
 }
 

@@ -39,8 +39,8 @@ async fn session_worker(node: &'static TaskNode) {
         .await;
 }
 
-// One task fn per spawn site: the generated shell's pool_size is 1, so the
-// provider and the pool members cannot share a worker.
+// One task fn per spawn site: a node's resident shell is one task slot, so
+// the provider and the pool members cannot share a worker.
 async fn plain_worker(node: &'static TaskNode) {
     PLAIN_SPAWNS.fetch_add(1, Ordering::SeqCst);
     let _ = node

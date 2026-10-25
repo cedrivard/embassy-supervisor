@@ -20,9 +20,9 @@ pub struct Zeroed {
 unsafe impl Zeroable for Zeroed {}
 
 supervisor_graph! {
-    node CRUNCH = Terminate, deps: [], task: crunch_worker, pool_size: 2,
+    node CRUNCH = Terminate, deps: [], task: crunch_worker,
         state: Scratch = Scratch { buf: [0; STATE_SIZE], cursor: 0 }, disabled;
-    node ZERO = Terminate, deps: [], task: zero_worker, pool_size: 2,
+    node ZERO = Terminate, deps: [], task: zero_worker,
         state: zeroed Zeroed, disabled;
 }
 
@@ -148,7 +148,7 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn state_boxes_are_reclaimed_and_fallible() {
-    let _clock = embassy_time::MockDriver::get();
+    let clock = embassy_time::MockDriver::get();
 
     std::thread::spawn(|| {
         let executor: &'static mut embassy_executor::Executor =
@@ -158,6 +158,8 @@ fn state_boxes_are_reclaimed_and_fallible() {
         });
     });
 
+    // A refused allocation is retried, one executor pass per attempt, until the
+    // node's slot_timeout: the clock has to move for the denial to fault.
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
     while !DONE.load(Ordering::SeqCst) {
         assert!(
@@ -166,6 +168,7 @@ fn state_boxes_are_reclaimed_and_fallible() {
             RUNS.load(Ordering::SeqCst),
             STATE_BYTES_LIVE.load(Ordering::SeqCst),
         );
-        std::thread::sleep(StdDuration::from_millis(5));
+        clock.advance(embassy_time::Duration::from_millis(20));
+        std::thread::sleep(StdDuration::from_millis(2));
     }
 }

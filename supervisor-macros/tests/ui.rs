@@ -37,4 +37,8 @@ fn ui() {
         t.compile_fail("tests/ui/compile_fail_veto/*.rs");
         t.pass("tests/ui/compile_pass_veto/*.rs");
     }
+    #[cfg(feature = "enabled-if")]
+    t.pass("tests/ui/compile_pass_enabled_if/*.rs");
+    #[cfg(feature = "restart-intensity")]
+    t.pass("tests/ui/compile_pass_restart_intensity/*.rs");
 }

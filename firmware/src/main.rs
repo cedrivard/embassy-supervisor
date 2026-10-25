@@ -11,6 +11,8 @@ use embassy_rp::interrupt::{InterruptExt, Priority};
 use {defmt_rtt as _, panic_probe as _};
 
 mod bench;
+#[cfg(any(feature = "breadcrumb", feature = "enabled-if"))]
+mod bootflag;
 mod heap;
 mod heartbeat;
 mod http;
@@ -39,7 +41,9 @@ embassy_supervisor::compose_graph! {
             disabled;
 
         node BENCH = Terminate, deps: [HEARTBEAT ready bound], executor: CORE1,
-            task: crate::bench::bench_task, exit: u32, disabled;
+            task: crate::bench::bench_task, exit: u32,
+            #[cfg(not(feature = "enabled-if"))] disabled,
+            #[cfg(feature = "enabled-if")] enabled_if: crate::bootflag::bench_enabled;
 
         node OTA_CONFIRM = Terminate, deps: [HTTP, NET ready], task: crate::ota_confirm,
             dataflow: [crate::net::stack_ready];
@@ -122,15 +126,41 @@ fn record_fault(fault: &embassy_supervisor::NodeFault) {
         FaultKind::ResourceMissing => "resource missing",
         FaultKind::ReadyDepTimeout { .. } => "ready dep timeout",
         FaultKind::Spawn(_) => "spawn refused",
+        #[cfg(feature = "restart-intensity")]
+        FaultKind::RestartStorm => "restart budget exhausted",
         _ => "fault",
     };
     LAST_FAULT.lock(|c| c.set(Some((fault.node.name(), kind))));
+}
+
+/// The crumb word the previous boot left in watchdog scratch, for
+/// `/api/tasks`. Written once in `main`, before the graph starts.
+#[cfg(feature = "breadcrumb")]
+pub(crate) static PREV_CRUMB: AtomicU32 = AtomicU32::new(0);
+
+/// The node name and phase a breadcrumb word names, if it is valid.
+#[cfg(feature = "breadcrumb")]
+pub(crate) fn decode_crumb(word: u32) -> Option<(&'static str, embassy_supervisor::CrumbPhase)> {
+    let (phase, slot) = embassy_supervisor::decode_crumb(word)?;
+    let node = GRAPH.nodes.get(usize::from(slot)).copied().flatten()?;
+    Some((node.name(), phase))
 }
 
 static mut CORE1_STACK: embassy_rp::multicore::Stack<4096> = embassy_rp::multicore::Stack::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // What the supervisor was doing when the previous boot ended, read
+    // before anything here can overwrite the stash.
+    #[cfg(feature = "breadcrumb")]
+    {
+        let prev = bootflag::take_prev_crumb();
+        PREV_CRUMB.store(prev, Ordering::Relaxed);
+        match decode_crumb(prev) {
+            Some((node, phase)) => defmt::info!("boot: previous crumb: {} {}", node, phase),
+            None => defmt::info!("boot: no previous crumb ({=u32:#x})", prev),
+        }
+    }
     let p = embassy_rp::init(Default::default());
     heap::init();
 
@@ -182,6 +212,9 @@ async fn main(spawner: Spawner) {
 async fn app_supervisor() {
     let spawner = unsafe { Spawner::for_current_executor() }.await;
     let sup = embassy_supervisor::Supervisor::new(&GRAPH);
+    // Before the first wave, so bring-up is recorded too.
+    #[cfg(feature = "lifecycle-sink")]
+    embassy_supervisor::set_lifecycle_sink(crate::http::record_lifecycle);
     loop {
         // `run` returns startup/activation faults or a shutdown timeout. Report
         // and re-enter; a wedged node stays marked running until it acks.

@@ -68,6 +68,28 @@ fn gate_node(n: &NodeItem) -> SynResult<()> {
              how many consecutive stale sweeps are reported on",
         )?;
     }
+    if let Some(e) = &n.enabled_if {
+        require_feature_ungated(
+            &e.cfg,
+            &e.kw,
+            cfg!(feature = "enabled-if"),
+            "`enabled_if:` requires the `enabled-if` feature \
+             (embassy-supervisor feature `enabled-if`) — start() then \
+             evaluates the predicate and disables the node when it \
+             returns false",
+        )?;
+    }
+    if let Some(rb) = &n.restart_budget {
+        require_feature_ungated(
+            &rb.cfg,
+            &rb.kw,
+            cfg!(feature = "restart-intensity"),
+            "`restart_budget:` requires the `restart-intensity` feature \
+             (embassy-supervisor feature `restart-intensity`) — \
+             Supervisor::restart then refuses the N+1th restart inside \
+             the window with FaultKind::RestartStorm",
+        )?;
+    }
     Ok(())
 }
 

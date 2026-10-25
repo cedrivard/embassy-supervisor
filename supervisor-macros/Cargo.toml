@@ -4,7 +4,7 @@ name = "embassy-supervisor-macros"
 # version (`=x.y.z`): the generated code references doc(hidden) supervisor internals,
 # so only the tested pair is guaranteed compatible. Bump only when the macro changes;
 # the supervisor updates its pin to match.
-version = "0.10.0"
+version = "0.11.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -98,6 +98,16 @@ liveness = []
 # matching `.with_beat_timeout(..)` / `.with_beat_window(..)` builder calls.
 # Without it either clause is a span-attached compile error naming the feature.
 liveness-monitor = []
+# Forwarded from the supervisor's `enabled-if` feature: permits the
+# `enabled_if: <fn() -> bool>` node clause and emits the matching
+# `.with_enabled_if(..)` builder call. Without it the clause is a
+# span-attached compile error naming the feature.
+enabled-if = []
+# Forwarded from the supervisor's `restart-intensity` feature: permits the
+# `restart_budget: MAX in WINDOW_MS` node clause and emits the matching
+# `.with_restart_budget(..)` builder call. Without it the clause is a
+# span-attached compile error naming the feature.
+restart-intensity = []
 # Forwarded from the supervisor's `trace` feature: the generated spawn glue captures
 # each SpawnToken's task id into the node (`set_task_id`) before spawning it.
 # Pulls `graph-ref` because the recorders resolve that id by walking the chain
@@ -121,7 +131,7 @@ trace-hooks = ["trace"]
 [dependencies]
 # The graph grammar, shared with the diagram tool. Pinned by EXACT version: the
 # AST is an internal contract between the two crates and changes with the syntax.
-embassy-supervisor-syntax = { version = "=0.4.0", path = "../supervisor-syntax" }
+embassy-supervisor-syntax = { version = "=0.5.0", path = "../supervisor-syntax" }
 syn = { version = "3.0.4", features = ["full"] }
 quote = "1.0.46"
 proc-macro2 = "1.0.106"
@@ -157,6 +167,13 @@ embassy-supervisor = { path = "../supervisor", features = [
     # `beat_verb_requires_feature`) — the same arrangement as `readiness`.
     "liveness",
     "liveness-monitor",
+    # The pass fixtures call `.with_enabled_if(..)` / `.with_restart_budget(..)`,
+    # which only exist with these. Feature unification then re-enables the
+    # macro's own features in the scratch project, so their rejection is
+    # unit-tested here instead (see `enabled_if_requires_feature` and
+    # `restart_budget_requires_feature`).
+    "enabled-if",
+    "restart-intensity",
     "bound-deps",
     "graph-ref",
     "trace",

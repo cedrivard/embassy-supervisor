@@ -4,6 +4,80 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-10-24
+
+Opt-in lifecycle observability and policy (events as a queue or a sink, breadcrumb,
+watchdog feed gate, restart intensity, `enabled_if:`), and respawns that work across
+executor tiers (resident `task:` shells, executor fences). Companion crate versions:
+macros 0.11.0, syntax 0.5.0, tools 0.6.0.
+
+### Added
+
+- `lifecycle-events` feature: `wait_lifecycle()` / `try_wait_lifecycle()` deliver a
+  `LifecycleEvent { node, kind }` for every transition a supervisor drives:
+  `LifecycleKind::{Started, Resumed, StopRequested, Stopped, Exited, Faulted(FaultKind)}`
+  (`Stopped` = acked without the body returning, `Exited` = acked by returning). The
+  queue holds 8 and is lossy on purpose; `lifecycle_events_dropped()` counts the
+  drops. A body that returns on its own, unasked, is not evented.
+- `lifecycle-sink` feature: `set_lifecycle_sink(LifecycleSink)` has the supervisor call
+  an app `fn(LifecycleEvent)` synchronously at each of the same transitions, in order,
+  from the supervisor task. No queue and no consumer task, so nothing is dropped and a
+  timestamp taken in the sink is exact; the sink must be short and non-blocking. Costs
+  one fn pointer. Combinable with `lifecycle-events` (both see every event). On the
+  demo firmware, switching from the queue to the sink cut the feature's `.bss` from
+  +380 B to +204 B.
+- `breadcrumb` feature: `TaskNode::crumb() -> CrumbPhase` (the last phase a supervisor
+  drove the node through) and `crumb_word()` / `decode_crumb()`, the binary-wide last
+  transition packed into one `u32` (valid bit, phase, slot index) for stashing in
+  no-init RAM or a watchdog scratch register.
+- `Graph::all_fresh()` / `Graph::stale_nodes()` (under the existing
+  `liveness-monitor`): the synchronous hardware-watchdog feed gate over `beat_timeout:`
+  policing. Running, non-detached policed nodes only; pending beats are granted as it
+  looks.
+- `restart-intensity` feature (implies `restart`): the `restart_budget: MAX in
+  WINDOW_MS` clause, `NodeCfg::with_restart_budget`, `TaskNode::restart_budget()`, and
+  `FaultKind::RestartStorm`. `Supervisor::restart` refuses the MAX+1th restart of its
+  target inside the window before stopping anything.
+- `enabled-if` feature: the `enabled_if: fn() -> bool` clause and
+  `NodeCfg::with_enabled_if`. `Supervisor::start` evaluates it for each down node and
+  latches `disabled` on `false`; `true` never clears a latch.
+
+### Fixed
+
+- Respawning a node that runs on a lower-priority executor (or another core) than the
+  supervisor no longer fails. The old task's slot frees only when its final poll returns,
+  and the `Busy` retry was a `yield_now` loop that, on a preempting tier, starved exactly
+  that poll until `slot_timeout` faulted the respawn with `FaultKind::Spawn`. On the demo
+  firmware a `net` restart never came back.
+- A respawned node no longer inherits flags its previous instance wrote late (a worker's
+  own ack followed by the shell's `mark_exited`). The new instance read as already
+  stopped, so the next stop resolved it without signalling it.
+
+### Changed
+
+- **Breaking:** `task:` shells are resident: spawned by the node's first activation and
+  never returning, they park after each activation and the next start wakes them in
+  place. The supervisor starts the next activation only once the shell has parked, then
+  resets the node's flags. No RAM change (task storage is static either way; +8 B per
+  shell future). A `state:` type must now be `Send`: it crosses into the resident shell
+  through a handoff slot.
+- **Breaking:** `SpawnerSlot::set` takes `&'static self`, and spawns the slot's executor
+  fence on first fill. `SpawnerSlot::with_fence(FenceSpawn)` (emitted by
+  `supervisor_graph!` for every `executor NAME;`) attaches it. A `Busy` respawn of a
+  `spawn:` node waits one pass of its executor's fence per attempt, or yields once when
+  the node runs on the supervisor's own executor; no timer, no spin. Each fence is one
+  parked task per executor.
+- `start_node` retries a `Busy` spawn until the node's `slot_timeout` (one executor pass
+  per attempt), as bring-up waves already did, instead of retrying once.
+- With `restart-intensity`, `apply_control(ControlOp::Restart)` propagates
+  `FaultKind::RestartStorm` (like `ShutdownTimeout`) instead of absorbing it, so the
+  `run` driver returns it.
+
+### Removed
+
+- **Breaking:** the `pool_size:` node clause. A resident shell never needs a second task
+  slot; the clause is now a compile error naming the change.
+
 ## [0.11.0] - 2026-09-30
 
 Returns activation faults to callers and the control driver. Companion crate
@@ -1176,7 +1250,8 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.11.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.12.0...HEAD
+[0.12.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.11.0...embassy-supervisor-v0.12.0
 [0.11.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.10.0...embassy-supervisor-v0.11.0
 [0.10.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.9.0...embassy-supervisor-v0.10.0
 [0.9.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.8.1...embassy-supervisor-v0.9.0

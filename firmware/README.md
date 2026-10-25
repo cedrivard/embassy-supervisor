@@ -18,9 +18,9 @@ a dependency cycle is a compile error wherever its two ends are declared.
 
 <!-- supervisor-mermaid:start -->
 ```mermaid
-%% runtime coupling — compose_graph!  (/home/cedric/DEV/embassy-supervisor/firmware/src/main.rs:19)
+%% runtime coupling — compose_graph!  (firmware/src/main.rs:23)
 flowchart TD
-  accDescr: supervisor task graph declared at firmware/src/main.rs:19
+  accDescr: supervisor task graph declared at firmware/src/main.rs:23
   subgraph f_NET_FRAG["NET_FRAG"]
     direction TD
     n_NET["NET<br/>Terminate · task"]
@@ -32,7 +32,7 @@ flowchart TD
   n_WATCHDOG["WATCHDOG<br/>Terminate · task"]
   n_HEARTBEAT["HEARTBEAT<br/>Pause · task · @HIGH · beat 15000"]
   n_OTA["OTA<br/>Terminate · task"]
-  n_BENCH["BENCH<br/>Terminate · task · @CORE1"]
+  n_BENCH["BENCH<br/>Terminate · task · @CORE1 · disabled <small>cfg(not (feature = #quot;enabled-if#quot;))</small>"]
   n_OTA_CONFIRM["OTA_CONFIRM<br/>Terminate · task"]
 
   n_NET -. "spawn · ready" .-> n_HTTP
@@ -105,13 +105,13 @@ handlers ring core 0's doorbell when they run on core 1, and core 0's
 
 | Node | Mode | Deps | Executor | Boot state | What it demonstrates |
 |---|---|---|---|---|---|
-| `watchdog` | Terminate | none | thread | started | Detached daemon: feeds the bootloader's 8 s rollback watchdog every 2 s; detached, so no cascade or respawn ever stops it. Warns on trace stalls (any poll over 100 ms) and logs liveness events. |
-| `net` | Terminate | none | thread | started | Reclaimable subsystem: heap-allocates every USB and network buffer on start (~16 KB total), frees them on stop. Root of the data plane: stopping it tears `http` and `ota` down first, then returns the heap. USB peripheral threaded from `main` via `resources:`; restored on stop, re-taken on restart, no `steal()`. |
+| `watchdog` | Terminate | none | thread | started | Detached daemon: feeds the bootloader's 8 s rollback watchdog every 2 s; detached, so no cascade or respawn ever stops it. With `feed-gate` the feed is withheld while a policed node is stale (`GRAPH.all_fresh()`), so a stalled `heartbeat` resets the chip. Warns on trace stalls (any poll over 100 ms), logs liveness events, stashes the supervisor's breadcrumb in watchdog scratch every pass, and resets the chip on `POST /api/reboot`. Its feed runs on its own deadline, so no event stream can postpone it. |
+| `net` | Terminate | none | thread | started | Reclaimable subsystem: heap-allocates every USB and network buffer on start (~16 KB total), frees them on stop. Root of the data plane: stopping it tears `http` and `ota` down first, then returns the heap. USB peripheral threaded from `main` via `resources:`; restored on stop, re-taken on restart, no `steal()`. `restart_budget: 3 in 60000`: a fourth restart inside a minute is refused as a restart storm. |
 | `heartbeat` | Pause | none | `HIGH` | started | Pause/Resume demo: parks and keeps its LED pin. Blinks the LED (beat every 15 s), survives thread-tier stalls because it is on `HIGH`, and exposes `POST /api/heartbeat?ms=` to change the blink period. |
 | `http0` | Terminate | `net ready` | thread | started | Pool floor: always on while `net` is up. Stopping the floor seeds a whole-pool stop. |
 | `http1` | OnDemand | `net ready` | thread | stopped | Elastic burst worker: the pool (`min: 1, max: 2`, `DeferredShrink` with a 4 s cooldown) grows it when every running worker is busy, shrinks it after the cooldown. Each worker owns one socket and heap I/O buffers, so scaling stays inside the fixed `StackResources` socket budget. |
 | `ota` | Terminate | `net ready` | thread | **disabled** | Control-started update path: detaches itself (uninterruptible), drains the pool and `net`, decodes a zstd image into DFU, arms the swap, resets. FLASH threaded from `main` via `resources:`; `mark_booted` (the `ota-confirm` path) borrows the same slot manually with `take()`/`restore()`, so the two FLASH users exclude each other at runtime. Reports its phase via `report_status`. |
-| `bench` | Terminate | `heartbeat ready bound` | `CORE1` | **disabled** | Multi-core placement: the core-0 supervisor spawns and stops it on core 1 through the `CORE1` spawner slot. The graph's one bound edge: it runs only while the heartbeat is actively blinking; pausing the heartbeat stops it, resuming restarts it. Returns its slice count into the `exit:` slot (`GET /api/bench`). |
+| `bench` | Terminate | `heartbeat ready bound` | `CORE1` | **disabled** (started when the boot flag is set, under `enabled-if`) | Multi-core placement: the core-0 supervisor spawns and stops it on core 1 through the `CORE1` spawner slot. The graph's one bound edge: it runs only while the heartbeat is actively blinking; pausing the heartbeat stops it, resuming restarts it. Returns its slice count into the `exit:` slot (`GET /api/bench`). Under `enabled-if` its `disabled` becomes `enabled_if: crate::bootflag::bench_enabled`, a flag in watchdog scratch 5 that survives a reset (`POST /api/bootflag?bench=on`). |
 | `ota-confirm` | Terminate | `http` (pool floor), `net ready` | thread | started | Run-last ordering: depending on the pool name resolves to the floor member, so it spawns last in topological order. Detaches, waits for the network, calls `mark_booted` to confirm the image, exits. An update too broken to reach it never confirms, and the bootloader rolls back. |
 
 ### Supervisor features exercised
@@ -125,7 +125,7 @@ handlers ring core 0's doorbell when they run on core 1, and core 0's
 | Lifecycle: Pause/Resume | `heartbeat` keeps its LED pin across a pause |
 | Generated task shells (`task:`) | every node and the pool declared with `task:`; the only hand-written `#[task]` is the supervisor task itself |
 | Safe resource threading (`resources:`) | every peripheral moved from `main`; zero `steal()` in the firmware |
-| Control-started nodes | `ota` and `bench` are disabled at boot, started by control |
+| Control-started nodes | `ota` is disabled at boot, started by control; so is `bench` unless the boot flag enables it |
 | Multi-executor tier | `heartbeat` on the `HIGH` `InterruptExecutor` (SWI_IRQ_0 @ P2); the supervisor itself on `SWI_IRQ_1` @ P1 |
 | `default executor` | `THREAD`: the thread executor published from `main`, inherited by every node and fragment that names no tier |
 | Fault injection (`fault-inject`) | `POST /api/fault`, the dashboard's ⚡ menu: stall, wedge, crash or hog any `task:` node |
@@ -142,7 +142,12 @@ handlers ring core 0's doorbell when they run on core 1, and core 0's
 | One-call driver | `sup.run(&spawner)`: start + pool scaling + control, returns only on error |
 | Task-asserted readiness | `net` calls `set_ready()` once the link is configured |
 | Liveness heartbeat | `heartbeat` calls `beat()` per blink edge |
-| Liveness policing (`liveness-monitor`) | `beat_timeout: 15000` on `heartbeat`; `watchdog` consumes `wait_health()` and logs (report only, no automatic escalation) |
+| Liveness policing (`liveness-monitor`) | `beat_timeout: 15000` on `heartbeat`; `watchdog` consumes `wait_health()` and logs. The monitor itself only reports; the escalation is `feed-gate` below |
+| Watchdog feed gate (`all_fresh`, firmware feature `feed-gate`) | `watchdog` feeds the hardware watchdog only while `GRAPH.all_fresh()`; a stale policed node withholds the feed and the chip resets ~8 s later. Stopped, paused, crashed (exited) and detached nodes are never stale |
+| Lifecycle sink (`lifecycle-sink`) | `app_supervisor` installs `http::record_lifecycle` with `set_lifecycle_sink`; the supervisor calls it at every transition, and it logs the event and stamps it into a 16-entry ring (12 B per entry); `GET /api/events` returns the ring newest-first |
+| Bring-up breadcrumb (`breadcrumb`) | `watchdog` stashes `crumb_word()` in watchdog scratch 6 every pass; the next boot logs the decoded node and phase, and `/api/tasks` reports it as `prev_crumb` |
+| Restart intensity (`restart-intensity`) | `net` declares `restart_budget: 3 in 60000`; the fourth restart in a minute fails as `RestartStorm`, which `Supervisor::run` returns into `last_fault` |
+| Settings-gated bring-up (`enabled-if`) | `bench` declares `enabled_if: crate::bootflag::bench_enabled`; `POST /api/bootflag?bench=on` plus `POST /api/reboot` brings it up at the next boot |
 | Activation generations (`epochs`) | the dashboard `gen` column: a restarted node shows it even if the page missed it being down |
 | Derived dataflow | `heartbeat` carries `discover`; no `reads:`/`writes:` lists anywhere in the graph |
 | Adopted dataflow | `http` adopts `set_period_ms`, `net` adopts `publish_stack`, `ota` adopts `lease_stack`, `ota-confirm` adopts `stack_ready` |
@@ -173,7 +178,9 @@ section).
 `beat_timeout:` is the steady-state bound, the counterpart aimed at running
 nodes rather than gates. `heartbeat` declares 15 s; the monitor reports a
 miss within about 1.5x the budget (~22 s) and leaves the node running: it
-names what it saw, the application decides.
+names what it saw, the application decides. This application decides with
+`feed-gate`: once `heartbeat` is past its budget, `watchdog` stops feeding the
+hardware watchdog and the chip resets about 8 s later, through the bootloader.
 
 ### The stack handle: copy at spawn, or lease per use
 
@@ -208,7 +215,8 @@ The firmware always runs from the ACTIVE partition under the bootloader (it
 is linked at `0x10021000` and cannot boot standalone), so a first flash
 installs the bootloader + firmware pair. The bootloader arms an 8 s watchdog
 as its OTA rollback safety; the firmware's `watchdog` node feeds it, so a
-healthy image stays up and a hung one resets and rolls back.
+healthy image stays up and a hung one resets and rolls back. With `feed-gate`
+(default), "healthy" also means every node with a `beat_timeout:` is beating.
 
 ```sh
 # Board variant: firmware/Cargo.toml uses embassy-rp `rp235xb` (SparkFun IoT
@@ -235,11 +243,21 @@ steps 2-3 is also the recovery path if a bad image bricks the boot.
 
 | feature | default | effect |
 | --- | --- | --- |
+| `lifecycle-sink` | on | `embassy-supervisor/lifecycle-sink`: the supervisor's lifecycle sink logs every transition and records the last 16 for `GET /api/events`. |
+| `breadcrumb` | on | `embassy-supervisor/breadcrumb`: the supervisor's last transition is stashed in watchdog scratch 6, logged at the next boot and reported as `prev_crumb` in `/api/tasks`. |
+| `feed-gate` | on | Demo-only, no supervisor feature: feed the hardware watchdog only while `GRAPH.all_fresh()`. A stale `heartbeat` resets the chip. |
+| `restart-intensity` | on | `embassy-supervisor/restart-intensity`: `net`'s `restart_budget: 3 in 60000`. |
+| `enabled-if` | on | `embassy-supervisor/enabled-if`: `bench` boots enabled when the boot flag in watchdog scratch 5 is set; adds `POST /api/bootflag` and `POST /api/reboot`. Without it `bench` is plainly `disabled`. |
 | `dns` | off | Resolve the OTA target by hostname through a real `DnsSocket`, instead of the parse-only `ota::IpDns` that only accepts literal IPv4. Pulls `embassy-net/dns`, adds a `StackResources` slot (`net::SOCKET_BUDGET`), costs ~7 KB of flash. |
 
 ```sh
 cargo build --release -p firmware --features dns
+cargo build --release -p firmware --no-default-features   # none of the five
 ```
+
+The five default features exist so each one's cost can be measured on its
+own; see [Footprint](#footprint). `--no-default-features` builds the firmware
+without any of them, behaving as before they were added.
 
 ### Supervisor features this firmware enables
 
@@ -259,6 +277,8 @@ embassy-supervisor = { path = "../supervisor", features = [
 
 `macros` comes from the crate's defaults and `control` via `restart`. Dropping
 any opt-in compiles the corresponding clause out of the graph.
+`lifecycle-sink`, `breadcrumb`, `restart-intensity` and `enabled-if` arrive
+through this crate's features of the same names (above).
 
 ## Host network setup (USB-net)
 
@@ -317,15 +337,55 @@ xdg-open http://10.42.0.61/             # task view + stop/start/pause/resume/re
   A plain stop-then-start of `net` does not do this: the workers keep running
   against the new instance and their `gen` does not move. (`ota-confirm` is
   detached, so it is excluded from both.)
+  The restart comes back in about 5 ms: `net`'s `task:` shell is resident, so
+  the supervisor restarts it in place once it has parked, instead of
+  re-spawning into a task slot that frees only after the old poll returns.
   ```sh
   curl -XPOST 'http://10.42.0.61/api/control?node=net&op=restart'
   ```
 - **Liveness monitor:** set a blink period longer than the 15 s
   `beat_timeout:`. Within ~22 s the supervisor reports the node stale over
-  defmt, once, and reports it recovered on the next blink edge. The node is
-  **not** stopped or restarted: the monitor reports, the application decides.
+  defmt, once, and reports it recovered on the next blink edge. The monitor
+  does **not** stop or restart the node: it reports, the application decides.
+  This firmware's `feed-gate` decides to reset: with it on (the default) the
+  feed is withheld as soon as the beat is late, and the chip resets about 8 s
+  later unless a beat lands first. Build with `--no-default-features` (or
+  without `feed-gate`) to watch the report-only behavior.
   ```sh
   curl -XPOST 'http://10.42.0.61/api/heartbeat?ms=20000'
+  ```
+- **Lifecycle events:** cycle a node, then read the ring. Each entry is
+  `{node, kind, tick}`, newest first (`kind` is `started`, `resumed`,
+  `stop_requested`, `stopped`, `exited` or `faulted`; the defmt log names the
+  fault). `tick` is the transition's own time in µs since boot (`tick_hz`),
+  taken inside the sink, truncated to `u32` like `now_ticks` (wraps every
+  ~71.6 min; diff the two wrap-safely). The ring keeps the last 16 events;
+  the sink itself drops nothing.
+  ```sh
+  curl -XPOST 'http://10.42.0.61/api/control?node=heartbeat&op=pause'
+  curl -XPOST 'http://10.42.0.61/api/control?node=heartbeat&op=resume'
+  curl 'http://10.42.0.61/api/events'
+  ```
+- **Restart storm:** `net` allows 3 restarts per 60 s. The fourth inside the
+  window is refused before anything stops: defmt logs `supervisor: net restart
+  budget exhausted`, `Supervisor::run` returns the `RestartStorm` fault into
+  `last_fault`, and the event ring shows a `faulted` entry. Each restart
+  re-enumerates the USB link; raise the `sleep` if a request lands before the
+  host's `usb0` is back.
+  ```sh
+  for i in 1 2 3 4; do curl -XPOST 'http://10.42.0.61/api/control?node=net&op=restart'; sleep 3; done
+  curl 'http://10.42.0.61/api/tasks' | jq .last_fault
+  ```
+- **Settings-gated bring-up (`enabled_if:`):** set the boot flag and reboot.
+  The flag lives in watchdog scratch 5, which a watchdog reset keeps, so after
+  the reboot `bench` is not `disabled`: `start()` brings it up with the rest of
+  the graph and core 1 goes busy. `bench=off` plus another reboot restores the
+  default; a power cycle clears the flag too. `/api/reboot` answers first, then
+  `watchdog` triggers the reset.
+  ```sh
+  curl -XPOST 'http://10.42.0.61/api/bootflag?bench=on'
+  curl -XPOST 'http://10.42.0.61/api/reboot'
+  curl -XPOST 'http://10.42.0.61/api/bootflag?bench=off'
   ```
 - **Bound readiness edge:** start `bench`, then pause the heartbeat. The
   heartbeat's pause withdraws readiness, and because `bench` declared
@@ -339,8 +399,8 @@ xdg-open http://10.42.0.61/             # task view + stop/start/pause/resume/re
   curl -XPOST 'http://10.42.0.61/api/control?node=heartbeat&op=resume'
   ```
 - **Fault injection:** the dashboard's ⚡ menu, or `POST /api/fault?node=NAME&kind=stall|wedge|crash|hog|clear`. The worker does not know it exists.
-  - **stall:** stop polling the node. The LED freezes and a stale report fires. `clear` resumes polling.
-  - **wedge:** hide the next pause ack so the 2 s window expires. `clear` lets the ack through.
+  - **stall:** stop polling the node. The LED freezes and a stale report fires. With `feed-gate` a stalled `heartbeat` is a hang: unless `clear`ed within its 15 s beat budget, the feed is withheld and the chip resets about 8 s later (see the breadcrumb recipe below).
+  - **wedge:** hide the next pause ack so the 2 s window expires. `clear` lets the ack through. A wedged `heartbeat` stays marked running without beating, so with `feed-gate` it too resets the chip unless cleared within 15 s.
   - **crash:** drop the worker future cleanly. Restart the node to bring it back.
   - **hog:** spin a task for the requested milliseconds. Hogging `heartbeat` starves the `HIGH` tier and everything below it; hogging `http0` starves the thread tier.
 
@@ -360,15 +420,38 @@ xdg-open http://10.42.0.61/             # task view + stop/start/pause/resume/re
     curl -XPOST 'http://10.42.0.61/api/fault?node=heartbeat&kind=hog'
     curl -XPOST 'http://10.42.0.61/api/fault?node=http0&kind=hog&ms=2000'
     ```
+- **Breadcrumb + feed gate:** stall `heartbeat` and leave it. After its 15 s
+  budget `watchdog` logs `watchdog: feed withheld, stale: heartbeat` every 2 s
+  and the hardware watchdog resets the chip about 8 s later; the bootloader
+  boots the image again. The new boot logs `boot: previous crumb: <node>
+  <phase>` (the supervisor's last transition before the reset, not
+  necessarily the stale node), and `/api/tasks` carries it.
+  ```sh
+  curl -XPOST 'http://10.42.0.61/api/fault?node=heartbeat&kind=stall'
+  # ~15-25 s later the board resets; once it is back:
+  curl 'http://10.42.0.61/api/tasks' | jq '{prev_crumb, prev_crumb_node, prev_crumb_phase}'
+  ```
+
+  Verified on a SparkFun IoT RedBoard RP2350 (2026-10-24): the restart,
+  restart-storm, lifecycle-events, `enabled_if:` and breadcrumb/feed-gate
+  recipes behave as described (three `net` restarts back in ~5 ms each, the
+  fourth logged `net restart budget exhausted` with `net` still running;
+  stall → stale at 15 s → three withheld feeds → reset → `previous crumb`
+  names the last transition). With the sink, the ring holds bring-up from
+  `tick` 872 µs, a `heartbeat` stop ack 287 µs after its request, and the
+  refused fourth restart as `net faulted`.
 
 ## Reading `/api/tasks`
 
 `GET /api/tasks` reports the whole graph as JSON: `heap_free`, `heap_total`,
-`tick_hz`, `now_ticks`, a `tasks` array (one object per node), and an
-`executors` array. All counters are raw wrapping `u32` ticks: to get a rate,
-sample twice and subtract with wrapping (`(a - b) >>> 0`; the dashboard and
-the wrk script both do this). `tick_hz` converts ticks to time (here 1 MHz,
-so 1 tick = 1 us).
+`tick_hz`, `now_ticks`, `last_fault`, a `tasks` array (one object per node),
+and an `executors` array. With `breadcrumb` it also carries `prev_crumb`, the
+raw crumb word the previous boot left (0: none), and, when that word names a
+node, `prev_crumb_node` and `prev_crumb_phase` (`idle`, `spawning`,
+`started`, `stop_signalled`, `stopped`, `faulted` or `resumed`). All counters
+are raw wrapping `u32` ticks: to get a rate, sample twice and subtract with
+wrapping (`(a - b) >>> 0`; the dashboard and the wrk script both do this).
+`tick_hz` converts ticks to time (here 1 MHz, so 1 tick = 1 us).
 
 ### System / heap
 

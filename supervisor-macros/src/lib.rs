@@ -23,6 +23,7 @@ struct HelperIdents {
     alloc_alias: Ident,
     nodes: Ident,
     graph_ref: Ident,
+    fence: Ident,
 }
 
 impl HelperIdents {
@@ -35,6 +36,7 @@ impl HelperIdents {
                 alloc_alias: format_ident!("__sv_alloc"),
                 nodes: format_ident!("NODES"),
                 graph_ref: format_ident!("GRAPH_REF"),
+                fence: format_ident!("__sv_fence"),
             },
             Some(n) => {
                 let lower = n.to_string().to_lowercase();
@@ -45,6 +47,7 @@ impl HelperIdents {
                     alloc_alias: format_ident!("__sv_alloc_{lower}"),
                     nodes: format_ident!("__SV_NODES_{}", n),
                     graph_ref: format_ident!("__SV_GRAPH_REF_{}", n),
+                    fence: format_ident!("__sv_fence_{lower}"),
                 }
             }
         }
@@ -626,6 +629,9 @@ struct Slot {
 fn node_spawn(
     ident: &Ident,
     spawn: &Option<Expr>,
+    // `task:` node: its shell is resident, so the glue spawns it once and
+    // restarts it in place after that (see `emit_shell`).
+    resident: bool,
     executor: &Option<Ident>,
     resources: &[ResourceDecl],
     // `state:`: fallibly box the init value in the glue, BEFORE the resource
@@ -637,13 +643,12 @@ fn node_spawn(
 ) -> SynResult<TokenStream2> {
     // `resources:` glue prelude: every entry is PROBED here — the fail-closed
     // check that turns "unprovided" into `SpawnError::Busy` out of
-    // `Supervisor::start` — and read by the shell itself at first poll
-    // (`take()` for lend/consume, the non-destructive `get()` for `shared`): a
-    // value moved through the task-fn call would be dropped, unrecoverable,
-    // when the claim fails (`Busy` while the previous instance's storage is
-    // still releasing), and even a `Copy` handle passed as an argument sits in
-    // the task arena for the whole run beside the worker's own copy
-    // (rust-lang/rust#62958). Nothing crosses the call.
+    // `Supervisor::start` — and read by the shell itself at the start of each
+    // activation (`take()` for lend/consume, the non-destructive `get()` for
+    // `shared`): a value moved through the task-fn call would be dropped,
+    // unrecoverable, when the claim fails, and even a `Copy` handle passed as
+    // an argument sits in the task arena for the whole run beside the worker's
+    // own copy (rust-lang/rust#62958). Nothing crosses the call.
     let take_prelude: Vec<TokenStream2> = resources
         .iter()
         .map(|r| {
@@ -657,9 +662,48 @@ fn node_spawn(
             }
         })
         .collect();
-    let (state_prelude, state_arg) = match state {
-        Some((ty, init)) => (state_box_stmt(ty, init, helpers), vec![quote!(__state)]),
-        None => (quote!(), vec![]),
+    let (state_prelude, state_arg, state_handoff) = match state {
+        Some((ty, init)) if resident => {
+            let slot = format_ident!("__SV_STATE_{}", ident);
+            (
+                state_box_stmt(ty, init, helpers),
+                vec![quote!(&#slot)],
+                quote!(#slot.provide(__state);),
+            )
+        }
+        Some((ty, init)) => (
+            state_box_stmt(ty, init, helpers),
+            vec![quote!(__state)],
+            quote!(),
+        ),
+        None => (quote!(), vec![], quote!()),
+    };
+    // The body after the executor guard. A resident shell is spawned by the
+    // first activation only; every later one restarts it (`__sv_start`).
+    // `__sv_resident` fails `Busy` while the shell is still finishing its
+    // previous activation — before anything is boxed or probed, so a refused
+    // restart costs nothing.
+    let launch = |stmts: TokenStream2| {
+        if resident {
+            quote! {
+                let __resident = #ident.__sv_resident()?;
+                #state_prelude
+                #(#take_prelude)*
+                #state_handoff
+                if __resident {
+                    #ident.__sv_start();
+                } else {
+                    #stmts
+                    #ident.__sv_mark_resident();
+                }
+            }
+        } else {
+            quote! {
+                #state_prelude
+                #(#take_prelude)*
+                #stmts
+            }
+        }
     };
     Ok(match (spawn, executor) {
         (None, None) => quote!(::core::option::Option::None),
@@ -683,18 +727,16 @@ fn node_spawn(
             let call = inject_call_with(e, &lead)?;
             match executor {
                 None => {
-                    let stmts = spawn_stmts(&call, &quote!(&#ident), &quote!(s));
+                    let body = launch(spawn_stmts(&call, &quote!(&#ident), &quote!(s)));
                     quote!(::core::option::Option::Some(
                         (|s| {
-                            #state_prelude
-                            #(#take_prelude)*
-                            #stmts
+                            #body
                             ::core::result::Result::Ok(())
                         }) as #spawn_fn
                     ))
                 }
                 Some(ex) => {
-                    let stmts = spawn_stmts(&call, &quote!(&#ident), &quote!(__sp));
+                    let body = launch(spawn_stmts(&call, &quote!(&#ident), &quote!(__sp)));
                     quote!(::core::option::Option::Some(
                         (|_s| {
                             // The supervisor awaits this slot's `ready()` before
@@ -706,9 +748,7 @@ fn node_spawn(
                             let __sp = #ex
                                 .get()
                                 .ok_or(::embassy_executor::SpawnError::Busy)?;
-                            #state_prelude
-                            #(#take_prelude)*
-                            #stmts
+                            #body
                             ::core::result::Result::Ok(())
                         }) as #spawn_fn
                     ))
@@ -892,7 +932,7 @@ fn emit_shell(
                     #(#cfg)*
                     let ::core::option::Option::Some(#var) = #res.get() else {
                         __node.mark_lost_resource();
-                        return;
+                        break '__sv_act;
                     };
                 }),
                 ResourceKind::Divisible if pool_member => None,
@@ -916,7 +956,7 @@ fn emit_shell(
                         #(#cfg)*
                         let ::core::option::Option::Some(#mutability #var) = #slot.take() else {
                             __node.mark_lost_resource();
-                            return;
+                            break '__sv_act;
                         };
                     })
                 }
@@ -953,15 +993,43 @@ fn emit_shell(
         })
         .collect();
     let alloc_alias = &helpers.alloc_alias;
-    let (state_param, state_lease, state_drop) = match state {
-        Some((ty, _)) => (
-            quote!(, mut __state: #alloc_alias::boxed::Box<#ty>),
-            vec![quote!(&mut *__state)],
-            // Reclaim the bulk FIRST: before restores, exit-provide, and the
-            // completion record, so has_exited() implies the heap is back.
-            quote!(::core::mem::drop(__state);),
-        ),
-        None => (quote!(), vec![], quote!()),
+    // `state:` crosses from the spawn glue (which boxes it, fallibly, per
+    // activation) into the resident shell through a handoff slot: a node's
+    // own static, or member `I`'s element of the pool's array, passed in by
+    // the wrapper. A `ResourceSlot` is `Sync` only for `Send` contents, so the
+    // state type must be `Send`.
+    let state_slot = format_ident!("__SV_STATE_{}", owner);
+    let (state_param, state_def, state_take, state_lease, state_drop) = match state {
+        Some((ty, _)) => {
+            let def = if pool_member {
+                quote! {
+                    #(#cfg)*
+                    static #state_slot: [#cr::ResourceSlot<#alloc_alias::boxed::Box<#ty>>; #pool_size] =
+                        [const { #cr::ResourceSlot::new() }; #pool_size];
+                }
+            } else {
+                quote! {
+                    #(#cfg)*
+                    static #state_slot: #cr::ResourceSlot<#alloc_alias::boxed::Box<#ty>> =
+                        #cr::ResourceSlot::new();
+                }
+            };
+            (
+                quote!(, __state_slot: &'static #cr::ResourceSlot<#alloc_alias::boxed::Box<#ty>>),
+                def,
+                quote! {
+                    let ::core::option::Option::Some(mut __state) = __state_slot.take() else {
+                        __node.mark_lost_resource();
+                        break '__sv_act;
+                    };
+                },
+                vec![quote!(&mut *__state)],
+                // Reclaim the bulk FIRST: before restores, exit-provide, and the
+                // completion record, so has_exited() implies the heap is back.
+                quote!(::core::mem::drop(__state);),
+            )
+        }
+        None => (quote!(), quote!(), quote!(), vec![], quote!()),
     };
     // `cancel` workers take no node: the shell holds it and races the worker's
     // future against the shutdown signal itself, which is the whole point of the
@@ -1096,26 +1164,45 @@ fn emit_shell(
     };
     // Record the completion (and ack any pending shutdown handshake): a worker
     // that returns on its own reads as down, not running forever, and a control
-    // Activate can respawn it. A per-node shell names its node STATIC here (like
-    // the `_EXIT` provide above) so `__node`'s last use is the worker call — a
-    // local dead before the await stays out of the task arena. A pool shell is
-    // shared by its members, so only the parameter knows the node.
-    let mark_exited = if pool_member {
-        quote!(__node.mark_exited();)
+    // Activate can start it again. A per-node shell names its node STATIC here
+    // (like the `_EXIT` provide above). A pool shell is shared by its members,
+    // so only the parameter knows the node.
+    let (mark_exited, park) = if pool_member {
+        (
+            quote!(__node.mark_exited();),
+            quote!(__node.__sv_park().await;),
+        )
     } else {
-        quote!(#owner.mark_exited();)
+        (
+            quote!(#owner.mark_exited();),
+            quote!(#owner.__sv_park().await;),
+        )
     };
+    // Resident: spawned once, the shell runs one activation per start and
+    // parks in between, so a restart never waits for its task slot to free
+    // (which happens only after the final poll returns, out of the
+    // supervisor's sight). Parking is the shell's last act of an activation,
+    // after the restores and the exit record, so a parked shell has nothing
+    // left that could touch the next activation's state.
     let def = quote! {
+        #state_def
         #(#cfg)*
         #[::embassy_executor::task(pool_size = #ps)]
         #allow_unreachable
+        #[allow(unused_labels)]
         async fn #shell(__node: &'static #cr::TaskNode #(, #res_params)* #state_param) {
-            #(#res_takes)*
-            #drive
-            #state_drop
-            #(#restores)*
-            #provide_exit
-            #mark_exited
+            loop {
+                '__sv_act: {
+                    #state_take
+                    #(#res_takes)*
+                    #drive
+                    #state_drop
+                    #(#restores)*
+                    #provide_exit
+                    #mark_exited
+                }
+                #park
+            }
         }
     };
     let path: Expr = syn::parse_quote!(#shell);
@@ -1145,32 +1232,11 @@ fn emit_node(
     let disabled = disabled_tokens(n.disabled.as_ref());
     let (shell_def, spawn_expr) = match &n.source {
         Some(TaskSource::Shell(worker)) => {
-            let ps = match &n.pool_size {
-                Some(l) => l.base10_parse::<usize>()?,
-                None => 1,
-            };
-            // A node's take-kind slots hold ONE value, so extra instances
-            // could only race the shell's take; a divisible slot is ONE
-            // claimant, so extra instances would clobber each other's want
-            // and share one grant. Reject the combination instead of letting
-            // the loser exit as a lost resource.
-            if ps > 1
-                && n.resources
-                    .iter()
-                    .any(|r| !matches!(r.kind(), ResourceKind::Shared))
-            {
-                return Err(syn::Error::new_spanned(
-                    n.pool_size.as_ref().unwrap(),
-                    "`pool_size > 1` cannot combine with lend/consume/divisible \
-                     `resources:` (the slot holds one value, or one claimant; use \
-                     `shared`, or an `ElasticPool` with per-member slots)",
-                ));
-            }
             let (def, path) = emit_shell(
                 ident,
                 cfg,
                 worker,
-                ps,
+                1,
                 &n.resources,
                 &claims,
                 n.exit.as_ref(),
@@ -1188,6 +1254,7 @@ fn emit_node(
     let spawn = node_spawn(
         ident,
         &spawn_expr,
+        matches!(n.source, Some(TaskSource::Shell(_))),
         &n.executor,
         &n.resources,
         n.state.as_ref().map(|(_, ty, init)| (ty, init)),
@@ -1312,6 +1379,33 @@ fn emit_node(
                     err: "`beat_window:` requires the `liveness-monitor` feature \
                           (embassy-supervisor feature `liveness-monitor`) — it sets \
                           how many consecutive stale sweeps are reported on",
+                }
+            }),
+            n.enabled_if.as_ref().map(|g| {
+                let (c, f) = (&g.cfg, &g.value);
+                GatedBuilder {
+                    cfg: c.clone(),
+                    tokens: quote!( .with_enabled_if(#f) ),
+                    available: cfg!(feature = "enabled-if"),
+                    err: "`enabled_if:` requires the `enabled-if` feature \
+                          (embassy-supervisor feature `enabled-if`) — start() then \
+                          evaluates the predicate and disables the node when it \
+                          returns false",
+                }
+            }),
+            n.restart_budget.as_ref().map(|g| {
+                let (c, (max, window)) = (&g.cfg, &g.value);
+                let max = LitInt::new(&format!("{}u16", max.base10_digits()), max.span());
+                GatedBuilder {
+                    cfg: c.clone(),
+                    tokens: quote!(
+                        .with_restart_budget(#max, #cr::_export::Duration::from_millis(#window))
+                    ),
+                    available: cfg!(feature = "restart-intensity"),
+                    err: "`restart_budget:` requires the `restart-intensity` feature \
+                          (embassy-supervisor feature `restart-intensity`) — \
+                          Supervisor::restart then refuses the N+1th restart inside \
+                          the window with FaultKind::RestartStorm",
                 }
             }),
             n.ready_on_write.as_ref().map(|g| GatedBuilder {
@@ -1560,9 +1654,18 @@ fn emit_pool(
             }
         })
         .collect();
-    let (state_prelude, state_arg) = match &p.state {
-        Some((_, ty, init)) => (state_box_stmt(ty, init, helpers), vec![quote!(__state)]),
-        None => (quote!(), vec![]),
+    // A `task:` pool's shell is resident per member (see `emit_shell`): member
+    // `I` spawns its shell instance once and restarts it after that, its
+    // `state:` box crossing through element `I` of the handoff array.
+    let resident = matches!(p.source, TaskSource::Shell(_));
+    let state_slot = format_ident!("__SV_STATE_{}", ident);
+    let (state_prelude, state_arg, state_handoff) = match &p.state {
+        Some((_, ty, init)) => (
+            state_box_stmt(ty, init, helpers),
+            vec![quote!(&#state_slot[I])],
+            quote!(#state_slot[I].provide(__state);),
+        ),
+        None => (quote!(), vec![], quote!()),
     };
     let mut lead: Vec<TokenStream2> = vec![quote!(&#ident[I])];
     lead.extend(res_args);
@@ -1599,6 +1702,26 @@ fn emit_pool(
         })
         .collect();
     let pool_spawn_stmts = spawn_stmts(&call, &quote!(&#ident[I]), &sp_tokens);
+    let body = if resident {
+        quote! {
+            let __resident = #ident[I].__sv_resident()?;
+            #state_prelude
+            #(#get_prelude)*
+            #state_handoff
+            if __resident {
+                #ident[I].__sv_start();
+            } else {
+                #pool_spawn_stmts
+                #ident[I].__sv_mark_resident();
+            }
+        }
+    } else {
+        quote! {
+            #state_prelude
+            #(#get_prelude)*
+            #pool_spawn_stmts
+        }
+    };
     let wrapper = format_ident!("spawn_{}", ident.to_string().to_lowercase());
     let mut defs: Vec<TokenStream2> = Vec::new();
     defs.push(shell_def);
@@ -1608,9 +1731,7 @@ fn emit_pool(
             #param: ::embassy_executor::Spawner,
         ) -> ::core::result::Result<(), ::embassy_executor::SpawnError> {
             #prelude
-            #state_prelude
-            #(#get_prelude)*
-            #pool_spawn_stmts
+            #body
             ::core::result::Result::Ok(())
         }
     });
@@ -2162,6 +2283,22 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
             _ => None,
         })
         .collect();
+    // One executor fence per `executor NAME;` (see `SpawnerSlot`): a resident
+    // task on that tier, spawned when the slot is filled, whose single poll
+    // proves every task polled before it has returned from its poll.
+    if !executor_names.is_empty() {
+        let fence = &helpers.fence;
+        let n = LitInt::new(
+            &executor_names.len().to_string(),
+            proc_macro2::Span::call_site(),
+        );
+        defs.push(quote! {
+            #[::embassy_executor::task(pool_size = #n)]
+            async fn #fence(__slot: &'static #cr::SpawnerSlot) {
+                __slot.__sv_fence_loop().await
+            }
+        });
+    }
     let pool_names: std::collections::HashSet<String> = graph
         .items
         .iter()
@@ -2602,9 +2739,16 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
             }
             Item::Executor(x) => {
                 let (cfg, ident) = (&x.cfg, &x.ident);
+                let fence = &helpers.fence;
                 defs.push(quote! {
                     #(#cfg)*
-                    pub static #ident: #cr::SpawnerSlot = #cr::SpawnerSlot::new();
+                    pub static #ident: #cr::SpawnerSlot = #cr::SpawnerSlot::new().with_fence(
+                        (|__sp: ::embassy_executor::SendSpawner,
+                          __slot: &'static #cr::SpawnerSlot| {
+                            __sp.spawn(#fence(__slot)?);
+                            ::core::result::Result::Ok(())
+                        }) as #cr::FenceSpawn,
+                    );
                 });
             }
             Item::Pool(p) => {
@@ -3309,6 +3453,17 @@ mod tests {
                 "with_ready_on_write",
             ),
             (
+                "node A = Terminate, deps: [], #[cfg(feature = \"x\")] enabled_if: crate::on;",
+                cfg!(feature = "enabled-if"),
+                "with_enabled_if",
+            ),
+            (
+                "node A = Terminate, deps: [], \
+                 #[cfg(feature = \"x\")] restart_budget: 3 in 1000;",
+                cfg!(feature = "restart-intensity"),
+                "with_restart_budget (3u16",
+            ),
+            (
                 "node A = Terminate, deps: [], task: w, #[cfg(feature = \"x\")] discover;",
                 cfg!(feature = "dataflow"),
                 "__SV_DATAFLOW_",
@@ -3564,6 +3719,24 @@ mod tests {
     }
 
     #[test]
+    fn enabled_if_requires_feature() {
+        gate_rejects(
+            "node A = Terminate, deps: [], task: f, enabled_if: crate::on;",
+            cfg!(feature = "enabled-if"),
+            "requires the `enabled-if` feature",
+        );
+    }
+
+    #[test]
+    fn restart_budget_requires_feature() {
+        gate_rejects(
+            "node A = Terminate, deps: [], task: f, restart_budget: 3 in 1000;",
+            cfg!(feature = "restart-intensity"),
+            "requires the `restart-intensity` feature",
+        );
+    }
+
+    #[test]
     fn ready_on_write_requires_both_features() {
         let src = "node A = Terminate, deps: [], task: f, beat_timeout: 10, \
                    ready_on_write, writes: [crate::S observed beat via it.get()];";
@@ -3759,19 +3932,6 @@ mod tests {
         match expand(spec) {
             Ok(_) => panic!("accepted"),
             Err(e) => assert!(e.to_string().contains("more than 32"), "{e}"),
-        }
-    }
-
-    #[cfg(feature = "budget")]
-    #[test]
-    fn pool_size_cannot_share_a_claimant_slot() {
-        let spec = syn::parse_str::<GraphSpec>(
-            "node A = Terminate, deps: [], task: f, pool_size: 2, resources: [P: divisible];",
-        )
-        .unwrap();
-        match expand(spec) {
-            Ok(_) => panic!("accepted"),
-            Err(e) => assert!(e.to_string().contains("lend/consume/divisible"), "{e}"),
         }
     }
 

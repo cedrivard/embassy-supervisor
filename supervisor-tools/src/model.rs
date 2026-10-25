@@ -212,8 +212,6 @@ pub struct NodeModel {
     pub deps: Vec<DepModel>,
     /// The `spawn:` / `task:` clause; `None` for a parked node.
     pub task: Option<TaskModel>,
-    /// The `pool_size:` literal, if any.
-    pub pool_size: Option<LitValue>,
     /// The `resources:` list.
     pub resources: Vec<ResourceModel>,
     /// The `provides:` list.
@@ -411,7 +409,6 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                         cfg: cfg_texts(&n.cfg),
                         deps: n.deps.iter().map(dep_model).collect(),
                         task: n.source.as_ref().map(TaskModel::new),
-                        pool_size: n.pool_size.as_ref().map(|l| LitValue::new(Vec::new(), l)),
                         resources: n.resources.iter().map(resource_model).collect(),
                         provides: n
                             .provides

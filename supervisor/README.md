@@ -31,6 +31,7 @@ third-party deps are pure-embassy crates (`embassy-executor`/`-sync`/`-time`/
 - [Multi-executor tiers and multi-core](#multi-executor-tiers-and-multi-core)
 - [Composing graphs across crates](#composing-graphs-across-crates)
 - [Observability](#observability)
+- [Lifecycle events and the bring-up breadcrumb](#lifecycle-events-and-the-bring-up-breadcrumb)
 - [Cargo features](#cargo-features)
 - [Testing on the host](#testing-on-the-host)
 - [no_std / MSRV](#no_std--msrv)
@@ -181,7 +182,9 @@ supervisor_graph! {
         , dataflow: [crate::setter]     //   adopt an accessor fn's #[dataflow] tables
         , beat_timeout: MS , ready_on_write //   every value-level clause (the timeouts, beats,
                                         //     ready_on_write, disabled, discover) takes a #[cfg(...)] gate
-        , pool_size: N , executor: NAME , slot_timeout: MS , ack_timeout: MS , disabled;
+        , enabled_if: crate::settings::lora_on //   fn() -> bool; false at start() latches disabled
+        , restart_budget: MAX in MS     //   restart() refuses the MAX+1th inside the window
+        , executor: NAME , slot_timeout: MS , ack_timeout: MS , disabled;
 
     pool NAME = [Mode, ..],             // one Mode per member, floor first
         deps: [..], task: worker,
@@ -305,7 +308,9 @@ command can be queued, and `try_request_control` reports only queue capacity.
 `apply_control` propagates Activate's startup fault, and the `run` driver returns
 that fault to its caller. Restart keeps its distinct control policy: `apply_control`
 returns its shutdown timeout but logs and absorbs its startup faults; a direct
-`restart` call returns those faults.
+`restart` call returns those faults. With `restart-intensity`, a refused restart
+(`FaultKind::RestartStorm`, see [`restart_budget:`](#restart_budget--restart-intensity))
+is propagated by `apply_control` too: a crash loop is a fault the app must see.
 
 activate walks up through dependencies; deactivate walks down through dependents. They are opposites, but they compose symmetrically over a subtree.
 
@@ -567,7 +572,7 @@ in place), or keep the node argument and race the work yourself (one
 executor NAME;                        // runtime-filled SendSpawner slot (tier / second core)
 default executor NAME;                // the slot every task:/spawn:-fn item without executor: inherits
 node NAME = Mode, deps: [A, B][, executor: EXEC], spawn: <spawn>[, disabled];
-node NAME = Mode, deps: [A, B][, executor: EXEC], task: <worker>[, pool_size: N]
+node NAME = Mode, deps: [A, B][, executor: EXEC], task: <worker>
     [, resources: [[#[cfg(..)]] RES: [local] [shared|consume] Type, ..]]
     [, slot_timeout: MS][, ack_timeout: MS][, cancel][, disabled];
 node NAME = Mode, deps: [A];          // neither => parked node the app spawns itself
@@ -612,16 +617,26 @@ supervisor_graph! {
 Semantics:
 
 - Same path / partial-call forms as `spawn:` (no closures — the shell needs a name to call).
-- **Worker args are evaluated inside the shell**, at the task's first poll, on the node's own
-  executor — so the DSL never needs the arg types, an `executor:`/second-core node builds its
-  resources on the core that runs them, and cross-node data should go through awaited
-  accessors (a spawn batch polls last-first). Corollary: an extra that can be **missing** at
-  first poll is a task-side panic, not a failed spawn — extras are for infallible accessors.
-  A value that might not exist yet belongs in `resources:` (a `shared` entry for a fan-out
-  handle): the pre-spawn gate turns "missing" into a clean `FaultKind::ResourceMissing`.
-- `pool_size: N` (default 1) sizes the shell's `TaskPool` — headroom for a respawn issued
-  while the previous instance is still draining.
-- On a `pool`, `task:` emits ONE shell sized to the member count.
+- **Worker args are evaluated inside the shell**, at the start of each activation, on the
+  node's own executor — so the DSL never needs the arg types, an `executor:`/second-core node
+  builds its resources on the core that runs them, and cross-node data should go through
+  awaited accessors (a spawn batch polls last-first). Corollary: an extra that can be
+  **missing** then is a task-side panic, not a failed spawn — extras are for infallible
+  accessors. A value that might not exist yet belongs in `resources:` (a `shared` entry for a
+  fan-out handle): the pre-spawn gate turns "missing" into a clean `FaultKind::ResourceMissing`.
+- **The shell is resident.** It is spawned once, by the node's first activation, and never
+  returns: each activation runs the worker, puts back what it lent, records the exit, and
+  parks; the next start (restart, respawn, `activate`, pool growth) wakes it in place instead
+  of spawning again. A restart therefore never waits for a task slot to free — which embassy
+  does only after the task's final poll returns, out of the supervisor's sight, and which a
+  supervisor on a higher-priority tier would otherwise race. The supervisor starts the next
+  activation only once the shell has parked, so nothing the previous one does late can land
+  on the new one. The worker future is still rebuilt per activation; the task slot is
+  static either way, so residency costs no RAM.
+- On a `pool`, `task:` emits ONE shell sized to the member count; each member keeps its own
+  resident instance.
+- `state:` crosses from the spawn glue into the resident shell through a handoff slot, so the
+  state type must be `Send`.
 - Trace adoption and `executor:` routing compose exactly as with `spawn:`.
 - The ceiling embassy imposes still stands: concrete types are fixed per binary — `task:`
   removes the boilerplate, not the monomorphization.
@@ -679,14 +694,15 @@ have emitted.
 
 4. **Arguments that must be evaluated at spawn time, on the supervisor's executor.**
    `spawn:` partial-call args run in the spawn glue, at the moment of the (re)spawn;
-   `task:` extras run inside the shell at its *first poll, on the node's own executor*.
+   `task:` extras run inside the shell at the *start of each activation, on the node's
+   own executor*.
    The `task:` behavior is what you usually want (an `executor:`/second-core node builds
    its state on the core that runs it) — reach for `spawn:` when an argument snapshots
    something that must be read *now* or must not run on the target tier.
 
    ```rust,ignore
-   // Snapshot the respawn count at the moment of this spawn, not at first poll
-   // (an interrupt-tier node's first poll can preempt and land arbitrarily later):
+   // Snapshot the respawn count at the moment of this spawn, not when the activation
+   // starts (an interrupt-tier node's start can preempt and land arbitrarily later):
    node REPORT = Terminate, executor: HIGH, spawn: report_task(boot_epoch());
    ```
 
@@ -735,8 +751,9 @@ The protocol, per (re)spawn:
    node's `slot_timeout`, 100 ms by default; the supervisor logs the node name) —
    fail-closed at bring-up, not a panic inside a running task. Provisioning is the
    runtime-checked half of the contract.
-3. The generated shell `take()`s the value at its first poll — never through the task-fn
-   call, where a `Busy` storage claim would drop it, unrecoverable — hands the worker
+3. The generated shell `take()`s the value at the start of each activation — never
+   through the task-fn call, where a `Busy` storage claim would drop it, unrecoverable —
+   hands the worker
    `&mut Type` (after the node arg, in declared order, before any partial-call extras) and
    `restore()`s it after the worker returns (i.e. after its shutdown ack). A Terminate
    respawn therefore re-takes the **same instance**; a Pause worker never returns, so it
@@ -744,10 +761,7 @@ The protocol, per (re)spawn:
 
 The supervisor awaits a node's slots being filled before each (re)spawn (same bounded wait
 as `executor` slots), so late provisioning and the respawn-vs-restore window on another core
-are both covered. Caveats: a panic in the worker skips the restore (embedded panic = reboot);
-`pool_size > 1` cannot combine with lend/consume/divisible entries — the slot holds ONE
-value (a budget, one claimant), so the macro rejects it (use `shared`, or an `ElasticPool`,
-whose members get per-member slot arrays).
+are both covered. Caveat: a panic in the worker skips the restore (embedded panic = reboot).
 
 `ResourceSlot<T>`'s hand-usable API, for providers and app code (the macro's glue uses
 the same calls): `provide(T)` / `restore(T)` fill the slot (restore is provide, named for
@@ -1011,6 +1025,43 @@ and rejected on `Mode::Pause` because a Pause worker must survive the stop and p
 
 Declared but not started at boot; a control `Activate` starts it later (e.g. an OTA task).
 
+### `enabled_if:` — settings-gated bring-up
+
+*(feature `enabled-if`)*
+
+```rust,ignore
+fn lora_on() -> bool { SETTINGS.lock(|s| s.lora) }
+
+supervisor_graph! {
+    node LORA = Terminate, task: lora_task, enabled_if: crate::lora_on;
+}
+```
+
+`disabled` decided at runtime. `Supervisor::start` calls the predicate (any expression
+coercing to `fn() -> bool`) once per call, before the wave, for each node that is down;
+`false` latches `disabled` exactly as the `disabled` marker would — dashboards see it,
+and `activate` / `start_node` still override it. `true` never clears a latch, so a
+manual `deactivate` survives a later `start()`. Running and detached nodes are not
+evaluated, and neither `respawn_terminate` nor the control verbs re-evaluate: when a
+setting changes at runtime, waking the node is the app's call (`activate`).
+
+### `restart_budget:` — restart intensity
+
+*(feature `restart-intensity`, implies `restart`)*
+
+```rust,ignore
+node NET = Terminate, task: net_task, restart_budget: 3 in 60000;
+```
+
+OTP's restart intensity, per node: at most `MAX` explicit `Supervisor::restart`s of this
+node (directly or through `ControlOp::Restart`) per `WINDOW_MS` window. The `MAX+1`th
+inside the window returns `FaultKind::RestartStorm` **before anything is stopped** — the
+node keeps running as it was — and `apply_control` propagates it rather than absorbing
+it like a startup fault. Only the verb's target counts: dependents cycled with it, and
+`activate`, do not. The window opens at the first counted restart; one after it closes
+opens a fresh window. Windows cap at `u32::MAX / 2` ticks (~35 min at a 1 MHz tick).
+`MAX` and `WINDOW_MS` must both be at least 1.
+
 ### `executor NAME;` and `executor: NAME`
 
 `executor NAME;` declares a `SpawnerSlot` that the app fills with a `SendSpawner`.
@@ -1127,8 +1178,8 @@ offending token:
   closure
 - **`task:` and `spawn:` together** — mutually exclusive per node/pool
 - **a closure in `task:`** — the generated shell needs a worker fn it can name
-- **`pool_size:` without `task:`** (or `pool_size: 0`) — it sizes the generated shell's
-  `TaskPool`; a hand-written task fn declares its own
+- **`pool_size:` on a node** — removed: the resident `task:` shell never needs a second
+  task slot; a hand-written `spawn:` task fn declares its own `pool_size`
 - **`resources:` without `task:`** — resources are taken/restored by the generated shell; a
   hand-written `spawn:` fn manages its own arguments
 - **empty `resources:` list / duplicate resource name** — slot names are statics, unique
@@ -1142,8 +1193,7 @@ offending token:
   so it is strictly opt-in
 - **`shared` with `consume`** — one value cannot both fan out and move by value.
 - **`divisible` with any other kind marker, or with a type** — a budget is its own kind.
-  Also rejected without the `budget` feature, with more than 256 slots, or with
-  `pool_size > 1` (one claimant per slot).
+  Also rejected without the `budget` feature, or with more than 256 slots.
 - **`serialized` without `shared`** — serialization applies only to fan-out slots. Also
   rejected when holders span multiple executors.
 - **`veto` on a `reads:` entry** — vetoes are asserted, not read. Also rejected without
@@ -1822,6 +1872,14 @@ for (i, node) in GRAPH.iter_nodes() {
 With `liveness-monitor` the polling is done for you: declare `beat_timeout:` on the
 nodes whose bodies beat, and consume `wait_health()`.
 
+**The hardware watchdog as the backstop.** `GRAPH.all_fresh()` (`liveness-monitor`) is
+the same policing as one synchronous `bool`: `true` unless a running, non-detached node
+with a `beat_timeout:` has gone without a beat for longer than it. Feed the hardware
+watchdog only while it holds and a wedged node resets the chip, even if the app's
+health consumer is the thing that hung. `GRAPH.stale_nodes()` names the culprits for
+the log line. It grants pending beats as it looks (like the monitor's sweep) and has no
+`beat_window:` hysteresis, so size the hardware timeout to cover a node's jitter.
+
 **Write freshness is not value validity.** The monitor only answers whether a node
 wrote recently. `Stamped<T>` lets a reader check a value's age, but that means
 "written within `max_age`", not "this exact read is correct". It cannot detect
@@ -1925,11 +1983,10 @@ correctly: each node is reset per cycle (re-entry starts clean), running and det
 nodes are skipped (idempotent; a detached instance survived the teardown), and a
 `Pause` instance parked by the previous `teardown()` is **resumed in place** rather
 than double-spawned (spawned once, resumed every re-entry). `teardown()` awaits every
-ack, so re-entering the state cannot race the previous instances — for the canonical
-ack-by-returning bodies the previous task has fully exited (and freed its `TaskPool`
-slot) before `teardown()` returns, so the default `pool_size` of 1 suffices for
-cycling; `consume` slots make "rebuild the radio each entry" fail-closed instead of
-stale-reuse.
+ack, and the next `start()` waits for each resident `task:` shell to park (and each
+`spawn:` task to return, see [the executor fence](#respawning-across-tiers-resident-shells-and-the-executor-fence)), so re-entering the
+state cannot race the previous instances; `consume` slots make "rebuild the radio each
+entry" fail-closed instead of stale-reuse.
 
 **One-graph variant** *(feature `control`)*: declare the subtree `Terminate` +
 `disabled` in the **main** graph and drive it as a dependency cascade — `Activate` on
@@ -1996,8 +2053,8 @@ supervisor_graph! {
 }
 ```
 
-Args (`bme()`, `sht()`) are evaluated inside each shell at first poll, on the
-node's own executor.
+Args (`bme()`, `sht()`) are evaluated inside each shell at the start of every
+activation, on the node's own executor.
 
 ### Provider node — async multi-output construction in the graph
 
@@ -2349,10 +2406,38 @@ Five hazards when inverting:
    arguments run on the target tier.
 3. The supervisor's own work runs elevated. That is the point, and the cost.
 4. A hardware watchdog feeder on the elevated tier can mask hangs on the tier it
-   watches. Make the feed conditional on the watched tier's health.
+   watches. Make the feed conditional on the watched tier's health:
+   `if GRAPH.all_fresh() { wd.feed(..) }` (`liveness-monitor`) withholds it while any
+   node with a `beat_timeout:` is running but not beating.
 5. A second core cannot wake an `InterruptExecutor` directly. Embassy pends the IRQ
    in the local NVIC only, so cross-core wakes from remote acks are lost and stall
    the supervisor. Relay the pend through a doorbell, as the demo does.
+
+### Respawning across tiers: resident shells and the executor fence
+
+A task's slot in its `TaskPool` frees only when its **final poll returns** — after its
+last statement, inside the executor, where nothing can signal it. A supervisor on a
+higher-priority tier (or another core) wakes on the task's ack while that poll is still
+running, so a respawn issued right then finds the slot taken. Retrying in a loop is no
+answer: on a preempting tier the loop starves the very poll it is waiting for. The
+supervisor never sleeps or spins on it instead:
+
+- **`task:` nodes** have resident shells (see
+  [`task:`](#task--generated-shells-for-plain-or-generic-workers)): spawned once, they park
+  after each activation, and the supervisor starts the next one only once the shell has
+  parked — an exact event, published as the shell's last act.
+- **`spawn:` nodes** are re-spawned through **the executor fence**: `supervisor_graph!` gives
+  every `executor NAME;` a small resident task on that tier, spawned when the slot is
+  `set()`. A `Busy` respawn asks it for one pass and retries when it reports. An executor
+  polls one task at a time, so by the time the fence runs, the old task's poll has
+  returned. A node with no `executor:` spawns on the supervisor's own executor, where a
+  yield is that pass.
+
+One pass suffices when a `spawn:` task acks as its last act (`mark_exited`/`ack_dropped`,
+then return). A body that awaits something after its ack costs one pass per retry until
+it returns or its `slot_timeout` faults the respawn with `FaultKind::Spawn`. Each fence costs
+one parked task per executor; a hand-built `SpawnerSlot` without `with_fence` has no pass to
+offer and retries on the next gate event or at the deadline.
 
 ## Composing graphs across crates
 
@@ -2479,6 +2564,90 @@ keep their `u32` keys either way; custom hooks narrow ids with `trace::task_key`
 `trace::executor_key`. CI's canary job builds and tests exactly that configuration, and the
 cfg goes away once the crate pins the release that ships it.
 
+## Lifecycle events and the bring-up breadcrumb
+
+### Lifecycle events (features `lifecycle-events`, `lifecycle-sink`)
+
+Every transition a supervisor drives — the waves of `start`/`teardown`/`activate`/
+`deactivate`/`restart`/`respawn_terminate`, the single-node verbs, pool scaling, bound-dep
+cascades — posts one `LifecycleEvent { node, kind }`:
+
+| `LifecycleKind` | when |
+|---|---|
+| `Started` | a fresh instance was spawned (an app-spawned node: marked running) |
+| `Resumed` | a parked `Pause` instance was resumed in place |
+| `StopRequested` | the node was signalled to stop |
+| `Stopped` | it acked without its body returning (a parked `Pause` instance, a hand-written `ack_dropped()`) |
+| `Exited` | it acked by its body returning (`mark_exited`, which every `task:` shell calls) |
+| `Faulted(FaultKind)` | a lifecycle step failed: gate timeout, spawn failure, missed ack, refused restart |
+
+```rust,ignore
+loop {
+    let ev = embassy_supervisor::wait_lifecycle().await;
+    info!("{} {}", ev.node.name(), ev.kind.as_str());
+}
+```
+
+The queue holds 8 and is lossy on purpose, like the health mailbox: the waves run on
+the supervisor task, which must never park behind a slow consumer. While it is full
+new events are dropped and counted (`lifecycle_events_dropped()`), so a consumer that
+starts after a large bring-up sees its head, not its tail. One consumer;
+`try_wait_lifecycle()` for polling. A body that returns on its own, unasked, is not
+evented — no supervisor is watching it then; `has_exited()` reads it. Costs one 8-slot
+channel, one `AtomicU32`, and one `try_send` per transition.
+
+An app that only logs or records events does not need the queue or a task to drain it.
+`lifecycle-sink` delivers the same events by calling a function instead:
+
+```rust,ignore
+fn record(ev: embassy_supervisor::LifecycleEvent) {
+    let now = embassy_time::Instant::now(); // the transition's own time
+    info!("{} {}", ev.node.name(), ev.kind.as_str());
+    // ... push (ev.node, ev.kind, now) into a ring ...
+}
+embassy_supervisor::set_lifecycle_sink(record); // before the first wave
+```
+
+The sink is called synchronously, in transition order, from the supervisor task inside
+the wave or verb that made the transition, so nothing is dropped and a timestamp taken
+in it is exact. That is also its constraint: it runs on the supervisor's executor (an
+interrupt executor or another core in a tiered app) and must be short and
+non-blocking — a log line or a critical-section ring write. Events before
+`set_lifecycle_sink` are not delivered. Costs one fn pointer and one critical section
+per transition. Both features can be on; then every event reaches both.
+
+On the demo firmware (RP2350, thumbv8m), moving from the queue plus a draining
+`watchdog` branch to the sink cut the feature's `.bss` from +380 B to +204 B
+(the queue's 128 B and 48 B of the consumer's future) and its flash by 424 B; the
+rest is the firmware's own 16-entry ring.
+
+### Bring-up breadcrumb (feature `breadcrumb`)
+
+A reset mid-bring-up leaves nothing to say which node hung it. With `breadcrumb` each
+node records the last phase a supervisor drove it through (`node.crumb()`:
+`Idle`, `Spawning`, `Started`, `StopSignalled`, `Stopped`, `Faulted`, `Resumed`), and
+`crumb_word()` packs the binary-wide last transition into one `u32` — bit 31 valid,
+bits 16..24 the phase, bits 0..16 the node's slot in `GRAPH.nodes`. Stash the word
+somewhere that survives the reset, decode it on the next boot:
+
+```rust,ignore
+// in the watchdog feeder (or the panic handler): one store per pass
+pac::WATCHDOG.scratch(6).write_value(embassy_supervisor::crumb_word());
+
+// at boot
+if let Some((phase, slot)) = embassy_supervisor::decode_crumb(prev) {
+    let name = GRAPH.nodes.get(slot as usize).copied().flatten().map_or("?", |n| n.name());
+    warn!("previous run ended at {} {}", name, phase.as_str());
+}
+```
+
+A wave parked on a gate leaves `Spawning`; a teardown that never got its ack leaves
+`StopSignalled`. The word is last-writer-wins across graphs and concurrent waves, and a
+multi-graph binary cannot tell which graph's slot it names — the per-node `crumb()` dump
+(`GRAPH.nodes.iter().flatten().map(|n| (n.name(), n.crumb()))`) is authoritative. Relaxed
+stores throughout: a diagnostic, not a synchronisation point. Costs one `AtomicU8` per
+node, one `AtomicU32`, and one store pair per transition.
+
 ## Fault injection
 
 `fault-inject` lets tests or dashboards inject faults into a node without worker
@@ -2514,7 +2683,7 @@ and one `AtomicWaker` per node. The [demo firmware](../firmware/README.md#exerci
 | `budget` | | the `divisible` resource kind: a graph-sized `Budget<K>` of units, a `Claimant` per holder, `FairShare`/`ShrinkFastGrowSlow` policies, and a holder's share released by the supervisor when it stops — including a wedged holder that misses its ack |
 | `readiness` | | task-asserted readiness: `set_ready`/`wait_ready`/`clear_ready` + the `ready` dep marker (bring-up + pool-growth gating) |
 | `liveness` | | per-node heartbeat: `beat()` raises a flag that `ticks_since_beat() -> u32` converts using the clock read it already makes, plus `is_stale(max_age)` — alive-but-stalled detection without `trace`. A fresh spawn counts as a beat, so a node is never instantly stale. The `beat_put`/`beat_writer` verbs exist only with this on |
-| `liveness-monitor` | | the sweep over those heartbeats: `beat_timeout:` / `beat_window:` clauses, `Supervisor::monitor`, `HealthEvent` on `wait_health()`. **Report-only** — escalation is the application's call (implies `liveness`) |
+| `liveness-monitor` | | the sweep over those heartbeats: `beat_timeout:` / `beat_window:` clauses, `Supervisor::monitor`, `HealthEvent` on `wait_health()`; plus `GRAPH.all_fresh()` / `GRAPH.stale_nodes()`, the synchronous hardware-watchdog feed gate. **Report-only** — escalation is the application's call (implies `liveness`) |
 | `epochs` | | per-node activation generation (`epoch()`, `wait_epoch_change()`), so an *already-running* dependent can notice that a provider was restarted underneath it. Pure status |
 | `coupling` | | declared dataflow: `reads:` / `writes:` naming real signal statics, and the signal-indexed queries; `Stamped<T>`, the read-side write-freshness wrapper (`age`, `read_fresh`) |
 | `coupling-observe` | `coupling` | the `observed` entry marker and its accessor (`via`, graph default, or the `Observable` facade): a way to ask whether a signal moved. `beat` is what currently asks — with `liveness-monitor` it drives the heartbeat and `ready_on_write` by polling, nothing asked of the task |
@@ -2524,6 +2693,11 @@ and one `AtomicWaker` per node. The [demo firmware](../firmware/README.md#exerci
 | `data-deps` | `graph-ref` + `dataflow` | data-driven dependencies, both directions. Bring-up: `node.open(&SIG).await` runs the signal's own `Gated::ensure` first, `Backed<T>` (with `readiness`) starts the producer on first open and holds the reader until it is ready, and `producer_of` finds that producer through the graph by address. Teardown: `Leased<T>` + `node.lease(&SIG)` count the live holders so a producer's `drain()` waits for zero before it frees what it published. Nothing names anything; a signal that uses neither costs nothing |
 | `node-status` | | `report_status()`/`status()` — a one-line self-description per node, `sd_notify(STATUS=..)` style; shown when asked, cleared on activation, never an event |
 | `restart` | | `Supervisor::restart` — rest_for_one: cycle a node and its transitive dependents, re-gating them on the way back up (implies `control`) |
+| `restart-intensity` | | the `restart_budget: MAX in MS` clause: `restart` refuses the MAX+1th restart of a node inside the window with `FaultKind::RestartStorm`, before stopping anything, and `apply_control` propagates it (implies `restart`) |
+| `enabled-if` | | the `enabled_if: fn() -> bool` clause: `start()` evaluates it for each down node and latches `disabled` on `false` — settings-gated bring-up |
+| `lifecycle-events` | | `wait_lifecycle()` / `try_wait_lifecycle()`: a lossy 8-slot queue of `LifecycleEvent { node, kind }` for every driven transition, with a drop counter |
+| `lifecycle-sink` | | `set_lifecycle_sink(fn(LifecycleEvent))`: the same events, pushed synchronously to an app callback on the supervisor task; no queue, no drops |
+| `breadcrumb` | | `node.crumb()` and the packed `crumb_word()` / `decode_crumb()`: the last lifecycle phase, per node and binary-wide, for postmortem stashing |
 | `bound-deps` | | the `bound` dep marker: opt-in contract change where `clear_ready()` stops the dependent and a spent readiness budget parks it instead of faulting (implies `readiness` + `control`) |
 | `heap-state` | | `state: Type = expr` / `state: zeroed Type` per-activation boxed state, reclaimed on task exit — ⚠ opt-in: emits the ~6-line fallible-boxing `unsafe` helper into your crate; needs a `#[global_allocator]`; pulls `bytemuck` for `Zeroable` |
 | `fault-inject` | | `TaskNode::inject(Fault::{Stall, Wedge, Crash, Hog(..)})` / `clear_fault()` / `fault()`: faults done TO a task (the shell withholds polls, drops the future or busy-spins; the node hides a stop and swallows the ack), see [Fault injection](#fault-injection). A bench, test and demo feature |
