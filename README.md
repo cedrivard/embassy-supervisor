@@ -7,8 +7,9 @@
 [<img src="https://embassy-supervisor.github.io/og.png" alt="embassy-supervisor.github.io — docs, guides and an in-browser playground" width="640">](https://embassy-supervisor.github.io/)
 
 **[embassy-supervisor.github.io](https://embassy-supervisor.github.io/)** — docs and guides,
-plus an in-browser playground that runs the real crate compiled to WebAssembly: declare a graph,
-wire behaviors to it, and watch the supervisor drive lifecycle, couplings and dataflow live.
+plus an [in-browser playground](https://embassy-supervisor.github.io/playground/) that runs the
+real crate compiled to WebAssembly: declare a graph, wire behaviors to it, and watch the
+supervisor drive lifecycle, couplings and dataflow live.
 
 ---
 
@@ -17,6 +18,21 @@ wire behaviors to it, and watch the supervisor drive lifecycle, couplings and da
 executors, and a declared-and-verified dataflow between the tasks, with a governed heap and
 coordinated power and OTA — the structure and guarantees of an RTOS with none of its kernel,
 stacks, or overhead. The `no_std` **`embassy-supervisor`** crate is its drop-in core.
+
+```rust
+use embassy_supervisor::{supervisor_graph, Supervisor};
+
+// One declaration generates the node `static`s and a single `GRAPH` bundling the
+// node slots, deps, and compile-time order. `app` depends on `net`, so it starts after it.
+supervisor_graph! {
+    node NET = Terminate, task: net_task;
+    node APP = Terminate, deps: [NET], task: app_task;
+}
+
+// in your supervisor task (an async context):
+let sup = Supervisor::new(&GRAPH);                    // infallible — a cycle is a compile error
+sup.start(&spawner).await.expect("spawn");            // brings up net, then app
+```
 
 [<img src="https://i.ytimg.com/vi_webp/rlLaaMKMPWo/maxresdefault.webp" alt="Video: embassy-supervisor — RTOS-grade Lifecycle for Async Rust Firmware" width="640">](https://youtu.be/rlLaaMKMPWo)
 
@@ -210,21 +226,6 @@ once with the `supervisor_graph!` macro; the supervisor does the rest:
   `RestartStorm` fault the app must handle, instead of an endless restart cycle.
 - **Settings-gated bring-up (feature-gated)** — `enabled_if: crate::settings::lora_on` decides at
   `start()` whether a node comes up, latching the same `disabled` state as the static marker.
-
-```rust
-use embassy_supervisor::{supervisor_graph, Supervisor};
-
-// One declaration generates the node `static`s and a single `GRAPH` bundling the
-// node slots, deps, and compile-time order. `app` depends on `net`, so it starts after it.
-supervisor_graph! {
-    node NET = Terminate, task: net_task;
-    node APP = Terminate, deps: [NET], task: app_task;
-}
-
-// in your supervisor task (an async context):
-let sup = Supervisor::new(&GRAPH);                    // infallible — a cycle is a compile error
-sup.start(&spawner).await.expect("spawn");            // brings up net, then app
-```
 
 The library is feature-gated — the control plane, pools, and tracing are optional, so a minimal
 build is just the dependency-ordered core. The full model — lifecycle matrix (what each operation
