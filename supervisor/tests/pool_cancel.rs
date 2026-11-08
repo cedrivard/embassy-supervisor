@@ -44,6 +44,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 async fn drive_until<const N: usize, T: embassy_supervisor::Topology<N>>(
@@ -59,6 +60,7 @@ async fn drive_until<const N: usize, T: embassy_supervisor::Topology<N>>(
             }
             embassy_time::Timer::after(embassy_time::Duration::from_millis(5)).await;
         }
+        assert!(until(), "drive_until: did not settle");
     };
     match select(sup.run_pools(&spawner), watch).await {
         Either::First(err) => panic!("member never acked: {:?}", err.node.name()),
@@ -94,7 +96,9 @@ async fn driver(spawner: Spawner) {
 
     let rounds_before = ROUNDS[1].load(Ordering::SeqCst);
     WORK[1].signal(());
-    settle(|| false).await;
+    for _ in 0..10_000 {
+        embassy_futures::yield_now().await;
+    }
     assert_eq!(
         ROUNDS[1].load(Ordering::SeqCst),
         rounds_before,

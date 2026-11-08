@@ -6,6 +6,37 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.12.0] - 2026-11-07
+
+Pins `embassy-supervisor-syntax` 0.6.0; pinned by `embassy-supervisor` 0.13.0.
+
+### Added
+
+- `trace-self` feature (forwarded by the supervisor's `trace-self`): emits the graph's
+  self-node `TaskHandle` static and `.with_self_handle(..)` on its `GraphRef`.
+
+### Changed
+
+- **Breaking (emitted code):** three statics per node: `__SV_CFG_<tag>` (the flash
+  `NodeCfg`, with `.with_disabled_at_boot(..)` for a `disabled` node), `__SV_HANDLE_<tag>`
+  (a zeroed `TaskHandle` in `.bss`) and the node, `TaskNode::new(&cfg, &handle)`. Pool
+  members get one `[TaskHandle; K]` array.
+- A pool emits one `__sv_spawn_<tag>_at(spawner, i)` spawn body and a `const I`
+  trampoline per member instead of K copies of the body.
+- Spawn glue probes `resources:` gates through `TaskNode::__sv_gates_filled`, one
+  out-of-line call instead of an inlined check per entry.
+- On a lost resource the activation restores what it took in reverse order, then drops
+  the `state:` box, then records the exit.
+- Helper names are `{idx}_{owner}`, and `{len}g{name}_{idx}_{owner}` in a named graph, so
+  they no longer collide; node names are read with `unraw`.
+- Errors for feature-gated clauses are attached to the clause's span.
+- `bound-deps` implies `readiness` and `liveness-monitor` implies `liveness`, as in the
+  supervisor.
+
+### Removed
+
+- **Breaking:** the `trace-names` feature.
+
 ## [0.11.0] - 2026-10-24
 
 Pins `embassy-supervisor-syntax` 0.5.0.
@@ -573,7 +604,8 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.11.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.12.0...HEAD
+[0.12.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.11.0...embassy-supervisor-macros-v0.12.0
 [0.11.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.10.0...embassy-supervisor-macros-v0.11.0
 [0.10.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.9.1...embassy-supervisor-macros-v0.10.0
 [0.9.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.9.0...embassy-supervisor-macros-v0.9.1

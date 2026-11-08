@@ -10,7 +10,7 @@ use embassy_supervisor_tools::{
 const TOOL: &str = "supervisor-mermaid";
 
 const USAGE: &str = "\
-supervisor-mermaid — Mermaid diagrams from embassy-supervisor graph declarations
+supervisor-mermaid: Mermaid diagrams from embassy-supervisor graph declarations
 
 USAGE:
     supervisor-mermaid [OPTIONS] [FILE|DIR]...
@@ -28,23 +28,23 @@ render; `--select`, `--all` or a pipe skips it.
 OPTIONS:
   inputs
         --deps             also scan the workspace's path dependencies (via
-                           `cargo metadata`) — for graphs adopting another
+                           `cargo metadata`), for graphs adopting another
                            crate's `#[dataflow]` fns
 
   what to draw
         --runtime          the running system: every signal and resource slot,
-                   and no bring-up edges by default
+                           and no bring-up edges by default
         --states           node lifecycles, as a state diagram; with --signals,
                            one composite per node carrying its concrete gates
-      --runtime-deps     with --runtime, restore every `deps:` edge as dotted
-                   `spawn` context (overrides --anchor-uncoupled)
+        --runtime-deps     with --runtime, restore every `deps:` edge as dotted
+                           `spawn` context (overrides --anchor-uncoupled)
         --anchor-uncoupled with --runtime, restore dotted `deps:` edges that
-                   touch a node with no runtime coupling or resource
+                           touch a node with no runtime coupling or resource
     -s, --signals          draw declared and scanned dataflow as dotted signal
                            edges (the runtime view always draws solid edges)
     -f, --full-paths       label signals with the declared path, not the last
                            segment that tells them apart
-            --hide-cfg         omit `#[cfg(...)]` predicates from labels and edges
+        --hide-cfg         omit `#[cfg(...)]` predicates from labels and edges
     -x, --exclude <NAMES>  leave out these nodes or pools (comma separated), and
                            every edge that named them; repeatable
         --fragments        box each fragment's items in a subgraph
@@ -58,7 +58,8 @@ OPTIONS:
         --title <TEXT>     override the Mermaid and HTML page title
         --no-title         omit the Mermaid and HTML page title
         --max-fanout <N>   collapse a signal's readers into one aggregate box
-                           once more than N nodes read it
+                           once more than N nodes read it; 0, the default,
+                           never collapses
         --h-spacing <N>    horizontal gap between boxes, in pixels (Mermaid
                            defaults to 50)
         --v-spacing <N>    vertical gap between boxes
@@ -76,9 +77,11 @@ OPTIONS:
         --json             print the graph model as JSON instead of a diagram
                            (with every warning, under \"warnings\")
         --check            verify and stop: print the diagnostics, no diagram;
-                           exit non-zero on any warning — CI's guard against
+                           exit non-zero on any warning, CI's guard against
                            graphs and `#[dataflow]` fns drifting apart (what
-                           the dataflow itself says is `supervisor-lint`)
+                           the dataflow itself says is `supervisor-lint`);
+                           every declaration found is checked, whatever
+                           --select or -x leaves to draw
         --live-url         print a mermaid.live share link per diagram
         --html <FILE>      write a self-rendering HTML page (mermaid.js CDN)
         --render <FILE>    render through `mmdc` (svg/png/pdf, by extension)
@@ -87,6 +90,7 @@ OPTIONS:
                            destination: -o, --html, --render or --update)
     -o, --output <FILE>    write to a file instead of stdout
     -h, --help             show this
+    -V, --version          print the version
 ";
 
 fn main() -> ExitCode {
@@ -150,6 +154,10 @@ fn parse_args_from(raw_args: impl IntoIterator<Item = String>) -> Result<Option<
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
+                return Ok(None);
+            }
+            "-V" | "--version" => {
+                println!("{TOOL} {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             "-s" | "--signals" => args.opts.signals = true,
@@ -261,10 +269,70 @@ fn spacing(v: &str) -> Result<u32, String> {
     }
 }
 
+/// What this combination accepts and never uses, one note per flag (`-o`,
+/// the `--states` view flags, and the output flags a `--list`/`--check`/`--json`
+/// run returns before).
+fn ignored_flags(args: &Args) -> Vec<String> {
+    let mut notes = Vec::new();
+    let to_output = args.json
+        || args.live_url
+        || (args.html.is_none() && args.render_to.is_none() && args.update.is_none());
+    if args.output.is_some() && (args.list || args.check || !to_output) {
+        notes.push(
+            "`-o` is ignored: nothing in this run writes to it (a diagram on stdout, \
+             `--json` and `--live-url` do)"
+                .to_string(),
+        );
+    }
+    if args.opts.states {
+        let o = &args.opts;
+        for (given, flag) in [
+            (o.links.is_some(), "--links"),
+            (o.fragments, "--fragments"),
+            (o.executors, "--executors"),
+            (o.max_fanout > 0, "--max-fanout"),
+            (o.full_paths, "--full-paths"),
+            (!o.show_cfg, "--hide-cfg"),
+        ] {
+            if given {
+                notes.push(format!(
+                    "`{flag}` does nothing on `--states`, a lifecycle diagram"
+                ));
+            }
+        }
+    }
+    let stops_early = if args.list {
+        Some("--list")
+    } else if args.check {
+        Some("--check")
+    } else if args.json {
+        Some("--json")
+    } else {
+        None
+    };
+    if let Some(mode) = stops_early {
+        for (given, flag) in [
+            (args.live_url, "--live-url"),
+            (args.html.is_some(), "--html"),
+            (args.render_to.is_some(), "--render"),
+            (args.update.is_some(), "--update"),
+            (args.markdown, "--markdown"),
+        ] {
+            if given {
+                notes.push(format!("`{flag}` is ignored: `{mode}` stops before it"));
+            }
+        }
+    }
+    notes
+}
+
 fn run() -> Result<(), String> {
     let Some(args) = parse_args()? else {
         return Ok(());
     };
+    for note in ignored_flags(&args) {
+        eprintln!("{TOOL}: warning: {note}");
+    }
     let files = inputs::gather(&args.files, args.deps, TOOL)?;
     if args.watch {
         watch(&args, &files)
@@ -301,6 +369,9 @@ fn generate(args: &Args, files: &Sources) -> Result<(), String> {
     }
 
     let (mut resolved, warnings) = resolve(decls);
+    // Over every declaration, before -x or a selection narrows what is drawn:
+    // whether a fn is bound is a fact of the sources, not of the view.
+    let coverage = coverage_warnings(&resolved, &scanned, &dep_scanned, &bundles);
     let mut all_warnings = warnings.clone();
     for w in &warnings {
         eprintln!("{TOOL}: warning: {w}");
@@ -350,7 +421,7 @@ fn generate(args: &Args, files: &Sources) -> Result<(), String> {
         resolved = pick(resolved, &files.graph)?;
     }
 
-    for w in coverage_warnings(&resolved, &scanned, &dep_scanned, &bundles) {
+    for w in coverage {
         eprintln!("{TOOL}: warning: {w}");
         all_warnings.push(w);
         warned += 1;
@@ -394,6 +465,12 @@ fn generate(args: &Args, files: &Sources) -> Result<(), String> {
     if apart {
         diagrams.push(("legend".to_string(), legend_diagram(&legend_opts)));
     }
+    // `--render` draws one image, so it is checked before anything is written,
+    // and a legend the text outputs detach is chained back into it.
+    let chained = match &args.render_to {
+        Some(_) => render_image(&resolved, &opts, apart)?,
+        None => None,
+    };
 
     let mut handled = false;
     if args.live_url {
@@ -414,13 +491,7 @@ fn generate(args: &Args, files: &Sources) -> Result<(), String> {
         handled = true;
     }
     if let Some(path) = &args.render_to {
-        if diagrams.len() > 1 {
-            return Err(format!(
-                "`--render` writes one image and there are {} diagrams; --select one",
-                diagrams.len()
-            ));
-        }
-        out::mmdc_render(&diagrams[0].1, path)?;
+        out::mmdc_render(chained.as_deref().unwrap_or(&diagrams[0].1), path)?;
         handled = true;
     }
     if let Some(path) = &args.update {
@@ -446,6 +517,27 @@ fn generate(args: &Args, files: &Sources) -> Result<(), String> {
 fn html_page_title(opts: &Options) -> Option<&str> {
     opts.show_title
         .then(|| opts.title.as_deref().unwrap_or("supervisor graphs"))
+}
+
+/// `--render`'s one image: several declarations are refused; with a detached
+/// legend, the declaration drawn again with the legend chained in (`None`:
+/// the text diagram is the image).
+fn render_image(resolved: &[Decl], opts: &Options, apart: bool) -> Result<Option<String>, String> {
+    match resolved {
+        [one] => Ok(apart.then(|| {
+            render(
+                one,
+                &Options {
+                    legend: true,
+                    ..opts.clone()
+                },
+            )
+        })),
+        many => Err(format!(
+            "`--render` writes one image and there are {} declarations; --select one",
+            many.len()
+        )),
+    }
 }
 
 fn describe(d: &Decl) -> String {
@@ -515,7 +607,10 @@ fn write_out(args: &Args, text: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{USAGE, html_page_title, parse_args_from};
+    use super::{
+        Options, Sources, USAGE, generate, html_page_title, ignored_flags, parse_args_from,
+        render_image,
+    };
 
     fn parse(args: &[&str]) -> Result<super::Args, String> {
         parse_args_from(args.iter().map(|arg| (*arg).to_string()))
@@ -601,26 +696,135 @@ mod tests {
     }
 
     #[test]
-    fn every_flag_is_in_the_readme_option_list() {
-        let readme = include_str!("../../README.md");
-        let list = readme
-            .split_once("## Options")
-            .and_then(|(_, rest)| rest.split_once("```"))
-            .and_then(|(_, rest)| rest.split_once("```"))
-            .map(|(block, _)| block)
-            .expect("the README's option list");
-        for line in USAGE.lines() {
-            let Some(flag) = line.split_whitespace().find(|w| w.starts_with("--")) else {
-                continue;
-            };
-            let flag = flag.trim_end_matches(',');
-            if flag == "--help" {
-                continue;
-            }
+    fn the_readme_carries_the_help_text_verbatim() {
+        assert!(
+            include_str!("../../README.md").contains(USAGE),
+            "README.md must quote `--help` verbatim"
+        );
+    }
+
+    #[test]
+    fn every_help_line_lines_up() {
+        let options = USAGE
+            .split_once("OPTIONS:\n")
+            .expect("an OPTIONS section")
+            .1;
+        for line in options.lines() {
+            let b = line.as_bytes();
+            let at_27 = b.get(26) == Some(&b' ') && b.get(27).is_some_and(|c| *c != b' ');
+            let flag = (line.starts_with("    -") && !line.starts_with("    --"))
+                || line.starts_with("        --");
+            let continued = line.starts_with(&" ".repeat(27));
+            let heading = line.starts_with("  ") && !line.starts_with("   ");
             assert!(
-                list.contains(flag),
-                "`{flag}` is missing from the README list"
+                line.is_empty() || heading || ((flag || continued) && at_27),
+                "`{line}` does not line up with column 28"
             );
         }
+    }
+
+    #[test]
+    fn version_prints_and_stops() {
+        assert!(
+            parse_args_from(["--version".to_string()])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn check_covers_every_declaration_whatever_select_or_exclude_narrows() {
+        let dir = std::env::temp_dir().join(format!("svm_check_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("two.rs");
+        std::fs::write(
+            &file,
+            r#"
+            embassy_supervisor::supervisor_graph! { name: A; node X = Terminate, task: fa, discover; }
+            embassy_supervisor::supervisor_graph! { name: B; node Y = Terminate, task: fb, discover; }
+            #[embassy_supervisor::dataflow]
+            async fn fa(node: &'static TaskNode) { node.put(&crate::S, 1); }
+            #[embassy_supervisor::dataflow]
+            async fn fb(node: &'static TaskNode) { let _ = node.get(&crate::S); }
+        "#,
+        )
+        .unwrap();
+        let files = Sources {
+            graph: vec![file.display().to_string()],
+            scan_only: Vec::new(),
+        };
+        for flags in [
+            &["--check"][..],
+            &["--check", "--select", "A"],
+            &["--check", "-x", "Y"],
+        ] {
+            assert_eq!(
+                generate(&parse(flags).unwrap(), &files),
+                Ok(()),
+                "{flags:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_takes_one_declaration_and_keeps_its_legend() {
+        let one = embassy_supervisor_tools::parse_source(
+            "embassy_supervisor::supervisor_graph! { node A = Terminate, task: f; }",
+            "t.rs",
+        )
+        .unwrap();
+        let Ok(Some(chained)) = render_image(&one, &Options::default(), true) else {
+            panic!("a detached legend is chained back into the image");
+        };
+        assert!(chained.contains("subgraph legend"), "{chained}");
+        assert_eq!(render_image(&one, &Options::default(), false), Ok(None));
+
+        let two = embassy_supervisor_tools::parse_source(
+            "embassy_supervisor::supervisor_graph! { name: A; node X = Terminate, task: f; }\n\
+             embassy_supervisor::supervisor_graph! { name: B; node Y = Terminate, task: g; }",
+            "t.rs",
+        )
+        .unwrap();
+        assert_eq!(
+            render_image(&two, &Options::default(), false),
+            Err(
+                "`--render` writes one image and there are 2 declarations; --select one"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_flag_the_run_never_uses_is_named() {
+        let notes = |a: &[&str]| ignored_flags(&parse(a).unwrap());
+        let html = notes(&["--html", "g.html", "-o", "g.mmd"]);
+        assert_eq!(html.len(), 1, "{html:?}");
+        assert!(html[0].contains("`-o` is ignored"), "{html:?}");
+        assert!(notes(&["--live-url", "--html", "g.html", "-o", "l.txt"]).is_empty());
+        assert!(notes(&["--json", "-o", "m.json"]).is_empty());
+        assert_eq!(notes(&["--check", "-o", "x"]).len(), 1);
+        let json = notes(&["--json", "--html", "g.html"]);
+        assert_eq!(json.len(), 1, "{json:?}");
+        assert!(json[0].contains("`--html` is ignored"), "{json:?}");
+        assert_eq!(
+            notes(&["--list", "--render", "g.svg", "--update", "r.md"]).len(),
+            2
+        );
+        let states = notes(&[
+            "--states",
+            "--executors",
+            "--max-fanout",
+            "3",
+            "--links",
+            "x{line}",
+        ]);
+        assert_eq!(states.len(), 3, "{states:?}");
+        assert!(
+            states.iter().all(|n| n.contains("on `--states`")),
+            "{states:?}"
+        );
+        assert!(notes(&["--states", "--max-fanout", "0"]).is_empty());
+        assert!(notes(&["--executors", "--max-fanout", "3"]).is_empty());
     }
 }

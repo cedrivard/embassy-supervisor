@@ -41,11 +41,17 @@ are span-attached:
   bare `beat` entry, `beat` on a `reads:` entry.
 - Numeric ranges: `slot_timeout:`/`ack_timeout:`/`beat_timeout:`
   at least 1, `beat_window:` in 1..=255, `restart_budget: MAX in WINDOW_MS` with
-  `MAX` in 1..=65535 and `WINDOW_MS` at least 1.
-- Clause combinations: `task:` vs `spawn:`, clauses that require `task:`
-  (`resources:`, `state:`, `exit:`, `cancel`), the removed `pool_size:`, `cancel` with
-  `Mode::Pause`, `exit:` on a `pool`,
-  `ready_on_write` without `beat_timeout:` and an `observed beat` write.
+  `MAX` in 1..=65535 and `WINDOW_MS` at least 1. The three timeouts and both
+  `restart_budget:` numbers carry no suffix (`slot_timeout: 5s` is an error).
+- Clause combinations: `task:` vs `spawn:`, clauses that require `task:` (on a
+  node `resources:`, `state:`, `exit:`, `cancel`; on a pool `cancel`, while a
+  pool's `resources:`/`state:` without `task:` is rejected by
+  `embassy-supervisor-macros`), the removed `pool_size:`, `cancel` with
+  `Mode::Pause`, `exit:` on a `pool`, `ready_on_write` without `beat_timeout:`
+  and an `observed beat` write.
+- A repeated clause or marker, `exit:` and `provides:` included; list entries
+  separated by commas (a trailing comma is fine); an attribute on a clause or a
+  list entry that is not `#[cfg(...)]`.
 - `default executor` shape: one per graph, never `#[cfg]`-gated, never inside
   `@fragment` markers (it resolves across them at the compose site). Whether a
   `local` slot's declarations share one executor is checked by

@@ -1,7 +1,7 @@
 //! Dataflow linting: finding one-sided signal couplings.
 
-use crate::render::{boxed_name, discovered_access_matches, discovered_key, signals_of};
-use crate::{Bundle, Decl, Discovered, GateStatic, expand_bundles, module_of};
+use crate::render::{boxed_name, discovered_key, signals_of};
+use crate::{Bundle, Decl, Discovered, GateStatic, binding_for, expand_bundles, fn_bindings};
 use std::collections::BTreeMap;
 
 /// Enabled lint categories for a `supervisor-lint` run.
@@ -20,6 +20,11 @@ impl LintCats {
     /// Return `true` if any category is enabled.
     pub fn any(&self) -> bool {
         self.orphan_reads || self.dead_writes || self.public_gate
+    }
+
+    /// Return `true` if a signal category (`orphan-reads`, `dead-writes`) is enabled.
+    pub fn dataflow(&self) -> bool {
+        self.orphan_reads || self.dead_writes
     }
 
     /// Enable every lint category.
@@ -58,10 +63,13 @@ struct Sides {
     monitor_consumed: bool,
 }
 
-/// Run enabled dataflow lints over the given declarations and discoveries.
+/// Run enabled dataflow lints over the given declarations and discoveries,
+/// returning human-readable warnings.
 ///
-/// `allow` contains signal path patterns that suppress matching warnings.
-/// Returns human-readable warning strings.
+/// `allow` contains signal path patterns that suppress matching warnings; an
+/// entry counts as used when it names any one-sided signal, also one whose
+/// category `cats` leaves out. With no signal category enabled, returns
+/// nothing.
 pub fn dataflow_lints(
     decls: &[Decl],
     discovered: &[Discovered],
@@ -69,10 +77,12 @@ pub fn dataflow_lints(
     cats: &LintCats,
     allow: &[String],
 ) -> Vec<String> {
+    if !cats.dataflow() {
+        return Vec::new();
+    }
     let mut warnings = Vec::new();
     let mut allow_hit = vec![false; allow.len()];
     for decl in decls {
-        let graph_module = module_of(&decl.origin);
         let mut order: Vec<String> = Vec::new();
         let mut sides: BTreeMap<String, Sides> = BTreeMap::new();
         let note = |order: &mut Vec<String>,
@@ -114,14 +124,14 @@ pub fn dataflow_lints(
             let Some(name) = boxed_name(item) else {
                 continue;
             };
-            let funcs = expand_bundles(crate::render::dataflow_fn_sources(item), bundles);
-            if funcs.is_empty() {
+            let bindings = expand_bundles(fn_bindings(item), bundles);
+            if bindings.is_empty() {
                 continue;
             }
             let mut seen: Vec<(bool, String)> = Vec::new();
             for d in discovered {
                 let a = &d.access;
-                if !discovered_access_matches(&funcs, d, &graph_module)
+                if binding_for(&bindings, d).is_none()
                     || seen.iter().any(|(w, p)| *w == a.write && *p == a.path)
                 {
                     continue;
@@ -170,11 +180,8 @@ pub fn dataflow_lints(
         }
         for key in &order {
             let s = &sides[key];
-            let orphan = cats.orphan_reads && s.writers.is_empty() && !s.readers.is_empty();
-            let dead = cats.dead_writes
-                && s.readers.is_empty()
-                && !s.writers.is_empty()
-                && !s.monitor_consumed;
+            let orphan = s.writers.is_empty() && !s.readers.is_empty();
+            let dead = s.readers.is_empty() && !s.writers.is_empty() && !s.monitor_consumed;
             if !(orphan || dead) {
                 continue;
             }
@@ -182,13 +189,13 @@ pub fn dataflow_lints(
                 allow_hit[i] = true;
                 continue;
             }
-            if orphan {
+            if orphan && cats.orphan_reads {
                 warnings.push(format!(
                     "orphan read: `{key}` is read by {} but nothing in this graph writes it",
                     s.readers.join(", ")
                 ));
             }
-            if dead {
+            if dead && cats.dead_writes {
                 warnings.push(format!(
                     "dead write: `{key}` is written by {} but nothing in this graph reads it",
                     s.writers.join(", ")
@@ -293,6 +300,35 @@ mod tests {
     }
 
     #[test]
+    fn allow_entries_count_for_categories_only_leaves_out() {
+        let src = r#"
+            embassy_supervisor::supervisor_graph! {
+                node W = Terminate, task: w_entry, writes: [crate::sig::TAP];
+                node R = Terminate, task: r_entry, reads: [crate::sig::MISSING];
+            }
+        "#;
+        let decls = parse_source(src, "t.rs").unwrap();
+        let cats = |list: &str| {
+            let mut c = LintCats::default();
+            c.parse(list).unwrap();
+            c
+        };
+        let allow = ["TAP".to_string(), "MISSING".to_string()];
+        for only in ["dead-writes", "public-gate"] {
+            let w = dataflow_lints(&decls, &[], &[], &cats(only), &allow);
+            assert!(w.is_empty(), "--only {only}: {w:?}");
+        }
+        let w = dataflow_lints(&decls, &[], &[], &cats("dead-writes"), &["GONE".into()]);
+        assert!(w.iter().any(|w| w.contains("--allow GONE")), "{w:?}");
+        assert!(
+            w.iter()
+                .any(|w| w.contains("dead write") && w.contains("TAP")),
+            "{w:?}"
+        );
+        assert!(!w.iter().any(|w| w.contains("MISSING")), "{w:?}");
+    }
+
+    #[test]
     fn element_writes_and_whole_array_reads_cover_each_other() {
         let src = r#"
             embassy_supervisor::supervisor_graph! {
@@ -323,7 +359,7 @@ mod tests {
             static QUIET: Backed<u32> = Backed::new(0);
         "#;
         let mut found = Vec::new();
-        crate::scan_gate_statics(src, "sig.rs", &mut found);
+        crate::scan_gate_statics(&syn::parse_file(src).unwrap(), "sig.rs", &mut found);
         let names: Vec<&str> = found.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(
             names,
@@ -364,7 +400,7 @@ mod tests {
         "#;
         let decls = parse_source(src, "t.rs").unwrap();
         let mut discovered = Vec::new();
-        scan_source(body, "tasks.rs", &mut discovered);
+        scan_source(&syn::parse_file(body).unwrap(), "tasks.rs", &mut discovered);
         let w = dataflow_lints(&decls, &discovered, &[], &all(), &[]);
         assert!(
             w.iter()

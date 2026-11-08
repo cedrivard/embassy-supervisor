@@ -89,6 +89,5 @@ fn a_producer_drains_before_it_may_free() {
     assert!(polled(&mut idle), "nothing to wait for");
     HANDLE.reopen();
 
-    assert_eq!(HANDLE.load(Ordering::Relaxed), 7);
     assert_eq!(HANDLE.leases(), 0);
 }

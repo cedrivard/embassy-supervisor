@@ -20,8 +20,17 @@ impl GraphRef {
             #[cfg(feature = "trace")]
             chain: Chain::new(),
             #[cfg(feature = "trace-self")]
-            self_node: Some(TaskNode::new(&SELF_NODE_CFG, false)),
+            self_node: None,
         }
+    }
+
+    /// The supervisor's own introspection node, over a handle the graph owns;
+    /// emitted by [`supervisor_graph!`](crate::supervisor_graph) under
+    /// `trace-self`.
+    #[cfg(feature = "trace-self")]
+    pub const fn with_self_handle(mut self, handle: &'static crate::TaskHandle) -> Self {
+        self.self_node = Some(TaskNode::new(&SELF_NODE_CFG, handle));
+        self
     }
 
     /// Return the graph's node slot array.
@@ -30,7 +39,8 @@ impl GraphRef {
     }
 
     #[cfg(feature = "trace-self")]
-    /// Return the supervisor's own introspection node, if enabled.
+    /// Return the supervisor's own introspection node: `Some` for a graph
+    /// built [`with_self_handle`](Self::with_self_handle).
     pub const fn self_node(&'static self) -> Option<&'static TaskNode> {
         self.self_node.as_ref()
     }

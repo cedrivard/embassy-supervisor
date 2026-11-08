@@ -15,12 +15,16 @@ use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 /// certain age. What neither can tell is whether a fresh value is *valid*;
 /// a plausible-looking drift needs a consumer that understands the value.
 ///
-/// Writes go through [`w`](Self::w), reads through [`r`](Self::r); there is
-/// deliberately no `Deref`, so an unstamped write path does not exist. It
-/// records the time and nothing else — compose `Stamped<Counted<T>>` when
-/// the write count matters too. Costs one `AtomicU32` and one `AtomicBool`
+/// Writes go through [`w`](Self::w), which stamps them; [`r`](Self::r) and
+/// [`inner`](Self::inner) hand out the same `&T` unstamped, so a write
+/// through them (an atomic store, a `Signal::signal`) leaves the age alone.
+/// There is deliberately no `Deref`: an unstamped access is spelled out. It
+/// records the time and nothing else; compose `Stamped<Counted<T>>` when the
+/// write count matters too. Costs one `AtomicU32` and one `AtomicBool`
 /// beside the wrapped value. The stamp is `Instant` ticks truncated to
-/// `u32`, like the node heartbeat: ages are exact up to `u32::MAX` ticks.
+/// `u32`, like the node heartbeat: an age saturates at `u32::MAX / 2` ticks
+/// (about 35.8 min at a 1 MHz tick) instead of wrapping, provided something
+/// asks at least that often.
 pub struct Stamped<T> {
     inner: T,
     stamp: AtomicU32,
@@ -37,15 +41,23 @@ impl<T> Stamped<T> {
         }
     }
 
-    /// Borrow the inner signal for a write, stamping now.
+    /// Borrow the inner signal for a write, stamping now. The stamp lands
+    /// before the write it covers, so until that write completes
+    /// [`read_fresh`](Self::read_fresh) vouches for the previous value; `put`
+    /// (the `Sink` impl, feature `dataflow`) stamps after its write instead.
     pub fn w(&self) -> &T {
-        self.stamp
-            .store(Instant::now().as_ticks() as u32, Ordering::Release);
-        self.written.store(true, Ordering::Release);
+        self.stamp_now();
         &self.inner
     }
 
-    /// Borrow the inner signal for a read.
+    fn stamp_now(&self) {
+        self.stamp
+            .store(Instant::now().as_ticks() as u32, Ordering::Release);
+        self.written.store(true, Ordering::Release);
+    }
+
+    /// Borrow the inner signal for a read. Not stamped: a write through it
+    /// leaves the age alone.
     pub fn r(&self) -> &T {
         &self.inner
     }
@@ -55,19 +67,23 @@ impl<T> Stamped<T> {
         &self.inner
     }
 
-    /// Time since the last stamped write, `None` until the first.
+    /// Time since the last stamped write, `None` until the first; saturates at
+    /// `u32::MAX / 2` ticks.
     pub fn age(&self) -> Option<Duration> {
         if !self.written.load(Ordering::Acquire) {
             return None;
         }
-        let now = Instant::now().as_ticks() as u32;
-        let ticks = now.wrapping_sub(self.stamp.load(Ordering::Acquire));
-        Some(Duration::from_ticks(u64::from(ticks)))
+        Some(Duration::from_ticks(u64::from(crate::saturating_age(
+            &self.stamp,
+        ))))
     }
 
-    /// Has the signal been written within `max_age`?
+    /// Has the signal been written within `max_age`? A `max_age` at or past
+    /// the saturation point is clamped below it, so a dead signal never reads
+    /// fresh.
     pub fn is_fresh(&self, max_age: Duration) -> bool {
-        self.age().is_some_and(|age| age <= max_age)
+        self.age()
+            .is_some_and(|age| age.as_ticks() <= crate::age_bound(max_age))
     }
 
     /// The inner signal if it was written within `max_age`, else `None`.
@@ -87,7 +103,8 @@ impl<T: crate::Observable> crate::Observable for Stamped<T> {
 impl<T: crate::Sink> crate::Sink for Stamped<T> {
     type Item = T::Item;
     fn put(&self, v: T::Item) {
-        self.w().put(v);
+        self.inner.put(v);
+        self.stamp_now();
     }
 }
 

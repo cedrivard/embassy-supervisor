@@ -255,13 +255,14 @@ pub struct Scan {
     pub decls: Vec<Decl>,
     /// Discovered `#[dataflow]` accesses in graph sources and dependencies.
     pub scanned_accesses: Vec<Discovered>,
-    /// `(module, name)` pairs for `#[dataflow]` fns in graph sources.
-    pub fns: Vec<(String, String)>,
-    /// `(module, name)` pairs for `#[dataflow]` fns in dependency sources.
-    pub dep_fns: Vec<(String, String)>,
+    /// `#[dataflow]` fns in graph sources, with their module paths.
+    pub fns: Vec<crate::ScannedFn>,
+    /// `#[dataflow]` fns in dependency sources, with their module paths.
+    pub dep_fns: Vec<crate::ScannedFn>,
     /// Discovered `#[dataflow_bundle]` modules.
     pub bundles: Vec<Bundle>,
-    /// Gate-wrapped statics (`Backed`, `Leased`, `VetoGate`) in graph sources.
+    /// Gate-wrapped statics (`Backed`, `Leased`, `VetoGate`) in every scanned
+    /// source, `--deps` sources included.
     pub gate_statics: Vec<crate::GateStatic>,
 }
 
@@ -286,10 +287,13 @@ pub fn scan(sources: &Sources) -> Result<Scan, String> {
             out.decls
                 .extend(crate::parse_source(&src, file).map_err(|e| e.to_string())?);
         }
-        crate::scan_source(&src, file, &mut out.scanned_accesses);
-        crate::scan_gate_statics(&src, file, &mut out.gate_statics);
+        let Ok(parsed) = syn::parse_file(&src) else {
+            continue;
+        };
+        crate::scan_source(&parsed, file, &mut out.scanned_accesses);
+        crate::scan_gate_statics(&parsed, file, &mut out.gate_statics);
         crate::scan_fns(
-            &src,
+            &parsed,
             file,
             if graph_source {
                 &mut out.fns
@@ -297,7 +301,7 @@ pub fn scan(sources: &Sources) -> Result<Scan, String> {
                 &mut out.dep_fns
             },
         );
-        crate::scan_bundles(&src, file, &mut out.bundles);
+        crate::scan_bundles(&parsed, file, &mut out.bundles);
     }
     Ok(out)
 }

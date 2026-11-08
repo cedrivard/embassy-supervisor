@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
-use embassy_supervisor::{DeferredShrink, Supervisor, TaskNode, dataflow, supervisor_graph};
+use embassy_supervisor::{
+    Coupling, DeferredShrink, Sig, Supervisor, TaskNode, dataflow, supervisor_graph,
+};
 use embassy_time::{Duration, MockDriver};
 
 pub static IN: AtomicU32 = AtomicU32::new(0);
@@ -28,6 +30,7 @@ fn put_out(node: &'static TaskNode, v: u32) {
 }
 
 /// The same write, carrying the node's heartbeat. The verb is the declaration:
+/// no `beat` marker in the graph; calling `beat_put` is what claims the beat.
 #[dataflow]
 fn beat_out(node: &'static TaskNode, v: u32) {
     node.beat_put(&crate::OUT, v);
@@ -49,16 +52,17 @@ fn read_in_ref(node: &'static TaskNode) -> &'static AtomicU32 {
 }
 
 #[dataflow]
-fn touch_rogue(node: &'static TaskNode) {
-    node.get(&crate::ROGUE);
+fn touch_rogue(node: &'static TaskNode) -> u32 {
+    node.get(&crate::ROGUE)
 }
 
 #[dataflow]
-fn touch_scratch(node: &'static TaskNode) {
-    node.get(&crate::SCRATCH);
+fn touch_scratch(node: &'static TaskNode) -> u32 {
+    node.get(&crate::SCRATCH)
 }
 
 /// An accessor: callers pass their node; adopters bind this fn's table, so
+/// its write is attributed to whichever node calls it (ADOPTER's second table).
 #[dataflow]
 fn set_scratch(node: &'static TaskNode, v: u32) {
     node.put(&crate::SCRATCH, v);
@@ -136,7 +140,8 @@ async fn driver(spawner: Spawner) {
         0,
         "`beat_put` flagged a beat, and this very check granted it"
     );
-    assert_eq!(get_in(&WORKER), 0, "`get` performed the read");
+    IN.store(3, Ordering::Relaxed);
+    assert_eq!(get_in(&WORKER), 3, "`get` performed the read");
     bump_out(&WORKER);
     assert_eq!(
         OUT.load(Ordering::Relaxed),
@@ -153,9 +158,18 @@ async fn driver(spawner: Spawner) {
     push_pool_out(&WORKERS[1], 4);
     assert_eq!(POOL_OUT.load(Ordering::Relaxed), 4);
 
-    touch_rogue(&BYSTANDER);
+    ROGUE.store(6, Ordering::Relaxed);
+    assert_eq!(
+        touch_rogue(&BYSTANDER),
+        6,
+        "a declared read performs through the verb"
+    );
     SCRATCH.store(9, Ordering::Relaxed);
-    touch_scratch(&BYSTANDER);
+    assert_eq!(
+        touch_scratch(&BYSTANDER),
+        9,
+        "an access through a verb performs whether or not the calling node declares it"
+    );
 
     WORKER.report_status("steady");
     assert_eq!(WORKER.status(), Some("steady"));
@@ -182,4 +196,17 @@ fn the_body_is_the_declaration() {
         assert!(StdInstant::now() < deadline, "did not complete");
         std::thread::sleep(StdDuration::from_millis(5));
     }
+}
+
+static PLAIN: AtomicU32 = AtomicU32::new(0);
+static PLAIN_ENTRY: Coupling = Coupling::new("crate::PLAIN", &PLAIN);
+
+#[test]
+fn sig_is_copy_whatever_the_signal_type() {
+    let s = Sig {
+        entry: &PLAIN_ENTRY,
+        target: &PLAIN,
+    };
+    let (a, b) = (s, s); // AtomicU32 is not Copy; the handle is
+    assert!(core::ptr::eq(a.target, b.target));
 }

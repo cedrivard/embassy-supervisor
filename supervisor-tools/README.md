@@ -16,6 +16,21 @@ lint finding names the same box a diagram draws.
 
 ## Install
 
+From crates.io:
+
+```console
+$ cargo install embassy-supervisor-tools
+```
+
+Prebuilt `supervisor-mermaid` and `supervisor-lint` binaries are attached to
+each `embassy-supervisor-tools-v*`
+[release](https://github.com/cedrivard/embassy-supervisor/releases): Linux
+(x86_64 and aarch64, static musl), macOS (x86_64 and aarch64) and Windows
+(x86_64), with a `SHA256SUMS` file.
+
+From a checkout of this repository, whose default build target is the
+embedded one, name the host:
+
 ```console
 $ cargo install --path supervisor-tools --target $(rustc --print=host-tuple)
 ```
@@ -28,8 +43,10 @@ From the crate whose graph you want drawn:
 $ cd firmware && supervisor-mermaid
 ```
 
-No arguments means "this crate": the `src/` roots named by the nearest
-`Cargo.toml`, followed through their `mod` declarations. The diagram goes to
+No arguments means "this crate": `src/main.rs`, `src/lib.rs` and `src/bin/*`
+under the nearest `Cargo.toml` above the working directory, followed through
+their `mod` declarations (a `[lib]` or `[[bin]]` `path =` elsewhere is not
+read; pass such a file explicitly). The diagram goes to
 stdout; `-o graph.mmd` writes a file, `--live-url` prints a
 [mermaid.live](https://mermaid.live) link that opens with nothing installed,
 `--html graph.html` writes a page that renders itself in a browser.
@@ -67,24 +84,37 @@ contain cycles.
   overrides `--anchor-uncoupled` when both are given.
 - `--anchor-uncoupled` restores a dotted `spawn` edge only when either
   endpoint has no runtime coupling: no declared signal, no scanned
-  discovered/adopted dataflow access, no resource. A root with no `deps:` of
-  its own is anchored by its dependent's edge. An edge between two
-  runtime-coupled items is never restored.
+  discovered/adopted dataflow access, no resource it takes, and no
+  `provides:` slot another item takes. A root with no `deps:` of its own is
+  anchored by its dependent's edge. An edge between two runtime-coupled items
+  is never restored.
 
 **Lifecycles** (`--states`) answers what happens to one node over its life, as
 a `stateDiagram-v2`. Only transitions the declaration implies are drawn: a
 `bound` dep proves the cascade exists, `ready` proves the readiness gate,
-`beat_timeout:` proves the liveness sweep. Nodes sharing a lifecycle shape
-share one composite state. Add `-s`/`--signals` for one composite per node,
-its transitions carrying the concrete gates (the slots its spawn takes, the
-readiness it waits on, the slots a stop clears) and its declared reads/writes
-in the title.
+`beat_timeout:` proves the liveness sweep, `enabled_if:` the latch `start()`
+may set; a `restart_budget:` is a `restarts MAX/WINDOWms` fact in the title.
+Nodes sharing a lifecycle shape share one composite state. Add
+`-s`/`--signals` for one composite per node, its transitions carrying the
+concrete gates (the slots its spawn takes, the readiness it waits on, the
+slots a stop clears) and its declared reads/writes in the title.
 
-A `#[cfg]`-gated node, dep, signal entry or `#[dataflow]` call site draws like
-any other, with the predicate in its label or on its edge: the diagram shows
-every build, and the `cfg(…)` text says which. A `#[dataflow]` applied through
-`#[cfg_attr(pred, dataflow)]` is scanned too, with `pred` on its edges. Pass
-`--hide-cfg` to omit those markers.
+A `#[cfg]`-gated node, dep, signal entry, `discover` clause, `dataflow:` entry
+or `#[dataflow]` call site draws like any other, with the predicate in its
+label or on its edge: the diagram shows every build, and the `cfg(…)` text
+says which. A `#[dataflow]` applied through `#[cfg_attr(pred, dataflow)]` is
+scanned too, with `pred` on its edges. Pass `--hide-cfg` to omit those
+markers.
+
+A `discover` task fn or a `dataflow:` adoption binds the `#[dataflow]` fns
+whose module path ends with the path as written. A fn's module path is its
+file's place under `src/` (`src/imu/driver.rs` is `imu::driver`; `main.rs`,
+`lib.rs` and the `src/bin/` roots are the crate root), then the inline `mod`s
+around it; a file outside a `src/` tree contributes its stem. A path not
+written `crate::` may lead with the crate's name; a crate-root fn is reached
+that way only when the scanned file's crate directory (the one above `src/`,
+`-` read as `_`) is that name. A path written `crate::` matches a file under
+`src/` exactly, and a file outside a `src/` tree by suffix.
 
 Each diagram's Mermaid frontmatter title comes from its declaration. Use
 `--title 'Firmware bring-up'` to replace it, including the generated HTML
@@ -98,9 +128,9 @@ page's browser title and heading, or `--no-title` to omit those titles.
 | `--live-url` | a `mermaid.live` share link per diagram; the diagram rides in the URL itself, nothing to install |
 | `--html FILE` | one self-rendering page (mermaid.js from the CDN), a double-click view |
 | `--render FILE` | an svg/png/pdf through [`mmdc`], if it is installed; the format follows the extension |
-| `--update FILE.md` | rewrite the block between `<!-- supervisor-mermaid:start -->` and `<!-- supervisor-mermaid:end -->` markers in a markdown file, touching nothing else |
+| `--update FILE.md` | rewrite the block between the `<!-- supervisor-mermaid:start -->` and `<!-- supervisor-mermaid:end -->` lines in a markdown file, touching nothing else |
 | `--json` | the graph model (nodes, deps, resources, provides, signals, scanned accesses) as JSON, for anything that is not a diagram |
-| `--watch` | re-run whenever an input file changes; needs one of the destinations above |
+| `--watch` | re-run whenever an input file changes; needs `-o`, `--html`, `--render` or `--update` |
 
 `--links 'vscode://file/{file}:{line}:1'` makes each node box a link to its
 declaration (`{file}` is its canonical absolute path, `{line}` its source
@@ -116,7 +146,7 @@ into one aggregate box naming its readers.
 ## Options
 
 ```
-supervisor-mermaid — Mermaid diagrams from embassy-supervisor graph declarations
+supervisor-mermaid: Mermaid diagrams from embassy-supervisor graph declarations
 
 USAGE:
     supervisor-mermaid [OPTIONS] [FILE|DIR]...
@@ -134,23 +164,23 @@ render; `--select`, `--all` or a pipe skips it.
 OPTIONS:
   inputs
         --deps             also scan the workspace's path dependencies (via
-                           `cargo metadata`) — for graphs adopting another
+                           `cargo metadata`), for graphs adopting another
                            crate's `#[dataflow]` fns
 
   what to draw
         --runtime          the running system: every signal and resource slot,
-                   and no bring-up edges by default
+                           and no bring-up edges by default
         --states           node lifecycles, as a state diagram; with --signals,
                            one composite per node carrying its concrete gates
-      --runtime-deps     with --runtime, restore every `deps:` edge as dotted
-                   `spawn` context (overrides --anchor-uncoupled)
+        --runtime-deps     with --runtime, restore every `deps:` edge as dotted
+                           `spawn` context (overrides --anchor-uncoupled)
         --anchor-uncoupled with --runtime, restore dotted `deps:` edges that
-                   touch a node with no runtime coupling or resource
+                           touch a node with no runtime coupling or resource
     -s, --signals          draw declared and scanned dataflow as dotted signal
                            edges (the runtime view always draws solid edges)
     -f, --full-paths       label signals with the declared path, not the last
                            segment that tells them apart
-            --hide-cfg         omit `#[cfg(...)]` predicates from labels and edges
+        --hide-cfg         omit `#[cfg(...)]` predicates from labels and edges
     -x, --exclude <NAMES>  leave out these nodes or pools (comma separated), and
                            every edge that named them; repeatable
         --fragments        box each fragment's items in a subgraph
@@ -164,7 +194,8 @@ OPTIONS:
         --title <TEXT>     override the Mermaid and HTML page title
         --no-title         omit the Mermaid and HTML page title
         --max-fanout <N>   collapse a signal's readers into one aggregate box
-                           once more than N nodes read it
+                           once more than N nodes read it; 0, the default,
+                           never collapses
         --h-spacing <N>    horizontal gap between boxes, in pixels (Mermaid
                            defaults to 50)
         --v-spacing <N>    vertical gap between boxes
@@ -182,9 +213,11 @@ OPTIONS:
         --json             print the graph model as JSON instead of a diagram
                            (with every warning, under "warnings")
         --check            verify and stop: print the diagnostics, no diagram;
-                           exit non-zero on any warning — CI's guard against
+                           exit non-zero on any warning, CI's guard against
                            graphs and `#[dataflow]` fns drifting apart (what
-                           the dataflow itself says is `supervisor-lint`)
+                           the dataflow itself says is `supervisor-lint`);
+                           every declaration found is checked, whatever
+                           --select or -x leaves to draw
         --live-url         print a mermaid.live share link per diagram
         --html <FILE>      write a self-rendering HTML page (mermaid.js CDN)
         --render <FILE>    render through `mmdc` (svg/png/pdf, by extension)
@@ -193,6 +226,7 @@ OPTIONS:
                            destination: -o, --html, --render or --update)
     -o, --output <FILE>    write to a file instead of stdout
     -h, --help             show this
+    -V, --version          print the version
 ```
 
 ## supervisor-lint
@@ -204,7 +238,8 @@ The same model, asked what its dataflow is missing:
 - `public-gate`: a gate static (`Backed`, `Leased`, or `VetoGate`) reachable
   from outside its module. Keep the gate private and expose `#[dataflow]`
   accessors so a bypass is deliberate. The lint matches by the type's last
-  segment, so aliases and re-exports escape it.
+  segment, so aliases and re-exports escape it. It needs no graph
+  declaration: `supervisor-lint --only public-gate` runs on any source.
 
 Build-time checks for the one-sided-signal diagnostics a running supervisor
 logs, plus exposed gates. A gate guards the access path, not the static; keep
@@ -215,17 +250,19 @@ $ cd firmware && supervisor-lint
 $ supervisor-lint --only dead-writes --allow RATE_PID_TERMS src/
 ```
 
-Every category runs unless `--only` narrows it, and a finding exits non-zero:
-this is a CI gate, not a report. A one-sided signal is often a real absence of
-the build (an input this target has no producer for, a telemetry tap nothing
-consumes yet) rather than a mistake, so `--allow SIGNAL,…` names the accepted
-ones. The list lives in the invocation, where it is reviewed like code, and an
-`--allow` entry that no longer suppresses anything is itself reported.
+Every category runs unless `--only` narrows it. A finding exits 1 and a failed
+run (a bad option, an unreadable input, no graph) exits 2, so a CI gate can
+tell them apart: this is a gate, not a report. A one-sided signal is often a
+real absence of the build (an input this target has no producer for, a
+telemetry tap nothing consumes yet) rather than a mistake, so
+`--allow SIGNAL,…` names the accepted ones. The list lives in the invocation,
+where it is reviewed like code, and an `--allow` entry that names no one-sided
+signal is itself reported, whichever categories `--only` keeps.
 
 Drift warnings (a bound fn that no scanned file defines, a scanned fn that
-nothing binds) are printed here too, because that is how a signal comes to
-look one-sided when it is not; failing on them is `supervisor-mermaid
---check`'s job.
+nothing binds) are printed here too when `orphan-reads` or `dead-writes` runs,
+because that is how a signal comes to look one-sided when it is not; failing
+on them is `supervisor-mermaid --check`'s job.
 
 ### Categories and exemptions
 
@@ -240,14 +277,14 @@ suffix in either direction. An indexed element (`ARR[0]`) must be spelled with
 its index: element and whole array are two coupling identities.
 
 ```
-supervisor-lint — one-sided signals and exposed gates in an embassy-supervisor graph
+supervisor-lint: one-sided signals and exposed gates in an embassy-supervisor graph
 
 USAGE:
     supervisor-lint [OPTIONS] [FILE|DIR]...
 
-Reads the same sources `supervisor-mermaid` draws from — `supervisor_graph!`,
+Reads the same sources `supervisor-mermaid` draws from (`supervisor_graph!`,
 `supervisor_fragment!` and `compose_graph!`, plus the `#[dataflow]` fn bodies
-a `discover` node or a `dataflow:` adoption binds — and reports what the
+a `discover` node or a `dataflow:` adoption binds) and reports what the
 dataflow model says: a signal read where nothing writes it, a signal written
 where nothing reads it, a gate-wrapped static (`Backed`, `Leased`, `VetoGate`)
 reachable from outside its module. The static shape of the diagnostics a
@@ -255,17 +292,20 @@ running supervisor logs, at build time instead of on a serial console.
 
 A directory is walked recursively for `*.rs`; with no inputs at all, the crate
 the working directory is in is scanned (its `src/` roots, expanded through
-`mod` declarations). `-` reads stdin. Every declaration found is linted, and a
-finding exits non-zero: `--allow` is how a known, accepted absence is written
-down where it gets reviewed.
+`mod` declarations). `-` reads stdin. Every declaration found is linted;
+`public-gate` alone needs none. `--allow` is how a known, accepted absence is
+written down where it gets reviewed.
+
+Exit status: 0 for no findings, 1 for findings (a stale `--allow` included),
+2 when the run itself fails (a bad option, an unreadable input, no graph).
 
 OPTIONS:
         --deps             also scan the workspace's path dependencies (via
-                           `cargo metadata`) — for graphs adopting another
+                           `cargo metadata`), for graphs adopting another
                            crate's `#[dataflow]` fns
         --only <CATS>      restrict to these categories (comma separated,
                            repeatable): `orphan-reads` (read, never written),
-                           `dead-writes` (written, never read — `observed` /
+                           `dead-writes` (written, never read; `observed` /
                            `beat` entries and `beat_*` verbs are exempt, their
                            consumer is the supervisor), `public-gate` (a gated
                            static any module can reach around its gate), or
@@ -275,4 +315,5 @@ OPTIONS:
                            `::`-suffix); an entry suppressing nothing is
                            itself reported
     -h, --help             show this
+    -V, --version          print the version
 ```

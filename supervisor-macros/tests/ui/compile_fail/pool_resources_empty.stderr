@@ -1,0 +1,13 @@
+error: `resources:` must declare at least one `NAME: Type` entry
+ --> tests/ui/compile_fail/pool_resources_empty.rs:7:51
+  |
+7 |     pool P = [Terminate], deps: [], task: worker, resources: [],
+  |                                                   ^^^^^^^^^
+
+warning: unused import: `DeferredShrink`
+ --> tests/ui/compile_fail/pool_resources_empty.rs:2:26
+  |
+2 | use embassy_supervisor::{DeferredShrink, TaskNode, supervisor_graph};
+  |                          ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

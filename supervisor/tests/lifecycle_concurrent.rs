@@ -61,14 +61,14 @@ supervisor_graph! {
 }
 
 /// One stopped pass just completed: both leaves down, the lease released, and
-/// the consumer's ack collected before the producer finished draining.
+/// both acks collected.
 fn assert_pass_down() {
     assert!(!CONS.is_running() && !PROD.is_running(), "leaves are down");
     assert_eq!(HANDLE.leases(), 0, "the lease was released, not leaked");
     assert_eq!(
         *ACKS.lock().unwrap(),
         ["cons", "prod"],
-        "the consumer let go before the producer finished draining"
+        "both acks were collected (the handshake orders the consumer's first)"
     );
 }
 
@@ -111,7 +111,7 @@ async fn driver(spawner: Spawner) {
     assert_eq!(
         *ACKS.lock().unwrap(),
         ["cons", "prod"],
-        "restart's down half collected the same ack order"
+        "restart's down half collected both acks"
     );
     while !CONS_HOLDS.load(Ordering::SeqCst) {
         embassy_futures::yield_now().await;

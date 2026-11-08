@@ -14,9 +14,15 @@
 #   USB-CDC-NCM network with an HTTP control plane, an elastic worker pool, and OTA.
 # - `bootloader` : the embassy-boot-rp A/B bootloader.
 [workspace]
+# Explicit: a virtual manifest never takes its resolver from an edition. Not
+# "3": its MSRV fallback would apply the libraries' 1.88 to every dependency in
+# the shared lock, firmware-only ones included; the `msrv` CI job checks the
+# committed lock on 1.88 instead.
 resolver = "2"
 members = ["supervisor", "supervisor-syntax", "supervisor-macros", "supervisor-tools", "supervisor-observe", "firmware", "bootloader"]
-default-members = ["supervisor", "supervisor-macros", "firmware", "bootloader"]
+# The host-testable crates, so `cargo test --target x86_64-unknown-linux-gnu`
+# at the root runs every suite; firmware and bootloader build with `-p`.
+default-members = ["supervisor", "supervisor-syntax", "supervisor-macros", "supervisor-tools", "supervisor-observe"]
 
 [workspace.package]
 edition = "2024"

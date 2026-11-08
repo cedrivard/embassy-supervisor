@@ -59,6 +59,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]
@@ -98,9 +99,19 @@ async fn driver(spawner: Spawner) {
     );
 
     sup.respawn_terminate(&spawner).await.expect("respawn");
-    settle(|| FAST_RUNS.load(Ordering::SeqCst) == 2 && SLOW_RUNS.load(Ordering::SeqCst) == 2).await;
+    settle(|| {
+        FAST_RUNS.load(Ordering::SeqCst) == 2
+            && SLOW_RUNS.load(Ordering::SeqCst) == 2
+            && POOL_RUNS.load(Ordering::SeqCst) == 2
+    })
+    .await;
     assert_eq!(FAST_RUNS.load(Ordering::SeqCst), 2, "Fast shell respawned");
     assert_eq!(SLOW_RUNS.load(Ordering::SeqCst), 2, "Slow shell respawned");
+    assert_eq!(
+        POOL_RUNS.load(Ordering::SeqCst),
+        2,
+        "the pool floor's shell respawned with them"
+    );
 
     DONE.store(true, Ordering::SeqCst);
 }

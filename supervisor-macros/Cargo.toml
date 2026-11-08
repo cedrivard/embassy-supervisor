@@ -4,7 +4,7 @@ name = "embassy-supervisor-macros"
 # version (`=x.y.z`): the generated code references doc(hidden) supervisor internals,
 # so only the tested pair is guaranteed compatible. Bump only when the macro changes;
 # the supervisor updates its pin to match.
-version = "0.11.0"
+version = "0.12.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -47,9 +47,11 @@ budget = []
 # marker on `writes:`. Without it the marker is a compile error.
 veto = ["dataflow"]
 # Forwarded from the supervisor's `heap-state` feature: permits the
-# `state: Type = init_expr` clause and emits the consumer-crate `__sv_try_box`
-# fallible-boxing helper (raw alloc + null check + Box::from_raw — after which
-# it is a normal Box, freed by drop on task exit).
+# `state: Type = init_expr` and `state: zeroed Type` clauses and emits their
+# consumer-crate fallible-boxing helpers, `__sv_try_box` (alloc, null check,
+# write, Box::from_raw) and `__sv_try_box_zeroed` (alloc_zeroed, null check,
+# Box::from_raw; sound because `Type: Zeroable`). The result is a normal Box,
+# dropped at the end of each activation.
 heap-state = []
 # Forwarded from the supervisor's `readiness` feature: permits the `ready` dep
 # marker (`deps: [NET ready]`) and emits the per-node ready-dep arrays plus
@@ -59,8 +61,9 @@ readiness = []
 # Forwarded from the supervisor's `bound-deps` feature: permits the `bound` dep
 # marker (`deps: [NET ready bound]`) and emits the per-node bound-dep arrays
 # plus `.with_bound_deps` builder calls. Without it the marker is a
-# span-attached compile error naming the feature.
-bound-deps = []
+# span-attached compile error naming the feature. Implies `readiness`, as the
+# supervisor's feature does.
+bound-deps = ["readiness"]
 # Forwarded from the supervisor's `coupling` feature: permits the `reads:` /
 # `writes:` node clauses, and emits the per-node
 # `Coupling` tables plus the `.with_reads(..)` / `.with_writes(..)` builder
@@ -83,9 +86,9 @@ dataflow = ["coupling"]
 # tables, with nothing naming it as a whole.
 graph-ref = []
 # Forwarded from the supervisor's `data-deps` feature: emits the
-# `.with_graph(&GRAPH_REF)` builder call that points every node (and pool
-# member) at its own graph, whose node table is what a gated read resolves its
-# producer through. Purely additive; without it the nodes carry no back-pointer.
+# `.with_graph(..)` builder call that points every node (and pool member) at its
+# own graph, whose node table is what a gated read resolves its producer
+# through. Purely additive; without it the nodes carry no back-pointer.
 data-deps = ["dataflow", "graph-ref"]
 # Forwarded from the supervisor's `liveness` feature: permits `beat_put` /
 # `beat_writer` in a `#[dataflow]` body. Those verbs do not exist without it
@@ -97,7 +100,8 @@ liveness = []
 # `beat_timeout: <millis>` / `beat_window: <n>` node clauses and emits the
 # matching `.with_beat_timeout(..)` / `.with_beat_window(..)` builder calls.
 # Without it either clause is a span-attached compile error naming the feature.
-liveness-monitor = []
+# Implies `liveness`, as the supervisor's feature does.
+liveness-monitor = ["liveness"]
 # Forwarded from the supervisor's `enabled-if` feature: permits the
 # `enabled_if: <fn() -> bool>` node clause and emits the matching
 # `.with_enabled_if(..)` builder call. Without it the clause is a
@@ -113,25 +117,26 @@ restart-intensity = []
 # Pulls `graph-ref` because the recorders resolve that id by walking the chain
 # of `GraphRef`s, which the graph site is what emits.
 trace = ["graph-ref"]
-# Forwarded from the supervisor's `metadata-names` feature: the generated spawn glue
-# stamps the node name into the task's Metadata (`stamp_name`). Read at expansion
-# time by `spawn_stmts`; independent of `trace`, so a graph built with names but not
-# `trace` emits the name-only spawn path (no `adopt`, no id capture).
+# Forwarded from the supervisor's `metadata-names` feature: each node and pool
+# member config gets a NUL-terminated copy of its name (`.with_trace_name(..)`),
+# and the spawn glue stamps it into the task's Metadata (`stamp_name`, or
+# `adopt` under `trace`). Independent of `trace`: a graph built with names but
+# not `trace` emits the name-only spawn path (no `adopt`, no id capture).
 metadata-names = []
-# Forwarded from `trace-names`: the full trace layer with node names = trace + the
-# name stamp.
-trace-names = ["trace", "metadata-names"]
 # Forwarded from the supervisor's `trace-hooks`: expand the supervisor's
 # `__sv_trace_hooks!` at the graph declaration site. The bodies (seven `no_mangle`
 # `_embassy_trace_*` symbols, or a `Trace` impl against embassy git main) are the
 # supervisor's: the graph site only hosts them, because the supervisor crate is
 # `forbid(unsafe_code)` and `no_mangle` cannot be written there.
 trace-hooks = ["trace"]
+# Forwarded from the supervisor's `trace-self`: `GraphRef::with_self_handle` and
+# its `TaskHandle` static for the supervisor's own trace node.
+trace-self = ["trace"]
 
 [dependencies]
 # The graph grammar, shared with the diagram tool. Pinned by EXACT version: the
 # AST is an internal contract between the two crates and changes with the syntax.
-embassy-supervisor-syntax = { version = "=0.5.0", path = "../supervisor-syntax" }
+embassy-supervisor-syntax = { version = "=0.6.0", path = "../supervisor-syntax" }
 syn = { version = "3.0.4", features = ["full"] }
 quote = "1.0.46"
 proc-macro2 = "1.0.106"
@@ -145,13 +150,18 @@ proc-macro2 = "1.0.106"
 # (embassy-supervisor depends back on this crate; a dev-dependency cycle is allowed.)
 [dev-dependencies]
 trybuild = "1"
-# `readiness` unconditionally: trybuild re-resolves this declaration verbatim in
-# its scratch project, so a feature forwarded from this crate's own features
-# would never reach it. Additive API only — the no-feature UI split tests the
-# MACRO-side rejection (expansion-time cfg!), which this does not affect.
-# `pool`/`control` named explicitly: the supervisor's defaults are `macros` only,
-# and the UI fixtures declare pools and control verbs. trybuild re-resolves this
-# declaration verbatim in its scratch project.
+# `span-locations`: unit tests compare where a deferred `compile_error!` is
+# spanned with the clause it reports.
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
+# The features the UI fixtures need from the supervisor. Each but `control`
+# (`control = []` in the supervisor) also forwards
+# `embassy-supervisor-macros?/<f>`, so cargo turns the same macro features on
+# in the trybuild scratch projects and in this crate's own lib-test build: no
+# fixture and no `cfg!` can see one of them off. The rejection paths are
+# unit-tested against an explicit `gate::Features` value instead (see
+# `gate_rejects` in src/lib.rs). `pool`/`control` are named because the
+# supervisor's defaults are `macros` only and the fixtures declare pools and
+# control verbs.
 embassy-supervisor = { path = "../supervisor", features = [
     "pool",
     "control",
@@ -161,23 +171,20 @@ embassy-supervisor = { path = "../supervisor", features = [
     # The macro emits `.with_graph(..)` when its own `data-deps` is on, so the
     # scratch project's supervisor must carry the builder it calls.
     "data-deps",
-    # `beat_put` / `beat_writer` only exist with `liveness`, and a pass fixture
-    # uses them. Feature unification then re-enables the macro's own `liveness`
-    # in the scratch project, so its rejection is unit-tested here instead (see
-    # `beat_verb_requires_feature`) — the same arrangement as `readiness`.
+    # `beat_put` / `beat_writer` only exist with `liveness`, and a pass fixture uses them.
     "liveness",
     "liveness-monitor",
     # The pass fixtures call `.with_enabled_if(..)` / `.with_restart_budget(..)`,
-    # which only exist with these. Feature unification then re-enables the
-    # macro's own features in the scratch project, so their rejection is
-    # unit-tested here instead (see `enabled_if_requires_feature` and
-    # `restart_budget_requires_feature`).
+    # which only exist with these.
     "enabled-if",
     "restart-intensity",
     "bound-deps",
     "graph-ref",
     "trace",
     "trace-hooks",
+    # The macro emits `.with_self_handle(..)` when its own `trace-self` is on (an
+    # `--all-features` run turns it on), so the supervisor must carry the method.
+    "trace-self",
     "metadata-names",
     "fault-inject",
     "budget",

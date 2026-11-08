@@ -12,6 +12,9 @@ async fn worker(node: &'static TaskNode, count: &mut u32) {
     RUNS.store(*count, Ordering::SeqCst);
     let _ = node.run_cancellable(core::future::pending::<()>()).await;
     // Arm the stale run-queue entry BEFORE the ack: the driver's wake is then
+    // enqueued after it, and a batch runs in reverse enqueue order
+    // (embassy-executor run_queue.rs), so the respawn meets this storage still
+    // queued: `Busy` for one pass.
     core::future::poll_fn(|cx| {
         cx.waker().wake_by_ref();
         core::task::Poll::Ready(())
@@ -32,6 +35,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]

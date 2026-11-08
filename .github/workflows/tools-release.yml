@@ -2,16 +2,18 @@ name: tools release
 
 # Prebuilt binaries for the host tools (`supervisor-mermaid` and
 # `supervisor-lint`), built when an `embassy-supervisor-tools-v*` tag is pushed
-# and attached to that tag's GitHub release. `workflow_dispatch` runs the build
-# matrix alone (artifacts only, no release), as a dry run for the packaging.
+# and attached to that tag's GitHub release. `workflow_dispatch` from a branch
+# runs the build matrix alone (artifacts only, a packaging dry run); dispatched
+# on a tools tag, it also publishes the release.
 on:
   push:
     tags: ["embassy-supervisor-tools-v*"]
   workflow_dispatch:
 
-# The release job creates the release for the tag and uploads the archives.
+# Read-only by default; the release job alone writes, to create the release
+# and upload the archives.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -86,6 +88,8 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/embassy-supervisor-tools-v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Check the tag against the manifest
@@ -109,3 +113,5 @@ jobs:
         with:
           name: embassy-supervisor-tools ${{ steps.version.outputs.version }}
           files: dist/*
+          # The supervisor crate's release stays the repository's Latest.
+          make_latest: "false"

@@ -8,14 +8,14 @@ use embassy_supervisor_tools::{
 const TOOL: &str = "supervisor-lint";
 
 const USAGE: &str = "\
-supervisor-lint — one-sided signals and exposed gates in an embassy-supervisor graph
+supervisor-lint: one-sided signals and exposed gates in an embassy-supervisor graph
 
 USAGE:
     supervisor-lint [OPTIONS] [FILE|DIR]...
 
-Reads the same sources `supervisor-mermaid` draws from — `supervisor_graph!`,
+Reads the same sources `supervisor-mermaid` draws from (`supervisor_graph!`,
 `supervisor_fragment!` and `compose_graph!`, plus the `#[dataflow]` fn bodies
-a `discover` node or a `dataflow:` adoption binds — and reports what the
+a `discover` node or a `dataflow:` adoption binds) and reports what the
 dataflow model says: a signal read where nothing writes it, a signal written
 where nothing reads it, a gate-wrapped static (`Backed`, `Leased`, `VetoGate`)
 reachable from outside its module. The static shape of the diagnostics a
@@ -23,17 +23,20 @@ running supervisor logs, at build time instead of on a serial console.
 
 A directory is walked recursively for `*.rs`; with no inputs at all, the crate
 the working directory is in is scanned (its `src/` roots, expanded through
-`mod` declarations). `-` reads stdin. Every declaration found is linted, and a
-finding exits non-zero: `--allow` is how a known, accepted absence is written
-down where it gets reviewed.
+`mod` declarations). `-` reads stdin. Every declaration found is linted;
+`public-gate` alone needs none. `--allow` is how a known, accepted absence is
+written down where it gets reviewed.
+
+Exit status: 0 for no findings, 1 for findings (a stale `--allow` included),
+2 when the run itself fails (a bad option, an unreadable input, no graph).
 
 OPTIONS:
         --deps             also scan the workspace's path dependencies (via
-                           `cargo metadata`) — for graphs adopting another
+                           `cargo metadata`), for graphs adopting another
                            crate's `#[dataflow]` fns
         --only <CATS>      restrict to these categories (comma separated,
                            repeatable): `orphan-reads` (read, never written),
-                           `dead-writes` (written, never read — `observed` /
+                           `dead-writes` (written, never read; `observed` /
                            `beat` entries and `beat_*` verbs are exempt, their
                            consumer is the supervisor), `public-gate` (a gated
                            static any module can reach around its gate), or
@@ -43,14 +46,16 @@ OPTIONS:
                            `::`-suffix); an entry suppressing nothing is
                            itself reported
     -h, --help             show this
+    -V, --version          print the version
 ";
 
 fn main() -> ExitCode {
     match run() {
-        Ok(code) => code,
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::from(1),
         Err(e) => {
             eprintln!("{TOOL}: {e}");
-            ExitCode::FAILURE
+            ExitCode::from(2)
         }
     }
 }
@@ -80,6 +85,10 @@ fn parse_args_from(raw_args: impl IntoIterator<Item = String>) -> Result<Option<
                 print!("{USAGE}");
                 return Ok(None);
             }
+            "-V" | "--version" => {
+                println!("{TOOL} {}", env!("CARGO_PKG_VERSION"));
+                return Ok(None);
+            }
             "--deps" => args.deps = true,
             "--only" => args.only.parse(&value("--only")?)?,
             "--allow" => args.allow.extend(
@@ -101,29 +110,43 @@ fn parse_args_from(raw_args: impl IntoIterator<Item = String>) -> Result<Option<
     Ok(Some(args))
 }
 
-fn run() -> Result<ExitCode, String> {
-    let Some(args) = parse_args_from(std::env::args().skip(1))? else {
-        return Ok(ExitCode::SUCCESS);
-    };
-    let files = inputs::gather(&args.files, args.deps, TOOL)?;
-    lint(&args, &files)
+/// A note for `--allow` given where no category could use it.
+fn ignored_allow(args: &Args) -> Option<&'static str> {
+    (!args.allow.is_empty() && !args.only.dataflow()).then_some(
+        "`--allow` is ignored: it names signals, and only `orphan-reads` and `dead-writes` lint signals",
+    )
 }
 
-fn lint(args: &Args, files: &Sources) -> Result<ExitCode, String> {
+fn run() -> Result<usize, String> {
+    let Some(args) = parse_args_from(std::env::args().skip(1))? else {
+        return Ok(0);
+    };
+    if let Some(note) = ignored_allow(&args) {
+        eprintln!("{TOOL}: warning: {note}");
+    }
+    let files = inputs::gather(&args.files, args.deps, TOOL)?;
+    lint(&args, &files, &mut std::io::stderr())
+}
+
+/// Lint `files`, reporting to `err` (stderr outside tests), and return the
+/// number of findings.
+fn lint(args: &Args, files: &Sources, err: &mut dyn std::io::Write) -> Result<usize, String> {
     let scan = inputs::scan(files)?;
-    if scan.decls.is_empty() {
+    if args.only.dataflow() && scan.decls.is_empty() {
         return Err("no graph declaration found in the given files".to_string());
     }
     let (resolved, warnings) = resolve(scan.decls);
+    // Drift explains a signal that looks one-sided; with no signal category
+    // there is none to explain, and a graph-less run binds nothing.
+    let drift = if args.only.dataflow() {
+        coverage_warnings(&resolved, &scan.fns, &scan.dep_fns, &scan.bundles)
+    } else {
+        Vec::new()
+    };
 
     let mut warned = 0usize;
-    for w in warnings.into_iter().chain(coverage_warnings(
-        &resolved,
-        &scan.fns,
-        &scan.dep_fns,
-        &scan.bundles,
-    )) {
-        eprintln!("{TOOL}: warning: {w}");
+    for w in warnings.into_iter().chain(drift) {
+        let _ = writeln!(err, "{TOOL}: warning: {w}");
         warned += 1;
     }
 
@@ -139,11 +162,12 @@ fn lint(args: &Args, files: &Sources) -> Result<ExitCode, String> {
         .iter()
         .chain(&gate_lints(&scan.gate_statics, &args.only))
     {
-        eprintln!("{TOOL}: lint: {w}");
+        let _ = writeln!(err, "{TOOL}: lint: {w}");
         findings += 1;
     }
 
-    eprintln!(
+    let _ = writeln!(
+        err,
         "{TOOL}: {} declaration{}, {}{}",
         resolved.len(),
         if resolved.len() == 1 { "" } else { "s" },
@@ -161,16 +185,12 @@ fn lint(args: &Args, files: &Sources) -> Result<ExitCode, String> {
             ),
         }
     );
-    Ok(if findings > 0 {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
+    Ok(findings)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{USAGE, parse_args_from};
+    use super::{Sources, USAGE, ignored_allow, lint, parse_args_from};
 
     fn parse(args: &[&str]) -> Result<super::Args, String> {
         parse_args_from(args.iter().map(|arg| (*arg).to_string()))
@@ -225,26 +245,96 @@ mod tests {
     }
 
     #[test]
-    fn every_flag_is_in_the_readme_option_list() {
-        let readme = include_str!("../../README.md");
-        let list = readme
-            .split_once("## supervisor-lint")
-            .and_then(|(_, section)| section.split_once("OPTIONS:"))
-            .and_then(|(_, rest)| rest.split_once("```"))
-            .map(|(block, _)| block)
-            .expect("the README's supervisor-lint option list");
-        for line in USAGE.lines() {
-            let Some(flag) = line.split_whitespace().find(|w| w.starts_with("--")) else {
-                continue;
-            };
-            let flag = flag.trim_end_matches(',');
-            if flag == "--help" {
-                continue;
-            }
+    fn the_readme_carries_the_help_text_verbatim() {
+        assert!(
+            include_str!("../../README.md").contains(USAGE),
+            "README.md must quote `--help` verbatim"
+        );
+    }
+
+    #[test]
+    fn every_help_line_lines_up() {
+        let options = USAGE
+            .split_once("OPTIONS:\n")
+            .expect("an OPTIONS section")
+            .1;
+        for line in options.lines() {
+            let b = line.as_bytes();
+            let at_27 = b.get(26) == Some(&b' ') && b.get(27).is_some_and(|c| *c != b' ');
+            let flag = (line.starts_with("    -") && !line.starts_with("    --"))
+                || line.starts_with("        --");
+            let continued = line.starts_with(&" ".repeat(27));
+            let heading = line.starts_with("  ") && !line.starts_with("   ");
             assert!(
-                list.contains(flag),
-                "`{flag}` is missing from the README list"
+                line.is_empty() || heading || ((flag || continued) && at_27),
+                "`{line}` does not line up with column 28"
             );
         }
+    }
+
+    #[test]
+    fn version_prints_and_stops() {
+        assert!(
+            parse_args_from(["--version".to_string()])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn allow_without_a_signal_category_is_named() {
+        let gate_only = parse(&["--only", "public-gate", "--allow", "X"]).unwrap();
+        assert!(ignored_allow(&gate_only).is_some());
+        assert!(ignored_allow(&parse(&["--allow", "X"]).unwrap()).is_none());
+    }
+
+    #[test]
+    fn public_gate_alone_lints_a_file_with_no_graph() {
+        let dir = std::env::temp_dir().join(format!("svl_gate_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gate.rs");
+        std::fs::write(
+            &path,
+            "pub static EST: Backed<u32> = Backed::new(0);\n\
+             #[embassy_supervisor::dataflow]\n\
+             fn est(node: &'static TaskNode) -> u32 { node.get(&EST) }\n",
+        )
+        .unwrap();
+        let mut files = Sources {
+            graph: vec![path.display().to_string()],
+            scan_only: Vec::new(),
+        };
+        let run = |only: &str, files: &Sources| {
+            let mut err = Vec::new();
+            let found = lint(&parse(&["--only", only]).unwrap(), files, &mut err);
+            (found, String::from_utf8(err).unwrap())
+        };
+        let (found, err) = run("public-gate", &files);
+        assert_eq!(found, Ok(1), "{err}");
+        assert!(err.contains("lint: public gate: "), "{err}");
+        assert!(
+            !err.contains("warning"),
+            "no signal category, no drift: {err}"
+        );
+        assert_eq!(
+            run("dead-writes", &files).0,
+            Err("no graph declaration found in the given files".to_string())
+        );
+
+        let graph = dir.join("graph.rs");
+        std::fs::write(
+            &graph,
+            "embassy_supervisor::supervisor_graph! { node A = Terminate, task: a; }\n",
+        )
+        .unwrap();
+        files.graph.push(graph.display().to_string());
+        let (_, err) = run("public-gate", &files);
+        assert!(!err.contains("is not bound"), "{err}");
+        let (_, err) = run("dead-writes", &files);
+        assert!(
+            err.contains("warning: `#[dataflow]` fn `gate::est` is not bound"),
+            "a signal category reports drift: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

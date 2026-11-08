@@ -3,7 +3,8 @@ use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
-    ControlOp, DeferredShrink, FaultKind, Supervisor, TaskNode, request_control, supervisor_graph,
+    ControlOp, DeferredShrink, FaultKind, Pool, Supervisor, TaskNode, request_control,
+    supervisor_graph,
 };
 
 supervisor_graph! {
@@ -11,7 +12,7 @@ supervisor_graph! {
     node WEDGE = Terminate, deps: [], task: wedge_worker, disabled;
     pool WORKERS = [Terminate, OnDemand], deps: [],
         task: pool_worker,
-        policy: DeferredShrink::new(embassy_time::Duration::from_secs(3600)),
+        policy: DeferredShrink::new(embassy_time::Duration::from_secs(1)),
         min: 1, max: 2;
 }
 
@@ -41,13 +42,14 @@ async fn wedge_worker(_node: &'static TaskNode) {
     core::future::pending::<()>().await;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
+async fn settle(what: &str, mut f: impl FnMut() -> bool) {
     for _ in 0..10_000 {
         if f() {
             return;
         }
         embassy_futures::yield_now().await;
     }
+    panic!("never held: {what}");
 }
 
 /// The whole app: one `run()` call. Its return value is the test's payload.
@@ -65,16 +67,49 @@ async fn runner(spawner: Spawner) {
 
 #[embassy_executor::task]
 async fn scenario() {
-    settle(|| MAIN_SPAWNS.load(Ordering::SeqCst) == 1).await;
-    settle(|| POOL_SPAWNS.load(Ordering::SeqCst) == 2).await;
+    settle("start() spawned MAIN", || {
+        MAIN_SPAWNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    settle(
+        "run()'s pool arm grew the OnDemand member past the floor",
+        || POOL_SPAWNS.load(Ordering::SeqCst) == 2 && WORKERS[1].is_running(),
+    )
+    .await;
     PHASE.store(1, Ordering::SeqCst);
 
-    request_control(&WEDGE, ControlOp::Activate).await;
-    settle(|| WEDGE_SPAWNS.load(Ordering::SeqCst) == 1).await;
+    // Both members idle: the pool arm arms its 1 s shrink cooldown, and reaps
+    // the OnDemand member once mock time passes it.
+    WORKERS[0].mark_idle();
+    WORKERS[1].mark_idle();
+    settle("the pool arm armed the shrink cooldown", || {
+        WORKERS_POOL.deferred_until().is_some()
+    })
+    .await;
+    embassy_time::MockDriver::get().advance(embassy_time::Duration::from_millis(1001));
+    settle("run() reaped the idle OnDemand member", || {
+        !WORKERS[1].is_running() && WORKERS[1].has_exited()
+    })
+    .await;
+    assert!(WORKERS[0].is_running(), "the floor member is never reaped");
     PHASE.store(2, Ordering::SeqCst);
 
-    request_control(&WEDGE, ControlOp::Deactivate).await;
+    WORKERS[0].mark_busy();
+    settle("run() regrew the reaped member under load", || {
+        POOL_SPAWNS.load(Ordering::SeqCst) == 3 && WORKERS[1].is_running()
+    })
+    .await;
     PHASE.store(3, Ordering::SeqCst);
+
+    request_control(&WEDGE, ControlOp::Activate).await;
+    settle("the control arm spawned WEDGE", || {
+        WEDGE_SPAWNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    PHASE.store(4, Ordering::SeqCst);
+
+    request_control(&WEDGE, ControlOp::Deactivate).await;
+    PHASE.store(5, Ordering::SeqCst);
 }
 
 #[test]
@@ -92,8 +127,8 @@ fn run_drives_pools_and_control_until_error() {
 
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
     while !DONE.load(Ordering::SeqCst) {
-        // Phase 3 parks on the 2 s ack timeout; advance in small repeated steps.
-        if PHASE.load(Ordering::SeqCst) >= 3 {
+        // Phase 5 parks on WEDGE's 2 s ack window; advance in small repeated steps.
+        if PHASE.load(Ordering::SeqCst) >= 5 {
             clock.advance(embassy_time::Duration::from_millis(500));
         }
         assert!(

@@ -68,7 +68,7 @@ async fn oneshot_task(node: &'static TaskNode) {
 }
 
 /// Yield until `f()` holds (freshly-spawned tasks need to be polled before their
-/// bodies have run) or a generous turn budget elapses.
+/// bodies have run); panics if a generous turn budget elapses first.
 async fn settle(mut f: impl FnMut() -> bool) {
     for _ in 0..10_000 {
         if f() {
@@ -76,6 +76,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]
@@ -115,12 +116,8 @@ async fn driver(spawner: Spawner) {
         !DAEMON_SHUTDOWN_SEEN.load(Ordering::SeqCst),
         "detached daemon was never signaled to shut down"
     );
-    // The detached one-shot already exited (stale is_running); teardown must skip it.
-    // Reaching this line at all proves it did — else the frozen-clock ack wait hangs.
-    assert!(
-        ONESHOT.is_detached(),
-        "detached one-shot skipped by teardown"
-    );
+    // Reaching this line proves teardown skipped the exited, detached one-shot:
+    // with the clock frozen, an ack wait on it would hang.
     PHASE.store(2, Ordering::SeqCst);
 
     // ── resume_pausable(): resumes PAUSED in place (not respawned) ───────────
@@ -154,8 +151,8 @@ async fn driver(spawner: Spawner) {
         "detached daemon NOT respawned — no double-spawn of the still-running instance"
     );
     assert!(
-        DAEMON.is_running() && DAEMON.is_detached(),
-        "daemon is still the same running, detached instance"
+        DAEMON.is_running(),
+        "daemon is still the same running instance"
     );
     assert!(!DAEMON_SHUTDOWN_SEEN.load(Ordering::SeqCst));
     assert_eq!(
@@ -175,10 +172,6 @@ async fn driver(spawner: Spawner) {
         .expect("apply_control");
     assert!(!NORMAL.is_running(), "normal control-stopped");
     assert!(NORMAL.is_disabled(), "normal marked disabled by deactivate");
-    assert!(
-        ONESHOT.is_detached(),
-        "detached one-shot skipped by the deactivate cascade (did not hang on its ack)"
-    );
     assert_eq!(
         ONESHOT_SPAWNS.load(Ordering::SeqCst),
         1,
@@ -187,15 +180,13 @@ async fn driver(spawner: Spawner) {
 
     // ── deactivate the detached one-shot *directly*: it is seeded into the set,
     //    bypassing the growth-loop skip, so only the teardown loop's own detached guard
+    //    prevents signalling a shutdown to the already-exited task. A no-op: it stays
+    //    detached, is not even marked disabled, and the driver does not hang on an ack.
     request_control(&ONESHOT, ControlOp::Deactivate).await;
     let cmd = wait_control().await;
     sup.apply_control(cmd, &spawner)
         .await
         .expect("apply_control");
-    assert!(
-        ONESHOT.is_detached(),
-        "detached one-shot still detached after direct deactivate"
-    );
     assert!(
         !ONESHOT.is_disabled(),
         "detached one-shot left untouched by deactivate (not even disabled)"

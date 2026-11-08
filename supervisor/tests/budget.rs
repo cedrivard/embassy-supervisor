@@ -12,6 +12,8 @@ use embassy_time::{Duration, Instant, MockDriver};
 static REBALANCES: AtomicU32 = AtomicU32::new(0);
 /// What each holder's own loop last saw its grant as, by slot.
 static SEEN: [AtomicU32; 5] = [const { AtomicU32::new(u32::MAX) }; 5];
+/// Set around LATE's fail-closed gate wait and WEDGED's missed ack.
+static ADVANCE: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
 
 supervisor_graph! {
@@ -72,6 +74,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 fn grants() -> [u32; 5] {
@@ -110,10 +113,12 @@ async fn driver(spawner: Spawner) {
 
     // An unprovided budget is a missing resource, like any other slot.
     embassy_supervisor::ResourceGate::clear(&POWER);
+    ADVANCE.store(true, Ordering::SeqCst);
     let err = sup
         .start_node(&LATE, &spawner)
         .await
         .expect_err("no capacity: fail-closed");
+    ADVANCE.store(false, Ordering::SeqCst);
     assert!(
         matches!(err.kind, FaultKind::ResourceMissing),
         "an unprovided budget is a missing resource: {err}"
@@ -130,7 +135,9 @@ async fn driver(spawner: Spawner) {
     );
 
     // A holder that never acks is faulted, and its share released for it.
+    ADVANCE.store(true, Ordering::SeqCst);
     let err = sup.deactivate(&WEDGED).await.expect_err("never acks");
+    ADVANCE.store(false, Ordering::SeqCst);
     assert!(matches!(err.kind, FaultKind::ShutdownTimeout), "{err}");
     assert_eq!(
         (POWER.want_of(2), POWER.grant(2)),
@@ -139,6 +146,12 @@ async fn driver(spawner: Spawner) {
     );
     settle(|| grants() == [0, 30, 0, 20, 10]).await;
     assert_eq!(grants(), [0, 30, 0, 20, 10]);
+    settle(|| seen()[2] == 0).await;
+    assert_eq!(
+        seen()[2],
+        0,
+        "the wedged holder's own loop saw its share go to zero"
+    );
 
     // A parked holder keeps what it claimed.
     sup.stop_node(&PARKED).await.expect("parks");
@@ -181,7 +194,9 @@ fn a_divisible_resource_is_released_when_its_holder_stops() {
             seen(),
             REBALANCES.load(Ordering::SeqCst)
         );
-        clock.advance(Duration::from_millis(10));
+        if ADVANCE.load(Ordering::SeqCst) {
+            clock.advance(Duration::from_millis(10));
+        }
         std::thread::sleep(StdDuration::from_millis(2));
     }
 }

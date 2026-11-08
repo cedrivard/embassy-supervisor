@@ -1,27 +1,35 @@
 /* RP2350 firmware linker layout. The firmware always runs from the ACTIVE
  * partition under the `bootloader` crate (the ROM boots the bootloader, which
- * swaps DFU<->ACTIVE on a pending update and jumps here). Keep these addresses in
- * sync with `bootloader/memory.x`.
+ * swaps DFU<->ACTIVE on a pending update and jumps here). Keep FLASH (ACTIVE),
+ * BOOTLOADER_STATE and DFU in sync with `bootloader/memory.x`.
  *
  * The DFU + STATE symbols are exported for `FirmwareUpdaterConfig`: the firmware
- * streams a new image into DFU, the bootloader swaps it on the next reset. */
+ * streams a new image into DFU, the bootloader swaps it on the next reset.
+ * OTA_SCRATCH holds the compressed download (src/ota.rs reads its symbols); the
+ * asserts keep it clear of DFU and inside FLASH_SIZE (4 MiB, src/ota.rs). */
 MEMORY {
     /* FLASH == the ACTIVE partition. */
     FLASH            : ORIGIN = 0x10021000, LENGTH = 892K
     BOOTLOADER_STATE : ORIGIN = 0x10020000, LENGTH = 4K
     DFU              : ORIGIN = 0x10100000, LENGTH = 896K
+    OTA_SCRATCH      : ORIGIN = 0x101E0000, LENGTH = 256K
 
     RAM   : ORIGIN = 0x20000000, LENGTH = 512K
     SRAM8 : ORIGIN = 0x20080000, LENGTH = 4K
     SRAM9 : ORIGIN = 0x20081000, LENGTH = 4K
 }
 
-/* Flash-relative OFFSETS (not absolute addresses) — embassy-boot feeds these
+/* Flash-relative OFFSETS, not absolute addresses: embassy-boot feeds these
  * straight to embassy-rp's Flash as offset-from-start. See bootloader/memory.x. */
 __bootloader_state_start = ORIGIN(BOOTLOADER_STATE) - 0x10000000;
 __bootloader_state_end   = ORIGIN(BOOTLOADER_STATE) + LENGTH(BOOTLOADER_STATE) - 0x10000000;
 __bootloader_dfu_start   = ORIGIN(DFU) - 0x10000000;
 __bootloader_dfu_end     = ORIGIN(DFU) + LENGTH(DFU) - 0x10000000;
+__ota_scratch_start      = ORIGIN(OTA_SCRATCH) - 0x10000000;
+__ota_scratch_end        = ORIGIN(OTA_SCRATCH) + LENGTH(OTA_SCRATCH) - 0x10000000;
+
+ASSERT(ORIGIN(OTA_SCRATCH) >= ORIGIN(DFU) + LENGTH(DFU), "OTA_SCRATCH overlaps DFU");
+ASSERT(ORIGIN(OTA_SCRATCH) + LENGTH(OTA_SCRATCH) <= 0x10400000, "OTA_SCRATCH ends past the 4 MiB FLASH_SIZE of src/ota.rs");
 
 /* RP2350 boot blocks (binary-info fills the image-def). Unused by the ROM here
  * since the bootloader jumps to ACTIVE directly, but the firmware links with

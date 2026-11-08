@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
-use embassy_supervisor::{ControlCommand, ControlOp, Supervisor, TaskNode, supervisor_graph};
+use embassy_supervisor::{
+    ControlCommand, ControlOp, FaultKind, Supervisor, TaskNode, supervisor_graph,
+};
 use embassy_time::MockDriver;
 
 supervisor_graph! {
@@ -40,6 +42,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]
@@ -99,6 +102,10 @@ async fn driver(spawner: Spawner) {
         .expect_err("wedged task cannot ack");
     assert_eq!(err.node.name(), "wedged");
     assert!(
+        matches!(err.kind, FaultKind::ShutdownTimeout),
+        "stop_node: {err}"
+    );
+    assert!(
         WEDGED.is_running(),
         "a node that missed its ack stays marked running"
     );
@@ -110,9 +117,17 @@ async fn driver(spawner: Spawner) {
         .await
         .expect_err("wedge reported after visiting all nodes");
     assert_eq!(err.node.name(), "wedged");
+    assert!(
+        matches!(err.kind, FaultKind::ShutdownTimeout),
+        "teardown_continue: {err}"
+    );
     // Plain teardown now also errors on the wedge (nothing else is running).
     let err = sup.teardown().await.expect_err("wedge still wedged");
     assert_eq!(err.node.name(), "wedged");
+    assert!(
+        matches!(err.kind, FaultKind::ShutdownTimeout),
+        "teardown: {err}"
+    );
 
     DONE.store(true, Ordering::SeqCst);
 }

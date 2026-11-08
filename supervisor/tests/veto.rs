@@ -7,7 +7,8 @@ use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
-    DeferredShrink, Observable, Supervisor, TaskNode, VetoGate, dataflow, supervisor_graph,
+    Coupling, DeferredShrink, Mode, NodeCfg, Observable, Sig, Supervisor, TaskHandle, TaskNode,
+    VetoGate, dataflow, supervisor_graph,
 };
 
 pub static TRIP: VetoGate<8> = VetoGate::new();
@@ -81,6 +82,21 @@ async fn plain(node: &'static TaskNode) {
         .await;
 }
 
+/// Executor passes: the probe is polled once per pass, so a move of N means
+/// every task woken before it has been polled N times over.
+static PASSES: AtomicU32 = AtomicU32::new(0);
+static PROBE_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Ends after the test's last barrier instead of spinning for the life of the
+/// binary.
+#[embassy_executor::task]
+async fn pass_probe() {
+    while !PROBE_STOP.load(Ordering::SeqCst) {
+        PASSES.fetch_add(1, Ordering::SeqCst);
+        embassy_futures::yield_now().await;
+    }
+}
+
 #[embassy_executor::task]
 async fn runner(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
@@ -115,6 +131,7 @@ fn any_writer_trips_and_only_all_of_them_reset() {
             Box::leak(Box::new(embassy_executor::Executor::new()));
         executor.run(|spawner| {
             spawner.spawn(runner(spawner).unwrap());
+            spawner.spawn(pass_probe().unwrap());
         });
     });
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
@@ -137,11 +154,9 @@ fn any_writer_trips_and_only_all_of_them_reset() {
     let trips = || TRIPS.load(Ordering::SeqCst);
     let resets = || RESETS.load(Ordering::SeqCst);
 
-    wait_for("bring-up", &|| NO_SLOT.load(Ordering::SeqCst));
-    assert!(
-        NO_SLOT.load(Ordering::SeqCst),
-        "no declared slot, no handle"
-    );
+    wait_for("no declared slot, no handle", &|| {
+        NO_SLOT.load(Ordering::SeqCst)
+    });
 
     // ── any one contributor trips the gate ──────────────────────────────
     tell(0, 1);
@@ -154,7 +169,11 @@ fn any_writer_trips_and_only_all_of_them_reset() {
 
     // ── releasing one contributor does not clear another's trip ─────────
     tell(0, 2);
-    std::thread::sleep(StdDuration::from_millis(10));
+    let seen = PASSES.load(Ordering::SeqCst);
+    wait_for("100 executor passes", &|| {
+        PASSES.load(Ordering::SeqCst) >= seen + 100
+    });
+    PROBE_STOP.store(true, Ordering::SeqCst);
     assert!(TRIP.is_asserted(), "DIFF still holds it");
     assert_eq!(resets(), 0);
     tell(1, 2);
@@ -180,4 +199,24 @@ fn any_writer_trips_and_only_all_of_them_reset() {
 
     // ── the token counts flips, not writes ──────────────────────────────
     assert_eq!(TRIP.change_token(), 4, "trip, reset, trip, reset");
+}
+
+/// A hand-built writer whose entry names slot 9 of an 8-slot gate.
+static BAD_ENTRY: [Coupling; 1] = [Coupling::new("crate::TRIP", &TRIP).veto(9)];
+static BAD_CFG: NodeCfg = NodeCfg::new("bad", Mode::Terminate, None)
+    .with_writes(&[&BAD_ENTRY])
+    .with_disabled_at_boot(true);
+static BAD_HANDLE: TaskHandle = TaskHandle::new();
+static BAD: TaskNode = TaskNode::new(&BAD_CFG, &BAD_HANDLE);
+
+#[test]
+#[should_panic(expected = "veto slot beyond the gate's contributors")]
+fn a_slot_past_the_gate_is_caught_by_is_asserting_too() {
+    let veto = BAD
+        .veto(Sig {
+            entry: &BAD_ENTRY[0],
+            target: &TRIP,
+        })
+        .expect("the entry carries a slot");
+    let _ = veto.is_asserting();
 }

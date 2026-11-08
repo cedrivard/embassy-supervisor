@@ -1,37 +1,107 @@
 use embassy_supervisor_syntax::{Dep, GraphSpec, Item, NodeItem, PoolItem, SignalDecl};
 use syn::Result as SynResult;
 
-pub fn gate(spec: &GraphSpec) -> SynResult<()> {
+/// The macro crate's features as one value. The entry points pass `ENABLED`;
+/// a unit test passes its own, because this crate's lib tests are always
+/// built with the features the `embassy-supervisor` dev-dependency forwards,
+/// so `cfg!` alone could never show a rejection.
+pub(crate) struct Features {
+    pub(crate) readiness: bool,
+    pub(crate) liveness: bool,
+    pub(crate) liveness_monitor: bool,
+    pub(crate) enabled_if: bool,
+    pub(crate) restart_intensity: bool,
+    pub(crate) bound_deps: bool,
+    pub(crate) dataflow: bool,
+    pub(crate) veto: bool,
+    pub(crate) budget: bool,
+    pub(crate) coupling: bool,
+    pub(crate) coupling_observe: bool,
+    pub(crate) data_deps: bool,
+    pub(crate) graph_ref: bool,
+    pub(crate) pool: bool,
+    pub(crate) metadata_names: bool,
+    pub(crate) trace: bool,
+    pub(crate) trace_hooks: bool,
+    pub(crate) trace_self: bool,
+    pub(crate) fault_inject: bool,
+    pub(crate) local_resources: bool,
+    pub(crate) heap_state: bool,
+}
+
+/// This build's features.
+pub(crate) const ENABLED: Features = Features {
+    readiness: cfg!(feature = "readiness"),
+    liveness: cfg!(feature = "liveness"),
+    liveness_monitor: cfg!(feature = "liveness-monitor"),
+    enabled_if: cfg!(feature = "enabled-if"),
+    restart_intensity: cfg!(feature = "restart-intensity"),
+    bound_deps: cfg!(feature = "bound-deps"),
+    dataflow: cfg!(feature = "dataflow"),
+    veto: cfg!(feature = "veto"),
+    budget: cfg!(feature = "budget"),
+    coupling: cfg!(feature = "coupling"),
+    coupling_observe: cfg!(feature = "coupling-observe"),
+    data_deps: cfg!(feature = "data-deps"),
+    graph_ref: cfg!(feature = "graph-ref"),
+    pool: cfg!(feature = "pool"),
+    metadata_names: cfg!(feature = "metadata-names"),
+    trace: cfg!(feature = "trace"),
+    trace_hooks: cfg!(feature = "trace-hooks"),
+    trace_self: cfg!(feature = "trace-self"),
+    fault_inject: cfg!(feature = "fault-inject"),
+    local_resources: cfg!(feature = "local-resources"),
+    heap_state: cfg!(feature = "heap-state"),
+};
+
+pub fn gate(spec: &GraphSpec, f: &Features) -> SynResult<()> {
     for (kw, _) in [&spec.observe_writes, &spec.observe_reads]
         .into_iter()
         .flatten()
     {
-        require_observe(kw)?;
+        require_observe(kw, f)?;
     }
     for item in &spec.items {
         match item {
-            Item::Node(n) => gate_node(n)?,
-            Item::Pool(p) => gate_pool(p)?,
+            Item::Node(n) => gate_node(n, f)?,
+            Item::Pool(p) => gate_pool(p, f)?,
             Item::Executor(_) => {}
         }
     }
     Ok(())
 }
 
-fn gate_node(n: &NodeItem) -> SynResult<()> {
-    gate_deps(&n.deps)?;
-    gate_coupling(&n.reads, &n.writes)?;
-    require_discover(&n.discover)?;
-    require_dataflow(&n.dataflow)?;
-    gate_resources(n)?;
+/// Feature-required texts for clauses the emitter also handles: [`gate_node`]
+/// reports an ungated clause with one, and lib.rs's deferred `compile_error!`
+/// for a cfg-gated clause (`GatedBuilder::err`) carries the same text.
+pub(crate) const BEAT_TIMEOUT_NEEDS: &str = "`beat_timeout:` requires the `liveness-monitor` \
+     feature (embassy-supervisor feature `liveness-monitor`) — the supervisor then reports \
+     this node once it has been running that long without a beat()";
+pub(crate) const BEAT_WINDOW_NEEDS: &str = "`beat_window:` requires the `liveness-monitor` \
+     feature (embassy-supervisor feature `liveness-monitor`) — it sets how many consecutive \
+     stale sweeps are reported on";
+pub(crate) const ENABLED_IF_NEEDS: &str = "`enabled_if:` requires the `enabled-if` feature \
+     (embassy-supervisor feature `enabled-if`) — start() then evaluates the predicate and \
+     disables the node when it returns false";
+pub(crate) const RESTART_BUDGET_NEEDS: &str = "`restart_budget:` requires the \
+     `restart-intensity` feature (embassy-supervisor feature `restart-intensity`) — \
+     Supervisor::restart then refuses the N+1th restart inside the window with \
+     FaultKind::RestartStorm";
+
+fn gate_node(n: &NodeItem, f: &Features) -> SynResult<()> {
+    gate_deps(&n.deps, f)?;
+    gate_coupling(&n.reads, &n.writes, f)?;
+    require_discover(&n.discover, f)?;
+    require_dataflow(&n.dataflow, f)?;
+    gate_resource_list(&n.resources, f)?;
     if let Some((k, _, _)) = &n.state {
-        require_heap_state(k)?;
+        require_heap_state(k, f)?;
     }
     if let Some(row) = &n.ready_on_write {
         require_feature_ungated(
             &row.cfg,
             &row.kw,
-            cfg!(feature = "coupling-observe"),
+            f.coupling_observe,
             "`ready_on_write` requires the `coupling-observe` feature \
              (embassy-supervisor feature of the same name) — readiness \
              is asserted by the monitor sweep seeing an `observed beat` \
@@ -41,54 +111,23 @@ fn gate_node(n: &NodeItem) -> SynResult<()> {
         require_feature_ungated(
             &row.cfg,
             &row.kw,
-            cfg!(feature = "readiness"),
+            f.readiness,
             "`ready_on_write` requires the `readiness` feature \
              (embassy-supervisor feature `readiness`) — it is what \
              set_ready() and `deps: [X ready]` come from",
         )?;
     }
     if let Some(bt) = &n.beat_timeout {
-        require_feature_ungated(
-            &bt.cfg,
-            &bt.kw,
-            cfg!(feature = "liveness-monitor"),
-            "`beat_timeout:` requires the `liveness-monitor` feature \
-             (embassy-supervisor feature `liveness-monitor`) — the \
-             supervisor then reports this node once it has been running \
-             that long without a beat()",
-        )?;
+        require_feature_ungated(&bt.cfg, &bt.kw, f.liveness_monitor, BEAT_TIMEOUT_NEEDS)?;
     }
     if let Some(bw) = &n.beat_window {
-        require_feature_ungated(
-            &bw.cfg,
-            &bw.kw,
-            cfg!(feature = "liveness-monitor"),
-            "`beat_window:` requires the `liveness-monitor` feature \
-             (embassy-supervisor feature `liveness-monitor`) — it sets \
-             how many consecutive stale sweeps are reported on",
-        )?;
+        require_feature_ungated(&bw.cfg, &bw.kw, f.liveness_monitor, BEAT_WINDOW_NEEDS)?;
     }
     if let Some(e) = &n.enabled_if {
-        require_feature_ungated(
-            &e.cfg,
-            &e.kw,
-            cfg!(feature = "enabled-if"),
-            "`enabled_if:` requires the `enabled-if` feature \
-             (embassy-supervisor feature `enabled-if`) — start() then \
-             evaluates the predicate and disables the node when it \
-             returns false",
-        )?;
+        require_feature_ungated(&e.cfg, &e.kw, f.enabled_if, ENABLED_IF_NEEDS)?;
     }
     if let Some(rb) = &n.restart_budget {
-        require_feature_ungated(
-            &rb.cfg,
-            &rb.kw,
-            cfg!(feature = "restart-intensity"),
-            "`restart_budget:` requires the `restart-intensity` feature \
-             (embassy-supervisor feature `restart-intensity`) — \
-             Supervisor::restart then refuses the N+1th restart inside \
-             the window with FaultKind::RestartStorm",
-        )?;
+        require_feature_ungated(&rb.cfg, &rb.kw, f.restart_intensity, RESTART_BUDGET_NEEDS)?;
     }
     Ok(())
 }
@@ -105,38 +144,37 @@ fn require_feature_ungated<T: quote::ToTokens>(
     Ok(())
 }
 
-fn gate_pool(p: &PoolItem) -> SynResult<()> {
-    gate_deps(&p.deps)?;
-    gate_coupling(&p.reads, &p.writes)?;
-    require_discover(&p.discover)?;
-    require_dataflow(&p.dataflow)?;
-    gate_resource_list(&p.resources)?;
+fn gate_pool(p: &PoolItem, f: &Features) -> SynResult<()> {
+    gate_deps(&p.deps, f)?;
+    gate_coupling(&p.reads, &p.writes, f)?;
+    require_discover(&p.discover, f)?;
+    require_dataflow(&p.dataflow, f)?;
+    gate_resource_list(&p.resources, f)?;
     if let Some((k, _, _)) = &p.state {
-        require_heap_state(k)?;
+        require_heap_state(k, f)?;
     }
     Ok(())
 }
 
-fn gate_resources(n: &NodeItem) -> SynResult<()> {
-    gate_resource_list(&n.resources)
-}
-
-fn gate_resource_list(resources: &[embassy_supervisor_syntax::ResourceDecl]) -> SynResult<()> {
+fn gate_resource_list(
+    resources: &[embassy_supervisor_syntax::ResourceDecl],
+    f: &Features,
+) -> SynResult<()> {
     for r in resources {
         if let Some(l) = &r.local {
-            require_local(l)?;
+            require_local(l, f)?;
         }
         if let Some(d) = &r.divisible {
-            require_budget(d)?;
+            require_budget(d, f)?;
         }
     }
     Ok(())
 }
 
-fn gate_deps(deps: &[Dep]) -> SynResult<()> {
+fn gate_deps(deps: &[Dep], f: &Features) -> SynResult<()> {
     for d in deps {
         if let Some(m) = &d.ready
-            && !cfg!(feature = "readiness")
+            && !f.readiness
         {
             return Err(syn::Error::new_spanned(
                 m,
@@ -146,7 +184,7 @@ fn gate_deps(deps: &[Dep]) -> SynResult<()> {
             ));
         }
         if let Some(m) = &d.bound
-            && !cfg!(feature = "bound-deps")
+            && !f.bound_deps
         {
             return Err(syn::Error::new_spanned(
                 m,
@@ -160,17 +198,17 @@ fn gate_deps(deps: &[Dep]) -> SynResult<()> {
     Ok(())
 }
 
-fn gate_coupling(reads: &[SignalDecl], writes: &[SignalDecl]) -> SynResult<()> {
+fn gate_coupling(reads: &[SignalDecl], writes: &[SignalDecl], f: &Features) -> SynResult<()> {
     for (clause, list) in [("reads", reads), ("writes", writes)] {
         if let Some(first) = list.first() {
-            require_coupling(&first.path, clause)?;
+            require_coupling(&first.path, clause, f)?;
         }
         for s in list {
             if let Some(o) = &s.observed {
-                require_observe(o)?;
+                require_observe(o, f)?;
             }
             if let Some(v) = &s.veto {
-                require_veto(v)?;
+                require_veto(v, f)?;
             }
         }
     }
@@ -179,12 +217,13 @@ fn gate_coupling(reads: &[SignalDecl], writes: &[SignalDecl]) -> SynResult<()> {
 
 fn require_discover(
     discover: &Option<embassy_supervisor_syntax::Gated<embassy_supervisor_syntax::kw::discover>>,
+    f: &Features,
 ) -> SynResult<()> {
     if let Some(k) = discover {
         require_feature_ungated(
             &k.cfg,
             &k.kw,
-            cfg!(feature = "dataflow"),
+            f.dataflow,
             "`discover` requires the `dataflow` feature \
              (embassy-supervisor feature `dataflow`) — it binds the \
              coupling tables the task fn's `#[dataflow]` attribute derives, \
@@ -195,9 +234,12 @@ fn require_discover(
     Ok(())
 }
 
-fn require_dataflow(dataflow: &[embassy_supervisor_syntax::AdoptedFn]) -> SynResult<()> {
-    if let Some(first) = dataflow.first().map(|f| &f.path)
-        && !cfg!(feature = "dataflow")
+fn require_dataflow(
+    dataflow: &[embassy_supervisor_syntax::AdoptedFn],
+    f: &Features,
+) -> SynResult<()> {
+    if let Some(first) = dataflow.first().map(|a| &a.path)
+        && !f.dataflow
     {
         return Err(syn::Error::new_spanned(
             first,
@@ -210,8 +252,8 @@ fn require_dataflow(dataflow: &[embassy_supervisor_syntax::AdoptedFn]) -> SynRes
     Ok(())
 }
 
-fn require_coupling<T: quote::ToTokens>(tok: &T, clause: &str) -> SynResult<()> {
-    if cfg!(feature = "coupling") {
+fn require_coupling<T: quote::ToTokens>(tok: &T, clause: &str, f: &Features) -> SynResult<()> {
+    if f.coupling {
         return Ok(());
     }
     Err(syn::Error::new_spanned(
@@ -224,8 +266,8 @@ fn require_coupling<T: quote::ToTokens>(tok: &T, clause: &str) -> SynResult<()> 
     ))
 }
 
-fn require_observe<T: quote::ToTokens>(tok: &T) -> SynResult<()> {
-    if cfg!(feature = "coupling-observe") {
+fn require_observe<T: quote::ToTokens>(tok: &T, f: &Features) -> SynResult<()> {
+    if f.coupling_observe {
         return Ok(());
     }
     Err(syn::Error::new_spanned(
@@ -237,8 +279,8 @@ fn require_observe<T: quote::ToTokens>(tok: &T) -> SynResult<()> {
     ))
 }
 
-fn require_local<T: quote::ToTokens>(tok: &T) -> SynResult<()> {
-    if cfg!(feature = "local-resources") {
+fn require_local<T: quote::ToTokens>(tok: &T, f: &Features) -> SynResult<()> {
+    if f.local_resources {
         return Ok(());
     }
     Err(syn::Error::new_spanned(
@@ -248,8 +290,8 @@ fn require_local<T: quote::ToTokens>(tok: &T) -> SynResult<()> {
     ))
 }
 
-fn require_veto<T: quote::ToTokens>(tok: &T) -> SynResult<()> {
-    if cfg!(feature = "veto") {
+fn require_veto<T: quote::ToTokens>(tok: &T, f: &Features) -> SynResult<()> {
+    if f.veto {
         return Ok(());
     }
     Err(syn::Error::new_spanned(
@@ -260,8 +302,8 @@ fn require_veto<T: quote::ToTokens>(tok: &T) -> SynResult<()> {
     ))
 }
 
-fn require_budget<T: quote::ToTokens>(tok: &T) -> SynResult<()> {
-    if cfg!(feature = "budget") {
+fn require_budget<T: quote::ToTokens>(tok: &T, f: &Features) -> SynResult<()> {
+    if f.budget {
         return Ok(());
     }
     Err(syn::Error::new_spanned(
@@ -272,14 +314,14 @@ fn require_budget<T: quote::ToTokens>(tok: &T) -> SynResult<()> {
     ))
 }
 
-fn require_heap_state<T: quote::ToTokens>(tok: &T) -> SynResult<()> {
-    if cfg!(feature = "heap-state") {
+fn require_heap_state<T: quote::ToTokens>(tok: &T, f: &Features) -> SynResult<()> {
+    if f.heap_state {
         return Ok(());
     }
     Err(syn::Error::new_spanned(
         tok,
         "`state:` requires the `heap-state` feature \
-         (embassy-supervisor feature `heap-state`) — per-activation \
-         boxed state, reclaimed on task exit",
+         (embassy-supervisor feature `heap-state`), which boxes the state \
+         per activation and drops it when the activation ends",
     ))
 }

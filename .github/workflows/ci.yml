@@ -1,8 +1,8 @@
 name: CI
 
-# Scoped to the published library crate (`embassy-supervisor`). The firmware and
-# bootloader are RP2350 binaries (probe/flash tooling, git deps) and are out of
-# scope here; they can get their own job later.
+# The workspace's five published crates, on the host and on the RP2350 target
+# (thumbv8m), at the toolchain floor they declare, plus a build of the firmware
+# and bootloader that use them.
 on:
   push:
     branches: [main]
@@ -43,13 +43,18 @@ jobs:
       - run: cargo test -p embassy-supervisor --target $HOST --features lifecycle-events,breadcrumb,restart-intensity,enabled-if,liveness-monitor,control
       # The sink alone, without the queue, so `lifecycle_sink` runs sink-only.
       - run: cargo test -p embassy-supervisor --target $HOST --features macros,lifecycle-sink,control
+      # The name stamp without the trace layer: `--all-features` always has
+      # `trace`, which takes the `adopt` path instead of `stamp_name`.
+      - run: cargo test -p embassy-supervisor --target $HOST --features metadata-names
       # `supervisor_graph!` UI tests (trybuild): compile-fail cases lock the macro's
       # error contracts (cycle, unknown dep, ...); compile-pass cases run the generated
       # graph. Host-only — trybuild compiles real graphs — so `--target $HOST`.
       - run: cargo test -p embassy-supervisor-macros --target $HOST
       - run: cargo test -p embassy-supervisor-macros --target $HOST --all-features
-      - run: cargo test -p embassy-supervisor-macros --target $HOST --features restart-intensity
-      - run: cargo test -p embassy-supervisor-macros --target $HOST --features enabled-if
+      # The two macro features the dev-dependency does not force on: each picks a
+      # different trybuild directory set in tests/ui.rs.
+      - run: cargo test -p embassy-supervisor-macros --target $HOST --features local-resources
+      - run: cargo test -p embassy-supervisor-macros --target $HOST --features heap-state
 
       # The graph grammar itself, which both the proc-macro and the diagram tool
       # parse with. It has no features: it always accepts the full syntax.
@@ -84,11 +89,12 @@ jobs:
       - run: cargo build -p embassy-supervisor --no-default-features
       - run: cargo build -p embassy-supervisor --all-features
 
-  # Independent feature combinations: the crate markets `default-features = false`,
-  # so every subset a user can select must at least type-check on its own. Checked on
-  # the pinned embedded target (also guards no_std per combo). One job, one cache;
-  # a loop instead of a runner matrix because each check is seconds.
-  # Regression guard: `pool` without `control` once failed to compile (0.3.0 Fixed).
+  # Feature subsets on the pinned embedded target (which also guards no_std):
+  # the crate markets `default-features = false`, so every feature must
+  # type-check on its own and alongside `macros` if the macro takes it, plus the
+  # combinations whose cfg branches only meet together (`pool` without
+  # `control`, the trace chain, ...). One job, one cache; a loop, not a runner
+  # matrix, because each check takes seconds.
   features:
     name: check (feature matrix, thumbv8m)
     runs-on: ubuntu-latest
@@ -120,12 +126,46 @@ jobs:
                    veto macros,veto veto,coupling-observe,macros,pool \
                    lifecycle-events lifecycle-sink lifecycle-events,lifecycle-sink breadcrumb lifecycle-events,breadcrumb \
                    restart-intensity macros,restart-intensity enabled-if macros,enabled-if \
+                   local-resources fault-inject macros,fault-inject coupling-observe \
+                   metadata-names macros,metadata-names macros,trace macros,trace-hooks trace-nested \
                    lifecycle-events,breadcrumb,restart-intensity,enabled-if,liveness-monitor,macros \
                    control,pool,macros,readiness,liveness,epochs,liveness-monitor,coupling,restart,bound-deps,budget,veto,lifecycle-events,lifecycle-sink,breadcrumb,restart-intensity,enabled-if; do
             echo "::group::features=[${f:-none}]"
             cargo check -p embassy-supervisor --no-default-features ${f:+--features "$f"}
             echo "::endgroup::"
           done
+
+  # The RP2350 demo: it must keep building against the workspace crates, in its
+  # default and no-default-features configurations, and lint clean.
+  firmware:
+    name: build (firmware + bootloader, thumbv8m)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: thumbv8m.main-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p firmware
+      - run: cargo build --release -p firmware --no-default-features
+      - run: cargo clippy -p firmware -- -D warnings
+      - run: cargo build --release -p bootloader
+
+  # The declared `rust-version` (root Cargo.toml) is a promise for the five
+  # published crates: check them on exactly that toolchain, against the committed
+  # lockfile, on the host and (the runtime) on the MCU target.
+  msrv:
+    name: check (MSRV 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          targets: thumbv8m.main-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --workspace --exclude firmware --exclude bootloader --all-features --target $HOST
+      - run: cargo check --locked -p embassy-supervisor --all-features
 
   # Canary against embassy's main branch (allow-failure): the executor's trace-hook
   # API is documented as unstable, so this job builds and tests the trace feature
@@ -179,7 +219,7 @@ jobs:
       # went unseen while this checked the lib alone.
       - run: cargo clippy -p embassy-supervisor --target $HOST --all-features --all-targets -- -D warnings
       # The `supervisor_graph!` proc-macro crate (host-only build).
-      - run: cargo clippy -p embassy-supervisor-macros -- -D warnings
+      - run: cargo clippy -p embassy-supervisor-macros --target $HOST --all-targets -- -D warnings
       # Host crates, so they need the same `--target $HOST` override as the tests.
       - run: cargo clippy -p embassy-supervisor-syntax --target $HOST --all-targets -- -D warnings
       - run: cargo clippy -p embassy-supervisor-tools --target $HOST --all-targets -- -D warnings

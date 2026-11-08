@@ -1,15 +1,15 @@
 -- wrk script: load /api/tasks and analyze the trace counters it returns.
 --
--- Usage (single wrk thread gives the cleanest report; -c2 matches POOL_MAX so
+-- Usage (single wrk thread gives the cleanest report; -c2 matches HTTP_CEIL so
 -- every keep-alive connection gets a worker, more stresses accept):
 --
 --   wrk -t1 -c2 -d10s --latency -s firmware/tools/wrk-tasks.lua http://10.42.0.61/api/tasks
 --
 -- What it checks, per response:
---   * well-formedness (complete JSON with all expected fields — a truncated body
---     would indicate the response no longer fits the worker's tx buffer);
---   * heap_free min/max (headroom under full-pool load — the failure mode that
---     motivated the tx/body sizing);
+--   * well-formedness (the expected fields present and a body that ends the
+--     object; the device writes every body in full, so a failure means the
+--     JSON changed shape);
+--   * heap_free min/max (the min is the headroom with the pool fully grown);
 --   * wrap-safe monotonicity of now_ticks and each task's exec_ticks (a backward
 --     step beyond wrap tolerance would mean a trace attribution bug).
 -- And over the whole run (first vs last sample, wrap-safe diffs):
@@ -19,14 +19,14 @@
 --     and the unsupervised-task share (in-poll minus the supervised sum).
 --
 -- All device counters are wrapping u32 ticks (tick_hz gives the unit), so every
--- delta below goes through sub32. The counters wrap after ~71 min of device
--- uptime at 1 MHz — fine for any wrk run; only a run *straddling* two device
--- reboots would confuse the first/last comparison.
+-- delta below goes through sub32. They wrap after ~71 min of device uptime at
+-- 1 MHz, which no wrk run spans; only a run straddling a device reboot confuses
+-- the first/last comparison.
 --
 -- Implementation note: each wrk thread runs an isolated Lua state, and done()
--- runs in yet another. thread:get() is only reliable for SCALAR values — copying
--- a nested table across states segfaults some wrk builds — so each thread keeps
--- its stats local and re-renders the full report into a plain STRING after every
+-- runs in yet another. thread:get() is only reliable for scalar values (copying
+-- a nested table across states segfaults some wrk builds), so each thread keeps
+-- its stats local and re-renders the full report into a plain string after every
 -- response; done() fetches and prints that string.
 
 local WRAP = 2 ^ 32
@@ -71,7 +71,7 @@ local function render()
     line("samples %d | non-200 %d | malformed/truncated %d | counter regressions %d",
         s.samples, s.bad_status, s.malformed, s.regressions)
     if s.body_max > 0 then
-        line("body bytes  min %d / max %d (worker tx buffer must hold max + headers)",
+        line("body bytes  min %d / max %d",
             s.body_min, s.body_max)
         line("heap_free   min %d / max %d B (min = headroom at peak load)",
             s.heap_min, s.heap_max)
@@ -143,7 +143,7 @@ function response(status, headers, body)
     local hz = tonumber(body:match('"tick_hz":(%d+)'))
     local now = tonumber(body:match('"now_ticks":(%d+)'))
     -- A complete body ends the tasks array and the object; anything else means
-    -- the device truncated the response.
+    -- the JSON changed shape.
     if not (heap and hz and now and body:sub(-2) == "]}") then
         stats.malformed = stats.malformed + 1
         report = render()

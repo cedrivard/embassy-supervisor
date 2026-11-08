@@ -13,7 +13,7 @@ supervisor_graph! {
 }
 
 static STARTS: AtomicU32 = AtomicU32::new(0);
-static ACKED: AtomicU32 = AtomicU32::new(0);
+static RESPAWN_CALLED: AtomicBool = AtomicBool::new(false);
 static RELEASE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static FAULT_PHASE: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -26,8 +26,22 @@ async fn remote_task(node: &'static TaskNode) {
     STARTS.fetch_add(1, Ordering::SeqCst);
     node.wait_shutdown().await;
     node.ack_dropped();
-    ACKED.fetch_add(1, Ordering::SeqCst);
     RELEASE.wait().await;
+}
+
+/// Executor passes: the probe is polled once per pass, so a move of N means
+/// every task woken before it has been polled N times over.
+static PASSES: AtomicU32 = AtomicU32::new(0);
+static PROBE_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Ends after the test's last barrier, so the executor idles instead of
+/// spinning for the life of the binary.
+#[embassy_executor::task]
+async fn pass_probe() {
+    while !PROBE_STOP.load(Ordering::SeqCst) {
+        PASSES.fetch_add(1, Ordering::SeqCst);
+        embassy_futures::yield_now().await;
+    }
 }
 
 #[embassy_executor::task]
@@ -39,6 +53,7 @@ async fn driver(spawner: Spawner) {
     }
 
     sup.stop_node(&REMOTE).await.expect("acked");
+    RESPAWN_CALLED.store(true, Ordering::SeqCst);
     sup.start_node(&REMOTE, &spawner)
         .await
         .expect("the respawn goes through once the old task returns");
@@ -68,6 +83,7 @@ fn respawn_after_ack_waits_for_the_task_to_return() {
             Box::leak(Box::new(embassy_executor::Executor::new()));
         executor.run(|spawner| {
             spawner.spawn(driver(spawner).unwrap());
+            spawner.spawn(pass_probe().unwrap());
         });
     });
     std::thread::spawn(|| {
@@ -76,14 +92,23 @@ fn respawn_after_ack_waits_for_the_task_to_return() {
         executor.run(|spawner| TIER.set(spawner.make_send()));
     });
 
-    // First stop: release only after the respawn has started trying. The
-    // clock stands still, so the respawn cannot be waiting on a timeout.
+    // First stop: release only once the respawn has been retrying for 50
+    // passes of the driver's executor. The clock stands still, so the respawn
+    // cannot be waiting on a timeout: its first attempt is a guaranteed `Busy`.
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while ACKED.load(Ordering::SeqCst) < 1 {
-        assert!(StdInstant::now() < deadline, "never acked");
+    while !RESPAWN_CALLED.load(Ordering::SeqCst) {
+        assert!(StdInstant::now() < deadline, "the respawn was never called");
         std::thread::sleep(StdDuration::from_millis(1));
     }
-    std::thread::sleep(StdDuration::from_millis(20));
+    let seen = PASSES.load(Ordering::SeqCst);
+    while PASSES.load(Ordering::SeqCst) < seen + 50 {
+        assert!(
+            StdInstant::now() < deadline,
+            "the driver's executor stalled"
+        );
+        std::thread::sleep(StdDuration::from_millis(1));
+    }
+    PROBE_STOP.store(true, Ordering::SeqCst);
     RELEASE.signal(());
 
     // Second stop: only now does the clock move, to fault the held respawn.

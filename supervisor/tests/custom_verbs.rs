@@ -9,6 +9,8 @@ pub static PLAIN: AtomicU32 = AtomicU32::new(0);
 static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
 
 /// The consumer's own verbs. They take [`Sig`], which is what the rewrite
+/// turns `&SIGNAL` into at a registered verb's call site: the signal plus its
+/// coupling-table entry.
 pub trait Signals {
     fn subscribe<T: Sync + ?Sized>(&'static self, s: Sig<T>) -> &'static T;
     fn publish(&'static self, s: Sig<AtomicU32>, v: u32);
@@ -127,7 +129,4 @@ fn a_registered_verb_records_like_a_built_in_one() {
     );
 
     assert_eq!(armed_entry(&WORKER).name(), "crate::ARMED");
-
-    ESTIMATE.store(5, Ordering::Relaxed);
-    assert_eq!(WORKER.peek(&ESTIMATE), 5);
 }

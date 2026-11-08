@@ -34,6 +34,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]
@@ -83,6 +84,7 @@ fn threaded_resource_round_trips_across_respawn() {
     PROBE.restore(p);
 
     // ^ the Probe (runs == 0) is back in the slot: this is main's provide(),
+    // done BEFORE the supervisor starts; the graph takes it from here.
     std::thread::spawn(|| {
         let executor: &'static mut embassy_executor::Executor =
             Box::leak(Box::new(embassy_executor::Executor::new()));

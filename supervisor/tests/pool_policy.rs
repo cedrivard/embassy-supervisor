@@ -95,6 +95,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]
@@ -120,26 +121,35 @@ async fn driver(spawner: Spawner) {
     CREW[1].set_disabled(false);
     CREW[2].set_disabled(false);
 
+    // Nor are detached ones: `start_node` leaves a detached node alone, so
+    // picking one would stall growth on it.
+    CREW[1].set_detached(true);
+    match CREW_POOL.evaluate(now) {
+        PoolAction::Start(n) => assert!(core::ptr::eq(n, &CREW[2]), "the next down member"),
+        _ => panic!("expected Start"),
+    }
+    CREW[1].set_detached(false);
+
     // All three up, none busy → idle surplus: first evaluate arms the
-    // cooldown, the one at +cooldown stops an idle OnDemand member (never the
-    // floor).
+    // cooldown, the one at +cooldown stops an idle OnDemand member: never the
+    // floor, and never a detached one, which `stop_node` would leave running.
     sup.start_node(&CREW[1], &spawner).await.expect("grow 1");
     sup.start_node(&CREW[2], &spawner).await.expect("grow 2");
     settle(|| CREW[1].is_running() && CREW[2].is_running()).await;
     CREW[0].mark_idle();
+    CREW[1].set_detached(true);
     assert!(
         matches!(CREW_POOL.evaluate(now), PoolAction::None),
         "first tick arms cooldown"
     );
     match CREW_POOL.evaluate(now + Duration::from_secs(4)) {
-        PoolAction::Stop(n) => {
-            assert!(
-                core::ptr::eq(n, &CREW[1]) || core::ptr::eq(n, &CREW[2]),
-                "an idle OnDemand member, never the floor"
-            );
-        }
+        PoolAction::Stop(n) => assert!(
+            core::ptr::eq(n, &CREW[2]),
+            "the idle OnDemand member that is not detached"
+        ),
         _ => panic!("expected Stop"),
     }
+    CREW[1].set_detached(false);
 
     DONE.store(true, Ordering::SeqCst);
 }

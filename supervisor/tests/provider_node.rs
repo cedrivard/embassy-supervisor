@@ -55,6 +55,7 @@ async fn reader_worker(node: &'static TaskNode, handle: Handle) {
 
 supervisor_graph! {
     // First in topo order; the consumers' `deps:` guarantee it (re)spawns
+    // before them, and their gate waits cover its build time.
     node PROVIDER = Terminate, deps: [], task: provider_worker;
     node OWNER = Terminate, deps: [PROVIDER], task: owner_worker,
         slot_timeout: 5000,
@@ -74,6 +75,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]

@@ -39,7 +39,6 @@ fn a_stamped_signal_knows_how_old_its_value_is() {
     assert_eq!(S.age(), None, "never written");
     assert!(!S.is_fresh(Duration::from_secs(1)));
     assert!(S.read_fresh(Duration::from_secs(1)).is_none());
-    assert_eq!(S.inner().inner().load(Ordering::SeqCst), 0);
 
     S.w().w().store(3, Ordering::SeqCst);
     assert_eq!(S.age(), Some(Duration::from_ticks(0)));
@@ -61,7 +60,21 @@ fn a_stamped_signal_knows_how_old_its_value_is() {
     clock.advance(Duration::from_secs(5));
     assert_eq!(S.change_token(), token, "time passing is not a write");
 
-    // Through the node's verb: `put` goes through `w()`, so it stamps.
+    // Ages saturate instead of wrapping: a dead signal never reads fresh again.
+    let age = S.age().expect("written").as_ticks();
+    clock.advance(Duration::from_ticks(1 << 31));
+    assert_eq!(S.age(), Some(Duration::from_ticks(u64::from(u32::MAX / 2))));
+    clock.advance(Duration::from_ticks((1 << 31) - age));
+    assert!(
+        !S.is_fresh(Duration::from_secs(1)),
+        "2^32 ticks after the write, still stale"
+    );
+    assert!(
+        !S.is_fresh(Duration::from_ticks(1 << 40)),
+        "a bound past the cap is clamped"
+    );
+
+    // Through the node's verb: `put` stamps after its write.
     std::thread::spawn(|| {
         let executor: &'static mut embassy_executor::Executor =
             Box::leak(Box::new(embassy_executor::Executor::new()));

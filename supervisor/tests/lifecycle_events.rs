@@ -14,6 +14,8 @@ supervisor_graph! {
     node DEAF = Terminate, deps: [], task: deaf, ack_timeout: 200;
 }
 
+/// Set while the missed-ack phase waits out DEAF's window.
+static ADVANCE: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
 
 /// Acks a stop and parks: the instance survives, so its ack is `Stopped`.
@@ -92,10 +94,12 @@ async fn driver(spawner: Spawner) {
     sup.resume_node(&PARK);
     assert_eq!(names(&drain()), [("park", "resumed")]);
 
+    ADVANCE.store(true, Ordering::SeqCst);
     let err = sup
         .stop_node(&DEAF)
         .await
         .expect_err("a worker that never acks faults the stop");
+    ADVANCE.store(false, Ordering::SeqCst);
     assert!(matches!(err.kind, FaultKind::ShutdownTimeout));
     let events = drain();
     assert_eq!(
@@ -157,11 +161,13 @@ fn reports_every_driven_transition_and_counts_drops() {
         });
     });
 
-    // The missed-ack phase needs the clock to pass DEAF's ack window.
+    // Only the missed-ack phase needs mock time.
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
     while !DONE.load(Ordering::SeqCst) {
         assert!(StdInstant::now() < deadline, "did not complete");
-        clock.advance(embassy_time::Duration::from_millis(50));
+        if ADVANCE.load(Ordering::SeqCst) {
+            clock.advance(embassy_time::Duration::from_millis(50));
+        }
         std::thread::sleep(StdDuration::from_millis(2));
     }
 }

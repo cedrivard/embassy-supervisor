@@ -31,9 +31,10 @@ use crate::ResourceGate;
 ///    over the wants with a [`BudgetPolicy`] ([`rebalance`](Self::rebalance)),
 ///    and each holder reads its [`grant`](Claimant::grant), or parks on
 ///    [`wait_grant_change`](Claimant::wait_grant_change) until it moves.
-/// 3. When a holder stops — cleanly, or by missing its shutdown ack — the
+/// 3. When a holder stops (cleanly, or by missing its shutdown ack), the
 ///    supervisor [`release`](Self::release)s its slot, so a dead session never
-///    strands its share. A parked (`Pause`) holder keeps its claim.
+///    strands its share. A wedged holder that is still running sees its grant
+///    drop to zero. A parked (`Pause`) holder keeps its claim.
 ///
 /// The budget never chooses a division itself: what "fair" means (equal,
 /// proportional, ramped) is the policy's, and *when* to re-divide is the
@@ -46,7 +47,8 @@ pub struct Budget<const N: usize> {
     capacity: AtomicU32,
     wants: [AtomicU32; N],
     grants: [AtomicU32; N],
-    /// The [`ResourceGate`] wake for the supervisor's pre-spawn wait.
+    /// The [`ResourceGate`] latch, for one app-side waiter. The supervisor's
+    /// pre-spawn wait watches the shared gate event instead.
     filled: Signal<CriticalSectionRawMutex, ()>,
     /// Holders parked in `wait_grant_change`, at most one per slot.
     claimants: [AtomicWaker; N],
@@ -102,12 +104,15 @@ impl<const N: usize> Budget<N> {
         self.watch.signal(());
     }
 
-    /// Drop slot `slot`'s demand and grant, and wake the allocator: what the
-    /// supervisor does when the slot's holder stops.
+    /// Drop slot `slot`'s demand and grant, wake a holder parked on that grant
+    /// and wake the allocator: what the supervisor does when the slot's holder
+    /// stops, so a wedged holder still running sees its share go to zero.
     pub fn release(&self, slot: u8) {
         let slot = usize::from(slot);
         self.wants[slot].store(0, Ordering::Release);
-        self.grants[slot].store(0, Ordering::Release);
+        if self.grants[slot].swap(0, Ordering::AcqRel) != 0 {
+            self.claimants[slot].wake();
+        }
         self.watch.signal(());
     }
 
@@ -128,16 +133,23 @@ impl<const N: usize> Budget<N> {
             .fold(0u32, |acc, g| acc.saturating_add(g.load(Ordering::Acquire)))
     }
 
-    /// Re-divide the capacity over the current wants with `policy`, publish
-    /// the new grants, and wake every holder whose grant moved.
+    /// Re-divide the capacity over the current wants with `policy`, publish the
+    /// new grants (every cut before any increase, so no reader sees an increase
+    /// ahead of the cut that pays for it), and wake every holder whose grant moved.
     pub fn rebalance(&self, policy: &impl BudgetPolicy, now: Instant) -> Option<Instant> {
         let capacity = self.capacity();
         let wants: [u32; N] = core::array::from_fn(|i| self.wants[i].load(Ordering::Acquire));
         let mut grants: [u32; N] = core::array::from_fn(|i| self.grants[i].load(Ordering::Acquire));
         let next = policy.divide(capacity, &wants, &mut grants, now);
-        for (i, g) in grants.iter().enumerate() {
-            if self.grants[i].swap(*g, Ordering::AcqRel) != *g {
-                self.claimants[i].wake();
+        for cuts in [true, false] {
+            for (i, &g) in grants.iter().enumerate() {
+                let prev = self.grants[i].load(Ordering::Acquire);
+                if g == prev || (g < prev) != cuts {
+                    continue;
+                }
+                if self.grants[i].swap(g, Ordering::AcqRel) != g {
+                    self.claimants[i].wake();
+                }
             }
         }
         let stale = self.capacity() != capacity
@@ -201,7 +213,8 @@ pub trait Divisible: Sync {
     fn release(&self, slot: u8);
     /// `slot`'s current grant.
     fn grant(&self, slot: u8) -> u32;
-    /// Park `waker` until the next rebalance that moves `slot`'s grant.
+    /// Park `waker` until `slot`'s grant next moves: a rebalance, or a release
+    /// or clear that zeroes it.
     fn register(&self, slot: u8, waker: &Waker);
 }
 
@@ -224,7 +237,9 @@ impl<const N: usize> Divisible for Budget<N> {
 }
 
 /// A holder's handle on one slot of a [`Budget`]: what a `divisible` entry
-/// hands the worker. `Copy`, so a worker may keep one per loop it runs.
+/// hands the worker. `Copy`, but every copy names the same slot and shares its
+/// single waker: at most one task may park on a slot's
+/// [`wait_grant_change`](Self::wait_grant_change) at a time.
 #[derive(Clone, Copy)]
 pub struct Claimant {
     budget: &'static dyn Divisible,
@@ -250,8 +265,9 @@ impl Claimant {
 
     /// Wait until the grant differs from `seen`, then return it.
     /// Uses a check/register/recheck to avoid missing a rebalance between the
-    /// load and the park. Only one waiter may park per slot; use your own
-    /// `Claimant`.
+    /// load and the park. At most one task may park per slot: all copies of a
+    /// `Claimant` share the slot's single waker, and a second registration
+    /// replaces the first without waking it.
     pub async fn wait_grant_change(&self, seen: u32) -> u32 {
         core::future::poll_fn(|cx| {
             let g = self.grant();
@@ -338,9 +354,12 @@ impl BudgetPolicy for FairShare {
 
 /// [`FairShare`]'s division, applied asymmetrically: a cut lands at once, an
 /// increase is ramped at most `step` units per `interval`. The safety shape
-/// of a shared power or bandwidth budget — a holder must never be granted
+/// of a shared power or bandwidth budget: a holder must never be granted
 /// more than the budget can carry, so reductions cannot wait, while a holder
-/// drawing more can wait for the others to have backed off.
+/// drawing more can wait: an increase lands at most `step` units per
+/// `interval`, the first in the same rebalance as the cut paying for it
+/// (published after it). The ramp deadline is the policy's own state, so give
+/// each budget its own instance.
 pub struct ShrinkFastGrowSlow {
     step: u32,
     interval: Duration,

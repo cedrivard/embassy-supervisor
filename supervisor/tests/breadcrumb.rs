@@ -14,7 +14,17 @@ supervisor_graph! {
         resources: [GATED_SLOT: u32], slot_timeout: 500;
 }
 
+// A second graph, driven by its own supervisor: it parks and resumes PARK,
+// holds DEAF's stop on a missed ack, and drives B, which it does not contain.
+supervisor_graph! {
+    name: AUX;
+    node PARK = Pause, deps: [], task: park;
+    node DEAF = Terminate, deps: [], task: deaf, ack_timeout: 200;
+}
+
 static DONE: AtomicBool = AtomicBool::new(false);
+/// Set once the bring-up has faulted: the test thread holds the clock again.
+static START_DONE: AtomicBool = AtomicBool::new(false);
 
 async fn plain(node: &'static TaskNode) {
     node.wait_shutdown().await;
@@ -26,8 +36,25 @@ async fn gated(node: &'static TaskNode, _slot: &mut u32) {
     node.mark_exited();
 }
 
+async fn park(node: &'static TaskNode) {
+    loop {
+        node.wait_shutdown().await;
+        node.ack_dropped();
+        node.wait_resume().await;
+    }
+}
+
+/// Never acks.
+async fn deaf(_node: &'static TaskNode) {
+    core::future::pending::<()>().await;
+}
+
 fn slot(node: &'static TaskNode) -> u16 {
     u16::from(GRAPH.index_of(node).expect("node is in GRAPH"))
+}
+
+fn aux_slot(node: &'static TaskNode) -> u16 {
+    u16::from(AUX.index_of(node).expect("node is in AUX"))
 }
 
 #[embassy_executor::task]
@@ -43,6 +70,7 @@ async fn driver(spawner: Spawner) {
         .start(&spawner)
         .await
         .expect_err("GATED's slot is empty");
+    START_DONE.store(true, Ordering::SeqCst);
     assert!(matches!(err.kind, FaultKind::ResourceMissing));
     assert_eq!(A.crumb(), CrumbPhase::Started);
     assert_eq!(B.crumb(), CrumbPhase::Started);
@@ -72,6 +100,32 @@ async fn driver(spawner: Spawner) {
     assert_eq!(decode_crumb(0x0002_0001), None, "bit 31 clear: not a crumb");
     assert_eq!(decode_crumb(0x8063_0001), None, "unknown phase");
 
+    let aux = Supervisor::new(&AUX);
+    aux.start(&spawner).await.expect("aux start");
+    aux.stop_node(&PARK).await.expect("park acks");
+    aux.resume_node(&PARK);
+    assert_eq!(PARK.crumb(), CrumbPhase::Resumed);
+    assert_eq!(
+        decode_crumb(crumb_word()),
+        Some((CrumbPhase::Resumed, aux_slot(&PARK))),
+        "a resume in place is its own phase, indexed in its own graph"
+    );
+
+    aux.stop_node(&B).await.expect("B acks");
+    assert_eq!(
+        decode_crumb(crumb_word()),
+        Some((CrumbPhase::Stopped, u16::MAX)),
+        "a node driven through a supervisor whose graph lacks it has no slot"
+    );
+
+    let err = aux.stop_node(&DEAF).await.expect_err("DEAF never acks");
+    assert!(matches!(err.kind, FaultKind::ShutdownTimeout));
+    assert_eq!(DEAF.crumb(), CrumbPhase::Faulted);
+    assert_eq!(
+        decode_crumb(crumb_word()),
+        Some((CrumbPhase::Faulted, aux_slot(&DEAF)))
+    );
+
     DONE.store(true, Ordering::SeqCst);
 }
 
@@ -100,9 +154,56 @@ fn crumbs_track_the_last_phase_per_node_and_globally() {
         "a wave stuck on a gate leaves `Spawning` as the last word"
     );
 
+    // Run the clock until the bring-up has faulted, then hold it: the phases
+    // after it need no time, and DEAF's stop must be seen parked.
+    while !START_DONE.load(Ordering::SeqCst) {
+        assert!(StdInstant::now() < deadline, "the bring-up never faulted");
+        clock.advance(embassy_time::Duration::from_millis(50));
+        std::thread::sleep(StdDuration::from_millis(2));
+    }
+    while DEAF.crumb() != CrumbPhase::StopSignalled {
+        assert!(
+            StdInstant::now() < deadline,
+            "DEAF never reached StopSignalled"
+        );
+        std::thread::sleep(StdDuration::from_millis(1));
+    }
+    assert_eq!(
+        decode_crumb(crumb_word()),
+        Some((CrumbPhase::StopSignalled, aux_slot(&DEAF))),
+        "a stop stuck on its ack leaves `StopSignalled` as the last word"
+    );
     while !DONE.load(Ordering::SeqCst) {
         assert!(StdInstant::now() < deadline, "did not complete");
         clock.advance(embassy_time::Duration::from_millis(50));
         std::thread::sleep(StdDuration::from_millis(2));
     }
+}
+
+#[test]
+fn every_phase_round_trips_through_the_word() {
+    let phases = [
+        (CrumbPhase::Idle, 0u32),
+        (CrumbPhase::Spawning, 1),
+        (CrumbPhase::Started, 2),
+        (CrumbPhase::StopSignalled, 3),
+        (CrumbPhase::Stopped, 4),
+        (CrumbPhase::Faulted, 5),
+        (CrumbPhase::Resumed, 6),
+    ];
+    for (phase, v) in phases {
+        for slot in [0u16, 7, u16::MAX] {
+            assert_eq!(
+                decode_crumb(0x8000_0000 | (v << 16) | u32::from(slot)),
+                Some((phase, slot)),
+                "{} at slot {slot}",
+                phase.as_str()
+            );
+        }
+    }
+    assert_eq!(
+        decode_crumb(0x8100_0001),
+        None,
+        "bits 24..31 must be clear: not a crumb"
+    );
 }

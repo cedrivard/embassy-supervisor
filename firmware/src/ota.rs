@@ -19,13 +19,25 @@ use embassy_time::{Duration, Timer};
 use embedded_io_async::Read as _;
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
-use ruzstd::decoding::StreamingDecoder;
+use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 use ruzstd::io::Read as _;
 
-const FLASH_SIZE: usize = 2 * 1024 * 1024;
+/// The flash `Flash` may address: 4 MiB (the Pico 2's part; the RedBoard has
+/// 16 MiB), because `OTA_SCRATCH` ends at 2.125 MiB. memory.x asserts it.
+/// A part that wraps at 2 MiB is refused before the first erase
+/// (`flash_aliases_at_2mib`).
+const FLASH_SIZE: usize = 4 * 1024 * 1024;
 
-const SCRATCH_OFFSET: u32 = 0x1E0000;
-const SCRATCH_LEN: u32 = 128 * 1024;
+/// The compressed download's region as `(offset, len)` from the flash base:
+/// `OTA_SCRATCH` in memory.x.
+fn scratch_region() -> (u32, u32) {
+    unsafe extern "C" {
+        static __ota_scratch_start: u32;
+        static __ota_scratch_end: u32;
+    }
+    let start = (&raw const __ota_scratch_start) as u32;
+    (start, (&raw const __ota_scratch_end) as u32 - start)
+}
 
 const DEFAULT_IP: Ipv4Address = Ipv4Address::new(10, 42, 0, 1);
 const DEFAULT_PORT: u16 = 8000;
@@ -84,6 +96,12 @@ fn parse_ip(s: &str) -> Option<Ipv4Address> {
 }
 
 /// Parse-only resolver for reqwless's `Dns` bound, used when the `dns` feature
+/// is off. [`set_target`] accepts only what [`parse_ip`] parses and the default
+/// is an address, so no lookup is ever needed; standing in for a `DnsSocket`
+/// keeps smoltcp's DNS socket and its `StackResources` slot out of the binary
+/// (`net::SOCKET_BUDGET`). `--features dns` links the real `DnsSocket` in its
+/// place; `set_target` still accepts only an IPv4 literal, so the socket is
+/// there to measure, not to resolve.
 #[cfg(not(feature = "dns"))]
 struct IpDns;
 
@@ -129,6 +147,11 @@ async fn run(
     node: &'static TaskNode,
     flash: &mut Peri<'static, FLASH>,
 ) -> Result<(), &'static str> {
+    // The request that started this task came over HTTP, which is the evidence
+    // `ota-confirm` waits for, and `write_firmware` refuses to stage over an
+    // unconfirmed swap (BadState). Confirm first.
+    confirm(flash.reborrow())?;
+
     // Fall back to the default target when started without one (e.g. the
     // dashboard's Activate button, which doesn't call set_target).
     let target = TARGET
@@ -149,7 +172,8 @@ async fn run(
     defmt::info!("ota: downloaded {} B, draining net for the decode", len);
     // Already detached (ota_task's first act), so this net teardown won't cascade
     // back into us and no control op can interrupt the decode below. The
-    // download's lease is dropped by now — it is scoped to the call above — and
+    // download's lease ended with `download_to_scratch`, so net's drain does not
+    // wait on this task.
     embassy_supervisor::request_control(&crate::NET, ControlOp::Deactivate).await;
     while crate::net::try_stack().is_some() {
         Timer::after(Duration::from_millis(20)).await;
@@ -175,6 +199,10 @@ async fn download_to_scratch(
     t: &Target,
     flash: Peri<'_, FLASH>,
 ) -> Result<usize, &'static str> {
+    let (start, len) = scratch_region();
+    if (start + len) as usize > 2 * 1024 * 1024 && flash_aliases_at_2mib() {
+        return Err("flash smaller than 4 MiB");
+    }
     let held = crate::net::lease_stack(node).ok_or("net not up")?;
     let stack = *held;
     let state: Box<TcpClientState<1, 512, 2048>> = Box::new(TcpClientState::new());
@@ -197,6 +225,9 @@ async fn download_to_scratch(
         .send(hdr.as_mut_slice())
         .await
         .map_err(|_| "http send")?;
+    if !resp.status.is_successful() {
+        return Err("http status not 2xx");
+    }
 
     let mut reader = resp.body().reader();
     let mut chunk = transfer_buf(1024)?;
@@ -216,17 +247,40 @@ async fn download_to_scratch(
     Ok(written as usize)
 }
 
+/// `true` when flash wraps at 2 MiB: the 256 bytes at offset 2 MiB read back as
+/// the bootloader's first 256 bytes. `OTA_SCRATCH` ends past 2 MiB, so an erase
+/// there would hit the bootloader on such a part.
+fn flash_aliases_at_2mib() -> bool {
+    const PROBE: usize = 256;
+    const TWO_MIB: usize = 2 * 1024 * 1024;
+    // SAFETY: both ranges are XIP-mapped flash inside FLASH_SIZE and are only read.
+    let (low, high) = unsafe {
+        (
+            core::slice::from_raw_parts(FLASH_BASE as *const u8, PROBE),
+            core::slice::from_raw_parts((FLASH_BASE as usize + TWO_MIB) as *const u8, PROBE),
+        )
+    };
+    low == high
+}
+
 type Blk<'a> = Flash<'a, FLASH, Blocking, FLASH_SIZE>;
 
+/// Streams the compressed download into OTA_SCRATCH, erasing each sector on
+/// first touch (offsets only grow).
 struct Scratch<'a> {
     flash: Blk<'a>,
+    start: u32,
+    len: u32,
     erased_sectors: u32,
 }
 
 impl<'a> Scratch<'a> {
     fn new(p: Peri<'a, FLASH>) -> Self {
+        let (start, len) = scratch_region();
         Self {
             flash: Flash::new_blocking(p),
+            start,
+            len,
             erased_sectors: 0,
         }
     }
@@ -236,27 +290,32 @@ impl<'a> Scratch<'a> {
             return Ok(());
         }
         let end = offset + data.len() as u32;
-        if end > SCRATCH_LEN {
+        if end > self.len {
             return Err("image larger than scratch");
         }
         let needed = end.div_ceil(ERASE_SIZE as u32);
         while self.erased_sectors < needed {
-            let s = SCRATCH_OFFSET + self.erased_sectors * ERASE_SIZE as u32;
+            let s = self.start + self.erased_sectors * ERASE_SIZE as u32;
             self.flash
                 .blocking_erase(s, s + ERASE_SIZE as u32)
                 .map_err(|_| "scratch erase")?;
             self.erased_sectors += 1;
         }
         self.flash
-            .blocking_write(SCRATCH_OFFSET + offset, data)
+            .blocking_write(self.start + offset, data)
             .map_err(|_| "scratch write")
     }
 }
 
 fn apply(compressed_len: usize, flash: Peri<'_, FLASH>) -> Result<(), &'static str> {
+    let (start, _) = scratch_region();
+    // SAFETY: OTA_SCRATCH is XIP-mapped flash, `compressed_len` lies inside it
+    // (`Scratch::write` bounds every write), and nothing writes it while the
+    // slice lives: the download is over and the decode writes only DFU and
+    // STATE, which memory.x keeps disjoint from it.
     let compressed = unsafe {
         core::slice::from_raw_parts(
-            (FLASH_BASE as usize + SCRATCH_OFFSET as usize) as *const u8,
+            (FLASH_BASE as usize + start as usize) as *const u8,
             compressed_len,
         )
     };
@@ -267,10 +326,20 @@ fn apply(compressed_len: usize, flash: Peri<'_, FLASH>) -> Result<(), &'static s
     let mut state_buf = [0u8; 1]; // == STATE::WRITE_SIZE
     let mut updater = BlockingFirmwareUpdater::new(config, &mut state_buf);
 
-    let mut dec = StreamingDecoder::new(compressed).map_err(|_| "zstd header")?;
+    // `StreamingDecoder` boxes every decode error (`io_nostd::Error`), which
+    // keeps ruzstd's error `Debug`/`Display` impls in the image and allocates
+    // on the failure path; the frame decoder is driven by hand instead.
+    let mut src: &[u8] = compressed;
+    let mut dec = FrameDecoder::new();
+    dec.init(&mut src).map_err(|_| "zstd header")?;
     let mut buf = [0u8; 512];
     let mut offset = 0usize;
     loop {
+        while dec.can_collect() < buf.len() && !dec.is_finished() {
+            let want = buf.len() - dec.can_collect();
+            dec.decode_blocks(&mut src, BlockDecodingStrategy::UptoBytes(want))
+                .map_err(|_| "zstd decode")?;
+        }
         let n = dec.read(&mut buf).map_err(|_| "zstd decode")?;
         if n == 0 {
             break;
@@ -284,25 +353,27 @@ fn apply(compressed_len: usize, flash: Peri<'_, FLASH>) -> Result<(), &'static s
     updater.mark_updated().map_err(|_| "mark_updated failed")
 }
 
-/// Confirm the running image so the bootloader keeps it instead of rolling back
-/// on the next reset. Safe to call on a normal (non-updated) boot.
-///
-/// Called from the OTA_CONFIRM node — a *different* node from OTA, so the shared
-/// FLASH cannot ride the `resources:` glue (one `Peri` provides one slot). Instead
-/// it borrows the same `FLASH_DEV` slot **manually**: `take()` the peripheral, use
-/// it, `restore()` it — the safe-slot equivalent of a scoped lock. An empty slot
-/// means the OTA task currently owns the flash, and failing with an error here
-/// is what keeps that from becoming a silent race.
-pub fn mark_booted() -> Result<(), &'static str> {
-    let mut p = crate::FLASH_DEV.take().ok_or("flash busy (ota running)")?;
-    let result = {
-        let blk: Blk<'_> = Flash::new_blocking(p.reborrow());
-        let shared: Mutex<NoopRawMutex, _> = Mutex::new(RefCell::new(blk));
-        let config = FirmwareUpdaterConfig::from_linkerfile_blocking(&shared, &shared);
-        let mut state_buf = [0u8; 1];
-        let mut updater = BlockingFirmwareUpdater::new(config, &mut state_buf);
-        updater.mark_booted().map_err(|_| "mark_booted failed")
+/// Mark the running image booted, so the bootloader keeps it on the next reset
+/// instead of rolling back. Writes nothing on a normal boot.
+fn confirm(p: Peri<'_, FLASH>) -> Result<(), &'static str> {
+    let blk: Blk<'_> = Flash::new_blocking(p);
+    let shared: Mutex<NoopRawMutex, _> = Mutex::new(RefCell::new(blk));
+    let config = FirmwareUpdaterConfig::from_linkerfile_blocking(&shared, &shared);
+    let mut state_buf = [0u8; 1];
+    let mut updater = BlockingFirmwareUpdater::new(config, &mut state_buf);
+    updater.mark_booted().map_err(|_| "mark_booted failed")
+}
+
+/// `confirm` for `ota-confirm`, a different node from `ota`: the shared FLASH
+/// cannot ride the `resources:` glue (one `Peri` fills one slot), so this
+/// borrows the `FLASH_DEV` slot by hand with `take()`/`restore()`. An empty
+/// slot means `ota` owns the flash and has already confirmed the image itself
+/// (`run` confirms before it stages); that is `Ok(false)`.
+pub fn mark_booted() -> Result<bool, &'static str> {
+    let Some(mut p) = crate::FLASH_DEV.take() else {
+        return Ok(false);
     };
+    let result = confirm(p.reborrow());
     crate::FLASH_DEV.restore(p);
-    result
+    result.map(|()| true)
 }

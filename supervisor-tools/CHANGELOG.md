@@ -3,6 +3,30 @@
 All notable changes to `embassy-supervisor-tools` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.0] - 2026-11-07
+
+Pins `embassy-supervisor-syntax` 0.6.0.
+
+### Changed
+
+- **Breaking:** `scan_source`, `scan_fns`, `scan_bundles` and `scan_gate_statics` take a
+  parsed `&syn::File`; `scan_fns` fills `Vec<ScannedFn>` and `coverage_warnings` takes
+  `&[ScannedFn]`; `Discovered::module` is a `Vec<String>`; `ScannedFn`, `Discovered` and
+  `Bundle` carry `rooted` and `crate_dir`; `expand_bundles` is crate-private; the
+  `scan_dataflow` re-export is removed.
+- **Breaking:** `supervisor-lint` exits 2 on errors.
+- The runtime diagram's header comment is `%% runtime coupling:`.
+
+### Fixed
+
+- A `name::fn` binding reaches a crate-root fn only when the scanned file's crate
+  directory (the one above `src/`, `-` read as `_`) is `name`, so `imu::run` no longer
+  binds the root `fn run` beside it; a `crate::` binding matches a file under `src/`
+  exactly.
+- An edge drawn from several accesses is labelled with the shortest `#[cfg]` set.
+- `supervisor-mermaid --list`/`--check`/`--json` name the output flags they return
+  before using.
+
 ## [0.7.0] - 2026-10-24
 
 Pins `embassy-supervisor-syntax` 0.5.0.
@@ -26,8 +50,8 @@ Pins `embassy-supervisor-syntax` 0.5.0.
 
 ### Removed
 
-- The `pool_size` field of the JSON node model and the `×N` node-label fact, with the
-  clause.
+- `model::NodeModel::pool_size`, the `pool_size` field of the JSON node model and the
+  `×N` node-label fact, with the clause.
 
 ## [0.5.0] - 2026-09-04
 
@@ -84,7 +108,8 @@ Pins `embassy-supervisor-syntax = "=0.3.0"`.
 
 Baseline for this changelog.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.7.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.8.0...HEAD
+[0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.7.0...embassy-supervisor-tools-v0.8.0
 [0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.6.0...embassy-supervisor-tools-v0.7.0
 [0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.5.0...embassy-supervisor-tools-v0.6.0
 [0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.4.1...embassy-supervisor-tools-v0.5.0

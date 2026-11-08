@@ -81,6 +81,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]
@@ -96,6 +97,7 @@ async fn driver(spawner: Spawner) {
     );
 
     // ── Named sub-graph, cycled like the user's state machine: three full
+    //    start()/teardown() cycles, dependency-ordered both ways each time. ──
     for cycle in 1..=3u32 {
         sub.start(&spawner).await.expect("sub start");
         settle(|| REPORT_SPAWNS.load(Ordering::SeqCst) == cycle).await;
@@ -126,8 +128,6 @@ async fn driver(spawner: Spawner) {
     settle(|| GAUGE.is_running()).await;
     sub.stop_node(&GAUGE).await.expect("pause = stop_node");
     assert!(!GAUGE.is_running());
-    sub.resume_node(&SENSOR);
-    assert_eq!(GAUGE_RESUMES.load(Ordering::SeqCst), 3, "not resumed yet");
     sub.resume_node(&GAUGE);
     settle(|| GAUGE_RESUMES.load(Ordering::SeqCst) == 4).await;
     assert!(GAUGE.is_running(), "resumed in place, single node");

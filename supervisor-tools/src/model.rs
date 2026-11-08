@@ -2,13 +2,12 @@
 //!
 //! [`full_model`] maps every clause the grammar carries into plain data:
 //! consumers that need the whole declaration (an interpreter, a code
-//! generator) read this instead of re-walking the syntax AST, and
-//! [`model_json`](crate::model_json) is a projection of it, so the two
-//! cannot drift.
+//! generator) read this instead of re-walking the syntax AST.
+//! [`model_json`](crate::model_json) projects it field for field.
 //!
 //! The projection interprets nothing. Literals and expressions come back as
 //! parsed (`syn` values) together with their token text; what a consumer can
-//! honor — say, restricting `min:` to an integer literal — is that consumer's
+//! honor (say, restricting `min:` to an integer literal) is that consumer's
 //! policy.
 
 use embassy_supervisor_syntax::{Dep, Item, ResourceDecl, SignalDecl, StateInit, TaskSource};
@@ -20,7 +19,7 @@ use crate::Decl;
 /// `#[cfg(...)]` gate tokens, spaces stripped, one string per attribute.
 pub type CfgTexts = Vec<String>;
 
-fn cfg_texts(attrs: &[Attribute]) -> CfgTexts {
+pub(crate) fn cfg_texts(attrs: &[Attribute]) -> CfgTexts {
     attrs
         .iter()
         .filter_map(|a| match &a.meta {
@@ -134,6 +133,9 @@ pub struct SignalModel {
 pub struct ResourceModel {
     /// The resource slot name.
     pub name: String,
+    /// The slot's value type; `None` for a `divisible` entry, whose slot is a
+    /// `Budget<K>` the graph sizes itself.
+    pub ty: Option<TypeValue>,
     /// The `local` marker.
     pub local: bool,
     /// The `consume` marker.
@@ -153,6 +155,15 @@ pub struct ResourceModel {
 pub struct ProvideModel {
     /// The resource slot this item fills.
     pub name: String,
+    /// `#[cfg(...)]` gates on the entry.
+    pub cfg: CfgTexts,
+}
+
+/// A `dataflow:` entry.
+#[derive(Clone)]
+pub struct AdoptionModel {
+    /// The adopted fn's path, as `a::b::c`.
+    pub path: String,
     /// `#[cfg(...)]` gates on the entry.
     pub cfg: CfgTexts,
 }
@@ -268,8 +279,8 @@ pub struct NodeModel {
     pub cancel: bool,
     /// The `discover` marker: `Some(gates)` when present.
     pub discover: Option<CfgTexts>,
-    /// Functions adopted via `dataflow:`, as `a::b::c` paths.
-    pub dataflow: Vec<String>,
+    /// The `dataflow:` list.
+    pub dataflow: Vec<AdoptionModel>,
 }
 
 /// A `pool NAME = [Mode, ...], ...;` declaration, fully mapped.
@@ -313,8 +324,8 @@ pub struct PoolModel {
     pub cancel: bool,
     /// The `discover` marker: `Some(gates)` when present.
     pub discover: Option<CfgTexts>,
-    /// Functions adopted via `dataflow:`, as `a::b::c` paths.
-    pub dataflow: Vec<String>,
+    /// The `dataflow:` list.
+    pub dataflow: Vec<AdoptionModel>,
 }
 
 /// An `executor NAME;` declaration.
@@ -351,6 +362,10 @@ pub struct GraphModel {
     pub origin: String,
     /// The declaration's line in its origin.
     pub line: usize,
+    /// The `observe writes:` default accessor, if any.
+    pub observe_writes: Option<ExprValue>,
+    /// The `observe reads:` default accessor, if any.
+    pub observe_reads: Option<ExprValue>,
     /// The declared items, in order.
     pub items: Vec<ItemModel>,
 }
@@ -385,6 +400,7 @@ fn signal_model(s: &SignalDecl) -> SignalModel {
 fn resource_model(r: &ResourceDecl) -> ResourceModel {
     ResourceModel {
         name: r.ident.to_string(),
+        ty: r.ty.as_ref().map(TypeValue::new),
         local: r.local.is_some(),
         consume: r.consume.is_some(),
         shared: r.shared.is_some(),
@@ -404,15 +420,17 @@ fn state_model(s: &(embassy_supervisor_syntax::kw::state, syn::Type, StateInit))
     }
 }
 
-fn dataflow_paths(fns: &[embassy_supervisor_syntax::AdoptedFn]) -> Vec<String> {
+fn adoption_models(fns: &[embassy_supervisor_syntax::AdoptedFn]) -> Vec<AdoptionModel> {
     fns.iter()
-        .map(|f| {
-            f.path
+        .map(|f| AdoptionModel {
+            path: f
+                .path
                 .segments
                 .iter()
                 .map(|s| s.ident.to_string())
                 .collect::<Vec<_>>()
-                .join("::")
+                .join("::"),
+            cfg: cfg_texts(&f.cfg),
         })
         .collect()
 }
@@ -477,7 +495,7 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                         state: n.state.as_ref().map(state_model),
                         cancel: n.cancel,
                         discover: n.discover.as_ref().map(|g| cfg_texts(&g.cfg)),
-                        dataflow: dataflow_paths(&n.dataflow),
+                        dataflow: adoption_models(&n.dataflow),
                     }),
                     Item::Pool(p) => ItemModel::Pool(PoolModel {
                         name: p.ident.to_string(),
@@ -505,7 +523,7 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                         state: p.state.as_ref().map(state_model),
                         cancel: p.cancel,
                         discover: p.discover.as_ref().map(|g| cfg_texts(&g.cfg)),
-                        dataflow: dataflow_paths(&p.dataflow),
+                        dataflow: adoption_models(&p.dataflow),
                     }),
                     Item::Executor(x) => ItemModel::Executor(ExecutorModel {
                         name: x.ident.to_string(),
@@ -519,6 +537,16 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                 name: d.name(),
                 origin: d.origin.clone(),
                 line: d.line,
+                observe_writes: d
+                    .spec
+                    .observe_writes
+                    .as_ref()
+                    .map(|(_, e)| ExprValue::new(e)),
+                observe_reads: d
+                    .spec
+                    .observe_reads
+                    .as_ref()
+                    .map(|(_, e)| ExprValue::new(e)),
                 items,
             }
         })

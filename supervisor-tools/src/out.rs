@@ -96,8 +96,7 @@ fn html_esc(s: &str) -> String {
 ///
 /// Returns an error if `mmdc` is not installed or exits unsuccessfully.
 pub fn mmdc_render(diagram: &str, out_path: &str) -> Result<(), String> {
-    let tmp = std::env::temp_dir().join(format!("supervisor-mermaid-{}.mmd", std::process::id()));
-    std::fs::write(&tmp, diagram).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    let tmp = mmdc_input(diagram)?;
     let status = std::process::Command::new("mmdc")
         .arg("-i")
         .arg(&tmp)
@@ -116,36 +115,78 @@ pub fn mmdc_render(diagram: &str, out_path: &str) -> Result<(), String> {
     }
 }
 
+/// Write `diagram` to a fresh temp file for `mmdc`. Named by pid and clock and
+/// created exclusively, so a file or symlink already at the path is an error,
+/// never a target.
+fn mmdc_input(diagram: &str) -> Result<std::path::PathBuf, String> {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp = std::env::temp_dir().join(format!("supervisor-mermaid-{pid}-{nanos}.mmd"));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| format!("{}: {e}", tmp.display()))?;
+    if let Err(e) = f.write_all(diagram.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", tmp.display()));
+    }
+    Ok(tmp)
+}
+
+const START: &str = "<!-- supervisor-mermaid:start -->";
+const END: &str = "<!-- supervisor-mermaid:end -->";
+
 /// Update a markdown file between `<!-- supervisor-mermaid:start -->` and
-/// `<!-- supervisor-mermaid:end -->` markers.
+/// `<!-- supervisor-mermaid:end -->` marker lines.
 ///
-/// If the markers are absent, appends the block to the end of the file.
+/// A marker counts only alone on its line, so one quoted in prose or a table
+/// is text. With no markers, the block is appended to the end of the file.
 pub fn update_markdown(path: &str, block: &str) -> Result<(), String> {
-    const START: &str = "<!-- supervisor-mermaid:start -->";
-    const END: &str = "<!-- supervisor-mermaid:end -->";
-    let managed = format!("{START}\n{block}{END}");
     let existing = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    let updated = match (existing.find(START), existing.find(END)) {
-        (Some(s), Some(e)) if e >= s => {
-            let after = e + END.len();
-            format!("{}{}{}", &existing[..s], managed, &existing[after..])
+    let updated =
+        splice(&existing, &format!("{START}\n{block}{END}")).map_err(|e| format!("{path}: {e}"))?;
+    std::fs::write(path, updated).map_err(|e| format!("{path}: {e}"))
+}
+
+/// `existing` with `managed` in place of its marked block, or appended.
+fn splice(existing: &str, managed: &str) -> Result<String, String> {
+    match (marker_line(existing, START), marker_line(existing, END)) {
+        (Some((s, _)), Some((e, after))) if e > s => {
+            Ok(format!("{}{managed}{}", &existing[..s], &existing[after..]))
         }
+        (Some(_), Some(_)) => Err("the supervisor-mermaid end marker comes before the start \
+                                   marker; fix the markers by hand"
+            .to_string()),
         (None, None) => {
             let sep = if existing.ends_with('\n') {
                 "\n"
             } else {
                 "\n\n"
             };
-            format!("{existing}{sep}{managed}\n")
+            Ok(format!("{existing}{sep}{managed}\n"))
         }
-        _ => {
-            return Err(format!(
-                "{path}: found one supervisor-mermaid marker without the other; \
-                 fix the markers by hand"
-            ));
+        _ => Err(
+            "found one supervisor-mermaid marker without the other; fix the markers by hand"
+                .to_string(),
+        ),
+    }
+}
+
+/// The byte range of `marker` on the first line that holds it alone
+/// (surrounding whitespace allowed).
+fn marker_line(text: &str, marker: &str) -> Option<(usize, usize)> {
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        if line.trim() == marker {
+            let lead = line.len() - line.trim_start().len();
+            return Some((at + lead, at + lead + marker.len()));
         }
-    };
-    std::fs::write(path, updated).map_err(|e| format!("{path}: {e}"))
+        at += line.len();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -258,5 +299,55 @@ mod tests {
         assert!(!s.contains("ONE"), "{s}");
         assert_eq!(s.matches("supervisor-mermaid:start").count(), 1, "{s}");
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn markers_count_only_as_whole_lines() {
+        let managed = "<!-- supervisor-mermaid:start -->\nX\n<!-- supervisor-mermaid:end -->";
+        let quoted = "| `--update FILE.md` | rewrite the block between the \
+                      `<!-- supervisor-mermaid:start -->` and \
+                      `<!-- supervisor-mermaid:end -->` lines in a markdown file, \
+                      touching nothing else |\n";
+        assert_eq!(
+            splice(quoted, managed).unwrap(),
+            format!("{quoted}\n{managed}\n")
+        );
+        let swapped = splice(
+            "<!-- supervisor-mermaid:end -->\n<!-- supervisor-mermaid:start -->\n",
+            managed,
+        );
+        assert!(
+            swapped
+                .as_ref()
+                .is_err_and(|e| e.contains("before the start")),
+            "{swapped:?}"
+        );
+        let lone = splice("<!-- supervisor-mermaid:start -->\n", managed);
+        assert!(
+            lone.as_ref()
+                .is_err_and(|e| e.contains("without the other")),
+            "{lone:?}"
+        );
+        assert_eq!(
+            splice(
+                "  <!-- supervisor-mermaid:start -->\nold\n<!-- supervisor-mermaid:end -->\n",
+                managed
+            )
+            .unwrap(),
+            format!("  {managed}\n")
+        );
+    }
+
+    #[test]
+    fn the_mmdc_input_is_a_fresh_file() {
+        let tmp = mmdc_input("flowchart TD\n").unwrap();
+        let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with(&format!("supervisor-mermaid-{}-", std::process::id())),
+            "{name}"
+        );
+        assert!(name.ends_with(".mmd"), "{name}");
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "flowchart TD\n");
+        std::fs::remove_file(&tmp).unwrap();
     }
 }

@@ -7,6 +7,26 @@ This crate is pinned by exact version from `embassy-supervisor-macros`: its AST 
 internal contract between the two, not a stable public API, and it changes whenever the
 graph syntax does. Publish it before the macro crate that depends on it.
 
+## [0.6.0] - 2026-11-07
+
+Stricter graph parsing and one shared access walker. Requires
+`embassy-supervisor-macros` 0.12.0 and `embassy-supervisor-tools` 0.8.0.
+
+### Added
+
+- `scan_fn_accesses(attrs, sig, block, out)`: one fn's dataflow accesses, as
+  `scan_dataflow` records them, for a caller that walks modules itself.
+
+### Changed
+
+- **Breaking**: rejects a second `exit:` or `provides:` clause, `resources: []`,
+  suffixed integer literals in clauses, attributes other than `#[cfg]` on list entries,
+  and list entries without separators.
+
+### Fixed
+
+- The `#[dataflow]` walker sees `field: node.verb(..)` in struct literals.
+
 ## [0.5.0] - 2026-10-24
 
 Adds two node-only clauses and removes `pool_size:`. Requires
@@ -163,7 +183,8 @@ tooling that wants it.
   against a whole graph by the macro. A fragment legitimately names nodes it does not
   contain, so parsing one in isolation has to succeed.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.5.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.6.0...HEAD
+[0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.5.0...embassy-supervisor-syntax-v0.6.0
 [0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.4.0...embassy-supervisor-syntax-v0.5.0
 [0.4.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.3.1...embassy-supervisor-syntax-v0.4.0
 [0.3.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.3.0...embassy-supervisor-syntax-v0.3.1

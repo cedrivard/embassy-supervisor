@@ -10,6 +10,8 @@ pub const HEAP_SIZE: usize = 33 * 1024;
 /// Initialize the global heap allocator.
 pub fn init() {
     static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+    // SAFETY: `main` calls this once at boot, before anything allocates, and
+    // HEAP_MEM is a function-local static nothing else can name.
     unsafe { HEAP.init(&raw mut HEAP_MEM as usize, HEAP_SIZE) }
 }
 

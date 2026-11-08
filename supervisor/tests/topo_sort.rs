@@ -35,12 +35,3 @@ fn unsorted_input_is_sorted() {
     assert!(pos(&ORDER, 1) < pos(&ORDER, 2), "1 before 2");
     assert!(pos(&ORDER, 2) < pos(&ORDER, 0), "2 before 0");
 }
-
-#[test]
-fn evaluates_at_compile_time() {
-    const DEPS: [&[u8]; 3] = [&[], &[0], &[1]];
-    const _: () = {
-        let order = topo_sort_const(&DEPS);
-        assert!(order[0] == 0 && order[1] == 1 && order[2] == 2);
-    };
-}

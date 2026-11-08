@@ -46,6 +46,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 async fn drive_until<const N: usize, T: embassy_supervisor::Topology<N>>(
@@ -61,6 +62,7 @@ async fn drive_until<const N: usize, T: embassy_supervisor::Topology<N>>(
             }
             embassy_futures::yield_now().await;
         }
+        assert!(until(), "drive_until: did not settle");
     };
     match select(sup.run_pools(&spawner), watch).await {
         Either::First(err) => panic!("pool driver errored: {:?}", err.node.name()),
@@ -110,7 +112,7 @@ async fn driver(spawner: Spawner) {
     assert_eq!(
         BACKING.load(Ordering::SeqCst),
         2,
-        "the exit path touched the fanned-out value"
+        "the exit path left the fanned-out value alone: two entry bumps, nothing else"
     );
 
     sup.start_node(&FAN[1], &spawner).await.expect("re-grow");
@@ -137,6 +139,7 @@ fn pool_shared_local_resource() {
     });
 
     // Tick mock time so the unprovided floor's gate timeout can expire (the
+    // other waits resolve by signal and never park).
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
     while !DONE.load(Ordering::SeqCst) {
         assert!(

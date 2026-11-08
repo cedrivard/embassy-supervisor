@@ -71,6 +71,8 @@ async fn driver(spawner: Spawner) {
     assert!(RUNNER.is_running() && CTRL.is_running() && WATCH.is_running());
 
     // Up-front signalling never returns from this call: RUNNER's service loop
+    // would be cancelled before CTRL's final request, CTRL would spin on its
+    // response forever, and with the clock frozen no ack window ever closes.
     sup.teardown().await.expect("teardown completes");
 
     assert!(!RUNNER.is_running() && !CTRL.is_running() && !WATCH.is_running());
