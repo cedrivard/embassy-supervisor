@@ -14,6 +14,7 @@ supervisor_graph! {
     node DOWNSTREAM = Terminate, deps: [CONSUMER], task: plain;
 
     node SIBLING = Terminate, deps: [ROOT], task: plain, disabled;
+    node HELD_DOWN = Terminate, deps: [PROVIDER], task: plain, disabled;
 }
 
 static PROVIDER_GEN: AtomicU32 = AtomicU32::new(0);
@@ -21,6 +22,8 @@ static WITHHOLD_READY: AtomicBool = AtomicBool::new(false);
 static CONSUMER_STARTS: AtomicU32 = AtomicU32::new(0);
 static DOWNSTREAM_STARTS: AtomicU32 = AtomicU32::new(0);
 static ROOT_STARTS: AtomicU32 = AtomicU32::new(0);
+/// Set for the last phase, the only one that runs a gate to its timeout.
+static ADVANCE: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
 
 async fn plain(node: &'static TaskNode) {
@@ -93,12 +96,17 @@ async fn driver(spawner: Spawner) {
         !SIBLING.is_running() && SIBLING.is_disabled(),
         "a deliberately disabled node is not resurrected by an unrelated restart"
     );
+    assert!(
+        !HELD_DOWN.is_running() && HELD_DOWN.is_disabled(),
+        "a disabled dependent inside the restart set is not brought back up"
+    );
 
     assert!(
         !PROVIDER.is_disabled() && !CONSUMER.is_disabled(),
         "a cycle is not a stop; nothing in the set is left marked disabled"
     );
 
+    ADVANCE.store(true, Ordering::SeqCst);
     WITHHOLD_READY.store(true, Ordering::SeqCst);
     let before = CONSUMER_STARTS.load(Ordering::SeqCst);
     let err = sup
@@ -140,12 +148,13 @@ fn rest_for_one_cycles_downstream_only() {
         });
     });
 
-    // The last phase deliberately runs a gate to its timeout, so the mock clock
-    // has to keep moving for the driver to get there.
+    // Only the last phase runs a gate to its timeout, so only it moves the clock.
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
     while !DONE.load(Ordering::SeqCst) {
         assert!(StdInstant::now() < deadline, "did not complete");
-        clock.advance(embassy_time::Duration::from_millis(100));
+        if ADVANCE.load(Ordering::SeqCst) {
+            clock.advance(embassy_time::Duration::from_millis(100));
+        }
         std::thread::sleep(StdDuration::from_millis(2));
     }
 }

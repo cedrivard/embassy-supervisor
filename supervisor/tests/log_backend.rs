@@ -6,6 +6,8 @@ use embassy_supervisor::supervisor_graph;
 use std::sync::Mutex;
 
 pub static PRODUCED: u32 = 0;
+/// One static, read twice: the same pointer, so the second report is no change.
+static DEGRADED: &str = "degraded: no input";
 
 supervisor_graph! {
     node SOURCE = Terminate, deps: [], writes: [crate::PRODUCED];
@@ -34,8 +36,8 @@ fn node_reports_reach_the_log_facade() {
     log::set_logger(&Capture).expect("no other logger is installed in this test binary");
     log::set_max_level(log::LevelFilter::Trace);
 
-    SINK.report_status("degraded: no input");
-    SINK.report_status("degraded: no input");
+    SINK.report_status(DEGRADED);
+    SINK.report_status(DEGRADED);
 
     let records = RECORDS.lock().unwrap();
     assert_eq!(records.len(), 1, "one change, one record: {records:?}");
@@ -43,7 +45,7 @@ fn node_reports_reach_the_log_facade() {
     let (level, message) = &records[0];
     assert_eq!(*level, log::Level::Info);
     assert!(
-        message.contains("sink") && message.contains("degraded: no input"),
+        message.contains("sink") && message.contains(DEGRADED),
         "message names the node and its status: {message}"
     );
 }

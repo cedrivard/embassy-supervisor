@@ -4,6 +4,9 @@
 use core::future::Future;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::task::Wake;
 
 use embassy_supervisor::{Budget, BudgetPolicy, FairShare, ResourceGate, ShrinkFastGrowSlow};
 use embassy_time::{Duration, Instant};
@@ -198,4 +201,76 @@ fn a_change_landing_mid_rebalance_re_arms_the_allocator() {
     );
     let mut changed = pin!(C.wait_change());
     assert!(poll_once(&mut changed).is_pending(), "and settles");
+}
+
+static D: Budget<1> = Budget::new();
+
+struct Woken(AtomicBool);
+impl Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn a_release_wakes_the_holder_parked_on_its_grant() {
+    let holder = D.claimant(0);
+    D.provide(10);
+    holder.want(10);
+    D.rebalance(&FairShare, t0());
+    assert_eq!(holder.grant(), 10);
+    let woken = Arc::new(Woken(AtomicBool::new(false)));
+    let waker = Waker::from(woken.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut waiting = pin!(holder.wait_grant_change(10));
+    assert!(waiting.as_mut().poll(&mut cx).is_pending());
+    D.release(0);
+    assert!(
+        woken.0.load(Ordering::SeqCst),
+        "zeroing a grant wakes its holder"
+    );
+    assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(0));
+}
+
+static E: Budget<2> = Budget::new();
+
+/// Reads the published total at the moment the budget wakes slot 0's holder.
+struct TotalAtWake(AtomicU32);
+impl Wake for TotalAtWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(E.total_granted(), Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn a_rebalance_publishes_cuts_before_increases() {
+    E.provide(10);
+    E.claimant(1).want(10);
+    E.rebalance(&FairShare, t0());
+    assert_eq!((E.grant(0), E.grant(1)), (0, 10));
+    let probe = Arc::new(TotalAtWake(AtomicU32::new(u32::MAX)));
+    let waker = Waker::from(probe.clone());
+    let holder = E.claimant(0);
+    let mut waiting = pin!(holder.wait_grant_change(0));
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    E.claimant(1).want(0);
+    holder.want(10);
+    E.rebalance(&FairShare, t0());
+    assert_eq!((E.grant(0), E.grant(1)), (10, 0));
+    assert_eq!(
+        probe.0.load(Ordering::SeqCst),
+        10,
+        "slot 0's increase was published after slot 1's cut"
+    );
 }

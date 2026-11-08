@@ -34,6 +34,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]
@@ -43,11 +44,11 @@ async fn driver(spawner: Spawner) {
 
     settle(|| SCORE.has_exited()).await;
     assert_eq!(
-        SCORE_EXIT.wait_take().await,
-        40,
-        "first run's return value read from the exit slot"
+        SCORE_EXIT.take(),
+        Some(40),
+        "the shell fills the exit slot before has_exited reads true"
     );
-    assert!(SCORE_EXIT.take().is_none(), "wait_take consumed the value");
+    assert!(SCORE_EXIT.take().is_none(), "take consumed the value");
     PHASE.store(1, Ordering::SeqCst);
 
     sup.respawn_terminate(&spawner).await.expect("respawn 1");

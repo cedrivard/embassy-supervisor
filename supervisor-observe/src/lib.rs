@@ -15,6 +15,17 @@ use portable_atomic::{
     AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 
+// Without native CAS, portable-atomic provides it only through its
+// `critical-section` or `unsafe-assume-single-core` feature: say so first.
+portable_atomic::cfg_no_atomic_cas! {
+    compile_error!(
+        "embassy-supervisor-observe needs atomic compare-and-swap, which this target \
+         lacks natively: enable portable-atomic's `critical-section` feature (an \
+         application linking embassy-supervisor already does) or its \
+         `unsafe-assume-single-core` feature"
+    );
+}
+
 /// A type whose writes can be observed without interpreting the value.
 ///
 /// `change_token()` returns a `u32` whose only meaning is that two unequal
@@ -59,16 +70,7 @@ macro_rules! value_as_token {
     )*};
 }
 value_as_token!(
-    AtomicU8,
-    AtomicU16,
-    AtomicU32,
-    AtomicU64,
-    AtomicUsize,
-    AtomicI8,
-    AtomicI16,
-    AtomicI32,
-    AtomicI64,
-    AtomicIsize,
+    AtomicU8, AtomicU16, AtomicU32, AtomicI8, AtomicI16, AtomicI32,
 );
 value_as_token!(
     #[cfg(target_has_atomic = "8")]
@@ -83,14 +85,37 @@ value_as_token!(
     core::sync::atomic::AtomicU32,
     #[cfg(target_has_atomic = "32")]
     core::sync::atomic::AtomicI32,
-    #[cfg(target_has_atomic = "64")]
-    core::sync::atomic::AtomicU64,
-    #[cfg(target_has_atomic = "64")]
-    core::sync::atomic::AtomicI64,
-    #[cfg(target_has_atomic = "ptr")]
-    core::sync::atomic::AtomicUsize,
-    #[cfg(target_has_atomic = "ptr")]
-    core::sync::atomic::AtomicIsize,
+);
+
+/// Fold a 64-bit value into a token: the wrapping sum of its halves, so a
+/// write that changes only bits 32 to 63 still moves it.
+#[inline]
+fn fold64(v: u64) -> u32 {
+    (v as u32).wrapping_add((v >> 32) as u32)
+}
+
+macro_rules! wide_value_as_token {
+    ($($(#[$cfg:meta])* $ty:ty => |$v:ident| $bits:expr),* $(,)?) => {$(
+        $(#[$cfg])*
+        impl Observable for $ty {
+            fn change_token(&self) -> u32 {
+                let $v = self.load(Ordering::Relaxed);
+                fold64($bits)
+            }
+        }
+    )*};
+}
+wide_value_as_token!(
+    AtomicU64 => |v| v,
+    AtomicI64 => |v| v as u64,
+    AtomicUsize => |v| v as u64,
+    AtomicIsize => |v| v as usize as u64,
+);
+wide_value_as_token!(
+    #[cfg(target_has_atomic = "64")] core::sync::atomic::AtomicU64 => |v| v,
+    #[cfg(target_has_atomic = "64")] core::sync::atomic::AtomicI64 => |v| v as u64,
+    #[cfg(target_has_atomic = "ptr")] core::sync::atomic::AtomicUsize => |v| v as u64,
+    #[cfg(target_has_atomic = "ptr")] core::sync::atomic::AtomicIsize => |v| v as usize as u64,
 );
 
 impl Observable for AtomicBool {
@@ -297,8 +322,15 @@ mod tests {
         a.store(3, Ordering::Relaxed);
         assert_eq!(a.change_token(), 3);
 
-        let wide = AtomicU64::new(u64::MAX);
-        assert_eq!(wide.change_token(), u32::MAX);
+        let wide = AtomicU64::new(7);
+        assert_eq!(wide.change_token(), 7, "below 2^32 the value is the token");
+        wide.store(7 | (1 << 40), Ordering::Relaxed);
+        assert_ne!(wide.change_token(), 7, "a high-half write moves the token");
+        let signed = AtomicI64::new(0);
+        signed.store(-1, Ordering::Relaxed);
+        assert_ne!(signed.change_token(), 0, "0 to -1 moves the token");
+        let host = core::sync::atomic::AtomicU64::new(1 << 32);
+        assert_eq!(host.change_token(), 1, "the core family folds the same way");
 
         let b = AtomicBool::new(false);
         b.store(true, Ordering::Relaxed);

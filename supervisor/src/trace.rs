@@ -17,8 +17,9 @@ pub fn register_graph(graph: &'static GraphRef) {
 
 /// Resolve an executor task id to its node: a linear scan over every registered
 /// graph's slots (id 0 = "unknown" is never matched), plus each graph's hidden
-/// self-node under `trace-self`. O(total nodes) with the per-graph cap at 256 —
-/// a handful of atomic loads per poll in practice.
+/// self-node under `trace-self`. O(total nodes) with the per-graph cap at 256:
+/// one atomic load per node, plus one critical section for the chain head and
+/// one per graph to follow the chain.
 fn node_for(task_id: u32) -> Option<&'static TaskNode> {
     if task_id == 0 {
         return None;

@@ -1,5 +1,6 @@
-// `enabled_if:` takes any expression coercible to `fn() -> bool`; the normal
-// form is a path. `all()` keeps a gated clause, `any()` strips it.
+// Every `enabled_if:` form compiles: a path, a local fn, and a clause kept by
+// `#[cfg(all())]` or stripped by `#[cfg(any())]`. supervisor/tests/enabled_if.rs
+// asserts which ones `start()` applies.
 use embassy_supervisor::{TaskNode, supervisor_graph};
 
 mod settings {

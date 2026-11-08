@@ -1,0 +1,5 @@
+error: `X_EXIT` is also the name the macro gives the `exit:` slot of node `X`; rename one of them
+  --> tests/ui/compile_fail/derived_name_collision.rs:10:10
+   |
+10 |     node X_EXIT = Terminate, deps: [];
+   |          ^^^^^^

@@ -1,3 +1,15 @@
+//! Network over the USB cable: embassy-usb CDC-NCM under an embassy-net stack.
+//!
+//! `net_task` boxes every USB and network buffer per activation and drives the
+//! runners inside its own future, so a stop returns its heap. The `Stack` handle
+//! it publishes is lifetime-extended to `'static` but valid only while those
+//! boxes live. The invariant: no handle is used after they drop. The http
+//! workers hold a `hold()` claim for their whole run and `ota`/`ota-confirm`
+//! lease per use; `net` closes and drains every claim (`STACK.drain()`) before
+//! it unpublishes and drops the buffers. A path that drops `net_task`'s future
+//! without reaching the drain would break it, which is why `/api/fault`
+//! refuses `crash` on `net`.
+
 embassy_supervisor::supervisor_fragment! {
     name: NET_FRAG;
     node NET = Terminate, task: crate::net::net_task,
@@ -35,6 +47,11 @@ const PREFIX: u8 = 24;
 /// feature is on.
 pub const SOCKET_BUDGET: usize = crate::HTTP_MAX + cfg!(feature = "dns") as usize;
 
+/// The published stack handle behind a critical-section mutex. `Stack` is
+/// `Copy` but neither `Send` nor `Sync` (it wraps a `&RefCell`), so the
+/// `unsafe impl Sync` below carries the contract: `get`/`set` copy the handle
+/// in and out inside a critical section, and the handle itself is only used on
+/// core 0 (`net`, `http`, `ota`, `ota-confirm`; core 1 runs only `bench`).
 pub(crate) struct StackCell(
     embassy_sync::blocking_mutex::Mutex<
         embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
@@ -42,8 +59,8 @@ pub(crate) struct StackCell(
     >,
 );
 
-// SAFETY: see the struct docs — accesses are critical-section-guarded, and the
-// contained handle is only used from core 0.
+// SAFETY: `get`/`set` touch the `Cell` only inside a critical section, and
+// every user of the handle runs on core 0 (struct docs above).
 unsafe impl Sync for StackCell {}
 
 impl StackCell {
@@ -68,6 +85,8 @@ impl StackCell {
 /// frees the backing, so the module invariant above is checked rather than
 /// argued. Both are `#[repr(C)]` with the wrapped value first, so the derived
 /// write in [`publish_stack`], the module's own `STACK.set(..)` and a
+/// reference to either wrapper all share `STACK`'s address, which is how the
+/// dataflow tables identify the signal (an address compare).
 static STACK: Backed<Leased<StackCell>> = Backed::new(Leased::new(StackCell::new()));
 
 /// A leased handle to the network stack; the lease keeps the stack alive.
@@ -107,6 +126,8 @@ pub async fn stack_ready(node: &'static TaskNode) -> Option<StackLease> {
 /// draining.
 ///
 /// Reads through the caller's node, so an adopting caller
+/// (`ota`, through `dataflow: [crate::net::lease_stack]`) is recorded as a
+/// reader of `STACK`.
 #[embassy_supervisor::dataflow]
 pub fn lease_stack(node: &'static TaskNode) -> Option<StackLease> {
     let cell = node.reader(&crate::net::STACK);
@@ -116,12 +137,24 @@ pub fn lease_stack(node: &'static TaskNode) -> Option<StackLease> {
 }
 
 /// A bare claim on net's backing, for a consumer that already holds a `Stack`
+/// copy (the http workers, from the `NET_STACK` slot at spawn). `None` once
+/// `net` has started draining.
 pub(crate) fn hold() -> Option<Lease<StackCell>> {
     STACK.lease()
 }
 
+/// Publish this activation's stack: the derived write to `STACK`, and the
+/// `NET_STACK` slot the http pool copies from at spawn.
+///
+/// # Safety
+///
+/// The backing of `s` must outlive every use of the published handle. The
+/// caller (`net_task`) drains `STACK` and unpublishes before it drops the
+/// backing; see the module docs.
 #[embassy_supervisor::dataflow]
 unsafe fn publish_stack(node: &'static TaskNode, s: Stack<'_>) {
+    // SAFETY: `Stack<'a>`'s layout does not depend on `'a`, so this only
+    // extends the lifetime; the function's contract bounds the real one.
     let s: Stack<'static> = unsafe { core::mem::transmute(s) };
     node.writer(&crate::net::STACK).set(Some(s));
     // The spawn-time fan-out: the http pool's glue copies this out per member.
@@ -146,7 +179,9 @@ pub(crate) async fn net_task(node: &'static TaskNode, usb: &mut embassy_rp::Peri
     let mut bos_desc = Box::new([0u8; 256]);
     let mut control_buf = Box::new([0u8; 128]);
     let mut state = Box::new(State::new());
-    let mut net_state = Box::new(NetState::<MTU, 4, 4>::new());
+    // Two RX buffers: wrk keeps the same request rate as with four, and the
+    // heap keeps the two MTU-sized buffers (3 KB) for the pool's peak.
+    let mut net_state = Box::new(NetState::<MTU, 2, 4>::new());
     let mut resources = Box::new(StackResources::<SOCKET_BUDGET>::new());
 
     let mut builder = Builder::new(
@@ -163,7 +198,7 @@ pub(crate) async fn net_task(node: &'static TaskNode, usb: &mut embassy_rp::Peri
     let class = CdcNcmClass::new(&mut builder, &mut state, host_mac, 64);
     let mut usb_dev = builder.build();
 
-    let (ncm_runner, device) = class.into_embassy_net_device::<MTU, 4, 4>(&mut net_state, our_mac);
+    let (ncm_runner, device) = class.into_embassy_net_device::<MTU, 2, 4>(&mut net_state, our_mac);
 
     let net_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
         address: Ipv4Cidr::new(DEV_IP, PREFIX),
@@ -174,6 +209,9 @@ pub(crate) async fn net_task(node: &'static TaskNode, usb: &mut embassy_rp::Peri
     let (stack, mut net_runner) = embassy_net::new(device, net_config, &mut resources, seed);
 
     STACK.reopen();
+    // SAFETY: the drain and unpublish at the end of this fn run before
+    // `resources` and the other boxes drop; `/api/fault` refuses `crash` on
+    // `net`, the one path that would drop this future first.
     unsafe { publish_stack(node, stack) };
 
     let ready = async {

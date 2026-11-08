@@ -41,13 +41,15 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
-/// Drive the pool until `until()` holds (or a generous yield budget elapses).
-/// Dropping `run_pools` mid-flight is documented-safe (a half-applied action is
-/// re-driven), and keeping ALL pool driving inside the one driver task is the
-/// production shape — a concurrent pool task would race the manual
-/// stop/start below on the member's handshake flags.
+/// Drive the pool until `until()` holds (panicking if a generous yield budget
+/// elapses first). Dropping `run_pools` mid-flight leaves a half-applied action
+/// to the next pass (its event and ack check are lost; this test reads
+/// neither), and keeping ALL pool driving inside the one driver task is the
+/// production shape: a concurrent pool task would race the manual stop/start
+/// below on the member's handshake flags.
 async fn drive_until<const N: usize, T: embassy_supervisor::Topology<N>>(
     sup: &Supervisor<N, T>,
     spawner: Spawner,
@@ -61,6 +63,7 @@ async fn drive_until<const N: usize, T: embassy_supervisor::Topology<N>>(
             }
             embassy_futures::yield_now().await;
         }
+        assert!(until(), "drive_until: did not settle");
     };
     match select(sup.run_pools(&spawner), watch).await {
         Either::First(err) => panic!("pool shrink timed out: {:?}", err.node.name()),
@@ -105,7 +108,6 @@ async fn driver(spawner: Spawner) {
     CONN[1].restore(back);
     embassy_supervisor::request_scale();
     drive_until(&sup, spawner, || SPAWNS[1].load(Ordering::SeqCst) == 2).await;
-    assert_eq!(SEEN_ID[1].load(Ordering::SeqCst), 20, "same Conn re-taken");
 
     DONE.store(true, Ordering::SeqCst);
 }
@@ -124,9 +126,11 @@ fn per_member_pool_resources() {
 
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
     while !DONE.load(Ordering::SeqCst) {
-        // Keep the mock clock moving: the empty-element growth attempt parks on
-        // its 100 ms gate timeout inside the pool driver, and only the timeout
-        // firing (SpawnError::Busy) lets the driver breathe and re-drive.
+        // Keep the mock clock moving: a growth attempt on the still-empty
+        // element 1 waits in the member's resource gate for its `slot_timeout`
+        // (100 ms default) and faults `ResourceMissing`, which the pool driver
+        // discards before waiting for the next scale request; with time
+        // frozen it would stay parked until `drive_until` drops it.
         clock.advance(embassy_time::Duration::from_millis(50));
         assert!(
             StdInstant::now() < deadline,

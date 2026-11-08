@@ -26,8 +26,10 @@ supervisor_graph! {
 
 #[dataflow]
 async fn estimator(node: &'static TaskNode) {
-    PRODUCER_SPAWNS.fetch_add(1, Ordering::SeqCst);
-    node.writer(&crate::ESTIMATE).store(42, Ordering::SeqCst);
+    // Each instance publishes its own value: 41, then 42.
+    let spawn = PRODUCER_SPAWNS.fetch_add(1, Ordering::SeqCst) + 1;
+    node.writer(&crate::ESTIMATE)
+        .store(40 + spawn, Ordering::SeqCst);
     node.set_ready();
     let _ = node
         .run_cancellable_acked(core::future::pending::<()>())
@@ -57,7 +59,8 @@ async fn second_consumer(node: &'static TaskNode) {
 }
 
 /// The third consumer: opens only after the producer has been stopped again,
-/// so its `open` is the second cycle's first — the one a lifetime latch would
+/// so its `open` is the second cycle's first: the one a lifetime latch would
+/// swallow, leaving the producer down.
 #[dataflow]
 async fn third_consumer(node: &'static TaskNode) {
     while !SECOND_CYCLE.load(Ordering::SeqCst) {
@@ -123,10 +126,10 @@ fn open_starts_the_producer_and_waits_for_readiness() {
     );
     assert_eq!(
         FIRST_SAW.load(Ordering::SeqCst),
-        42,
+        41,
         "`open` returned only after the producer published and set_ready"
     );
-    assert_eq!(SECOND_SAW.load(Ordering::SeqCst), 42, "late opener passes");
+    assert_eq!(SECOND_SAW.load(Ordering::SeqCst), 41, "late opener passes");
     assert_eq!(
         ESTIMATE.openers(),
         2,
@@ -136,6 +139,7 @@ fn open_starts_the_producer_and_waits_for_readiness() {
     // ── the latch is per down cycle ─────────────────────────────────────
     // Stop the producer again through the same mailbox the gate uses; once it
     // is down, the third opener's `open` must enqueue a fresh start rather
+    // than trust a latch left over from the first cycle.
     try_request_control(&ESTIMATOR, ControlOp::Deactivate).expect("mailbox has room");
     wait_for("the producer's stop", &|| !ESTIMATOR.is_running());
     SECOND_CYCLE.store(true, Ordering::SeqCst);
@@ -149,7 +153,7 @@ fn open_starts_the_producer_and_waits_for_readiness() {
     assert_eq!(
         THIRD_SAW.load(Ordering::SeqCst),
         42,
-        "against a fresh instance"
+        "read from the fresh instance, not the first one's leftover 41"
     );
 
     let reads: Vec<&str> = FIRST

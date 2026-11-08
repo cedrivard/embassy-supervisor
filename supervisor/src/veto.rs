@@ -86,6 +86,11 @@ impl<const N: usize> VetoGate<N> {
     }
 
     /// Park until the gate is asserted (returns at once if it already is).
+    ///
+    /// Single waiter: one task, normally the actuator, parks on a gate; a second
+    /// makes the two wake each other on every poll. Level-triggered: an assert and
+    /// release that both land before this task runs again are not seen, while
+    /// under `coupling-observe` the gate's change token counts every flip.
     pub async fn wait_asserted(&self) {
         while !self.is_asserted() {
             self.changed.wait().await;
@@ -93,6 +98,7 @@ impl<const N: usize> VetoGate<N> {
     }
 
     /// Park until every contributor has released the gate.
+    /// Single waiter and level-triggered, as [`wait_asserted`](Self::wait_asserted).
     pub async fn wait_released(&self) {
         while self.is_asserted() {
             self.changed.wait().await;
@@ -153,7 +159,7 @@ impl<const N: usize> Veto<N> {
 
     /// Is this writer's bit set?
     pub fn is_asserting(&self) -> bool {
-        self.gate.contributors() & (1 << self.slot) != 0
+        self.gate.contributors() & VetoGate::<N>::mask(self.slot) != 0
     }
 
     /// This writer's contributor slot.

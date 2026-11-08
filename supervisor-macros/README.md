@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/embassy-supervisor-macros.svg)](https://crates.io/crates/embassy-supervisor-macros)
 [![docs.rs](https://docs.rs/embassy-supervisor-macros/badge.svg)](https://docs.rs/embassy-supervisor-macros)
 
-Proc-macro crate for [`embassy-supervisor`]: the `supervisor_graph!` graph declaration macro plus `compose_graph!` for fragment assembly. Do not depend on this crate directly — use `embassy_supervisor` with its default `macros` feature, which re-exports the macro and forwards features here.
+Proc-macro crate for [`embassy-supervisor`](https://docs.rs/embassy-supervisor): the `supervisor_graph!` graph declaration, `supervisor_fragment!` for the graph fragments that `embassy_supervisor::compose_graph!` assembles, and the `#[dataflow]` / `#[dataflow_bundle]` attributes that derive coupling tables from fn bodies. Do not depend on this crate directly: use `embassy_supervisor` with its default `macros` feature, which re-exports the macros and forwards features here.
 
 **The macro's output references `embassy-supervisor` internals, so the supervisor pins this crate by exact version.** Use it only as a dependency of `embassy-supervisor`.
 

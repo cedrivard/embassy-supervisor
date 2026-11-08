@@ -8,7 +8,6 @@ pub use embassy_supervisor_macros::dataflow_bundle;
 
 pub use embassy_supervisor_observe::{Sink, Source};
 
-#[derive(Clone, Copy)]
 /// A typed handle to a signal declared in a `reads:`/`writes:` list.
 pub struct Sig<T: ?Sized + 'static> {
     /// The call site's entry: path text plus the type-erased identity.
@@ -16,6 +15,15 @@ pub struct Sig<T: ?Sized + 'static> {
     /// The signal, concretely typed.
     pub target: &'static T,
 }
+
+// By hand: a derive would require `T: Copy`, but both fields are references.
+impl<T: ?Sized + 'static> Clone for Sig<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: ?Sized + 'static> Copy for Sig<T> {}
 
 impl TaskNode {
     /// Write `v` into the signal `s`.
@@ -40,7 +48,9 @@ impl TaskNode {
         s.target
     }
 
-    /// [`writer`](Self::writer) that is also the node's sign of life — the
+    /// [`writer`](Self::writer) that is also the node's sign of life: it records a
+    /// [`beat`](Self::beat) before handing the target back, so the write that
+    /// proves progress needs no separate `beat()`.
     #[cfg(feature = "liveness")]
     pub fn beat_writer<T: Sync + ?Sized>(&self, s: Sig<T>) -> &'static T {
         self.beat();

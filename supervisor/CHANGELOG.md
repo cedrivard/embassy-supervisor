@@ -4,6 +4,57 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-11-07
+
+Node statics split between flash and `.bss`, a one-pass pool entry point, and fixes to
+gate waits, the driver loop and liveness reporting. Companion crate versions: macros
+0.12.0, syntax 0.6.0, tools 0.8.0, observe 0.1.2.
+
+### Added
+
+- `Supervisor::pool_pass` (`pool`): one pools pass that applies every pool's action to
+  completion and returns the earliest instant a pool asks to be re-evaluated at, for a
+  hand-written driver loop that adds wake sources. `run_pools` is built on it.
+
+### Fixed
+
+- `restart_budget:` windows are kept at full tick width, so they no longer wrap after
+  2^32 ticks (about 71.6 min at 1 MHz).
+- Bring-up gate waits (spawner slot, `resources:` gates, `ready` deps) watch the shared
+  gate event instead of each slot's single-waiter `Signal`, so an app task parked on that
+  `Signal` neither delays a start nor is woken by the supervisor.
+- Commands, bind cascades and pools run in one driver loop; after each bind cascade it
+  applies at most one queued command, so a provider whose readiness flaps cannot starve
+  control.
+- `embassy-supervisor-observe` 0.1.2 (now the minimum): a 64-bit or pointer-width
+  atomic folds its high half into the change token, so a write that changes only the
+  high bits still registers; a target without atomic compare-and-swap gets a
+  `compile_error!` naming portable-atomic's `critical-section` and
+  `unsafe-assume-single-core` features.
+
+### Changed
+
+- **Breaking:** `TaskNode` is two pointers: `TaskNode::new(cfg, handle)` takes a
+  `&'static TaskHandle`, and `TaskHandle::new()` is public and all zero, so a hand-built
+  node is three statics (the flash `NodeCfg`, the `.bss` `TaskHandle`, the flash
+  `TaskNode`). `NodeCfg::with_disabled_at_boot(bool)` carries the `disabled` boot state.
+  `GraphRef::new` no longer builds the supervisor's self node; `GraphRef::with_self_handle`
+  adds it under `trace-self`. The handles move from `.data` to `.bss` and the nodes to
+  flash.
+- **Breaking:** `poll_observed_writes` is crate-private and needs `liveness-monitor`;
+  the per-node write mark exists only with `liveness-monitor`.
+- **Breaking:** `with_beat_timeout` refuses a timeout at or past `u32::MAX / 2` ticks at
+  compile time instead of clamping it.
+- The `ready_on_write` readiness probe runs at its capped rate (at most 12.5 ms) only for
+  the activation's first `SLOT_READY_TIMEOUT`, then at an eighth of the node's beat
+  budget, so a node that never writes cannot hold every monitor sweep at 12.5 ms.
+- A health event that finds the mailbox full is sent again by a later sweep; a
+  re-injected `Hog` fault gets a fresh grace.
+- The restart window start is two `AtomicU32` halves: no critical section, and the
+  handle keeps 4-byte alignment.
+- `metadata-names` keeps one name literal per node: `name` points into the
+  NUL-terminated trace name.
+
 ## [0.12.0] - 2026-10-24
 
 Opt-in lifecycle observability and policy (events as a queue or a sink, breadcrumb,
@@ -16,7 +67,9 @@ macros 0.11.0, syntax 0.5.0, tools 0.6.0.
 - `lifecycle-events` feature: `wait_lifecycle()` / `try_wait_lifecycle()` deliver a
   `LifecycleEvent { node, kind }` for every transition a supervisor drives:
   `LifecycleKind::{Started, Resumed, StopRequested, Stopped, Exited, Faulted(FaultKind)}`
-  (`Stopped` = acked without the body returning, `Exited` = acked by returning). The
+  (`Stopped` = acked without the body returning, `Exited` = acked by returning, as seen
+  by a supervisor that cannot preempt the worker; a preempting supervisor can see a
+  returning body's ack before its exit record and post `Stopped`). The
   queue holds 8 and is lossy on purpose; `lifecycle_events_dropped()` counts the
   drops. A body that returns on its own, unasked, is not evented.
 - `lifecycle-sink` feature: `set_lifecycle_sink(LifecycleSink)` has the supervisor call
@@ -422,7 +475,7 @@ mutates.
   that is *already running* notice that a provider was restarted underneath it, which no
   `deps:` edge can do. Being per-node rather than per-edge, it also covers couplings the
   spawn DAG cannot express, including cyclic ones. Pure status: one `AtomicU32` and one
-  `Signal` per node, one relaxed load to poll.
+  `Signal` per node, one acquire load to poll.
 - **`liveness-monitor`** — the sweep the `liveness` primitives were missing. New
   `beat_timeout:` / `beat_window:` node clauses, `Supervisor::monitor()` (selected into
   `Supervisor::run` automatically), and `HealthEvent`s delivered through `wait_health()`
@@ -1250,7 +1303,8 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.12.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.13.0...HEAD
+[0.13.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.12.0...embassy-supervisor-v0.13.0
 [0.12.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.11.0...embassy-supervisor-v0.12.0
 [0.11.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.10.0...embassy-supervisor-v0.11.0
 [0.10.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.9.0...embassy-supervisor-v0.10.0

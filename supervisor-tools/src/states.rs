@@ -20,6 +20,8 @@ struct Shape {
     ready_on_write: bool,
     bound: bool,
     beat: Option<String>,
+    enabled_if: bool,
+    restarts: Option<String>,
 }
 
 #[derive(Default)]
@@ -208,10 +210,15 @@ pub(crate) fn legend(dir: &str) -> String {
 }
 
 fn member_range(members: &[usize]) -> String {
+    let contiguous = members.windows(2).all(|w| w[1] == w[0] + 1);
     match members {
-        [only] => format!("member {only}"),
-        [first, .., last] => format!("members {first}..{last}"),
         [] => "no members".to_string(),
+        [only] => format!("member {only}"),
+        [first, .., last] if contiguous => format!("members {first}..={last}"),
+        [rest @ .., last] => {
+            let rest: Vec<String> = rest.iter().map(usize::to_string).collect();
+            format!("members {} and {last}", rest.join(", "))
+        }
     }
 }
 
@@ -226,6 +233,11 @@ fn node_shape(n: &NodeItem, items: &[Item]) -> Shape {
         ready_on_write: n.ready_on_write.is_some(),
         bound: n.deps.iter().any(|d| d.bound.is_some()),
         beat: n.beat_timeout.as_ref().map(|bt| bt.value.to_string()),
+        enabled_if: n.enabled_if.is_some(),
+        restarts: n
+            .restart_budget
+            .as_ref()
+            .map(|b| format!("{}/{}ms", b.value.0, b.value.1)),
     }
 }
 
@@ -240,6 +252,8 @@ fn pool_shape(p: &PoolItem, items: &[Item], mode: &str) -> Shape {
         ready_on_write: false,
         bound: p.deps.iter().any(|d| d.bound.is_some()),
         beat: None,
+        enabled_if: false,
+        restarts: None,
     }
 }
 
@@ -299,9 +313,11 @@ fn composite(
     let running = format!("{g}_run");
     let down = format!("{g}_down");
 
-    if shape.disabled {
+    if shape.disabled || shape.enabled_if {
         let _ = writeln!(s, "    state \"disabled\" as {g}_off");
-        let _ = writeln!(s, "    [*] --> {g}_off");
+        if shape.disabled {
+            let _ = writeln!(s, "    [*] --> {g}_off");
+        }
         let _ = writeln!(
             s,
             "    {g}_off --> {down}: activate · the one path that clears the latch"
@@ -332,6 +348,12 @@ fn composite(
 
     if !shape.disabled {
         let _ = writeln!(s, "    [*] --> {down}");
+    }
+    if shape.enabled_if {
+        let _ = writeln!(
+            s,
+            "    {down} --> {g}_off: start · the enabled_if predicate returned false"
+        );
     }
 
     match shape.mode.rsplit("::").next().unwrap_or(&shape.mode) {
@@ -388,8 +410,8 @@ fn composite(
     }
 
     if shape.bound {
-        let is_pause = shape.mode.rsplit("::").next().unwrap_or(&shape.mode) == "Pause";
-        let stopped = if is_pause {
+        let mode = shape.mode.rsplit("::").next().unwrap_or(&shape.mode);
+        let stopped = if mode == "Pause" {
             format!("{g}_parked")
         } else {
             down.clone()
@@ -398,10 +420,15 @@ fn composite(
             s,
             "    {running} --> {stopped}: a bound dep called clear_ready()"
         );
-        let back = if is_pause {
-            "that dep is ready again · resumed in place"
-        } else {
-            "that dep is ready again · brought back through the gates"
+        let back = match (mode, shape.pool) {
+            ("Pause", _) => "that dep is ready again · resumed in place",
+            ("OnDemand", true) => {
+                "that dep is ready again · regrow-eligible, the pool policy restarts it"
+            }
+            ("OnDemand", false) => {
+                "that dep is ready again · eligible again, start_node brings it up"
+            }
+            _ => "that dep is ready again · brought back through the gates",
         };
         let _ = writeln!(s, "    {stopped} --> {running}: {back}");
     }
@@ -438,6 +465,9 @@ fn label(shape: &Shape, members: &[String]) -> String {
     if shape.disabled {
         facts.push("disabled".to_string());
     }
+    if shape.enabled_if {
+        facts.push("enabled_if".to_string());
+    }
     if shape.cancel {
         facts.push("cancel".to_string());
     }
@@ -451,6 +481,9 @@ fn label(shape: &Shape, members: &[String]) -> String {
     }
     if let Some(ms) = &shape.beat {
         facts.push(format!("beat {ms}"));
+    }
+    if let Some(budget) = &shape.restarts {
+        facts.push(format!("restarts {budget}"));
     }
     const SHOWN: usize = 4;
     let names = if members.len() > SHOWN {

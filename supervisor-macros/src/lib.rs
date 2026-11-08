@@ -5,10 +5,12 @@ use embassy_supervisor_syntax::{
     StateInit, TaskSource, VerbTable, item_executor, item_ident_cfg, item_resources, kw,
     name_string, node_param, normalize_fragment_crate, rewrite_verb_calls, substitute_dollar_crate,
 };
+use gate::{ENABLED, Features};
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use std::collections::{HashMap, HashSet};
+use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
@@ -23,6 +25,7 @@ struct HelperIdents {
     alloc_alias: Ident,
     nodes: Ident,
     graph_ref: Ident,
+    self_handle: Ident,
     fence: Ident,
 }
 
@@ -34,8 +37,9 @@ impl HelperIdents {
                 try_box: format_ident!("__sv_try_box"),
                 try_box_zeroed: format_ident!("__sv_try_box_zeroed"),
                 alloc_alias: format_ident!("__sv_alloc"),
-                nodes: format_ident!("NODES"),
-                graph_ref: format_ident!("GRAPH_REF"),
+                nodes: format_ident!("__SV_NODES"),
+                graph_ref: format_ident!("__SV_GRAPH_REF"),
+                self_handle: format_ident!("__SV_SELF_HANDLE"),
                 fence: format_ident!("__sv_fence"),
             },
             Some(n) => {
@@ -47,6 +51,7 @@ impl HelperIdents {
                     alloc_alias: format_ident!("__sv_alloc_{lower}"),
                     nodes: format_ident!("__SV_NODES_{}", n),
                     graph_ref: format_ident!("__SV_GRAPH_REF_{}", n),
+                    self_handle: format_ident!("__SV_SELF_HANDLE_{}", n),
                     fence: format_ident!("__sv_fence_{lower}"),
                 }
             }
@@ -121,7 +126,7 @@ fn cfg_aware_len<'a>(cfgs: impl Iterator<Item = &'a Vec<Attribute>> + Clone) -> 
 struct EmitCtx<'a> {
     cfg: &'a [Attribute],
     cr: &'a TokenStream2,
-    owner: &'a Ident,
+    tag: &'a str,
 }
 
 #[derive(Default)]
@@ -133,16 +138,16 @@ struct ObserveDefaults {
 fn marker_array_tokens(
     ctx: &EmitCtx<'_>,
     deps: &[Dep],
-    pool_names: &std::collections::HashSet<String>,
+    targets: &HashMap<String, DepTarget<'_>>,
     select: impl Fn(&Dep) -> bool,
     prefix: &str,
     builder: &str,
 ) -> (TokenStream2, TokenStream2) {
-    let EmitCtx { cfg, cr, owner } = ctx;
-    let Some((len, refs)) = marked_dep_tokens(deps, pool_names, select) else {
+    let EmitCtx { cfg, cr, tag } = ctx;
+    let Some((len, refs)) = marked_dep_tokens(deps, targets, select) else {
         return (quote!(), quote!());
     };
-    let table = format_ident!("__SV_{}_{}", prefix, owner);
+    let table = format_ident!("__SV_{}_{}", prefix, tag);
     let builder = format_ident!("{}", builder);
     (
         quote! {
@@ -171,12 +176,12 @@ fn coupling_binding_tokens(
     foreign: &[AdoptedFn],
     veto: VetoSlots<'_>,
 ) -> (TokenStream2, TokenStream2) {
-    let EmitCtx { cfg, cr, owner } = ctx;
+    let EmitCtx { cfg, cr, tag } = ctx;
     let mut defs = quote!();
     let mut defs_refs: Vec<TokenStream2> = Vec::new();
     let mut ref_cfgs: Vec<Vec<Attribute>> = Vec::new();
     if !decls.is_empty() {
-        let table = format_ident!("__SV_{}_{}", prefix, owner);
+        let table = format_ident!("__SV_{}_{}", prefix, tag);
         // Entries may be individually `#[cfg]`-gated, so the length is summed
         // the same way the dep overlays do it.
         let len = cfg_aware_len(decls.iter().map(|d| &d.cfg));
@@ -227,7 +232,7 @@ fn coupling_binding_tokens(
     // Adoptions may be individually cfg-gated (a feature-gated accessor is
     // ordinary), so the array length is summed cfg-aware like the dep overlays.
     let k = cfg_aware_len(ref_cfgs.iter());
-    let tbls = format_ident!("__SV_{}_TBLS_{}", prefix, owner);
+    let tbls = format_ident!("__SV_TBLS_{}_{}", prefix, tag);
     let builder = format_ident!("{}", builder);
     defs.extend(quote! {
         #(#cfg)*
@@ -253,7 +258,8 @@ fn marker_assert_tokens(
     for d in decls {
         let name = d.display();
         let entry_cfg = &d.cfg;
-        // Each term carries its adoption's `#[cfg]`, as statements in a
+        // Each term is a statement gated by its adoption's `#[cfg]`, so a
+        // compiled-out adoption adds nothing.
         let tables: Vec<TokenStream2> = foreign
             .iter()
             .map(|f| {
@@ -281,7 +287,7 @@ fn marker_assert_tokens(
             const _: () = {
                 let mut __sv_found = false;
                 #(#tables)*
-                assert!(__sv_found, #msg);
+                ::core::assert!(__sv_found, #msg);
             };
         });
     }
@@ -327,6 +333,8 @@ struct GatedBuilder {
     tokens: TokenStream2,
     available: bool,
     err: &'static str,
+    /// The clause keyword's span, which a deferred `compile_error!` reports at.
+    span: proc_macro2::Span,
 }
 
 fn builder_clause_tokens(
@@ -337,8 +345,10 @@ fn builder_clause_tokens(
     for c in clauses {
         let (clause_cfg, tokens) = (&c.cfg, &c.tokens);
         if !c.available && !clause_cfg.is_empty() {
-            let err = c.err;
-            errors.extend(quote!( #(#item_cfg)* #(#clause_cfg)* ::core::compile_error!(#err); ));
+            let err = syn::LitStr::new(c.err, c.span);
+            errors.extend(quote::quote_spanned!(c.span=>
+                #(#item_cfg)* #(#clause_cfg)* ::core::compile_error!(#err);
+            ));
         } else if clause_cfg.is_empty() {
             inline.extend(tokens.clone());
         } else {
@@ -351,11 +361,12 @@ fn builder_clause_tokens(
 fn discover_error_tokens(
     item_cfg: &[Attribute],
     discover: Option<&embassy_supervisor_syntax::Gated<kw::discover>>,
+    f: &Features,
 ) -> TokenStream2 {
     match discover {
-        Some(g) if !g.cfg.is_empty() && !cfg!(feature = "dataflow") => {
+        Some(g) if !g.cfg.is_empty() && !f.dataflow => {
             let c = &g.cfg;
-            quote!( #(#item_cfg)* #(#c)* ::core::compile_error!(
+            quote::quote_spanned!(g.kw.span=> #(#item_cfg)* #(#c)* ::core::compile_error!(
                 "`discover` requires the `dataflow` feature (embassy-supervisor \
                  feature `dataflow`) — it binds the coupling tables the task \
                  fn's `#[dataflow]` attribute derives"
@@ -365,11 +376,13 @@ fn discover_error_tokens(
     }
 }
 
+/// The `disabled` marker as a `.with_disabled_at_boot(..)` call on the node's
+/// config; nothing for a node that does not declare it.
 fn disabled_tokens(
     disabled: Option<&embassy_supervisor_syntax::Gated<kw::disabled>>,
 ) -> TokenStream2 {
-    match disabled {
-        None => quote!(false),
+    let value = match disabled {
+        None => return quote!(),
         Some(g) if g.cfg.is_empty() => quote!(true),
         Some(g) => {
             let pred = cfg_predicate(&g.cfg).expect("parse validated cfg attrs");
@@ -384,7 +397,40 @@ fn disabled_tokens(
                 }
             })
         }
-    }
+    };
+    quote!( .with_disabled_at_boot(#value) )
+}
+
+/// The `slot_timeout:`/`ack_timeout:` builder calls, in that order: nodes and
+/// pools both take them, and neither needs a feature.
+fn timeout_clauses(
+    slot: Option<&embassy_supervisor_syntax::Gated<kw::slot_timeout, LitInt>>,
+    ack: Option<&embassy_supervisor_syntax::Gated<kw::ack_timeout, LitInt>>,
+    cr: &TokenStream2,
+) -> [Option<GatedBuilder>; 2] {
+    let clause = |cfg: &[Attribute], builder: &str, ms: &LitInt, span| {
+        let builder = format_ident!("{builder}");
+        GatedBuilder {
+            cfg: cfg.to_vec(),
+            tokens: quote!( .#builder(#cr::_export::Duration::from_millis(#ms)) ),
+            available: true,
+            err: "",
+            span,
+        }
+    };
+    [
+        slot.map(|g| clause(&g.cfg, "with_slot_timeout", &g.value, g.kw.span)),
+        ack.map(|g| clause(&g.cfg, "with_ack_timeout", &g.value, g.kw.span)),
+    ]
+}
+
+/// `.with_trace_name("<name>\0")` under `metadata-names`: the NUL-terminated
+/// copy for the executor metadata (SystemView reads C strings).
+fn trace_name_tokens(f: &Features, name: &str) -> Option<TokenStream2> {
+    f.metadata_names.then(|| {
+        let nul = format!("{name}\0");
+        quote!( .with_trace_name(#nul) )
+    })
 }
 
 fn cfg_predicate(attrs: &[Attribute]) -> Option<TokenStream2> {
@@ -417,10 +463,10 @@ fn gate_tokens(resources: &[ResourceDecl]) -> (TokenStream2, Vec<TokenStream2>) 
 /// Graph-wide facts the per-item emitters consult: resource slots and the
 /// contributor slots of `veto` writes.
 struct ResourcePlan {
-    /// Per resource name: the first declaring entry's `#[cfg]`s, and whether
-    /// the name is a pool's per-member slot array (which `provides:` may not
-    /// name).
-    cfgs: HashMap<String, (Vec<Attribute>, bool)>,
+    /// Per resource name: the `#[cfg]` predicate its emitted static is present
+    /// under (`None` = unconditional), and whether the name is a pool's
+    /// per-member slot array (which `provides:` may not name).
+    slots: HashMap<String, (Option<TokenStream2>, bool)>,
     /// `(owner, resource)` -> the owner's base slot in that `divisible` budget.
     claim_bases: HashMap<(String, String), u8>,
     /// `(owner, signal display)` -> the owner's base contributor slot in that
@@ -494,8 +540,9 @@ fn claims_tokens(
 
 fn provides_tokens(
     n: &NodeItem,
+    tag: &str,
     cr: &TokenStream2,
-    resource_cfgs: &std::collections::HashMap<String, (Vec<Attribute>, bool)>,
+    slots: &HashMap<String, (Option<TokenStream2>, bool)>,
 ) -> SynResult<(TokenStream2, TokenStream2)> {
     if n.provides.is_empty() {
         return Ok((quote!(), quote!()));
@@ -506,7 +553,7 @@ fn provides_tokens(
         .iter()
         .map(|p| {
             let slot = &p.ident;
-            let Some((cfg, from_pool)) = resource_cfgs.get(&slot.to_string()) else {
+            let Some((presence, from_pool)) = slots.get(&slot.to_string()) else {
                 return Err(syn::Error::new_spanned(
                     slot,
                     format!(
@@ -528,14 +575,20 @@ fn provides_tokens(
                     ),
                 ));
             }
-            let entry_cfg = &p.cfg;
-            cfgs.push(cfg.iter().chain(entry_cfg.iter()).cloned().collect());
-            Ok(quote!(#(#cfg)* #(#entry_cfg)* &#slot))
+            // The entry exists where the slot static does and its own gate holds.
+            let mut cfg: Vec<Attribute> = presence
+                .iter()
+                .map(|pred| syn::parse_quote!(#[cfg(#pred)]))
+                .collect();
+            cfg.extend(p.cfg.iter().cloned());
+            let r = quote!(#(#cfg)* &#slot);
+            cfgs.push(cfg);
+            Ok(r)
         })
         .collect::<SynResult<Vec<_>>>()?;
     let len = cfg_aware_len(cfgs.iter());
     let node_cfg = &n.cfg;
-    let arr = format_ident!("__SV_PROVIDES_{}", n.ident);
+    let arr = format_ident!("__SV_PROVIDES_{}", tag);
     Ok((
         quote! {
             #(#node_cfg)*
@@ -554,32 +607,52 @@ fn fragment_suffix(fragment: &Option<String>) -> String {
     }
 }
 
+/// What a `deps:` name resolves to, for the marked-dep arrays.
+struct DepTarget<'a> {
+    /// The target item's `#[cfg]`s: an entry naming a compiled-out item drops
+    /// out of the array with it, so the array never names a missing static.
+    cfg: &'a [Attribute],
+    /// A pool stands in by its floor member (`&POOL[0]`).
+    pool: bool,
+}
+
 /// The `[&'static TaskNode; n]` element and length tokens for the deps
 /// carrying one marker, cfg-aware like `gate_tokens`. A dep naming a pool
 /// resolves to that pool's floor member (`&POOL[0]`), matching how `deps: [POOL]`
 /// resolves for spawn ordering.
 fn marked_dep_tokens(
     deps: &[Dep],
-    pool_names: &std::collections::HashSet<String>,
+    targets: &HashMap<String, DepTarget<'_>>,
     select: impl Fn(&Dep) -> bool,
 ) -> Option<(TokenStream2, Vec<TokenStream2>)> {
     let marked: Vec<&Dep> = deps.iter().filter(|d| select(d)).collect();
     if marked.is_empty() {
         return None;
     }
+    let mut cfgs: Vec<Vec<Attribute>> = Vec::with_capacity(marked.len());
     let refs: Vec<TokenStream2> = marked
         .iter()
         .map(|d| {
-            let cfg = &d.cfg;
             let ident = &d.ident;
-            if pool_names.contains(&ident.to_string()) {
-                quote!(#(#cfg)* &#ident[0])
+            let target = targets.get(&ident.to_string());
+            // Only the target's `#[cfg]`s: its other attributes (a doc comment,
+            // a lint level) belong to its own statics, not to an array element.
+            let target_cfg = target
+                .map_or(&[][..], |t| t.cfg)
+                .iter()
+                .filter(|a| a.path().is_ident("cfg"));
+            let cfg: Vec<Attribute> = d.cfg.iter().chain(target_cfg).cloned().collect();
+            let reference = if target.is_some_and(|t| t.pool) {
+                quote!(&#ident[0])
             } else {
-                quote!(#(#cfg)* &#ident)
-            }
+                quote!(&#ident)
+            };
+            let r = quote!(#(#cfg)* #reference);
+            cfgs.push(cfg);
+            r
         })
         .collect();
-    Some((cfg_aware_len(marked.iter().map(|d| &d.cfg)), refs))
+    Some((cfg_aware_len(cfgs.iter()), refs))
 }
 
 /// Extract the policy *type* from a `Type::new(..)` constructor expression. Only used
@@ -628,54 +701,42 @@ struct Slot {
 #[allow(clippy::too_many_arguments)]
 fn node_spawn(
     ident: &Ident,
+    // Private helpers are named after this tag (see `expand`).
+    tag: &str,
     spawn: &Option<Expr>,
     // `task:` node: its shell is resident, so the glue spawns it once and
     // restarts it in place after that (see `emit_shell`).
     resident: bool,
     executor: &Option<Ident>,
     resources: &[ResourceDecl],
-    // `state:`: fallibly box the init value in the glue, BEFORE the resource
-    // takes (a failed alloc strands nothing) — `SpawnError::Busy`, retryable.
+    // `state:`: fallibly box the init value in the glue, before the resource
+    // probes (a failed alloc strands nothing): `SpawnError::Busy`, retryable.
     state: Option<(&syn::Type, &StateInit)>,
     spawn_fn: &TokenStream2,
-    cr: &TokenStream2,
     helpers: &HelperIdents,
+    f: &Features,
 ) -> SynResult<TokenStream2> {
-    // `resources:` glue prelude: every entry is PROBED here — the fail-closed
-    // check that turns "unprovided" into `SpawnError::Busy` out of
-    // `Supervisor::start` — and read by the shell itself at the start of each
-    // activation (`take()` for lend/consume, the non-destructive `get()` for
-    // `shared`): a value moved through the task-fn call would be dropped,
-    // unrecoverable, when the claim fails, and even a `Copy` handle passed as
-    // an argument sits in the task arena for the whole run beside the worker's
-    // own copy (rust-lang/rust#62958). Nothing crosses the call.
-    let take_prelude: Vec<TokenStream2> = resources
-        .iter()
-        .map(|r| {
-            let cfg = &r.cfg;
-            let res = &r.ident;
-            quote! {
-                #(#cfg)*
-                if !#cr::ResourceGate::is_filled(&#res) {
-                    return ::core::result::Result::Err(::embassy_executor::SpawnError::Busy);
-                }
-            }
-        })
-        .collect();
+    // `resources:` glue prelude: every entry is PROBED here, through the
+    // node's gate table (the fail-closed check that turns "unprovided" into
+    // `SpawnError::Busy` out of `Supervisor::start`), and read by the shell
+    // itself at the start of each activation (`take()` for lend/consume, the
+    // non-destructive `get()` for `shared`): a value moved through the
+    // task-fn call would be dropped, unrecoverable, when the claim fails, and
+    // even a `Copy` handle passed as an argument sits in the task arena for
+    // the whole run beside the worker's own copy (rust-lang/rust#62958).
+    // Nothing crosses the call.
+    let take_prelude = gates_probe(resources, &quote!(&#ident));
+    // `state:` requires `task:`, whose shell is resident: the glue boxes the
+    // state and hands it over through the node's slot.
     let (state_prelude, state_arg, state_handoff) = match state {
-        Some((ty, init)) if resident => {
-            let slot = format_ident!("__SV_STATE_{}", ident);
+        Some((ty, init)) => {
+            let slot = format_ident!("__SV_STATE_{}", tag);
             (
                 state_box_stmt(ty, init, helpers),
                 vec![quote!(&#slot)],
                 quote!(#slot.provide(__state);),
             )
         }
-        Some((ty, init)) => (
-            state_box_stmt(ty, init, helpers),
-            vec![quote!(__state)],
-            quote!(),
-        ),
         None => (quote!(), vec![], quote!()),
     };
     // The body after the executor guard. A resident shell is spawned by the
@@ -688,7 +749,7 @@ fn node_spawn(
             quote! {
                 let __resident = #ident.__sv_resident()?;
                 #state_prelude
-                #(#take_prelude)*
+                #take_prelude
                 #state_handoff
                 if __resident {
                     #ident.__sv_start();
@@ -700,7 +761,7 @@ fn node_spawn(
         } else {
             quote! {
                 #state_prelude
-                #(#take_prelude)*
+                #take_prelude
                 #stmts
             }
         }
@@ -727,7 +788,7 @@ fn node_spawn(
             let call = inject_call_with(e, &lead)?;
             match executor {
                 None => {
-                    let body = launch(spawn_stmts(&call, &quote!(&#ident), &quote!(s)));
+                    let body = launch(spawn_stmts(&call, &quote!(&#ident), &quote!(s), f));
                     quote!(::core::option::Option::Some(
                         (|s| {
                             #body
@@ -736,10 +797,10 @@ fn node_spawn(
                     ))
                 }
                 Some(ex) => {
-                    let body = launch(spawn_stmts(&call, &quote!(&#ident), &quote!(__sp)));
+                    let body = launch(spawn_stmts(&call, &quote!(&#ident), &quote!(__sp), f));
                     quote!(::core::option::Option::Some(
                         (|_s| {
-                            // The supervisor awaits this slot's `ready()` before
+                            // The supervisor waits for this slot to fill before
                             // invoking the glue (the node carries `.with_executor(&EX)`
                             // and the bring-up bounds the wait), so `get()` is already
                             // filled; `ok_or` is the belt-and-braces unfilled guard.
@@ -766,6 +827,19 @@ fn node_spawn(
         // NOTE: with the `trace` feature such a node is not auto-mapped — the
         // closure owns the SpawnToken; call `adopt`/`set_task_id` in it yourself.
         (Some(e), None) => quote!(::core::option::Option::Some((#e) as #spawn_fn)),
+    })
+}
+
+/// The glue's resource probe: one out-of-line call over the node's gate
+/// table (`TaskNode::__sv_gates_filled`), which already carries each entry's
+/// `#[cfg]`. Nothing for an item without `resources:`.
+fn gates_probe(resources: &[ResourceDecl], node_ref: &TokenStream2) -> Option<TokenStream2> {
+    (!resources.is_empty()).then(|| {
+        quote! {
+            if !(#node_ref).__sv_gates_filled() {
+                return ::core::result::Result::Err(::embassy_executor::SpawnError::Busy);
+            }
+        }
     })
 }
 
@@ -800,21 +874,26 @@ fn state_box_stmt(ty: &syn::Type, init: &StateInit, helpers: &HelperIdents) -> T
 /// itself is infallible, so the token is available between the two).
 ///
 /// Three shapes, resolved at expansion by the macro crate's own features:
-/// * `trace` on → bind the token and `adopt` it (`set_task_id` + name stamp under
-///   `metadata-names`).
+/// * `trace` on → bind the token and `adopt` it (`set_task_id` + NUL-terminated
+///   name stamp under `metadata-names`).
 /// * `trace` off but `metadata-names` on → bind the token and `stamp_name` only:
 ///   the node name reaches the task Metadata (for rtos-trace/SystemView) with no id
 ///   capture and no dependency on the `_embassy_trace_*` hooks.
 /// * neither → plain infallible spawn.
-fn spawn_stmts(call: &TokenStream2, node_ref: &TokenStream2, sp: &TokenStream2) -> TokenStream2 {
-    if cfg!(feature = "trace") {
+fn spawn_stmts(
+    call: &TokenStream2,
+    node_ref: &TokenStream2,
+    sp: &TokenStream2,
+    f: &Features,
+) -> TokenStream2 {
+    if f.trace {
         // `adopt` = set_task_id + (under metadata-names) Metadata name stamp.
         quote! {
             let __token = #call?;
             (#node_ref).adopt(&__token);
             #sp.spawn(__token);
         }
-    } else if cfg!(feature = "metadata-names") {
+    } else if f.metadata_names {
         // Name-only path: stamp the node name into the task Metadata, nothing else.
         quote! {
             let __token = #call?;
@@ -826,14 +905,26 @@ fn spawn_stmts(call: &TokenStream2, node_ref: &TokenStream2, sp: &TokenStream2) 
     }
 }
 
+/// The slot a shell takes resource entry `i` from and restores it to: a pool
+/// member's own element rides in as the `__r{i}_slot` parameter, a node names
+/// its slot static.
+fn take_slot(pool_member: bool, i: usize, res: &Ident) -> TokenStream2 {
+    if pool_member {
+        let slot_param = format_ident!("__r{}_slot", i);
+        quote!(#slot_param)
+    } else {
+        quote!(#res)
+    }
+}
+
 /// Emit the `#[embassy_executor::task]` shell for a `task:` clause: a concrete,
 /// non-generic task fn that takes only the node and awaits the user's worker with
-/// the node injected first. This is how a **generic** worker becomes spawnable —
+/// the node injected first. This is how a **generic** worker becomes spawnable:
 /// embassy forbids generic tasks (one static `TaskPool` per concrete future type),
 /// so a monomorphized shell is stamped per declaration. Worker args are evaluated
-/// inside the shell — at the task's first poll, on the node's own executor — so
-/// the DSL never needs the arg types and a cross-core node builds its resources on
-/// the core that runs them.
+/// inside the shell, at the start of each activation, on the node's own executor,
+/// so the DSL never needs the arg types and a cross-core node builds its resources
+/// on the core that runs them.
 ///
 /// Returns the shell item and a path `Expr` naming it, which feeds the ordinary
 /// `spawn:` path-form glue (executor routing and trace `adopt` compose unchanged).
@@ -842,6 +933,8 @@ fn spawn_stmts(call: &TokenStream2, node_ref: &TokenStream2, sp: &TokenStream2) 
 #[allow(clippy::too_many_arguments)]
 fn emit_shell(
     owner: &Ident,
+    // Private helpers are named after this tag (see `expand`).
+    tag: &str,
     cfg: &[Attribute],
     worker: &Expr,
     pool_size: usize,
@@ -864,6 +957,7 @@ fn emit_shell(
     cancel: bool,
     cr: &TokenStream2,
     helpers: &HelperIdents,
+    f: &Features,
 ) -> SynResult<(TokenStream2, Expr)> {
     if !matches!(worker, Expr::Path(_) | Expr::Call(_)) {
         return Err(syn::Error::new_spanned(
@@ -872,27 +966,27 @@ fn emit_shell(
              `worker(args)`; for a closure or a ready spawn fn use `spawn:`",
         ));
     }
-    let shell = format_ident!("__sv_task_{}", owner.to_string().to_lowercase());
-    // `resources:` handling: every entry is read BY THE SHELL at first poll —
-    // `take()` for lend/consume, the non-destructive `get()` for `shared` —
-    // never through the task-fn call, where a `Busy` storage claim would drop
-    // an owned value unrecoverably and where even a `Copy` handle argument
-    // would sit in the task arena for the whole run beside the worker's own
-    // copy (rust-lang/rust#62958). The glue probed the slot, so a read that
-    // still comes up empty means an out-of-band `take()` won the race: the
-    // shell exits immediately (`mark_lost_resource` — a warn plus the
-    // completion record), reading as a failed activation rather than a panic.
+    let shell = format_ident!("__sv_task_{}", tag.to_lowercase());
+    // `resources:` handling: the shell reads every entry at the start of each
+    // activation (`take()` for lend/consume, the non-destructive `get()` for
+    // `shared`), never through the task-fn call, where a `Busy` storage claim
+    // would drop an owned value and even a `Copy` handle argument would sit in
+    // the task arena beside the worker's own copy (rust-lang/rust#62958). The
+    // glue probed every slot, so a read that comes up empty means an
+    // out-of-band `take()` won the race: the shell restores the entries it
+    // already took and exits (`mark_lost_resource`: a warn plus the completion
+    // record), a failed activation rather than a panic.
     //
     // Lend entries are lent to the worker as `&mut` and restored to their slot
-    // after the worker returns — i.e. after its clean shutdown ack — so a
-    // Terminate respawn re-takes the SAME instance instead of re-acquiring
-    // hardware. A `Pause` worker parks instead of returning and simply retains
-    // them. `consume` and `shared` forward by value with no restore: a consumed
-    // slot stays empty until the app re-`provide()`s (fail-closed respawn), a
-    // shared slot was never emptied. A `divisible` entry forwards the member's
-    // `Claimant` by value; its share is released by the supervisor, not here.
+    // after the worker returns (after its clean shutdown ack), so a Terminate
+    // respawn re-takes the same instance instead of re-acquiring hardware; a
+    // `Pause` worker parks instead and retains them. `consume` and `shared`
+    // forward by value with no restore: a consumed slot stays empty until the
+    // app re-`provide()`s (fail-closed respawn), a shared slot was never
+    // emptied. A `divisible` entry forwards the member's `Claimant` by value;
+    // the supervisor releases its share.
     //
-    // Per-entry `#[cfg]` rides on params, reads, worker-call arguments, and
+    // Per-entry `#[cfg]` rides on params, reads, worker-call arguments and
     // restore statements alike, so a cfg'd-out entry disappears from the whole
     // chain (the worker fn must gate its matching parameter the same way).
     let typed = |r: &ResourceDecl| r.ty.clone().expect("a typed resource kind");
@@ -907,7 +1001,7 @@ fn emit_shell(
                 // (`shared` slots are pool-wide statics, nameable directly.)
                 ResourceKind::Lend | ResourceKind::Consume if pool_member => {
                     let ty = typed(r);
-                    let slot_param = format_ident!("__r{}_slot", i);
+                    let slot_param = take_slot(pool_member, i, &r.ident);
                     Some(quote!(#(#cfg)* #slot_param: &'static #cr::ResourceSlot<#ty>))
                 }
                 // Likewise the member's slot in a budget: the wrapper builds
@@ -920,6 +1014,25 @@ fn emit_shell(
             }
         })
         .collect();
+    // The statement that puts entry `i` back in its slot. Only the take kinds
+    // move a value out of a slot.
+    let restore = |i: usize, r: &ResourceDecl| -> Option<TokenStream2> {
+        if !matches!(r.kind(), ResourceKind::Lend | ResourceKind::Consume) {
+            return None;
+        }
+        let cfg = &r.cfg;
+        let var = format_ident!("__r{}", i);
+        let slot = take_slot(pool_member, i, &r.ident);
+        Some(quote!(#(#cfg)* #slot.restore(#var);))
+    };
+    // A lost read reclaims the `state:` box too, after the restores and before
+    // the exit record, so has_exited() implies the heap is back on this path
+    // as well.
+    let lost_reclaim = if state.is_some() {
+        quote!(::core::mem::drop(__state);)
+    } else {
+        quote!()
+    };
     let res_takes: Vec<TokenStream2> = resources
         .iter()
         .enumerate()
@@ -927,13 +1040,26 @@ fn emit_shell(
             let cfg = &r.cfg;
             let var = format_ident!("__r{}", i);
             let res = &r.ident;
+            // A read that comes up empty hands back what this activation took
+            // so far, before the exit record, so a respawn finds those filled;
+            // in reverse order, so each lost arm is a suffix of the next and
+            // the compiler can merge them.
+            let undo: Vec<TokenStream2> = resources[..i]
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(|(j, r)| restore(j, r))
+                .collect();
+            let lost = quote! {
+                #(#undo)*
+                #lost_reclaim
+                __node.mark_lost_resource();
+                break '__sv_act;
+            };
             match r.kind() {
                 ResourceKind::Shared => Some(quote! {
                     #(#cfg)*
-                    let ::core::option::Option::Some(#var) = #res.get() else {
-                        __node.mark_lost_resource();
-                        break '__sv_act;
-                    };
+                    let ::core::option::Option::Some(#var) = #res.get() else { #lost };
                 }),
                 ResourceKind::Divisible if pool_member => None,
                 ResourceKind::Divisible => {
@@ -946,17 +1072,11 @@ fn emit_shell(
                     } else {
                         quote!(mut)
                     };
-                    let slot = if pool_member {
-                        let slot_param = format_ident!("__r{}_slot", i);
-                        quote!(#slot_param)
-                    } else {
-                        quote!(#res)
-                    };
+                    let slot = take_slot(pool_member, i, res);
                     Some(quote! {
                         #(#cfg)*
                         let ::core::option::Option::Some(#mutability #var) = #slot.take() else {
-                            __node.mark_lost_resource();
-                            break '__sv_act;
+                            #lost
                         };
                     })
                 }
@@ -980,17 +1100,7 @@ fn emit_shell(
         .iter()
         .enumerate()
         .filter(|(_, r)| r.kind() == ResourceKind::Lend)
-        .map(|(i, r)| {
-            let cfg = &r.cfg;
-            let var = format_ident!("__r{}", i);
-            if pool_member {
-                let slot_param = format_ident!("__r{}_slot", i);
-                quote!(#(#cfg)* #slot_param.restore(#var);)
-            } else {
-                let res = &r.ident;
-                quote!(#(#cfg)* #res.restore(#var);)
-            }
-        })
+        .filter_map(|(i, r)| restore(i, r))
         .collect();
     let alloc_alias = &helpers.alloc_alias;
     // `state:` crosses from the spawn glue (which boxes it, fallibly, per
@@ -998,7 +1108,7 @@ fn emit_shell(
     // own static, or member `I`'s element of the pool's array, passed in by
     // the wrapper. A `ResourceSlot` is `Sync` only for `Send` contents, so the
     // state type must be `Send`.
-    let state_slot = format_ident!("__SV_STATE_{}", owner);
+    let state_slot = format_ident!("__SV_STATE_{}", tag);
     let (state_param, state_def, state_take, state_lease, state_drop) = match state {
         Some((ty, _)) => {
             let def = if pool_member {
@@ -1098,7 +1208,7 @@ fn emit_shell(
     // With `fault-inject` the pinned worker is wrapped in `Injected`: stall,
     // hog and crash apply transparently. The wrapper still resolves to an
     // `Option`, so diverging-`exit:` remains a lint error as usual.
-    let (drive, provide_exit) = if cfg!(feature = "fault-inject") {
+    let (drive, provide_exit) = if f.fault_inject {
         match (cancel, exit) {
             (false, Some(ty)) => {
                 let provide = provide(ty);
@@ -1212,28 +1322,35 @@ fn emit_shell(
 /// Emit a `node`: its `pub static #ident: TaskNode` definition and its `Slot`. The
 /// caller assigns the slot index and records the name, so this touches neither.
 /// A `task:` node additionally emits its generated shell ahead of the static.
+// One argument per independent codegen input; a bundling struct would only
+// rename the coupling.
+#[allow(clippy::too_many_arguments)]
 fn emit_node(
     n: &NodeItem,
+    // Private helpers are named after this tag (see `expand`).
+    tag: &str,
     cr: &TokenStream2,
     spawn_fn: &TokenStream2,
-    // Threaded to ready_tokens: a ready dep naming a pool refs its floor member.
-    pool_names: &std::collections::HashSet<String>,
+    // What each `deps:` name resolves to, for the marked-dep arrays.
+    targets: &HashMap<String, DepTarget<'_>>,
     helpers: &HelperIdents,
     observe: &ObserveDefaults,
     // Graph-wide resource facts: `provides:` name resolution and this node's
     // slot in each `divisible` budget.
     plan: &ResourcePlan,
+    f: &Features,
 ) -> SynResult<(TokenStream2, Slot)> {
     let ident = &n.ident;
     let claims = plan.claims(&n.ident, &n.resources);
     let cfg = &n.cfg;
     let mode = &n.mode;
     let name = name_string(&n.ident);
-    let disabled = disabled_tokens(n.disabled.as_ref());
+    let with_disabled = disabled_tokens(n.disabled.as_ref());
     let (shell_def, spawn_expr) = match &n.source {
         Some(TaskSource::Shell(worker)) => {
             let (def, path) = emit_shell(
                 ident,
+                tag,
                 cfg,
                 worker,
                 1,
@@ -1245,6 +1362,7 @@ fn emit_node(
                 n.cancel,
                 cr,
                 helpers,
+                f,
             )?;
             (def, Some(path))
         }
@@ -1253,14 +1371,15 @@ fn emit_node(
     };
     let spawn = node_spawn(
         ident,
+        tag,
         &spawn_expr,
         matches!(n.source, Some(TaskSource::Shell(_))),
         &n.executor,
         &n.resources,
         n.state.as_ref().map(|(_, ty, init)| (ty, init)),
         spawn_fn,
-        cr,
         helpers,
+        f,
     )?;
     // `executor: NAME` routes the node through that SpawnerSlot; the supervisor
     // awaits the slot before spawning (see `TaskNode::with_executor`).
@@ -1270,7 +1389,7 @@ fn emit_node(
     };
     // With `fault-inject`, shelled `task:` nodes can be stalled, crashed or hogged.
     // Hand-written `spawn:` tasks only support wedge.
-    if cfg!(feature = "fault-inject") && matches!(n.source, Some(TaskSource::Shell(_))) {
+    if f.fault_inject && matches!(n.source, Some(TaskSource::Shell(_))) {
         with_exec.extend(quote!( .with_shell() ));
     }
     // `resources: [NAME: Type, ..]` — one `pub static NAME: ResourceSlot<Type>`
@@ -1282,7 +1401,7 @@ fn emit_node(
     let (res_defs, with_res) = if n.resources.is_empty() {
         (quote!(), quote!())
     } else {
-        let gates_ident = format_ident!("__SV_GATES_{}", ident);
+        let gates_ident = format_ident!("__SV_GATES_{}", tag);
         // `shared` slots and `divisible` budgets are emitted once per graph in
         // `expand` (several items may declare the same one); only this node's
         // exclusive (take-kind) slots are emitted here.
@@ -1338,111 +1457,84 @@ fn emit_node(
     };
     let (with_clauses, clause_stmts, clause_errors) = builder_clause_tokens(
         cfg,
-        [
-            n.slot_timeout.as_ref().map(|g| {
-                let (c, ms) = (&g.cfg, &g.value);
-                GatedBuilder {
-                    cfg: c.clone(),
-                    tokens: quote!( .with_slot_timeout(#cr::_export::Duration::from_millis(#ms)) ),
-                    available: true,
-                    err: "",
-                }
-            }),
-            n.ack_timeout.as_ref().map(|g| {
-                let (c, ms) = (&g.cfg, &g.value);
-                GatedBuilder {
-                    cfg: c.clone(),
-                    tokens: quote!( .with_ack_timeout(#cr::_export::Duration::from_millis(#ms)) ),
-                    available: true,
-                    err: "",
-                }
-            }),
-            n.beat_timeout.as_ref().map(|g| {
-                let (c, ms) = (&g.cfg, &g.value);
-                GatedBuilder {
-                    cfg: c.clone(),
-                    tokens: quote!( .with_beat_timeout(#cr::_export::Duration::from_millis(#ms)) ),
-                    available: cfg!(feature = "liveness-monitor"),
-                    err: "`beat_timeout:` requires the `liveness-monitor` feature \
-                          (embassy-supervisor feature `liveness-monitor`) — the \
-                          supervisor then reports this node once it has been running \
-                          that long without a beat()",
-                }
-            }),
-            // `beat_window:` alone is rejected as a shape error.
-            n.beat_window.as_ref().map(|g| {
-                let (c, w) = (&g.cfg, &g.value);
-                GatedBuilder {
-                    cfg: c.clone(),
-                    tokens: quote!( .with_beat_window(#w) ),
-                    available: cfg!(feature = "liveness-monitor"),
-                    err: "`beat_window:` requires the `liveness-monitor` feature \
-                          (embassy-supervisor feature `liveness-monitor`) — it sets \
-                          how many consecutive stale sweeps are reported on",
-                }
-            }),
-            n.enabled_if.as_ref().map(|g| {
-                let (c, f) = (&g.cfg, &g.value);
-                GatedBuilder {
-                    cfg: c.clone(),
-                    tokens: quote!( .with_enabled_if(#f) ),
-                    available: cfg!(feature = "enabled-if"),
-                    err: "`enabled_if:` requires the `enabled-if` feature \
-                          (embassy-supervisor feature `enabled-if`) — start() then \
-                          evaluates the predicate and disables the node when it \
-                          returns false",
-                }
-            }),
-            n.restart_budget.as_ref().map(|g| {
-                let (c, (max, window)) = (&g.cfg, &g.value);
-                let max = LitInt::new(&format!("{}u16", max.base10_digits()), max.span());
-                GatedBuilder {
-                    cfg: c.clone(),
-                    tokens: quote!(
-                        .with_restart_budget(#max, #cr::_export::Duration::from_millis(#window))
-                    ),
-                    available: cfg!(feature = "restart-intensity"),
-                    err: "`restart_budget:` requires the `restart-intensity` feature \
-                          (embassy-supervisor feature `restart-intensity`) — \
-                          Supervisor::restart then refuses the N+1th restart inside \
-                          the window with FaultKind::RestartStorm",
-                }
-            }),
-            n.ready_on_write.as_ref().map(|g| GatedBuilder {
-                cfg: g.cfg.clone(),
-                tokens: quote!( .with_ready_on_write() ),
-                available: cfg!(all(feature = "coupling-observe", feature = "readiness")),
-                err: "`ready_on_write` requires the `coupling-observe` and \
-                      `readiness` features (embassy-supervisor features of the \
-                      same names) — readiness is asserted by the monitor sweep \
-                      seeing an `observed beat` write advance",
-            }),
-        ]
-        .into_iter()
-        .flatten(),
+        timeout_clauses(n.slot_timeout.as_ref(), n.ack_timeout.as_ref(), cr)
+            .into_iter()
+            .chain([
+                n.beat_timeout.as_ref().map(|g| {
+                    let (c, ms) = (&g.cfg, &g.value);
+                    GatedBuilder {
+                        cfg: c.clone(),
+                        tokens: quote!( .with_beat_timeout(#cr::_export::Duration::from_millis(#ms)) ),
+                        available: f.liveness_monitor,
+                        err: gate::BEAT_TIMEOUT_NEEDS,
+                        span: g.kw.span,
+                    }
+                }),
+                // `beat_window:` alone is rejected as a shape error.
+                n.beat_window.as_ref().map(|g| {
+                    let (c, w) = (&g.cfg, &g.value);
+                    GatedBuilder {
+                        cfg: c.clone(),
+                        tokens: quote!( .with_beat_window(#w) ),
+                        available: f.liveness_monitor,
+                        err: gate::BEAT_WINDOW_NEEDS,
+                        span: g.kw.span,
+                    }
+                }),
+                n.enabled_if.as_ref().map(|g| {
+                    let (c, pred) = (&g.cfg, &g.value);
+                    GatedBuilder {
+                        cfg: c.clone(),
+                        tokens: quote!( .with_enabled_if(#pred) ),
+                        available: f.enabled_if,
+                        err: gate::ENABLED_IF_NEEDS,
+                        span: g.kw.span,
+                    }
+                }),
+                n.restart_budget.as_ref().map(|g| {
+                    let (c, (max, window)) = (&g.cfg, &g.value);
+                    let max = LitInt::new(&format!("{}u16", max.base10_digits()), max.span());
+                    GatedBuilder {
+                        cfg: c.clone(),
+                        tokens: quote!(
+                            .with_restart_budget(#max, #cr::_export::Duration::from_millis(#window))
+                        ),
+                        available: f.restart_intensity,
+                        err: gate::RESTART_BUDGET_NEEDS,
+                        span: g.kw.span,
+                    }
+                }),
+                n.ready_on_write.as_ref().map(|g| GatedBuilder {
+                    cfg: g.cfg.clone(),
+                    tokens: quote!( .with_ready_on_write() ),
+                    available: f.coupling_observe && f.readiness,
+                    err: "`ready_on_write` requires the `coupling-observe` and \
+                          `readiness` features (embassy-supervisor features of the \
+                          same names) — readiness is asserted by the monitor sweep \
+                          seeing an `observed beat` write advance",
+                    span: g.kw.span(),
+                }),
+            ])
+            .flatten(),
     );
     // The node's view of its own graph: what a data-driven dependency resolves
     // its producer through. Const, and a cycle only in the address sense — the
     // graph names the nodes, each node names the graph.
     let graph_ref = &helpers.graph_ref;
-    let with_graph = cfg!(feature = "data-deps").then(|| quote!( .with_graph(&#graph_ref) ));
-    // `deps: [X ready, ..]` — the ready-marked subset becomes a per-node
-    // `[&'static TaskNode; n]` array wired via `.with_ready_deps`: bring-up
-    // awaits each one's set_ready() (bounded by slot_timeout) after the
-    let ctx = EmitCtx {
-        cfg,
-        cr,
-        owner: ident,
-    };
+    let with_graph = f.data_deps.then(|| quote!( .with_graph(&#graph_ref) ));
+    // `deps: [X ready, ..]` / `[X ready bound]`: the marked subsets become
+    // `[&'static TaskNode; n]` arrays wired via `.with_ready_deps` /
+    // `.with_bound_deps`; each entry carries its own and its target's `#[cfg]`s.
+    let ctx = EmitCtx { cfg, cr, tag };
     let marker = |select: fn(&Dep) -> bool, prefix, builder| {
-        marker_array_tokens(&ctx, &n.deps, pool_names, select, prefix, builder)
+        marker_array_tokens(&ctx, &n.deps, targets, select, prefix, builder)
     };
     let (ready_def, with_ready) = marker(|d| d.ready.is_some(), "READY", "with_ready_deps");
     let (bound_def, with_bound) = marker(|d| d.bound.is_some(), "BOUND", "with_bound_deps");
     let mut foreign: Vec<AdoptedFn> = Vec::new();
     foreign.extend(
         discover_fn_path(n.discover.as_ref().map(|g| &g.kw), n.source.as_ref())?
-            .filter(|_| cfg!(feature = "dataflow"))
+            .filter(|_| f.dataflow)
             .map(|path| AdoptedFn {
                 cfg: n
                     .discover
@@ -1505,21 +1597,23 @@ fn emit_node(
          `resume_node`, `activate`/`deactivate`); the worker gets the same \
          `&'static TaskNode` for the task-side protocol."
     );
-    let cfg_ident = format_ident!("__SV_CFG_{}", ident);
-    let (prov_def, with_provides) = provides_tokens(n, cr, &plan.cfgs)?;
+    let cfg_ident = format_ident!("__SV_CFG_{}", tag);
+    let handle_ident = format_ident!("__SV_HANDLE_{}", tag);
+    let (prov_def, with_provides) = provides_tokens(n, tag, cr, &plan.slots)?;
     let (claims_def, with_claims) = claims_tokens(
-        &format_ident!("__SV_CLAIMS_{}", ident),
+        &format_ident!("__SV_CLAIMS_{}", tag),
         cfg,
         &n.resources,
         &claims,
         0,
         cr,
     );
+    let with_trace_name = trace_name_tokens(f, &name);
     let cfg_chain = quote! {
         #cr::NodeCfg::new(#name, #cr::Mode::#mode, #spawn)
-            #with_exec #with_res #with_provides #with_claims #with_clauses #with_ready
-            #with_bound #with_reads #with_writes
-            #with_graph
+            #with_exec #with_res #with_provides #with_claims #with_clauses #with_disabled
+            #with_ready #with_bound #with_reads #with_writes
+            #with_graph #with_trace_name
     };
     let cfg_init = if clause_stmts.is_empty() {
         cfg_chain
@@ -1530,7 +1624,7 @@ fn emit_node(
             __sv_cfg
         }}
     };
-    let discover_errors = discover_error_tokens(cfg, n.discover.as_ref());
+    let discover_errors = discover_error_tokens(cfg, n.discover.as_ref(), f);
     let def = quote! {
         #clause_errors
         #discover_errors
@@ -1548,8 +1642,11 @@ fn emit_node(
         #[doc(hidden)]
         static #cfg_ident: #cr::NodeCfg = #cfg_init;
         #(#cfg)*
+        #[doc(hidden)]
+        static #handle_ident: #cr::TaskHandle = #cr::TaskHandle::new();
+        #(#cfg)*
         #[doc = #node_doc]
-        pub static #ident: #cr::TaskNode = #cr::TaskNode::new(&#cfg_ident, #disabled);
+        pub static #ident: #cr::TaskNode = #cr::TaskNode::new(&#cfg_ident, &#handle_ident);
     };
     let slot = Slot {
         cfg_pred: cfg_predicate(cfg),
@@ -1560,16 +1657,23 @@ fn emit_node(
     Ok((def, slot))
 }
 
+// One argument per independent codegen input; a bundling struct would only
+// rename the coupling.
+#[allow(clippy::too_many_arguments)]
 fn emit_pool(
     p: &PoolItem,
+    // Private helpers are named after this tag (see `expand`).
+    tag: &str,
     cr: &TokenStream2,
     spawn_fn: &TokenStream2,
-    pool_names: &std::collections::HashSet<String>,
+    // What each `deps:` name resolves to, for the marked-dep arrays.
+    targets: &HashMap<String, DepTarget<'_>>,
     helpers: &HelperIdents,
     observe: &ObserveDefaults,
     // Graph-wide resource facts: the pool's base slot in each `divisible`
     // budget (member `j` holds base + j).
     plan: &ResourcePlan,
+    f: &Features,
 ) -> SynResult<(Vec<TokenStream2>, TokenStream2, Vec<Slot>)> {
     let ident = &p.ident;
     let claims = plan.claims(&p.ident, &p.resources);
@@ -1624,6 +1728,7 @@ fn emit_pool(
         TaskSource::Spawn(e) => (quote!(), e.clone()),
         TaskSource::Shell(worker) => emit_shell(
             ident,
+            tag,
             cfg,
             worker,
             k,
@@ -1635,6 +1740,7 @@ fn emit_pool(
             p.cancel,
             cr,
             helpers,
+            f,
         )?,
     };
     let res_args: Vec<TokenStream2> = p
@@ -1645,29 +1751,29 @@ fn emit_pool(
             let ecfg = &r.cfg;
             let res = &r.ident;
             match r.kind() {
-                ResourceKind::Lend | ResourceKind::Consume => Some(quote!(#(#ecfg)* &#res[I])),
+                ResourceKind::Lend | ResourceKind::Consume => Some(quote!(#(#ecfg)* &#res[i])),
                 ResourceKind::Divisible => {
                     let base = base.expect("a divisible entry has a slot");
-                    Some(quote!(#(#ecfg)* #res.claimant((#base as usize + I) as u8)))
+                    Some(quote!(#(#ecfg)* #res.claimant((#base as usize + i) as u8)))
                 }
                 ResourceKind::Shared => None,
             }
         })
         .collect();
     // A `task:` pool's shell is resident per member (see `emit_shell`): member
-    // `I` spawns its shell instance once and restarts it after that, its
-    // `state:` box crossing through element `I` of the handoff array.
+    // `i` spawns its shell instance once and restarts it after that, its
+    // `state:` box crossing through element `i` of the handoff array.
     let resident = matches!(p.source, TaskSource::Shell(_));
-    let state_slot = format_ident!("__SV_STATE_{}", ident);
+    let state_slot = format_ident!("__SV_STATE_{}", tag);
     let (state_prelude, state_arg, state_handoff) = match &p.state {
         Some((_, ty, init)) => (
             state_box_stmt(ty, init, helpers),
-            vec![quote!(&#state_slot[I])],
-            quote!(#state_slot[I].provide(__state);),
+            vec![quote!(&#state_slot[i])],
+            quote!(#state_slot[i].provide(__state);),
         ),
         None => (quote!(), vec![], quote!()),
     };
-    let mut lead: Vec<TokenStream2> = vec![quote!(&#ident[I])];
+    let mut lead: Vec<TokenStream2> = vec![quote!(&#ident[i])];
     lead.extend(res_args);
     lead.extend(state_arg);
     let call = inject_call_with(&member_expr, &lead)?;
@@ -1683,56 +1789,54 @@ fn emit_pool(
             quote!(__sp),
         ),
     };
-    let get_prelude: Vec<TokenStream2> = p
-        .resources
-        .iter()
-        .map(|r| {
-            let ecfg = &r.cfg;
-            let res = &r.ident;
-            let slot = match r.kind() {
-                ResourceKind::Lend | ResourceKind::Consume => quote!(#res[I]),
-                ResourceKind::Shared | ResourceKind::Divisible => quote!(#res),
-            };
-            quote! {
-                #(#ecfg)*
-                if !#cr::ResourceGate::is_filled(&#slot) {
-                    return ::core::result::Result::Err(::embassy_executor::SpawnError::Busy);
-                }
-            }
-        })
-        .collect();
-    let pool_spawn_stmts = spawn_stmts(&call, &quote!(&#ident[I]), &sp_tokens);
+    // Member `i`'s gate table (`__SV_GATES_<tag>_<i>`) lists its own element
+    // of each take-kind array and the pool-wide `shared`/`divisible` statics.
+    let get_prelude = gates_probe(&p.resources, &quote!(&#ident[i]));
+    let pool_spawn_stmts = spawn_stmts(&call, &quote!(&#ident[i]), &sp_tokens, f);
     let body = if resident {
         quote! {
-            let __resident = #ident[I].__sv_resident()?;
+            let __resident = #ident[i].__sv_resident()?;
             #state_prelude
-            #(#get_prelude)*
+            #get_prelude
             #state_handoff
             if __resident {
-                #ident[I].__sv_start();
+                #ident[i].__sv_start();
             } else {
                 #pool_spawn_stmts
-                #ident[I].__sv_mark_resident();
+                #ident[i].__sv_mark_resident();
             }
         }
     } else {
         quote! {
             #state_prelude
-            #(#get_prelude)*
+            #get_prelude
             #pool_spawn_stmts
         }
     };
-    let wrapper = format_ident!("spawn_{}", ident.to_string().to_lowercase());
+    // One spawn body per pool, indexed by the member at run time. Each
+    // member's `NodeCfg.spawn` is a bare `fn(Spawner)`, so every member keeps
+    // its own fn item: a trampoline that passes its index in and inlines to a
+    // tail call.
+    let wrapper = format_ident!("__sv_spawn_{}", tag.to_lowercase());
+    let wrapper_at = format_ident!("__sv_spawn_{}_at", tag.to_lowercase());
     let mut defs: Vec<TokenStream2> = Vec::new();
     defs.push(shell_def);
     defs.push(quote! {
         #(#cfg)*
-        fn #wrapper<const I: usize>(
+        fn #wrapper_at(
             #param: ::embassy_executor::Spawner,
+            i: usize,
         ) -> ::core::result::Result<(), ::embassy_executor::SpawnError> {
             #prelude
             #body
             ::core::result::Result::Ok(())
+        }
+        #(#cfg)*
+        #[inline(always)]
+        fn #wrapper<const I: usize>(
+            s: ::embassy_executor::Spawner,
+        ) -> ::core::result::Result<(), ::embassy_executor::SpawnError> {
+            #wrapper_at(s, I)
         }
     });
     let member_spawn: Vec<TokenStream2> = (0..k).map(|j| quote!(#wrapper::<#j>)).collect();
@@ -1741,7 +1845,7 @@ fn emit_pool(
         Some(ex) => quote!( .with_executor(&#ex) ),
         None => quote!(),
     };
-    if cfg!(feature = "fault-inject") && matches!(p.source, TaskSource::Shell(_)) {
+    if f.fault_inject && matches!(p.source, TaskSource::Shell(_)) {
         member_with_exec.extend(quote!( .with_shell() ));
     }
     for r in p
@@ -1773,7 +1877,7 @@ fn emit_pool(
         let gates_len = cfg_aware_len(p.resources.iter().map(|r| &r.cfg));
         (0..k)
             .map(|j| {
-                let gates_ident = format_ident!("__SV_GATES_{}_{}", ident, j);
+                let gates_ident = format_ident!("__SV_GATES_{}_{}", tag, j);
                 let gate_refs: Vec<TokenStream2> = p
                     .resources
                     .iter()
@@ -1802,7 +1906,7 @@ fn emit_pool(
     let member_with_claims: Vec<TokenStream2> = (0..k)
         .map(|j| {
             let (def, with) = claims_tokens(
-                &format_ident!("__SV_CLAIMS_{}_{}", ident, j),
+                &format_ident!("__SV_CLAIMS_{}_{}", tag, j),
                 cfg,
                 &p.resources,
                 &claims,
@@ -1820,20 +1924,16 @@ fn emit_pool(
     // K times, so its members gate on the same deps and exchange the same
     // signals — and sharing the statics keeps the flash cost independent of the
     // member count.
-    let ctx = EmitCtx {
-        cfg,
-        cr,
-        owner: ident,
-    };
+    let ctx = EmitCtx { cfg, cr, tag };
     let marker = |select: fn(&Dep) -> bool, prefix, builder| {
-        marker_array_tokens(&ctx, &p.deps, pool_names, select, prefix, builder)
+        marker_array_tokens(&ctx, &p.deps, targets, select, prefix, builder)
     };
     let (ready_def, member_with_ready) = marker(|d| d.ready.is_some(), "READY", "with_ready_deps");
     let (bound_def, member_with_bound) = marker(|d| d.bound.is_some(), "BOUND", "with_bound_deps");
     let mut foreign: Vec<AdoptedFn> = Vec::new();
     foreign.extend(
         discover_fn_path(p.discover.as_ref().map(|g| &g.kw), Some(&p.source))?
-            .filter(|_| cfg!(feature = "dataflow"))
+            .filter(|_| f.dataflow)
             .map(|path| AdoptedFn {
                 cfg: p
                     .discover
@@ -1862,11 +1962,11 @@ fn emit_pool(
             let mut def = quote!();
             let withs = (0..k)
                 .map(|j| {
-                    let member_ident = format_ident!("{}_{}", ident, j);
+                    let member_tag = format!("{tag}_{j}");
                     let member_ctx = EmitCtx {
                         cfg,
                         cr,
-                        owner: &member_ident,
+                        tag: &member_tag,
                     };
                     let (d, w) = coupling_binding_tokens(
                         &member_ctx,
@@ -1913,35 +2013,17 @@ fn emit_pool(
 
     let (member_with_clauses, member_clause_stmts, member_clause_errors) = builder_clause_tokens(
         cfg,
-        [
-            p.slot_timeout.as_ref().map(|g| {
-                let (c, ms) = (&g.cfg, &g.value);
-                GatedBuilder {
-                    cfg: c.clone(),
-                    tokens: quote!( .with_slot_timeout(#cr::_export::Duration::from_millis(#ms)) ),
-                    available: true,
-                    err: "",
-                }
-            }),
-            p.ack_timeout.as_ref().map(|g| {
-                let (c, ms) = (&g.cfg, &g.value);
-                GatedBuilder {
-                    cfg: c.clone(),
-                    tokens: quote!( .with_ack_timeout(#cr::_export::Duration::from_millis(#ms)) ),
-                    available: true,
-                    err: "",
-                }
-            }),
-        ]
-        .into_iter()
-        .flatten(),
+        timeout_clauses(p.slot_timeout.as_ref(), p.ack_timeout.as_ref(), cr)
+            .into_iter()
+            .flatten(),
     );
     defs.push(member_clause_errors);
-    defs.push(discover_error_tokens(cfg, p.discover.as_ref()));
+    defs.push(discover_error_tokens(cfg, p.discover.as_ref(), f));
     let member_graph_ref = &helpers.graph_ref;
-    let member_with_graph =
-        cfg!(feature = "data-deps").then(|| quote!( .with_graph(&#member_graph_ref) ));
-    let member_cfg_ident = format_ident!("__SV_CFG_{}", ident);
+    let member_with_graph = f
+        .data_deps
+        .then(|| quote!( .with_graph(&#member_graph_ref) ));
+    let member_cfg_ident = format_ident!("__SV_CFG_{}", tag);
     let member_cfgs = p
         .modes
         .iter()
@@ -1949,6 +2031,7 @@ fn emit_pool(
         .enumerate()
         .map(|(j, (mode, sp))| {
             let nm = format!("{lname}{j}");
+            let with_trace_name = trace_name_tokens(f, &nm);
             let with_res = &member_with_res[j];
             let with_claims = &member_with_claims[j];
             let member_with_writes = &member_with_writes[j];
@@ -1959,7 +2042,7 @@ fn emit_pool(
                 ) #member_with_exec #with_res #with_claims #member_with_clauses
                   #member_with_ready
                   #member_with_bound
-                  #member_with_reads #member_with_writes #member_with_graph
+                  #member_with_reads #member_with_writes #member_with_graph #with_trace_name
             };
             if member_clause_stmts.is_empty() {
                 chain
@@ -1971,16 +2054,24 @@ fn emit_pool(
                 }}
             }
         });
-    let members =
-        (0..p.modes.len()).map(|j| quote!( #cr::TaskNode::new(&#member_cfg_ident[#j], false) ));
+    // Pool members are never `disabled`: no `with_disabled_at_boot`.
+    let member_handle_ident = format_ident!("__SV_HANDLE_{}", tag);
+    let members = (0..k)
+        .map(|j| quote!( #cr::TaskNode::new(&#member_cfg_ident[#j], &#member_handle_ident[#j]) ));
+    let members_doc = format!(
+        "Pool `{ident}`'s members, one `TaskNode` per slot (index = member index). \
+         Index it for the per-node verbs; the pool itself is `{ident}_POOL`."
+    );
     defs.push(quote! {
         #(#cfg)*
         #[doc(hidden)]
         static #member_cfg_ident: [#cr::NodeCfg; #k] = [ #(#member_cfgs),* ];
         #(#cfg)*
-        #[doc = concat!("Pool `", stringify!(#ident), "`'s members, one `TaskNode` per slot \
-            (index = member index). Index it for the per-node verbs; the pool itself is \
-            `", stringify!(#ident), "_POOL`.")]
+        #[doc(hidden)]
+        static #member_handle_ident: [#cr::TaskHandle; #k] =
+            [const { #cr::TaskHandle::new() }; #k];
+        #(#cfg)*
+        #[doc = #members_doc]
         pub static #ident: [#cr::TaskNode; #k] = [ #(#members),* ];
     });
 
@@ -2017,15 +2108,22 @@ fn emit_pool(
             )
         }
     };
+    let min_doc =
+        format!("Pool `{ident}`'s `min:` floor (validated at expansion or by const assert).");
+    let max_doc = format!(
+        "Pool `{ident}`'s `max:` scaling ceiling: the most members ever running concurrently."
+    );
+    let members_count_doc =
+        format!("Pool `{ident}`'s declared member count (the `[TaskNode; K]` array length).");
     defs.push(quote! {
         #(#cfg)*
-        #[doc = concat!("Pool `", stringify!(#ident), "`'s `min:` floor (validated at expansion or by const assert).")]
+        #[doc = #min_doc]
         pub const #min_const: usize = #min_tokens;
         #(#cfg)*
-        #[doc = concat!("Pool `", stringify!(#ident), "`'s `max:` scaling ceiling — the most members ever running concurrently.")]
+        #[doc = #max_doc]
         pub const #max_const: usize = #max_tokens;
         #(#cfg)*
-        #[doc = concat!("Pool `", stringify!(#ident), "`'s declared member count (the `[TaskNode; K]` array length).")]
+        #[doc = #members_count_doc]
         pub const #members_const: usize = #k;
         #bound_asserts
     });
@@ -2039,11 +2137,13 @@ fn emit_pool(
             quote!(#path)
         }
     };
+    let pool_doc = format!(
+        "The `ElasticPool` over the `{ident}` members: the `min:`/`max:` bounds and the \
+         scaling policy `Supervisor::run_pools` drives. Also reachable through `GRAPH.pools`."
+    );
     defs.push(quote! {
         #(#cfg)*
-        #[doc = concat!("The `ElasticPool` over the `", stringify!(#ident), "` members: \
-            the `min:`/`max:` bounds and the scaling policy `Supervisor::run_pools` \
-            drives. Also reachable through `GRAPH.pools`.")]
+        #[doc = #pool_doc]
         pub static #pool_static: #cr::ElasticPool<#policy_ty> = #cr::ElasticPool {
             nodes: &[ #(#member_refs),* ],
             min: #min_const as u8,
@@ -2117,8 +2217,57 @@ fn slot_tables(
     Ok((all_entries, deps_entries))
 }
 
-fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
-    gate::gate(&graph)?;
+/// Refuse an item or resource named like a public item the expansion derives
+/// from another one's name (`X_EXIT`, `P_POOL`, `P_MIN`, `P_MAX`,
+/// `P_MEMBERS`): both would be items of the declaring module.
+fn check_derived_names(graph: &GraphSpec) -> SynResult<()> {
+    let mut derived: HashMap<String, String> = HashMap::new();
+    for item in &graph.items {
+        match item {
+            Item::Node(n) if n.exit.is_some() => {
+                let x = n.ident.unraw();
+                derived.insert(
+                    format!("{x}_EXIT"),
+                    format!("the `exit:` slot of node `{x}`"),
+                );
+            }
+            Item::Pool(p) => {
+                let id = p.ident.unraw();
+                for (suffix, what) in [
+                    ("POOL", "the `ElasticPool` static"),
+                    ("MIN", "the `min:` const"),
+                    ("MAX", "the `max:` const"),
+                    ("MEMBERS", "the member-count const"),
+                ] {
+                    derived.insert(format!("{id}_{suffix}"), format!("{what} of pool `{id}`"));
+                }
+            }
+            _ => {}
+        }
+    }
+    for item in &graph.items {
+        let own = match item {
+            Item::Node(n) => &n.ident,
+            Item::Pool(p) => &p.ident,
+            Item::Executor(x) => &x.ident,
+        };
+        for ident in std::iter::once(own).chain(item_resources(item).iter().map(|r| &r.ident)) {
+            if let Some(what) = derived.get(&ident.unraw().to_string()) {
+                return Err(syn::Error::new_spanned(
+                    ident,
+                    format!(
+                        "`{ident}` is also the name the macro gives {what}; rename one of them"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expand(graph: GraphSpec, f: &Features) -> SynResult<TokenStream2> {
+    gate::gate(&graph, f)?;
+    check_derived_names(&graph)?;
     let cr = quote!(::embassy_supervisor);
     let helpers = HelperIdents::new(graph.name.as_ref());
     let observe = ObserveDefaults {
@@ -2267,14 +2416,13 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                 }
                 fn clear(&self) {
                     let stale = self.slot.lock(::core::cell::Cell::take);
-                    drop(stale);
+                    ::core::mem::drop(stale);
                     self.filled.reset();
                 }
             }
         });
     }
 
-    let helpers = HelperIdents::new(graph.name.as_ref());
     let executor_names: Vec<String> = graph
         .items
         .iter()
@@ -2299,24 +2447,39 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
             }
         });
     }
-    let pool_names: std::collections::HashSet<String> = graph
+    let dep_targets: HashMap<String, DepTarget<'_>> = graph
         .items
         .iter()
         .filter_map(|i| match i {
-            Item::Pool(p) => Some(p.ident.to_string()),
-            _ => None,
+            Item::Node(n) => Some((
+                n.ident.to_string(),
+                DepTarget {
+                    cfg: &n.cfg,
+                    pool: false,
+                },
+            )),
+            Item::Pool(p) => Some((
+                p.ident.to_string(),
+                DepTarget {
+                    cfg: &p.cfg,
+                    pool: true,
+                },
+            )),
+            Item::Executor(_) => None,
         })
         .collect();
 
     /// A graph-wide slot — a `shared` slot or a `divisible` budget — that
     /// several items may declare and the graph emits once.
     struct GraphSlotPlan<'a> {
-        /// First declaration — supplies the emitted static's ident (span), type,
+        /// First declaration: supplies the emitted static's ident (span), type
+        /// and markers.
         decl: &'a ResourceDecl,
         /// Kinds+type token string every re-declaration must match.
         sig: String,
         /// One entry per declaring site: `None` = unconditional (the slot is
-        /// then unconditional too), `Some(pred)` = that site's combined
+        /// then unconditional too), `Some(pred)` = that site's item and entry
+        /// `#[cfg]`s combined.
         preds: Vec<Option<TokenStream2>>,
         owners: Vec<String>,
         /// The first declarer's `executor:` (`None` = the supervisor's own),
@@ -2329,6 +2492,9 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
     let mut shared_plans: Vec<(String, GraphSlotPlan)> = Vec::new();
     // (owner, resource) -> the owner's base slot in that budget.
     let mut claim_bases: HashMap<(String, String), u8> = HashMap::new();
+    // Resource name -> the predicate its emitted static is present under, and
+    // whether it is a pool's per-member slot array (see `ResourcePlan::slots`).
+    let mut slot_presence: HashMap<String, (Option<TokenStream2>, bool)> = HashMap::new();
     {
         let mut taken: HashSet<String> = HashSet::new();
         for item in &graph.items {
@@ -2466,6 +2632,7 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                             ),
                         ));
                     }
+                    slot_presence.insert(key, (pred, matches!(item, Item::Pool(_))));
                 }
             }
         }
@@ -2541,14 +2708,17 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
             }
         }
     }
-    for (_, plan) in &shared_plans {
+    for (key, plan) in &shared_plans {
         let res = &plan.decl.ident;
-        let cfg_attr = if plan.preds.iter().any(|p| p.is_none()) {
-            quote!()
+        // Present wherever one declarer is: unconditional if any one is.
+        let presence = if plan.preds.iter().any(Option::is_none) {
+            None
         } else {
             let preds = plan.preds.iter().flatten();
-            quote!(#[cfg(any(#(#preds),*))])
+            Some(quote!(any(#(#preds),*)))
         };
+        let cfg_attr = presence.as_ref().map(|p| quote!(#[cfg(#p)]));
+        slot_presence.insert(key.clone(), (presence, false));
         if plan.decl.kind() == ResourceKind::Divisible {
             let k = plan.slots;
             let doc = format!(
@@ -2588,16 +2758,6 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
         });
     }
 
-    let mut resource_cfgs: HashMap<String, (Vec<Attribute>, bool)> = HashMap::new();
-    for item in &graph.items {
-        let from_pool = matches!(item, Item::Pool(_));
-        for r in item_resources(item) {
-            let per_member = matches!(r.kind(), ResourceKind::Lend | ResourceKind::Consume);
-            resource_cfgs
-                .entry(r.ident.to_string())
-                .or_insert_with(|| (r.cfg.clone(), from_pool && per_member));
-        }
-    }
     // `veto` contributor slots: per gate (by its display text), writers are
     // numbered in item order — a node takes one slot, a pool one per member —
     // and the gate is checked once for the total. Counted syntactically, so a
@@ -2702,12 +2862,23 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
         });
     }
     let plan = ResourcePlan {
-        cfgs: resource_cfgs,
+        slots: slot_presence,
         claim_bases,
         veto_bases,
     };
 
-    for item in &graph.items {
+    // Private helper names carry the item's index (and the graph's name), so no
+    // two items, in this graph or another graph of the module, share one. The
+    // name's length and a `g` lead a named tag: `A` + `B_2_C` and `A_1_B` + `C`
+    // stay apart, and an unnamed tag always has `_` right after its digits.
+    let item_tag = |idx: usize, owner: &Ident| match &graph.name {
+        None => format!("{idx}_{}", owner.unraw()),
+        Some(g) => {
+            let g = g.unraw().to_string();
+            format!("{}g{g}_{idx}_{}", g.len(), owner.unraw())
+        }
+    };
+    for (idx, item) in graph.items.iter().enumerate() {
         match item {
             Item::Node(n) => {
                 if let Some(ex) = &n.executor
@@ -2732,8 +2903,17 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                         ),
                     ));
                 }
-                let (def, slot) =
-                    emit_node(n, &cr, &spawn_fn, &pool_names, &helpers, &observe, &plan)?;
+                let (def, slot) = emit_node(
+                    n,
+                    &item_tag(idx, &n.ident),
+                    &cr,
+                    &spawn_fn,
+                    &dep_targets,
+                    &helpers,
+                    &observe,
+                    &plan,
+                    f,
+                )?;
                 defs.push(def);
                 slots.push(slot);
             }
@@ -2752,7 +2932,7 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                 });
             }
             Item::Pool(p) => {
-                if cfg!(feature = "pool") {
+                if f.pool {
                     if let Some(ex) = &p.executor
                         && !executor_names.contains(&ex.to_string())
                     {
@@ -2765,8 +2945,17 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
                             ),
                         ));
                     }
-                    let (pool_defs, pool_entry, pool_slots) =
-                        emit_pool(p, &cr, &spawn_fn, &pool_names, &helpers, &observe, &plan)?;
+                    let (pool_defs, pool_entry, pool_slots) = emit_pool(
+                        p,
+                        &item_tag(idx, &p.ident),
+                        &cr,
+                        &spawn_fn,
+                        &dep_targets,
+                        &helpers,
+                        &observe,
+                        &plan,
+                        f,
+                    )?;
                     if names.insert(p.ident.to_string(), slots.len()).is_some() {
                         return Err(syn::Error::new_spanned(
                             &p.ident,
@@ -2891,7 +3080,7 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
     let shape_lit = proc_macro2::Literal::u32_suffixed(shape_bits);
     let flat = slots.iter().all(|s| s.deps.is_empty());
 
-    let pools_field = if cfg!(feature = "pool") {
+    let pools_field = if f.pool {
         quote!( pools: &[ #(#pool_entries),* ], )
     } else {
         quote!()
@@ -2899,7 +3088,7 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
 
     // The hook bodies are the supervisor's (`__sv_trace_hooks!`): which executor
     // hook API they speak is decided by that crate's build, not this one's.
-    let trace_hooks = if cfg!(feature = "trace-hooks") && graph.name.is_none() {
+    let trace_hooks = if f.trace_hooks && graph.name.is_none() {
         quote!( #cr::__sv_trace_hooks!(); )
     } else {
         quote!()
@@ -2912,12 +3101,26 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
     let nodes_ident = helpers.nodes.clone();
     let deps_ident = match &graph.name {
         Some(n) => format_ident!("__SV_DEPS_{}", n),
-        None => Ident::new("DEPS", proc_macro2::Span::call_site()),
+        None => Ident::new("__SV_DEPS", proc_macro2::Span::call_site()),
     };
     let graph_ref_ident = helpers.graph_ref.clone();
-    let (graph_ref_def, graph_ref_field) = if cfg!(feature = "graph-ref") {
+    let (graph_ref_def, graph_ref_field) = if f.graph_ref {
+        // `trace-self`: the supervisor's own node gets a handle the graph owns.
+        let (self_def, with_self) = if f.trace_self {
+            let self_handle = &helpers.self_handle;
+            (
+                quote!( static #self_handle: #cr::TaskHandle = #cr::TaskHandle::new(); ),
+                quote!( .with_self_handle(&#self_handle) ),
+            )
+        } else {
+            (quote!(), quote!())
+        };
         (
-            quote!( static #graph_ref_ident: #cr::GraphRef = #cr::GraphRef::new(&#nodes_ident); ),
+            quote! {
+                #self_def
+                static #graph_ref_ident: #cr::GraphRef =
+                    #cr::GraphRef::new(&#nodes_ident) #with_self;
+            },
             quote!( graph_ref: &#graph_ref_ident, ),
         )
     } else {
@@ -2963,23 +3166,27 @@ fn expand(graph: GraphSpec) -> SynResult<TokenStream2> {
 
 #[proc_macro_attribute]
 pub fn dataflow(args: TokenStream, item: TokenStream) -> TokenStream {
-    dataflow_expand(args.into(), item.into())
+    dataflow_expand(args.into(), item.into(), &ENABLED)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
 
 #[proc_macro_attribute]
 pub fn dataflow_bundle(args: TokenStream, item: TokenStream) -> TokenStream {
-    bundle_expand(args.into(), item.into())
+    bundle_expand(args.into(), item.into(), &ENABLED)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
 
-fn bundle_expand(args: TokenStream2, item: TokenStream2) -> SynResult<TokenStream2> {
+fn bundle_expand(
+    args: TokenStream2,
+    item: TokenStream2,
+    features: &Features,
+) -> SynResult<TokenStream2> {
     use quote::ToTokens;
 
     let mut m: syn::ItemMod = syn::parse2(item)?;
-    if !cfg!(feature = "dataflow") {
+    if !features.dataflow {
         return Err(syn::Error::new_spanned(
             &m.ident,
             "`#[dataflow_bundle]` requires the `dataflow` feature \
@@ -3174,11 +3381,15 @@ fn derived_entry_tokens(cr: &TokenStream2, e: &DerivedEntry) -> TokenStream2 {
     }
 }
 
-fn dataflow_expand(args: TokenStream2, item: TokenStream2) -> SynResult<TokenStream2> {
+fn dataflow_expand(
+    args: TokenStream2,
+    item: TokenStream2,
+    features: &Features,
+) -> SynResult<TokenStream2> {
     use quote::ToTokens;
 
     let mut f: syn::ItemFn = syn::parse2(item)?;
-    if !cfg!(feature = "dataflow") {
+    if !features.dataflow {
         return Err(syn::Error::new_spanned(
             &f.sig.ident,
             "`#[dataflow]` requires the `dataflow` feature \
@@ -3205,7 +3416,7 @@ fn dataflow_expand(args: TokenStream2, item: TokenStream2) -> SynResult<TokenStr
         &param.to_string(),
         &verbs,
         &mut |call| {
-            if !cfg!(feature = "liveness")
+            if !features.liveness
                 && matches!(call.verb.as_str(), "beat_put" | "beat_writer")
                 && call.cfgs.is_empty()
             {
@@ -3225,9 +3436,9 @@ fn dataflow_expand(args: TokenStream2, item: TokenStream2) -> SynResult<TokenStr
             // The verbs a feature adds to `TaskNode`: name the feature here
             // rather than leave rustc to report a missing method.
             let needs = match call.verb.as_str() {
-                "open" | "lease" if !cfg!(feature = "data-deps") => Some("`data-deps` feature"),
-                "veto" if !cfg!(feature = "veto") => Some("`veto` feature"),
-                "retire" if !cfg!(all(feature = "data-deps", feature = "readiness")) => {
+                "open" | "lease" if !features.data_deps => Some("`data-deps` feature"),
+                "veto" if !features.veto => Some("`veto` feature"),
+                "retire" if !(features.data_deps && features.readiness) => {
                     Some("`data-deps` and `readiness` features")
                 }
                 _ => None,
@@ -3298,19 +3509,19 @@ fn dataflow_expand(args: TokenStream2, item: TokenStream2) -> SynResult<TokenStr
 #[proc_macro]
 pub fn supervisor_graph(input: TokenStream) -> TokenStream {
     let graph = syn::parse_macro_input!(input as GraphSpec);
-    expand(graph)
+    expand(graph, &ENABLED)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
 
 #[proc_macro]
 pub fn supervisor_fragment(input: TokenStream) -> TokenStream {
-    fragment_expand(input.into())
+    fragment_expand(input.into(), &ENABLED)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
 
-fn fragment_expand(input: TokenStream2) -> SynResult<TokenStream2> {
+fn fragment_expand(input: TokenStream2, f: &Features) -> SynResult<TokenStream2> {
     struct FragmentSpec {
         name: Ident,
         items: TokenStream2,
@@ -3340,7 +3551,7 @@ fn fragment_expand(input: TokenStream2) -> SynResult<TokenStream2> {
              the compose site",
         ));
     }
-    gate::gate(&spec_parsed)?;
+    gate::gate(&spec_parsed, f)?;
 
     let items = &items;
     let dollar = proc_macro2::Punct::new('$', proc_macro2::Spacing::Alone);
@@ -3388,56 +3599,110 @@ fn validate_dollars(stream: TokenStream2) -> SynResult<()> {
 mod tests {
     use super::*;
 
-    fn parse_gated(src: &str) -> SynResult<GraphSpec> {
+    /// Every feature on, whatever this test binary was built with.
+    const ALL: Features = Features {
+        readiness: true,
+        liveness: true,
+        liveness_monitor: true,
+        enabled_if: true,
+        restart_intensity: true,
+        bound_deps: true,
+        dataflow: true,
+        veto: true,
+        budget: true,
+        coupling: true,
+        coupling_observe: true,
+        data_deps: true,
+        graph_ref: true,
+        pool: true,
+        metadata_names: true,
+        trace: true,
+        trace_hooks: true,
+        trace_self: true,
+        fault_inject: true,
+        local_resources: true,
+        heap_state: true,
+    };
+
+    /// Every feature off.
+    const NONE: Features = Features {
+        readiness: false,
+        liveness: false,
+        liveness_monitor: false,
+        enabled_if: false,
+        restart_intensity: false,
+        bound_deps: false,
+        dataflow: false,
+        veto: false,
+        budget: false,
+        coupling: false,
+        coupling_observe: false,
+        data_deps: false,
+        graph_ref: false,
+        pool: false,
+        metadata_names: false,
+        trace: false,
+        trace_hooks: false,
+        trace_self: false,
+        fault_inject: false,
+        local_resources: false,
+        heap_state: false,
+    };
+
+    fn parse_gated(src: &str, f: &Features) -> SynResult<GraphSpec> {
         let spec = syn::parse_str::<GraphSpec>(src)?;
-        gate::gate(&spec)?;
+        gate::gate(&spec, f)?;
         Ok(spec)
+    }
+
+    /// `src` passes the gate with every feature on, and fails it naming the
+    /// feature under `off`.
+    fn gate_rejects(src: &str, off: Features, needle: &str) {
+        if let Err(err) = parse_gated(src, &ALL) {
+            panic!("rejected with every feature on: {err}");
+        }
+        match parse_gated(src, &off) {
+            Ok(_) => panic!("accepted without the feature: {src}"),
+            Err(err) => assert!(err.to_string().contains(needle), "unexpected error: {err}"),
+        }
     }
 
     #[test]
     fn ready_marker_requires_feature() {
-        let res = parse_gated(
+        gate_rejects(
             "node NET = Terminate, deps: [];\n\
              node HTTP = Terminate, deps: [NET ready];",
+            Features {
+                readiness: false,
+                ..ALL
+            },
+            "requires the `readiness` feature",
         );
-        if cfg!(feature = "readiness") {
-            assert!(res.is_ok(), "marker accepted with the feature");
-        } else {
-            match res {
-                Ok(_) => panic!("marker accepted without the feature"),
-                Err(err) => assert!(
-                    err.to_string().contains("requires the `readiness` feature"),
-                    "unexpected error: {err}"
-                ),
-            }
-        }
     }
 
     #[test]
     fn beat_timeout_requires_feature() {
-        let res = parse_gated("node A = Terminate, deps: [], beat_timeout: 100;");
-        if cfg!(feature = "liveness-monitor") {
-            assert!(res.is_ok(), "clause accepted with the feature");
-        } else {
-            match res {
-                Ok(_) => panic!("clause accepted without the feature"),
-                Err(err) => assert!(
-                    err.to_string()
-                        .contains("requires the `liveness-monitor` feature"),
-                    "unexpected error: {err}"
-                ),
-            }
-        }
+        gate_rejects(
+            "node A = Terminate, deps: [], beat_timeout: 100;",
+            Features {
+                liveness_monitor: false,
+                ..ALL
+            },
+            "requires the `liveness-monitor` feature",
+        );
     }
 
     #[test]
     fn cfg_gated_clauses_defer_to_rustc() {
-        for (src, feature_on, builder) in [
+        for (src, off, builder) in [
             (
                 "node A = Terminate, deps: [], \
                  #[cfg(feature = \"x\")] beat_timeout: 100, \
                  #[cfg(feature = \"x\")] beat_window: 3;",
-                cfg!(feature = "liveness-monitor"),
+                Features {
+                    liveness_monitor: false,
+                    ..ALL
+                },
                 "with_beat_timeout",
             ),
             (
@@ -3445,38 +3710,46 @@ mod tests {
                  writes: [crate::S observed beat via it.get()], \
                  #[cfg(feature = \"x\")] beat_timeout: 100, \
                  #[cfg(feature = \"x\")] ready_on_write;",
-                cfg!(all(
-                    feature = "liveness-monitor",
-                    feature = "coupling-observe",
-                    feature = "readiness"
-                )),
+                Features {
+                    readiness: false,
+                    ..ALL
+                },
                 "with_ready_on_write",
             ),
             (
                 "node A = Terminate, deps: [], #[cfg(feature = \"x\")] enabled_if: crate::on;",
-                cfg!(feature = "enabled-if"),
+                Features {
+                    enabled_if: false,
+                    ..ALL
+                },
                 "with_enabled_if",
             ),
             (
                 "node A = Terminate, deps: [], \
                  #[cfg(feature = \"x\")] restart_budget: 3 in 1000;",
-                cfg!(feature = "restart-intensity"),
+                Features {
+                    restart_intensity: false,
+                    ..ALL
+                },
                 "with_restart_budget (3u16",
             ),
             (
                 "node A = Terminate, deps: [], task: w, #[cfg(feature = \"x\")] discover;",
-                cfg!(feature = "dataflow"),
+                Features {
+                    dataflow: false,
+                    ..ALL
+                },
                 "__SV_DATAFLOW_",
             ),
         ] {
-            let spec = parse_gated(src).expect("a gated clause passes the gate");
-            let out = expand(spec).expect("expansion succeeds").to_string();
-            if feature_on {
-                assert!(out.contains(builder), "{src}\n{out}");
-                assert!(!out.contains("compile_error"), "{src}\n{out}");
-            } else {
-                assert!(out.contains("compile_error"), "{src}\n{out}");
-            }
+            let spec = parse_gated(src, &ALL).expect("a gated clause passes the gate");
+            let out = expand(spec, &ALL).expect("expansion succeeds").to_string();
+            assert!(out.contains(builder), "{src}\n{out}");
+            assert!(!out.contains("compile_error"), "{src}\n{out}");
+            let spec = parse_gated(src, &off).expect("a gated clause passes the gate");
+            let out = expand(spec, &off).expect("expansion succeeds").to_string();
+            assert!(out.contains("compile_error"), "{src}\n{out}");
+            assert!(!out.contains(builder), "{src}\n{out}");
         }
     }
 
@@ -3488,9 +3761,10 @@ mod tests {
              #[cfg(feature = \"x\")] ack_timeout: 200, \
              #[cfg(feature = \"x\")] disabled;\n\
              node B = Terminate, deps: [], slot_timeout: 300;",
+            &NONE,
         )
         .expect("gated featureless clauses pass the gate");
-        let out = expand(spec).expect("expansion succeeds").to_string();
+        let out = expand(spec, &NONE).expect("expansion succeeds").to_string();
         assert!(out.contains("with_slot_timeout"), "{out}");
         assert!(out.contains("with_ack_timeout"), "{out}");
         // The gated `disabled` becomes a cfg-block bool, not a bare literal.
@@ -3498,119 +3772,193 @@ mod tests {
         assert!(!out.contains("compile_error"), "{out}");
 
         // Pool timeouts ride the same emitter.
-        if cfg!(feature = "pool") {
-            let spec = parse_gated(
-                "pool P = [Terminate], deps: [], task: w, \
-                 policy: embassy_supervisor::DeferredShrink::new(d()), \
-                 min: 1, max: 1, #[cfg(feature = \"x\")] slot_timeout: 100;",
-            )
-            .expect("gated pool timeout passes the gate");
-            let out = expand(spec).expect("expansion succeeds").to_string();
-            assert!(out.contains("with_slot_timeout"), "{out}");
-            assert!(!out.contains("compile_error"), "{out}");
-        }
+        let pool = Features { pool: true, ..NONE };
+        let spec = parse_gated(
+            "pool P = [Terminate], deps: [], task: w, \
+             policy: embassy_supervisor::DeferredShrink::new(d()), \
+             min: 1, max: 1, #[cfg(feature = \"x\")] slot_timeout: 100;",
+            &pool,
+        )
+        .expect("gated pool timeout passes the gate");
+        let out = expand(spec, &pool).expect("expansion succeeds").to_string();
+        assert!(out.contains("with_slot_timeout"), "{out}");
+        assert!(!out.contains("compile_error"), "{out}");
+    }
+
+    #[test]
+    fn nodes_pair_a_flash_cfg_with_a_zeroed_handle() {
+        let pool = Features { pool: true, ..NONE };
+        let spec = parse_gated(
+            "node A = Terminate, deps: [], disabled;\n\
+             node B = Terminate, deps: [];\n\
+             pool P = [Terminate, Terminate], deps: [], task: w, \
+             policy: embassy_supervisor::DeferredShrink::new(d()), min: 1, max: 2;",
+            &pool,
+        )
+        .expect("the graph passes the gate");
+        let out = expand(spec, &pool).expect("expansion succeeds").to_string();
+        // One zeroed handle per node, paired with the node's config.
+        assert!(
+            out.contains(
+                "static __SV_HANDLE_0_A : :: embassy_supervisor :: TaskHandle = \
+                 :: embassy_supervisor :: TaskHandle :: new () ;"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("TaskNode :: new (& __SV_CFG_0_A , & __SV_HANDLE_0_A)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("TaskNode :: new (& __SV_CFG_1_B , & __SV_HANDLE_1_B)"),
+            "{out}"
+        );
+        // `disabled` is the config's: only `A` declares it.
+        assert_eq!(out.matches("with_disabled_at_boot").count(), 1, "{out}");
+        assert!(out.contains(". with_disabled_at_boot (true)"), "{out}");
+        // Pool members: one handle array, indexed like the config array.
+        assert!(
+            out.contains("[const { :: embassy_supervisor :: TaskHandle :: new () } ; 2usize]"),
+            "{out}"
+        );
+        assert!(
+            out.contains("TaskNode :: new (& __SV_CFG_2_P [1usize] , & __SV_HANDLE_2_P [1usize])"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn self_handle_follows_trace_self() {
+        let on = Features {
+            graph_ref: true,
+            trace: true,
+            trace_self: true,
+            ..NONE
+        };
+        let expand_with = |src: &str, f: &Features| {
+            let spec = parse_gated(src, f).expect("the graph passes the gate");
+            expand(spec, f).expect("expansion succeeds").to_string()
+        };
+        let src = "node A = Terminate, deps: [];";
+        let out = expand_with(src, &on);
+        assert!(
+            out.contains(
+                "static __SV_SELF_HANDLE : :: embassy_supervisor :: TaskHandle = \
+                 :: embassy_supervisor :: TaskHandle :: new () ;"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "GraphRef :: new (& __SV_NODES) . with_self_handle (& __SV_SELF_HANDLE) ;"
+            ),
+            "{out}"
+        );
+        // A named graph's handle carries the graph's name, like its `GraphRef`.
+        let out = expand_with("name: SUB;\nnode A = Terminate, deps: [];", &on);
+        assert!(
+            out.contains(
+                "GraphRef :: new (& __SV_NODES_SUB) . with_self_handle (& __SV_SELF_HANDLE_SUB) ;"
+            ),
+            "{out}"
+        );
+        let off = Features {
+            trace_self: false,
+            ..on
+        };
+        let out = expand_with(src, &off);
+        assert!(out.contains("GraphRef :: new (& __SV_NODES) ;"), "{out}");
+        assert!(!out.contains("SELF_HANDLE"), "{out}");
     }
 
     #[test]
     fn beat_verb_requires_feature() {
-        let expand = |verb: &str| {
+        let expand = |verb: &str, f: &Features| {
             dataflow_expand(
                 quote!(),
                 format!("fn f(node: &'static TaskNode) {{ node.{verb}(&crate::OUT, 1); }}")
                     .parse()
                     .unwrap(),
+                f,
             )
         };
+        let off = Features {
+            liveness: false,
+            ..ALL
+        };
         for verb in ["beat_put", "beat_writer"] {
-            let res = expand(verb);
-            if !cfg!(feature = "dataflow") {
-                continue;
-            }
-            if cfg!(feature = "liveness") {
-                assert!(res.is_ok(), "`{verb}` accepted with the feature");
-            } else {
-                match res {
-                    Ok(_) => panic!("`{verb}` accepted without the feature"),
-                    Err(err) => {
-                        let msg = err.to_string();
-                        assert!(
-                            msg.contains("requires the `liveness` feature"),
-                            "`{verb}`: {msg}"
-                        );
-                        assert!(
-                            msg.contains(verb.trim_start_matches("beat_")),
-                            "the message names the plain verb to fall back to: {msg}"
-                        );
-                    }
+            assert!(
+                expand(verb, &ALL).is_ok(),
+                "`{verb}` accepted with the feature"
+            );
+            match expand(verb, &off) {
+                Ok(_) => panic!("`{verb}` accepted without the feature"),
+                Err(err) => {
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains("requires the `liveness` feature"),
+                        "`{verb}`: {msg}"
+                    );
+                    assert!(
+                        msg.contains(verb.trim_start_matches("beat_")),
+                        "the message names the plain verb to fall back to: {msg}"
+                    );
                 }
             }
         }
-        if cfg!(feature = "dataflow") {
-            assert!(expand("put").is_ok(), "`put` needs no liveness");
-            let gated = dataflow_expand(
-                quote!(),
-                "fn f(node: &'static TaskNode) { \
-                 #[cfg(feature = \"x\")] node.beat_put(&crate::OUT, 1); }"
-                    .parse()
-                    .unwrap(),
-            );
-            assert!(gated.is_ok(), "a cfg-gated beat verb defers to rustc");
-        }
+        assert!(expand("put", &off).is_ok(), "`put` needs no liveness");
+        let gated = dataflow_expand(
+            quote!(),
+            "fn f(node: &'static TaskNode) { \
+             #[cfg(feature = \"x\")] node.beat_put(&crate::OUT, 1); }"
+                .parse()
+                .unwrap(),
+            &off,
+        );
+        assert!(gated.is_ok(), "a cfg-gated beat verb defers to rustc");
     }
 
     #[test]
     fn coupling_clauses_require_feature() {
-        let res =
-            parse_gated("node A = Terminate, deps: [], reads: [crate::SIG], writes: [crate::OUT];");
-        if cfg!(feature = "coupling") {
-            assert!(res.is_ok(), "clauses accepted with the feature");
-        } else {
-            match res {
-                Ok(_) => panic!("clauses accepted without the feature"),
-                Err(err) => assert!(
-                    err.to_string().contains("requires the `coupling` feature"),
-                    "unexpected error: {err}"
-                ),
-            }
-        }
+        gate_rejects(
+            "node A = Terminate, deps: [], reads: [crate::SIG], writes: [crate::OUT];",
+            Features {
+                coupling: false,
+                ..ALL
+            },
+            "requires the `coupling` feature",
+        );
     }
 
     #[test]
     fn bound_marker_requires_feature() {
-        let res = parse_gated(
-            "node A = Terminate, deps: [];\nnode B = Terminate, deps: [A ready bound];",
+        let src = "node A = Terminate, deps: [];\nnode B = Terminate, deps: [A ready bound];";
+        gate_rejects(
+            src,
+            Features {
+                bound_deps: false,
+                ..ALL
+            },
+            "requires the `bound-deps` feature",
         );
-        if cfg!(all(feature = "bound-deps", feature = "readiness")) {
-            assert!(res.is_ok(), "marker accepted with the features");
-        } else if !cfg!(feature = "bound-deps") {
-            match res {
-                Ok(_) => panic!("marker accepted without the feature"),
-                Err(err) => assert!(
-                    err.to_string()
-                        .contains("requires the `bound-deps` feature"),
-                    "unexpected error: {err}"
-                ),
-            }
-        }
-    }
-
-    fn gate_rejects(src: &str, feature: bool, needle: &str) {
-        let res = parse_gated(src);
-        if feature {
-            assert!(res.is_ok(), "rejected with the feature: {:?}", res.err());
-        } else {
-            match res {
-                Ok(_) => panic!("accepted without the feature"),
-                Err(err) => assert!(err.to_string().contains(needle), "unexpected error: {err}"),
-            }
-        }
+        gate_rejects(
+            src,
+            Features {
+                readiness: false,
+                ..ALL
+            },
+            "requires the `readiness` feature",
+        );
     }
 
     #[test]
     fn observed_marker_requires_feature() {
         gate_rejects(
             "node A = Terminate, deps: [], task: f, writes: [crate::S observed via it.get()];",
-            cfg!(all(feature = "coupling-observe", feature = "coupling")),
+            Features {
+                coupling_observe: false,
+                ..ALL
+            },
             "requires the `coupling-observe` feature",
         );
     }
@@ -3619,8 +3967,23 @@ mod tests {
     fn discover_clause_requires_feature() {
         gate_rejects(
             "node A = Terminate, deps: [], task: f, discover;",
-            cfg!(feature = "dataflow"),
+            Features {
+                dataflow: false,
+                ..ALL
+            },
             "requires the `dataflow` feature",
+        );
+    }
+
+    #[test]
+    fn dataflow_clause_requires_feature() {
+        gate_rejects(
+            "node A = Terminate, deps: [], task: f, dataflow: [crate::g];",
+            Features {
+                dataflow: false,
+                ..ALL
+            },
+            "`dataflow:` requires the `dataflow` feature",
         );
     }
 
@@ -3628,7 +3991,10 @@ mod tests {
     fn observe_default_requires_feature() {
         gate_rejects(
             "observe writes: it.get();\nnode A = Terminate, deps: [], task: f;",
-            cfg!(feature = "coupling-observe"),
+            Features {
+                coupling_observe: false,
+                ..ALL
+            },
             "requires the `coupling-observe` feature",
         );
     }
@@ -3637,7 +4003,10 @@ mod tests {
     fn local_resource_requires_feature() {
         gate_rejects(
             "node A = Terminate, deps: [], task: f, resources: [R: local Thing];",
-            cfg!(feature = "local-resources"),
+            Features {
+                local_resources: false,
+                ..ALL
+            },
             "`local-resources` feature",
         );
     }
@@ -3646,7 +4015,10 @@ mod tests {
     fn state_clause_requires_feature() {
         gate_rejects(
             "node A = Terminate, deps: [], task: f, state: Buf = Buf::new();",
-            cfg!(feature = "heap-state"),
+            Features {
+                heap_state: false,
+                ..ALL
+            },
             "requires the `heap-state` feature",
         );
     }
@@ -3655,16 +4027,21 @@ mod tests {
     fn zeroed_state_clause_requires_feature() {
         gate_rejects(
             "node A = Terminate, deps: [], task: f, state: zeroed Buf;",
-            cfg!(feature = "heap-state"),
+            Features {
+                heap_state: false,
+                ..ALL
+            },
             "requires the `heap-state` feature",
         );
     }
 
     #[test]
-    #[cfg(feature = "heap-state")]
     fn zeroed_state_parses_as_marker() {
-        let spec = parse_gated("node A = Terminate, deps: [], task: f, state: zeroed Buf;")
-            .expect("marker form");
+        let spec = parse_gated(
+            "node A = Terminate, deps: [], task: f, state: zeroed Buf;",
+            &ALL,
+        )
+        .expect("marker form");
         let Item::Node(n) = &spec.items[0] else {
             panic!("node")
         };
@@ -3672,8 +4049,11 @@ mod tests {
             panic!("zeroed state")
         };
         assert_eq!(quote!(#ty).to_string(), "Buf");
-        let spec = parse_gated("node A = Terminate, deps: [], task: f, state: zeroed = Z;")
-            .expect("type named zeroed");
+        let spec = parse_gated(
+            "node A = Terminate, deps: [], task: f, state: zeroed = Z;",
+            &ALL,
+        )
+        .expect("type named zeroed");
         let Item::Node(n) = &spec.items[0] else {
             panic!("node")
         };
@@ -3685,9 +4065,9 @@ mod tests {
 
     #[test]
     fn deps_clause_is_optional() {
-        assert!(parse_gated("node A = Terminate, task: f;").is_ok());
-        assert!(parse_gated("node A = Terminate, task: f, deps: [];").is_ok());
-        match parse_gated("node A = Terminate, deps: [], task: f, deps: [];") {
+        assert!(parse_gated("node A = Terminate, task: f;", &ALL).is_ok());
+        assert!(parse_gated("node A = Terminate, task: f, deps: [];", &ALL).is_ok());
+        match parse_gated("node A = Terminate, deps: [], task: f, deps: [];", &ALL) {
             Ok(_) => panic!("duplicate deps accepted"),
             Err(e) => assert!(e.to_string().contains("duplicate `deps:`"), "{e}"),
         }
@@ -3700,7 +4080,7 @@ mod tests {
              node C = Terminate, deps: [P], task: g, resources: [SLOT: shared u32];",
         )
         .unwrap();
-        match expand(spec) {
+        match expand(spec, &ALL) {
             Ok(_) => panic!("unknown slot accepted"),
             Err(e) => assert!(
                 e.to_string().contains("no `resources:` entry"),
@@ -3713,7 +4093,10 @@ mod tests {
     fn beat_window_requires_feature() {
         gate_rejects(
             "node A = Terminate, deps: [], task: f, beat_timeout: 10, beat_window: 3;",
-            cfg!(feature = "liveness-monitor"),
+            Features {
+                liveness_monitor: false,
+                ..ALL
+            },
             "requires the `liveness-monitor` feature",
         );
     }
@@ -3722,7 +4105,10 @@ mod tests {
     fn enabled_if_requires_feature() {
         gate_rejects(
             "node A = Terminate, deps: [], task: f, enabled_if: crate::on;",
-            cfg!(feature = "enabled-if"),
+            Features {
+                enabled_if: false,
+                ..ALL
+            },
             "requires the `enabled-if` feature",
         );
     }
@@ -3731,7 +4117,10 @@ mod tests {
     fn restart_budget_requires_feature() {
         gate_rejects(
             "node A = Terminate, deps: [], task: f, restart_budget: 3 in 1000;",
-            cfg!(feature = "restart-intensity"),
+            Features {
+                restart_intensity: false,
+                ..ALL
+            },
             "requires the `restart-intensity` feature",
         );
     }
@@ -3740,25 +4129,238 @@ mod tests {
     fn ready_on_write_requires_both_features() {
         let src = "node A = Terminate, deps: [], task: f, beat_timeout: 10, \
                    ready_on_write, writes: [crate::S observed beat via it.get()];";
-        let all = cfg!(all(
-            feature = "coupling-observe",
-            feature = "readiness",
-            feature = "coupling",
-            feature = "liveness-monitor"
-        ));
-        let needle = if cfg!(feature = "coupling") && !cfg!(feature = "coupling-observe") {
-            "requires the `coupling-observe` feature"
-        } else if !cfg!(feature = "coupling") {
-            "requires the `coupling` feature"
-        } else if !cfg!(feature = "liveness-monitor") {
-            "requires the `liveness-monitor` feature"
-        } else {
-            "requires the `readiness` feature"
-        };
-        gate_rejects(src, all, needle);
+        for (off, needle) in [
+            (
+                Features {
+                    readiness: false,
+                    ..ALL
+                },
+                "`ready_on_write` requires the `readiness` feature",
+            ),
+            (
+                Features {
+                    coupling_observe: false,
+                    ..ALL
+                },
+                "requires the `coupling-observe` feature",
+            ),
+            (
+                Features {
+                    liveness_monitor: false,
+                    ..ALL
+                },
+                "requires the `liveness-monitor` feature",
+            ),
+            (
+                Features {
+                    coupling: false,
+                    ..ALL
+                },
+                "requires the `coupling` feature",
+            ),
+        ] {
+            gate_rejects(src, off, needle);
+        }
     }
 
-    #[cfg(feature = "dataflow")]
+    #[test]
+    fn pool_requires_feature() {
+        let src = "pool P = [Terminate], deps: [], task: w, \
+                   policy: embassy_supervisor::DeferredShrink::new(d()), min: 1, max: 1;";
+        let spec = parse_gated(src, &ALL).expect("passes the gate");
+        if let Err(e) = expand(spec, &ALL) {
+            panic!("rejected with every feature on: {e}");
+        }
+        let off = Features { pool: false, ..ALL };
+        let spec = parse_gated(src, &off).expect("passes the gate");
+        match expand(spec, &off) {
+            Ok(_) => panic!("a pool expanded without the feature"),
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("requires enabling embassy-supervisor's `pool` feature"),
+                "unexpected error: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn dataflow_attributes_require_feature() {
+        let off = Features {
+            dataflow: false,
+            ..ALL
+        };
+        let item = || quote! { fn f(node: &'static TaskNode) { node.put(&crate::OUT, 1); } };
+        if let Err(e) = dataflow_expand(TokenStream2::new(), item(), &ALL) {
+            panic!("`#[dataflow]` rejected with every feature on: {e}");
+        }
+        match dataflow_expand(TokenStream2::new(), item(), &off) {
+            Ok(_) => panic!("`#[dataflow]` accepted without the feature"),
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("`#[dataflow]` requires the `dataflow` feature"),
+                "unexpected error: {e}"
+            ),
+        }
+        let module = || {
+            quote! {
+                mod api {
+                    #[dataflow]
+                    fn f(node: &'static TaskNode) { node.put(&crate::OUT, 1); }
+                }
+            }
+        };
+        if let Err(e) = bundle_expand(TokenStream2::new(), module(), &ALL) {
+            panic!("`#[dataflow_bundle]` rejected with every feature on: {e}");
+        }
+        match bundle_expand(TokenStream2::new(), module(), &off) {
+            Ok(_) => panic!("`#[dataflow_bundle]` accepted without the feature"),
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("`#[dataflow_bundle]` requires the `dataflow` feature"),
+                "unexpected error: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn emitted_glue_follows_the_feature_set() {
+        let src = "node A = Terminate, deps: [], task: w;\nnode B = Terminate, deps: [A], task: w;";
+        let expand_with = |f: &Features| {
+            let spec = parse_gated(src, f).expect("passes the gate");
+            expand(spec, f).expect("expansion succeeds").to_string()
+        };
+        let glue = [
+            "with_graph",
+            "graph_ref :",
+            "pools :",
+            "with_shell",
+            "__sv_trace_hooks",
+            ". adopt (",
+        ];
+        let none = expand_with(&NONE);
+        for g in glue.iter().chain([&". stamp_name ("]) {
+            assert!(!none.contains(g), "`{g}` without its feature: {none}");
+        }
+        let all = expand_with(&ALL);
+        for g in glue {
+            assert!(
+                all.contains(g),
+                "`{g}` missing with every feature on: {all}"
+            );
+        }
+        assert!(
+            !all.contains(". stamp_name ("),
+            "`trace` adopts instead: {all}"
+        );
+        let names = expand_with(&Features {
+            metadata_names: true,
+            ..NONE
+        });
+        assert!(names.contains(". stamp_name ("), "{names}");
+        assert!(!names.contains(". adopt ("), "{names}");
+    }
+
+    #[test]
+    fn struct_literal_field_calls_are_rewritten() {
+        let item = quote! {
+            async fn f(node: &'static TaskNode) -> R {
+                R { a: node.reader(&crate::A), b: node.get(&crate::B) }
+            }
+        };
+        let out = dataflow_expand(TokenStream2::new(), item, &ALL)
+            .expect("expands")
+            .to_string();
+        assert_eq!(
+            out.matches(":: embassy_supervisor :: Sig {").count(),
+            2,
+            "both field initializers are verb calls: {out}"
+        );
+    }
+
+    /// The span of the first `compile_error` ident in `out`, through groups.
+    fn compile_error_span(out: TokenStream2) -> Option<proc_macro2::Span> {
+        out.into_iter().find_map(|tt| match tt {
+            proc_macro2::TokenTree::Ident(i) if i == "compile_error" => Some(i.span()),
+            proc_macro2::TokenTree::Group(g) => compile_error_span(g.stream()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_deferred_feature_error_points_at_its_clause() {
+        let off = Features {
+            enabled_if: false,
+            ..ALL
+        };
+        let spec = parse_gated(
+            "node A = Terminate, deps: [], #[cfg(feature = \"x\")] enabled_if: crate::on;",
+            &off,
+        )
+        .expect("a gated clause passes the gate");
+        let Item::Node(n) = &spec.items[0] else {
+            panic!("node")
+        };
+        let kw = n.enabled_if.as_ref().expect("enabled_if").kw.span;
+        let out = expand(spec, &off).expect("expansion succeeds");
+        let at = compile_error_span(out).expect("a deferred error");
+        assert_eq!(
+            at.start(),
+            kw.start(),
+            "the error is spanned on `enabled_if`"
+        );
+
+        let off = Features {
+            dataflow: false,
+            ..ALL
+        };
+        let spec = parse_gated(
+            "node A = Terminate, deps: [], task: w, #[cfg(feature = \"x\")] discover;",
+            &off,
+        )
+        .expect("a gated clause passes the gate");
+        let Item::Node(n) = &spec.items[0] else {
+            panic!("node")
+        };
+        let kw = n.discover.as_ref().expect("discover").kw.span;
+        let out = expand(spec, &off).expect("expansion succeeds");
+        let at = compile_error_span(out).expect("a deferred error");
+        assert_eq!(at.start(), kw.start(), "the error is spanned on `discover`");
+    }
+
+    #[test]
+    fn marker_assert_is_absolute() {
+        let spec = parse_gated(
+            "node A = Terminate, deps: [], task: w, discover, writes: [crate::S observed beat];",
+            &ALL,
+        )
+        .expect("passes the gate");
+        let out = expand(spec, &ALL).expect("expansion succeeds").to_string();
+        assert!(out.contains(":: core :: assert ! (__sv_found"), "{out}");
+    }
+
+    #[test]
+    fn derived_public_names_cannot_be_reused() {
+        for (src, what) in [
+            (
+                "pool P = [Terminate], deps: [], task: w, \
+                 policy: DeferredShrink::new(d), min: 1, max: 1;\n\
+                 node P_MAX = Terminate, deps: [];",
+                "the `max:` const of pool `P`",
+            ),
+            (
+                "node X = Terminate, deps: [], task: w, exit: u32;\n\
+                 node X_EXIT = Terminate, deps: [];",
+                "the `exit:` slot of node `X`",
+            ),
+        ] {
+            let spec = syn::parse_str::<GraphSpec>(src).unwrap();
+            match expand(spec, &ALL) {
+                Ok(_) => panic!("accepted: {src}"),
+                Err(e) => assert!(e.to_string().contains(what), "unexpected error: {e}"),
+            }
+        }
+    }
+
     #[test]
     fn dataflow_indices_bake_after_full_collection() {
         let item = quote::quote! {
@@ -3769,11 +4371,12 @@ mod tests {
                 node.put(&crate::A, 3u8);
             }
         };
-        let out = dataflow_expand(TokenStream2::new(), item)
+        let out = dataflow_expand(TokenStream2::new(), item, &ALL)
             .expect("expands")
             .to_string();
         // The third call makes `A` unconditional, so the only `feature = "x"`
-        // left is the statement's own attribute; a second occurrence is a call
+        // left is the statement's own attribute; a second one would be a stale
+        // predicate on the table entry.
         assert_eq!(
             out.matches("feature = \"x\"").count(),
             1,
@@ -3785,12 +4388,14 @@ mod tests {
     fn divisible_requires_feature() {
         gate_rejects(
             "node A = Terminate, deps: [], task: f, resources: [R: divisible];",
-            cfg!(feature = "budget"),
+            Features {
+                budget: false,
+                ..ALL
+            },
             "`budget` feature",
         );
     }
 
-    #[cfg(all(feature = "budget", feature = "pool"))]
     #[test]
     fn divisible_emits_one_budget_sized_by_its_holders() {
         let spec = syn::parse_str::<GraphSpec>(
@@ -3800,7 +4405,7 @@ mod tests {
              node B = Terminate, deps: [], task: f, resources: [P: divisible];",
         )
         .unwrap();
-        let out = expand(spec).expect("expansion succeeds").to_string();
+        let out = expand(spec, &ALL).expect("expansion succeeds").to_string();
         assert!(out.contains("pub static P : "), "{out}");
         assert!(
             out.contains("Budget < 5usize >"),
@@ -3808,12 +4413,12 @@ mod tests {
         );
         assert!(out.contains("P . claimant (0u8)"), "A takes slot 0: {out}");
         assert!(
-            out.contains("P . claimant ((1u8 as usize + I) as u8)"),
+            out.contains("P . claimant ((1u8 as usize + i) as u8)"),
             "W's members take 1..=3: {out}"
         );
         assert!(out.contains("P . claimant (4u8)"), "B takes slot 4: {out}");
         assert!(
-            out.contains("__SV_CLAIMS_W_2"),
+            out.contains("__SV_CLAIMS_1_W_2"),
             "one claims table per member: {out}"
         );
         assert!(
@@ -3824,7 +4429,6 @@ mod tests {
         assert!(!out.contains(". restore ("), "nothing to restore: {out}");
     }
 
-    #[cfg(feature = "budget")]
     #[test]
     fn divisible_slots_are_counted_syntactically() {
         let spec = syn::parse_str::<GraphSpec>(
@@ -3832,14 +4436,13 @@ mod tests {
              node B = Terminate, deps: [], task: f, resources: [P: divisible];",
         )
         .unwrap();
-        let out = expand(spec).expect("expansion succeeds").to_string();
+        let out = expand(spec, &ALL).expect("expansion succeeds").to_string();
         assert!(
             out.contains("Budget < 2usize >"),
             "a cfg'd-out holder still takes its slot: {out}"
         );
     }
 
-    #[cfg(feature = "budget")]
     #[test]
     fn a_budget_may_be_provided_by_a_node() {
         let spec = syn::parse_str::<GraphSpec>(
@@ -3847,11 +4450,10 @@ mod tests {
              node A = Terminate, deps: [ALLOC], task: g, resources: [P: divisible];",
         )
         .unwrap();
-        let out = expand(spec).expect("expansion succeeds").to_string();
-        assert!(out.contains("__SV_PROVIDES_ALLOC"), "{out}");
+        let out = expand(spec, &ALL).expect("expansion succeeds").to_string();
+        assert!(out.contains("__SV_PROVIDES_0_ALLOC"), "{out}");
     }
 
-    #[cfg(feature = "budget")]
     #[test]
     fn a_budget_name_cannot_double_as_a_take_kind_slot() {
         let spec = syn::parse_str::<GraphSpec>(
@@ -3859,7 +4461,7 @@ mod tests {
              node B = Terminate, deps: [], task: f, resources: [P: u32];",
         )
         .unwrap();
-        match expand(spec) {
+        match expand(spec, &ALL) {
             Ok(_) => panic!("accepted"),
             Err(e) => assert!(e.to_string().contains("duplicate resource name"), "{e}"),
         }
@@ -3869,12 +4471,11 @@ mod tests {
     fn veto_requires_feature() {
         gate_rejects(
             "node A = Terminate, deps: [], task: f, writes: [crate::TRIP veto];",
-            cfg!(feature = "veto"),
+            Features { veto: false, ..ALL },
             "`veto` feature",
         );
     }
 
-    #[cfg(all(feature = "veto", feature = "pool"))]
     #[test]
     fn veto_writers_are_numbered_in_item_order_across_nodes_and_pools() {
         let spec = syn::parse_str::<GraphSpec>(
@@ -3885,10 +4486,10 @@ mod tests {
              node R = Terminate, deps: [], task: h, reads: [crate::TRIP];",
         )
         .unwrap();
-        let out = expand(spec).expect("expansion succeeds").to_string();
+        let out = expand(spec, &ALL).expect("expansion succeeds").to_string();
         assert!(out.contains(". veto (0u8)"), "A: {out}");
         assert!(
-            out.contains("__SV_WRITES_P_0") && out.contains("__SV_WRITES_P_1"),
+            out.contains("__SV_WRITES_1_P_0") && out.contains("__SV_WRITES_1_P_1"),
             "a table per member: {out}"
         );
         assert!(
@@ -3906,7 +4507,6 @@ mod tests {
         assert_eq!(out.matches("__sv_check_veto").count(), 1, "{out}");
     }
 
-    #[cfg(feature = "veto")]
     #[test]
     fn a_pool_without_veto_keeps_one_writes_table() {
         let spec = syn::parse_str::<GraphSpec>(
@@ -3914,12 +4514,11 @@ mod tests {
              policy: DeferredShrink::new(d), min: 1, max: 2;",
         )
         .unwrap();
-        let out = expand(spec).expect("expansion succeeds").to_string();
-        assert!(out.contains("__SV_WRITES_P :"), "{out}");
-        assert!(!out.contains("__SV_WRITES_P_0"), "{out}");
+        let out = expand(spec, &ALL).expect("expansion succeeds").to_string();
+        assert!(out.contains("__SV_WRITES_0_P :"), "{out}");
+        assert!(!out.contains("__SV_WRITES_0_P_0"), "{out}");
     }
 
-    #[cfg(feature = "veto")]
     #[test]
     fn more_than_32_veto_writers_are_rejected() {
         let mut src = String::new();
@@ -3929,13 +4528,12 @@ mod tests {
             ));
         }
         let spec = syn::parse_str::<GraphSpec>(&src).unwrap();
-        match expand(spec) {
+        match expand(spec, &ALL) {
             Ok(_) => panic!("accepted"),
             Err(e) => assert!(e.to_string().contains("more than 32"), "{e}"),
         }
     }
 
-    #[cfg(feature = "veto")]
     #[test]
     fn a_veto_gate_spelled_two_ways_is_rejected() {
         let spec = syn::parse_str::<GraphSpec>(
@@ -3943,7 +4541,7 @@ mod tests {
              node B = Terminate, deps: [], task: f, writes: [TRIP veto];",
         )
         .unwrap();
-        match expand(spec) {
+        match expand(spec, &ALL) {
             Ok(_) => panic!("accepted"),
             Err(e) => {
                 let e = e.to_string();
@@ -3957,7 +4555,7 @@ mod tests {
              node B = Terminate, deps: [], task: f, writes: [crate::b::TRIP veto];",
         )
         .unwrap();
-        match expand(spec) {
+        match expand(spec, &ALL) {
             Ok(_) => panic!("accepted"),
             Err(e) => assert!(e.to_string().contains("`use .. as`"), "{e}"),
         }
@@ -3967,7 +4565,9 @@ mod tests {
              node B = Terminate, deps: [], task: f, writes: [crate::TRIP[1] veto];",
         )
         .unwrap();
-        let out = expand(spec).expect("two elements, two gates").to_string();
+        let out = expand(spec, &ALL)
+            .expect("two elements, two gates")
+            .to_string();
         assert_eq!(out.matches("__sv_check_veto").count(), 2, "{out}");
         assert!(
             out.contains(". veto (0u8)") && !out.contains(". veto (1u8)"),
@@ -3975,7 +4575,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "veto")]
     #[test]
     fn the_veto_check_is_gated_like_its_writers() {
         let spec = syn::parse_str::<GraphSpec>(
@@ -3985,7 +4584,7 @@ mod tests {
              writes: [#[cfg(feature = \"y\")] crate::TRIP veto];",
         )
         .unwrap();
-        let out = expand(spec).expect("expansion succeeds").to_string();
+        let out = expand(spec, &ALL).expect("expansion succeeds").to_string();
         assert!(
             out.contains("# [cfg (any (feature = \"x\" , feature = \"y\"))] const _ : () = "),
             "the check carries the union of its writers' cfgs: {out}"
@@ -3996,49 +4595,63 @@ mod tests {
              node B = Terminate, deps: [], task: f, writes: [crate::TRIP veto];",
         )
         .unwrap();
-        let out = expand(spec).expect("expansion succeeds").to_string();
+        let out = expand(spec, &ALL).expect("expansion succeeds").to_string();
         assert!(
             out.contains("const _ : () = ") && !out.contains("))] const _ : () = "),
             "one unconditional writer keeps the check bare: {out}"
         );
     }
 
-    #[cfg(feature = "dataflow")]
     #[test]
     fn feature_verbs_name_their_feature_in_dataflow_bodies() {
-        for (body, feature, needle) in [
+        for (body, off, needle) in [
             (
                 quote::quote! { let _ = node.open(&crate::EST).await; },
-                cfg!(feature = "data-deps"),
+                Features {
+                    data_deps: false,
+                    ..ALL
+                },
                 "`data-deps` feature",
             ),
             (
                 quote::quote! { let _ = node.lease(&crate::LNK); },
-                cfg!(feature = "data-deps"),
+                Features {
+                    data_deps: false,
+                    ..ALL
+                },
                 "`data-deps` feature",
             ),
             (
                 quote::quote! { node.veto(&crate::TRIP); },
-                cfg!(feature = "veto"),
+                Features { veto: false, ..ALL },
                 "`veto` feature",
             ),
             (
                 quote::quote! { node.retire(&crate::EST, d).await; },
-                cfg!(all(feature = "data-deps", feature = "readiness")),
+                Features {
+                    readiness: false,
+                    ..ALL
+                },
+                "`data-deps` and `readiness` features",
+            ),
+            (
+                quote::quote! { node.retire(&crate::EST, d).await; },
+                Features {
+                    data_deps: false,
+                    ..ALL
+                },
                 "`data-deps` and `readiness` features",
             ),
         ] {
             let item = quote::quote! {
                 async fn f(node: &'static TaskNode) { #body }
             };
-            let res = dataflow_expand(TokenStream2::new(), item);
-            if feature {
-                assert!(res.is_ok(), "rejected with the feature: {:?}", res.err());
-            } else {
-                match res {
-                    Ok(_) => panic!("accepted without the feature"),
-                    Err(e) => assert!(e.to_string().contains(needle), "{e}"),
-                }
+            if let Err(e) = dataflow_expand(TokenStream2::new(), item.clone(), &ALL) {
+                panic!("rejected with every feature on: {e}");
+            }
+            match dataflow_expand(TokenStream2::new(), item, &off) {
+                Ok(_) => panic!("accepted without the feature: {body}"),
+                Err(e) => assert!(e.to_string().contains(needle), "{e}"),
             }
         }
     }
@@ -4053,14 +4666,14 @@ mod tests {
              resources: [BUS: shared serialized Bus];",
         )
         .unwrap();
-        assert!(expand(ok).is_ok(), "one tier: accepted");
+        assert!(expand(ok, &ALL).is_ok(), "one tier: accepted");
         let root = syn::parse_str::<GraphSpec>(
             "node A = Terminate, deps: [], task: f, resources: [BUS: shared serialized Bus];\n\
              node B = Terminate, deps: [], task: f, resources: [BUS: shared serialized Bus];",
         )
         .unwrap();
         assert!(
-            expand(root).is_ok(),
+            expand(root, &ALL).is_ok(),
             "both on the supervisor's executor: accepted"
         );
         for (src, a, b) in [
@@ -4083,7 +4696,7 @@ mod tests {
             ),
         ] {
             let spec = syn::parse_str::<GraphSpec>(src).unwrap();
-            match expand(spec) {
+            match expand(spec, &ALL) {
                 Ok(_) => panic!("accepted across tiers: {src}"),
                 Err(e) => {
                     let msg = e.to_string();
@@ -4099,7 +4712,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            expand(plain).is_ok(),
+            expand(plain, &ALL).is_ok(),
             "without the marker a shared slot may span tiers"
         );
     }

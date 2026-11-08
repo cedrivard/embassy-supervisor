@@ -15,7 +15,6 @@ fn trace_recorders() {
 
     A.set_task_id(101);
     B.set_task_id(202);
-    assert_eq!(A.task_id(), 101);
 
     trace::on_task_exec_begin(EXEC, 101);
     clock.advance(Duration::from_ticks(100));

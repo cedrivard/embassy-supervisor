@@ -24,7 +24,9 @@ async fn provider(node: &'static TaskNode) {
     node.mark_exited();
 }
 
-/// Stays up across the provider's restart and reports what it can see — the
+/// Stays up across the provider's restart and reports what it can see: the
+/// provider's epoch, sampled on request or awaited past a seen value. Nothing
+/// re-gates it, so the epoch is its only view of the restart.
 async fn watcher(node: &'static TaskNode) {
     loop {
         match select3(node.wait_shutdown(), SAMPLE_NOW.wait(), WAIT_CHANGE.wait()).await {

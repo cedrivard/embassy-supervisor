@@ -122,6 +122,17 @@ async fn driver(spawner: Spawner) {
         "a recovered node can trip again, got {events:?}"
     );
 
+    // A stall past the u32 tick wrap stays one stall: no Recovered, no second Stale.
+    let age = u64::from(BEATER.ticks_since_beat());
+    sweeps(clock, Duration::from_ticks(1 << 30), 3).await;
+    sweeps(clock, Duration::from_ticks((1 << 30) - age), 1).await;
+    let events = drain();
+    assert!(
+        events.is_empty(),
+        "a node stalled for 2^32 ticks is the same stall, got {events:?}"
+    );
+    assert!(BEATER.is_stale(Duration::from_millis(100)));
+
     BEATER.mark_exited();
     assert!(!BEATER.is_running());
     let _ = drain();
@@ -130,6 +141,37 @@ async fn driver(spawner: Spawner) {
     assert!(
         !events.iter().any(|(n, _)| *n == "beater"),
         "a stopped node is down, not stale, got {events:?}"
+    );
+
+    // `beat_window:` counts consecutive misses: two misses, a beat, two more
+    // must not report; a third in a row does. 150 ms steps outlast every
+    // node's check interval, so each step is exactly one sweep.
+    let step = Duration::from_millis(150);
+    JITTERY.beat();
+    sweeps(clock, step, 1).await;
+    let events = drain();
+    assert!(
+        events
+            .iter()
+            .any(|(n, k)| *n == "jittery" && *k == HealthKind::Recovered),
+        "the windowed node recovers on its beat, got {events:?}"
+    );
+    sweeps(clock, step, 2).await;
+    JITTERY.beat();
+    sweeps(clock, step, 1).await;
+    sweeps(clock, step, 2).await;
+    let events = drain();
+    assert_eq!(
+        stales(&events, "jittery"),
+        0,
+        "a beat between misses restarts the count, got {events:?}"
+    );
+    sweeps(clock, step, 1).await;
+    let events = drain();
+    assert_eq!(
+        stales(&events, "jittery"),
+        1,
+        "the third consecutive miss reports, got {events:?}"
     );
 
     DONE.store(true, Ordering::SeqCst);

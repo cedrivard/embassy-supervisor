@@ -36,6 +36,20 @@ async fn driver(spawner: Spawner) {
     clock.advance(Duration::from_millis(2));
     assert!(WORKER.is_stale(Duration::from_secs(1)));
 
+    // A stall past the u32 tick wrap stays a stall: the age saturates.
+    let age = u64::from(WORKER.ticks_since_beat());
+    clock.advance(Duration::from_ticks(1 << 31));
+    assert_eq!(WORKER.ticks_since_beat(), u32::MAX / 2);
+    clock.advance(Duration::from_ticks((1 << 31) - age));
+    assert!(
+        WORKER.is_stale(Duration::from_secs(1)),
+        "2^32 ticks after the last beat, still stale"
+    );
+    assert!(
+        WORKER.is_stale(Duration::from_ticks(1 << 40)),
+        "a max_age past the cap is clamped"
+    );
+
     WORKER.mark_exited();
     assert!(!WORKER.is_running());
     assert!(WORKER.has_exited());

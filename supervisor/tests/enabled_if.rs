@@ -7,6 +7,7 @@ use embassy_time::MockDriver;
 
 static FLAG: AtomicBool = AtomicBool::new(false);
 static CALLS: AtomicU32 = AtomicU32::new(0);
+static SOLO_CALLS: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
 
 fn flag() -> bool {
@@ -14,9 +15,22 @@ fn flag() -> bool {
     FLAG.load(Ordering::SeqCst)
 }
 
+fn solo_flag() -> bool {
+    SOLO_CALLS.fetch_add(1, Ordering::SeqCst);
+    false
+}
+
+fn never() -> bool {
+    false
+}
+
 supervisor_graph! {
     node GATED = Terminate, deps: [], task: worker, enabled_if: flag;
     node ALWAYS = Terminate, deps: [], task: worker;
+    node SOLO = Terminate, deps: [], task: worker, enabled_if: solo_flag;
+    // `all()` keeps a gated clause, `any()` strips it.
+    node KEPT = Terminate, deps: [], task: worker, #[cfg(all())] enabled_if: never;
+    node STRIPPED = Terminate, deps: [], task: worker, #[cfg(any())] enabled_if: never;
 }
 
 async fn worker(node: &'static TaskNode) {
@@ -33,6 +47,8 @@ async fn settle() {
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
+    // Self-managed for the whole test: start() must never ask its predicate.
+    SOLO.set_detached(true);
 
     sup.start(&spawner).await.expect("start");
     settle().await;
@@ -40,6 +56,23 @@ async fn driver(spawner: Spawner) {
     assert!(!GATED.is_running(), "a false predicate keeps the node down");
     assert!(GATED.is_disabled(), "and latches it disabled, visibly");
     assert_eq!(CALLS.load(Ordering::SeqCst), 1, "evaluated once per start");
+    assert_eq!(
+        SOLO_CALLS.load(Ordering::SeqCst),
+        0,
+        "a detached node's predicate is never called"
+    );
+    assert!(
+        !SOLO.is_running() && !SOLO.is_disabled(),
+        "nor is it started or latched"
+    );
+    assert!(
+        KEPT.is_disabled() && !KEPT.is_running(),
+        "an all()-gated clause is kept"
+    );
+    assert!(
+        STRIPPED.is_running() && !STRIPPED.is_disabled(),
+        "an any()-gated clause is stripped"
+    );
 
     sup.activate(&GATED, &spawner)
         .await
@@ -60,6 +93,22 @@ async fn driver(spawner: Spawner) {
     sup.start(&spawner).await.expect("start");
     settle().await;
     assert!(GATED.is_running(), "a true predicate brings it up");
+
+    sup.teardown().await.expect("teardown");
+    FLAG.store(false, Ordering::SeqCst);
+    let calls = CALLS.load(Ordering::SeqCst);
+    sup.respawn_terminate(&spawner).await.expect("respawn");
+    settle().await;
+    assert!(
+        GATED.is_running() && !GATED.is_disabled(),
+        "respawn_terminate brings a Terminate node back without asking enabled_if"
+    );
+    assert_eq!(
+        CALLS.load(Ordering::SeqCst),
+        calls,
+        "the predicate was not called"
+    );
+    FLAG.store(true, Ordering::SeqCst);
 
     sup.teardown().await.expect("teardown");
     GATED.set_disabled(true);

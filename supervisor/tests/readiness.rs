@@ -35,6 +35,8 @@ async fn provider_worker(node: &'static TaskNode) {
 }
 
 /// The rendezvous proof lives here: this body's first statement records whether
+/// the provider was ready when the consumer got its first poll: bring-up must
+/// have held the spawn until then.
 async fn consumer_worker(node: &'static TaskNode) {
     CONSUMER_SAW_READY.store(PROVIDER.is_ready(), Ordering::SeqCst);
     CONSUMER_SPAWNS.fetch_add(1, Ordering::SeqCst);
@@ -65,6 +67,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]
@@ -141,6 +144,7 @@ fn ready_deps_gate_bringup_and_growth() {
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
     while !DONE.load(Ordering::SeqCst) {
         // Phase 2 parks on LATE's 100 ms ready-dep timeout; advance the frozen
+        // clock in small repeated steps (always landing after the timer arms).
         if PHASE.load(Ordering::SeqCst) >= 2 {
             clock.advance(embassy_time::Duration::from_millis(50));
         }

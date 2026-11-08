@@ -11,17 +11,19 @@ supervisor_graph! {
     node DEP = Terminate, deps: [PARK ready bound], task: dep, slot_timeout: 5000;
 }
 
-static PARK_STARTS: AtomicU32 = AtomicU32::new(0);
+static PARK_SPAWNS: AtomicU32 = AtomicU32::new(0);
+static PARK_RESUMES: AtomicU32 = AtomicU32::new(0);
 static DEP_STARTS: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
 
 async fn park(node: &'static TaskNode) {
+    PARK_SPAWNS.fetch_add(1, Ordering::SeqCst);
     loop {
-        PARK_STARTS.fetch_add(1, Ordering::SeqCst);
         node.set_ready();
         node.wait_shutdown().await;
         node.ack_dropped();
         node.wait_resume().await;
+        PARK_RESUMES.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -44,7 +46,7 @@ async fn driver(spawner: Spawner) {
 
     sup.start(&spawner).await.expect("start");
     settle().await;
-    assert_eq!(PARK_STARTS.load(Ordering::SeqCst), 1);
+    assert_eq!(PARK_SPAWNS.load(Ordering::SeqCst), 1);
     assert_eq!(DEP_STARTS.load(Ordering::SeqCst), 1);
     assert!(PARK.is_running());
     assert!(DEP.is_running());
@@ -53,8 +55,11 @@ async fn driver(spawner: Spawner) {
     settle().await;
 
     assert_eq!(
-        PARK_STARTS.load(Ordering::SeqCst),
-        2,
+        (
+            PARK_SPAWNS.load(Ordering::SeqCst),
+            PARK_RESUMES.load(Ordering::SeqCst)
+        ),
+        (1, 1),
         "the Pause node was resumed, not respawned"
     );
     assert!(PARK.is_running(), "and is running again");
@@ -90,9 +95,12 @@ async fn driver(spawner: Spawner) {
 
     assert!(PARK.is_running(), "PARK is resumed");
     assert_eq!(
-        PARK_STARTS.load(Ordering::SeqCst),
-        3,
-        "PARK re-entered its loop on resume"
+        (
+            PARK_SPAWNS.load(Ordering::SeqCst),
+            PARK_RESUMES.load(Ordering::SeqCst)
+        ),
+        (1, 2),
+        "PARK was resumed in place again, still one instance"
     );
     assert!(
         DEP.is_running(),
@@ -105,7 +113,7 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn pause_node_under_restart_and_bind() {
-    let clock = MockDriver::get();
+    let _clock = MockDriver::get();
 
     std::thread::spawn(|| {
         let executor: &'static mut embassy_executor::Executor =
@@ -118,7 +126,6 @@ fn pause_node_under_restart_and_bind() {
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
     while !DONE.load(Ordering::SeqCst) {
         assert!(StdInstant::now() < deadline, "did not complete");
-        clock.advance(embassy_time::Duration::from_millis(100));
         std::thread::sleep(StdDuration::from_millis(2));
     }
 }

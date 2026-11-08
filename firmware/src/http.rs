@@ -1,4 +1,7 @@
 use core::fmt::Write as _;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 
 use alloc::string::String;
 use embassy_futures::select::{Either, select};
@@ -19,15 +22,37 @@ pub const HTTP_CEIL: usize = 2;
 
 /// A `hog` fault's default bound.
 const HOG_DEFAULT_MS: u64 = 3000;
-/// A `hog` fault's ceiling. The thread executor also runs the watchdog feeder,
-/// so a hog must not outlast the 8 s bootloader watchdog feed.
-const HOG_MAX_MS: u64 = 6000;
+/// A `hog` fault's ceiling. A hog on the thread tier, or on `HIGH` above it,
+/// blocks the watchdog feeder: one that starts just before a due feed (every
+/// 2 s) holds that feed to the hog's end, 5 s later and 1 s inside the 8 s
+/// timeout.
+const HOG_MAX_MS: u64 = 5000;
 
-/// Counters tracked for each HTTP worker task.
+/// Set once a worker has written a whole response: the evidence `ota-confirm`
+/// waits for before it confirms an update ([`first_response`]).
+static SERVED_ONE: AtomicBool = AtomicBool::new(false);
+static SERVED_EVT: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Resolve once some worker has written a whole response (see `send_status`).
+/// Single waiter: `ota-confirm`. Later calls resolve at once.
+pub(crate) async fn first_response() {
+    if !SERVED_ONE.load(Ordering::Acquire) {
+        SERVED_EVT.wait().await;
+    }
+}
+
+/// Per-worker counters, one `HTTP_STATS` element per pool member: member `i`
+/// takes element `i` at spawn and restores it on exit, so the count survives
+/// a shrink and regrow.
 pub struct WorkerStats {
-    /// Number of requests served by this worker.
+    /// Requests this worker has answered (every request read, 404s included).
     pub served: u32,
 }
+
+/// Each member's `served`, mirrored for `/api/tasks`: while a member runs, its
+/// `WorkerStats` lives in its own task, out of reach of the worker that
+/// builds the report.
+static SERVED: [AtomicU32; crate::HTTP_MAX] = [const { AtomicU32::new(0) }; crate::HTTP_MAX];
 
 embassy_supervisor::supervisor_fragment! {
     name: HTTP_FRAG;
@@ -42,6 +67,15 @@ embassy_supervisor::supervisor_fragment! {
         slot_timeout: 2000;
 }
 
+// Dashboard script notes, kept out of the served string:
+// - `fmenu`/`flt`: the playground's verbs plus a bounded hog; no crash on net:
+//   it would free the buffers its sockets use.
+// - `prev`/`sub`: trace counters are raw wrapping u32 ticks: keep the previous
+//   sample and diff (`>>>0` = wrap-safe) to turn them into rates; max_poll
+//   converts via tick_hz.
+// - `document.activeElement` guard in `load`: an open menu lives in this table:
+//   rewriting it would close the menu, so hold the redraw while one has focus
+//   (the choice blurs it and redraws).
 const INDEX_HTML: &str = "<!doctype html><meta charset=utf-8><title>task supervisor</title>\
 <style>body{font-family:monospace;background:#111;color:#0f0;padding:1em}\
 table{border-collapse:collapse}td,th{border:1px solid #333;padding:4px 8px;text-align:left}\
@@ -59,13 +93,11 @@ load();setTimeout(load,400);}\
 async function hb(ms){await fetch('/api/heartbeat?ms='+ms,{method:'POST'});}\
 async function flt(n,k){if(!k)return;await fetch('/api/fault?node='+n+'&kind='+k,{method:'POST'});\
 load();setTimeout(load,400);}\
-/* the same verbs as the playground's menu, plus a bounded hog */\
 const fmenu=n=>'<select onchange=\"flt(\\''+n+'\\',this.value);this.value=\\'\\';this.blur()\">'+\
 '<option value=\"\">⚡</option><option value=stall>stall (stop polling)</option>'+\
-'<option value=wedge>wedge (no shutdown ack)</option><option value=crash>crash (abrupt exit)</option>'+\
+'<option value=wedge>wedge (no shutdown ack)</option>'+\
+(n=='net'?'':'<option value=crash>crash (abrupt exit)</option>')+\
 '<option value=hog>hog 3 s</option><option value=clear>clear fault</option></select>';\
-/* trace counters are raw wrapping u32 ticks: keep the previous sample and diff \
-(>>>0 = wrap-safe) to turn them into rates; max_poll converts via tick_hz. */\
 let prev=null;const sub=(a,b)=>(a-b)>>>0;\
 async function load(){let d=await (await fetch('/api/tasks')).json();\
 let f=d.heap_free,tot=d.heap_total,u=tot-f;\
@@ -103,8 +135,6 @@ if(pool){let op=pool.dis?'start':'stop';\
 h+='<tr><td>http (pool)<td>elastic<td>'+pool.r+'/'+pool.n+' up, '+pool.b+' busy<td>-<td>'+\
 cpu('_pool',pool.e)+'<td>'+us(pool.mp)+'<td>'+pool.deps.join(',')+\
 '<td><button onclick=\"ctl(\\'http0\\',\\''+op+'\\')\">'+op+'</button>'+fmenu('http0');}\
-/* an open menu lives in this table: rewriting it would close the menu, so \
-hold the redraw while one has focus (the choice blurs it and redraws) */\
 const ae=document.activeElement;if(ae&&ae.tagName=='SELECT'&&ae.closest('#t'))return;\
 document.getElementById('t').innerHTML=h;\
 let m={};for(let t of d.tasks)m[t.name]=t.exec_ticks;if(pool)m['_pool']=pool.e;\
@@ -119,6 +149,7 @@ pub struct HttpBufs {
     tx: [u8; 2560],
     req: [u8; 1024],
 }
+// SAFETY: three byte arrays, for which all-zero is a valid value.
 unsafe impl embassy_supervisor::Zeroable for HttpBufs {}
 
 pub(crate) async fn http_task(
@@ -131,6 +162,9 @@ pub(crate) async fn http_task(
         return;
     };
     let HttpBufs { rx, tx, req } = bufs;
+    let mirror = crate::HTTP_POOL
+        .member_index(node)
+        .and_then(|i| SERVED.get(i));
 
     loop {
         if node.shutdown_requested() {
@@ -140,6 +174,9 @@ pub(crate) async fn http_task(
 
         let mut socket = TcpSocket::new(stack, &mut rx[..], &mut tx[..]);
         socket.set_timeout(Some(Duration::from_secs(KEEPALIVE_IDLE_SECS)));
+        // Nagle would hold the body until the header's ACK; the two `write_all`s
+        // per response are one logical write.
+        socket.set_nagle_enabled(false);
 
         match node.run_cancellable(socket.accept(HTTP_PORT)).await {
             Err(Aborted) => {
@@ -151,15 +188,20 @@ pub(crate) async fn http_task(
         }
 
         node.mark_busy();
-        serve_connection(&mut socket, &mut req[..], node).await;
-        stats.served = stats.served.wrapping_add(1);
+        serve_connection(&mut socket, &mut req[..], node, stats, mirror).await;
         socket.close();
         let _ = socket.flush().await;
         node.mark_idle();
     }
 }
 
-async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &'static TaskNode) {
+async fn serve_connection(
+    socket: &mut TcpSocket<'_>,
+    req: &mut [u8],
+    node: &'static TaskNode,
+    stats: &mut WorkerStats,
+    mirror: Option<&AtomicU32>,
+) {
     loop {
         if node.shutdown_requested() {
             return;
@@ -176,6 +218,10 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &'st
         let method = parts.next().unwrap_or("");
         let path = parts.next().unwrap_or("");
         let keep = !connection_close_requested(request);
+        stats.served = stats.served.wrapping_add(1);
+        if let Some(m) = mirror {
+            m.store(stats.served, Ordering::Relaxed);
+        }
 
         match (method, path) {
             ("GET", "/") => send(socket, "text/html", INDEX_HTML, keep).await,
@@ -217,10 +263,12 @@ async fn serve_connection(socket: &mut TcpSocket<'_>, req: &mut [u8], node: &'st
                 let body = handle_heartbeat(p, node);
                 send(socket, "application/json", &body, keep).await;
             }
-            ("POST", p) if p.starts_with("/api/fault") => {
-                let body = handle_fault(p);
-                send(socket, "application/json", &body, keep).await;
-            }
+            ("POST", p) if p.starts_with("/api/fault") => match handle_fault(p) {
+                Ok(body) => send(socket, "application/json", &body, keep).await,
+                Err(body) => {
+                    send_status(socket, "400 Bad Request", "application/json", &body, keep).await
+                }
+            },
             ("POST", p) if p.starts_with("/api/ota") => {
                 match crate::ota::set_target(query(p, "ip="), query(p, "port="), query(p, "path="))
                 {
@@ -285,8 +333,10 @@ async fn send(socket: &mut TcpSocket<'_>, content_type: &str, body: &str, keep: 
     send_status(socket, "200 OK", content_type, body, keep).await;
 }
 
-/// Like [`send`] with an explicit status line — the control endpoint answers
-/// `503 Service Unavailable` when the supervisor's mailbox is full.
+/// Like [`send`] with an explicit status line: `503 Service Unavailable` from
+/// the control endpoint when the supervisor's mailbox is full, `400 Bad Request`
+/// from a refused `/api/fault`. The first response written in full releases
+/// [`first_response`].
 async fn send_status(
     socket: &mut TcpSocket<'_>,
     status: &str,
@@ -294,7 +344,8 @@ async fn send_status(
     body: &str,
     keep: bool,
 ) {
-    // Heap-built so the header isn't held inline in the worker future across the
+    // Heap-built so the header is not held inline in the worker future across
+    // the write `.await`s below.
     let mut header = String::with_capacity(128);
     let _ = write!(
         header,
@@ -304,15 +355,22 @@ async fn send_status(
         body.len(),
         if keep { "keep-alive" } else { "close" },
     );
-    let _ = socket.write_all(header.as_bytes()).await;
-    let _ = socket.write_all(body.as_bytes()).await;
+    let sent = socket.write_all(header.as_bytes()).await.is_ok()
+        && socket.write_all(body.as_bytes()).await.is_ok();
+    if sent && !SERVED_ONE.load(Ordering::Relaxed) {
+        SERVED_ONE.store(true, Ordering::Release);
+        SERVED_EVT.signal(());
+    }
 }
 
+/// True if the request carries a `Connection: close` header (ASCII case-insensitive).
 fn connection_close_requested(request: &str) -> bool {
     for l in request.lines() {
         let l = l.trim_start();
         const KEY: &str = "connection:";
-        if l.len() >= KEY.len() && l[..KEY.len()].eq_ignore_ascii_case(KEY) {
+        if l.get(..KEY.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(KEY))
+        {
             return contains_ascii_ci(&l[KEY.len()..], "close");
         }
     }
@@ -516,6 +574,12 @@ fn write_task(json: &mut String, node: &'static TaskNode, deps: &'static [u8]) {
         node.poll_count(),
         node.max_poll_ticks()
     );
+    if let Some(n) = crate::HTTP_POOL
+        .member_index(node)
+        .and_then(|i| SERVED.get(i))
+    {
+        let _ = write!(json, "\"served\":{},", n.load(Ordering::Relaxed));
+    }
     match node.fault() {
         Fault::None => json.push_str("\"fault\":null,"),
         f => {
@@ -577,8 +641,9 @@ fn handle_control(path: &str) -> Result<String, String> {
 }
 
 /// `POST /api/fault?node=NAME&kind=KIND[&ms=N]`. Inject a fault or clear it.
-/// `hog` takes an optional bound in ms, capped at `HOG_MAX_MS`.
-fn handle_fault(path: &str) -> String {
+/// `hog` takes an optional bound in ms, capped at `HOG_MAX_MS`. `Err` (400)
+/// refuses a detached node, and `crash` on `net`.
+fn handle_fault(path: &str) -> Result<String, String> {
     let node_name = query(path, "node=");
     let kind = query(path, "kind=");
     let node = crate::GRAPH
@@ -603,6 +668,16 @@ fn handle_fault(path: &str) -> String {
     };
     let mut out = String::with_capacity(96);
     match (node, fault) {
+        (Some(node), Some(_)) if node.is_detached() => {
+            out.push_str("{\"accepted\":false,\"error\":\"detached node\"}");
+            return Err(out);
+        }
+        // Dropping net's future skips its drain: live sockets and the published
+        // stack would point into the buffers it frees.
+        (Some(node), Some(Fault::Crash)) if core::ptr::eq(node, &crate::NET) => {
+            out.push_str("{\"accepted\":false,\"error\":\"crash refused on net, use restart\"}");
+            return Err(out);
+        }
         (Some(node), Some(fault)) => match node.inject(fault) {
             Ok(()) => {
                 let _ = write!(
@@ -620,7 +695,7 @@ fn handle_fault(path: &str) -> String {
         },
         _ => out.push_str("{\"accepted\":false,\"error\":\"unknown node or kind\"}"),
     }
-    out
+    Ok(out)
 }
 
 fn handle_heartbeat(path: &str, node: &'static TaskNode) -> String {

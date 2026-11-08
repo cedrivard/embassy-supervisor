@@ -28,8 +28,12 @@ pub(crate) async fn watchdog_task(
     wd: &mut embassy_rp::watchdog::Watchdog,
 ) {
     node.set_detached(true);
-    // Blocked-task detector (feature `trace`). Two complementary checks:
-    // - `stalled_task`: an in-flight poll > 100 ms. For a stall on this task's OWN
+    // Blocked-task detector (feature `trace`), run on every feed:
+    // - `stalled_task`: a poll in flight for over 100 ms. It sees core 1 live; a
+    //   stall on this thread executor, or on `HIGH` or the supervisor tier above
+    //   it, also stops this task, so `heartbeat` watches this executor from `HIGH`.
+    // - the `max_poll_ticks` watermark: after the fact, names any node whose
+    //   longest poll passed 100 ms, warned once per new maximum (16 slots).
     const STALL_TICKS: u32 = (embassy_time::TICK_HZ / 10) as u32;
     let mut warned = [0u32; 16];
     // The feed runs on its own deadline, not on a timer re-armed per wake, so

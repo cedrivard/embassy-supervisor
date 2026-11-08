@@ -38,6 +38,21 @@ async fn settle(mut f: impl FnMut() -> bool) {
     assert!(f(), "did not settle");
 }
 
+/// Executor passes: the probe is polled once per pass, so a move of N means
+/// every task woken before it has been polled N times over.
+static PASSES: AtomicU32 = AtomicU32::new(0);
+static PROBE_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Ends after the test's last barrier, so the executor idles instead of
+/// spinning for the life of the binary.
+#[embassy_executor::task]
+async fn pass_probe() {
+    while !PROBE_STOP.load(Ordering::SeqCst) {
+        PASSES.fetch_add(1, Ordering::SeqCst);
+        embassy_futures::yield_now().await;
+    }
+}
+
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
@@ -73,19 +88,34 @@ fn restart_waits_for_a_held_epilogue_and_never_inherits_its_flags() {
             Box::leak(Box::new(embassy_executor::Executor::new()));
         executor.run(|spawner| {
             spawner.spawn(driver(spawner).unwrap());
+            spawner.spawn(pass_probe().unwrap());
         });
     });
 
-    // Release each held activation only once the supervisor has its ack and
-    // is already bringing the node back up. The clock never moves: nothing
+    // Release each held activation only once the supervisor has collected its
+    // ack (HELD reads stopped) and its executor has run 50 more passes, so the
+    // restart is parked waiting for the shell. The clock never moves: nothing
     // here may wait on a timeout.
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
     for round in 1..=2 {
-        while STOPS.load(Ordering::SeqCst) < round {
-            assert!(StdInstant::now() < deadline, "round {round}: never stopped");
+        while STOPS.load(Ordering::SeqCst) < round || HELD.is_running() {
+            assert!(
+                StdInstant::now() < deadline,
+                "round {round}: the ack was never collected"
+            );
             std::thread::sleep(StdDuration::from_millis(1));
         }
-        std::thread::sleep(StdDuration::from_millis(20));
+        let seen = PASSES.load(Ordering::SeqCst);
+        while PASSES.load(Ordering::SeqCst) < seen + 50 {
+            assert!(
+                StdInstant::now() < deadline,
+                "round {round}: the executor stalled"
+            );
+            std::thread::sleep(StdDuration::from_millis(1));
+        }
+        if round == 2 {
+            PROBE_STOP.store(true, Ordering::SeqCst);
+        }
         RELEASE.signal(());
     }
     while !DONE.load(Ordering::SeqCst) {

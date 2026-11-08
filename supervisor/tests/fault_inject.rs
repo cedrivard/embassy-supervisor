@@ -23,6 +23,28 @@ static DROPPER_GO: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static LEAVER_GO: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static DONE: AtomicBool = AtomicBool::new(false);
 
+/// Set while the driver steps mock time itself: the test thread holds its own
+/// advance, so a wall-clock stall of this executor cannot read as a gap.
+static DRIVER_CLOCK: AtomicBool = AtomicBool::new(false);
+
+/// `max_gap`, with the driver stepping the clock 10 ms per yield.
+async fn self_clocked_gap(ms: u64) -> Duration {
+    let clock = MockDriver::get();
+    DRIVER_CLOCK.store(true, Ordering::Release);
+    let t0 = Instant::now();
+    let mut prev = t0;
+    let mut gap = Duration::from_ticks(0);
+    while Instant::now() - t0 < Duration::from_millis(ms) {
+        clock.advance(Duration::from_millis(10));
+        embassy_futures::yield_now().await;
+        let now = Instant::now();
+        gap = gap.max(now - prev);
+        prev = now;
+    }
+    DRIVER_CLOCK.store(false, Ordering::Release);
+    gap
+}
+
 /// Beats every 20 ms and counts; answers a stop through `wait_shutdown`.
 async fn ticking(node: &'static TaskNode, ticks: &AtomicU32) {
     loop {
@@ -181,7 +203,7 @@ async fn driver(spawner: Spawner) {
     spawner.spawn(monitor_task().unwrap());
     SUP.start(&spawner).await.expect("bring-up");
     settle("#1", || STALLER.is_running() && HAND.is_running()).await;
-    pass(300).await;
+    self_clocked_gap(300).await;
     assert!(drain().is_empty(), "healthy graph, no events");
 
     // ── stall: the worker is not polled ────────────────────────────────────
@@ -310,7 +332,7 @@ async fn driver(spawner: Spawner) {
     settle("#7", || CRASHER.is_running()).await;
 
     // ── hog: the whole executor freezes with it ────────────────────────────
-    let quiet = max_gap(300).await;
+    let quiet = self_clocked_gap(300).await;
     assert!(
         quiet < Duration::from_millis(100),
         "control: no freeze without a hog ({quiet})"
@@ -406,11 +428,13 @@ fn faults_are_done_to_the_task() {
         });
     });
 
-    // Mock time runs from here: 10 ms per 2 ms of wall time, so windows and
-    // the hog's spin resolve without the executor thread advancing anything.
+    // Mock time runs from here, 10 ms per 2 ms of wall time, except while the
+    // driver holds `DRIVER_CLOCK` and steps it itself.
     let deadline = StdInstant::now() + StdDuration::from_secs(60);
     while !DONE.load(Ordering::Acquire) {
-        clock.advance(Duration::from_millis(10));
+        if !DRIVER_CLOCK.load(Ordering::Acquire) {
+            clock.advance(Duration::from_millis(10));
+        }
         assert!(StdInstant::now() < deadline, "did not complete");
         std::thread::sleep(StdDuration::from_millis(2));
     }

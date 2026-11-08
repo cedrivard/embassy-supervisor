@@ -31,6 +31,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]
@@ -82,6 +83,7 @@ fn a_wedged_dependent_holds_then_releases_its_dependency() {
         // Both stop phases park on the 2 s ack window; advance the frozen
         // clock in small repeated steps so an advance always lands after the
         // window's timer arms, and small enough that a scheduling stall never
+        // overshoots a window by more than one 250 ms step.
         if PHASE.load(Ordering::SeqCst) >= 1 {
             clock.advance(embassy_time::Duration::from_millis(250));
         }

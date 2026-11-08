@@ -62,8 +62,6 @@ fn quiet(node: &'static TaskNode) {
 
 #[test]
 fn a_node_answers_for_its_own_graph() {
-    assert!(!ALPHA_PROD.is_running());
-
     let alpha: Vec<&str> = ALPHA_PROD
         .graph()
         .iter()

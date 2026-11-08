@@ -8,7 +8,7 @@ use embassy_executor::Spawner;
 use embassy_supervisor::{
     Claimant, DeferredShrink, FairShare, Supervisor, TaskNode, supervisor_graph,
 };
-use embassy_time::{Duration, Instant, MockDriver};
+use embassy_time::{Instant, MockDriver};
 
 static SLOTS_SEEN: [AtomicU32; 3] = [const { AtomicU32::new(u32::MAX) }; 3];
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -49,6 +49,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 fn grants() -> [u32; 4] {
@@ -93,7 +94,7 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn pool_members_hold_their_own_budget_slots() {
-    let clock = MockDriver::get();
+    let _clock = MockDriver::get();
     std::thread::spawn(|| {
         let executor: &'static mut embassy_executor::Executor =
             Box::leak(Box::new(embassy_executor::Executor::new()));
@@ -108,7 +109,6 @@ fn pool_members_hold_their_own_budget_slots() {
             "timed out: grants={:?}",
             grants()
         );
-        clock.advance(Duration::from_millis(10));
         std::thread::sleep(StdDuration::from_millis(2));
     }
 }

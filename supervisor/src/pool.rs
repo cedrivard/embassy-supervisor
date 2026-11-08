@@ -137,7 +137,6 @@ impl<P: ScalingPolicy> ElasticPool<P> {
 
 /// Object-safe, **synchronous** pool interface so `&dyn Pool` needs no heap: the
 /// policy decides here; the supervisor performs the async start/stop.
-/// Object-safe, synchronous pool interface used by the supervisor.
 pub trait Pool: Sync {
     /// Run the policy against the current snapshot and report the action to
     /// apply. Does not itself start/stop (that's async — the caller does it).
@@ -159,12 +158,18 @@ impl<P: ScalingPolicy + Sync> Pool for ElasticPool<P> {
                         && !n.is_running()
                         && !n.is_disabled()
                         && !n.is_collateral()
+                        && !n.is_detached()
                 })
                 .map_or(PoolAction::None, |n| PoolAction::Start(n)),
             ScaleAction::Shrink => self
                 .nodes
                 .iter()
-                .find(|n| matches!(n.mode(), Mode::OnDemand) && n.is_running() && !n.is_busy())
+                .find(|n| {
+                    matches!(n.mode(), Mode::OnDemand)
+                        && n.is_running()
+                        && !n.is_busy()
+                        && !n.is_detached()
+                })
                 .map_or(PoolAction::None, |n| PoolAction::Stop(n)),
             ScaleAction::None => PoolAction::None,
         }
@@ -179,31 +184,7 @@ impl<P: ScalingPolicy + Sync> Pool for ElasticPool<P> {
     }
 }
 
-async fn drive_pools<const N: usize, T: Topology<N>>(
-    pools: &[&dyn Pool],
-    sup: &Supervisor<N, T>,
-    spawner: &Spawner,
-) -> Result<Option<Instant>, crate::NodeFault> {
-    let now = Instant::now();
-    let mut next: Option<Instant> = None;
-    for pool in pools {
-        match pool.evaluate(now) {
-            PoolAction::Start(n) => {
-                if sup.deps_running(n) && n.ready_deps_ok() {
-                    let _ = sup.start_node(n, spawner).await;
-                }
-            }
-            PoolAction::Stop(n) => sup.stop_node(n).await?,
-            PoolAction::None => {}
-        }
-        if let Some(d) = pool.deferred_until() {
-            next = Some(next.map_or(d, |c| c.min(d)));
-        }
-    }
-    Ok(next)
-}
-
-async fn deadline_timer(deadline: Option<Instant>) {
+pub(crate) async fn deadline_timer(deadline: Option<Instant>) {
     match deadline {
         Some(t) => Timer::at(t).await,
         None => core::future::pending::<()>().await,
@@ -211,6 +192,31 @@ async fn deadline_timer(deadline: Option<Instant>) {
 }
 
 impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
+    /// One pools pass: evaluate every pool, apply its action to completion, and
+    /// return the earliest instant a pool asks to be re-evaluated at. The building
+    /// block of [`run_pools`](Self::run_pools) for a driver that adds wake sources:
+    /// call it after each wake, then wait on `select(wait_scale(), Timer::at(next))`,
+    /// or on `wait_scale()` alone when it returns `Ok(None)`.
+    pub async fn pool_pass(&self, spawner: &Spawner) -> Result<Option<Instant>, crate::NodeFault> {
+        let now = Instant::now();
+        let mut next: Option<Instant> = None;
+        for pool in self.pools {
+            match pool.evaluate(now) {
+                PoolAction::Start(n) => {
+                    if self.deps_running(n) && n.ready_deps_ok() {
+                        let _ = self.start_node(n, spawner).await;
+                    }
+                }
+                PoolAction::Stop(n) => self.stop_node(n).await?,
+                PoolAction::None => {}
+            }
+            if let Some(d) = pool.deferred_until() {
+                next = Some(next.map_or(d, |c| c.min(d)));
+            }
+        }
+        Ok(next)
+    }
+
     /// Drive all elastic pools forever, returning only on a fault.
     pub async fn run_pools(&self, spawner: &Spawner) -> crate::NodeFault {
         if !Self::has(crate::shape::POOLS) {
@@ -218,7 +224,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             match never {}
         }
         loop {
-            let next = match drive_pools(self.pools, self, spawner).await {
+            let next = match self.pool_pass(spawner).await {
                 Ok(next) => next,
                 Err(e) => return e,
             };

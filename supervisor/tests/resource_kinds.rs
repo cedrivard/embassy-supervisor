@@ -51,6 +51,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]
@@ -109,7 +110,8 @@ fn resource_kinds_consume_and_local() {
         });
     });
 
-    // Tick mock time so the Busy path's `with_timeout(SLOT_READY_TIMEOUT)` can
+    // Tick mock time so the empty consume slot's gate wait (the 100 ms default
+    // `slot_timeout`) can expire; the other waits are already satisfied and never park.
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
     while !DONE.load(Ordering::SeqCst) {
         assert!(

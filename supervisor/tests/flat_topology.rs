@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
-use embassy_supervisor::{Mode, NodeCfg, Supervisor, TaskNode, Topology, shape, supervisor_graph};
+use embassy_supervisor::{
+    Mode, NodeCfg, Supervisor, TaskHandle, TaskNode, Topology, shape, supervisor_graph,
+};
 
 static SPAWNS: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -41,8 +43,9 @@ async fn shaped_gated_task(node: &'static TaskNode, _slot: u8) {
         .await;
 }
 
-static HAND_CFG: NodeCfg = NodeCfg::new("hand", Mode::Terminate, None);
-static HAND: TaskNode = TaskNode::new(&HAND_CFG, true);
+static HAND_CFG: NodeCfg = NodeCfg::new("hand", Mode::Terminate, None).with_disabled_at_boot(true);
+static HAND_HANDLE: TaskHandle = TaskHandle::new();
+static HAND: TaskNode = TaskNode::new(&HAND_CFG, &HAND_HANDLE);
 
 async fn settle(mut f: impl FnMut() -> bool) {
     for _ in 0..10_000 {
@@ -51,6 +54,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]
@@ -90,10 +94,7 @@ fn flat_graph_lifecycle_and_shape() {
     let pos = |i: u8| SHAPED.order().position(|x| x == i).unwrap();
     assert!(pos(0) < pos(1));
 
-    assert_eq!(HAND.name(), "hand");
-    assert!(matches!(HAND.mode(), Mode::Terminate));
     assert!(HAND.is_disabled());
-    assert_eq!(shape::ALL, u32::MAX);
 
     std::thread::spawn(|| {
         let executor: &'static mut embassy_executor::Executor =

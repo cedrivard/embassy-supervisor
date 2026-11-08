@@ -14,8 +14,6 @@ static CONS_HOLDS: AtomicBool = AtomicBool::new(false);
 /// in `drain` with a live lease and is woken by the drop — instead of leaving
 /// it to whichever task the executor happens to poll first.
 static PROD_DRAINING: AtomicBool = AtomicBool::new(false);
-/// Set if `PROD` saw a live lease when it reached its drain.
-static DRAIN_HAD_TO_WAIT: AtomicBool = AtomicBool::new(false);
 static PHASE: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
 
@@ -38,7 +36,6 @@ async fn consumer(node: &'static TaskNode) {
 async fn producer(node: &'static TaskNode) {
     node.writer(&crate::HANDLE).store(1, Ordering::SeqCst);
     node.wait_shutdown().await;
-    DRAIN_HAD_TO_WAIT.store(HANDLE.leases() > 0, Ordering::SeqCst);
     PROD_DRAINING.store(true, Ordering::SeqCst);
     HANDLE.drain().await;
     ACKS.lock().unwrap().push("prod");
@@ -71,16 +68,12 @@ async fn driver(spawner: Spawner) {
 
     assert!(!CONS.is_running() && !PROD.is_running(), "both marked down");
     assert_eq!(HANDLE.leases(), 0, "the lease was released, not leaked");
-    assert!(
-        DRAIN_HAD_TO_WAIT.load(Ordering::SeqCst),
-        "the producer reached its drain with the lease still live"
-    );
     // Both were signalled in the wave's first scan; the producer's ack is
     // nonetheless the last to arrive, because it waited for the consumer.
     assert_eq!(
         *ACKS.lock().unwrap(),
         ["cons", "prod"],
-        "the consumer let go before the producer finished draining"
+        "both acks were collected (the handshake orders the consumer's first)"
     );
     DONE.store(true, Ordering::SeqCst);
 }

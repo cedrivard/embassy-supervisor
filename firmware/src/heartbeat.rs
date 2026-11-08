@@ -21,7 +21,10 @@ pub fn set_period_ms(node: &'static TaskNode, ms: i32) {
     CHANGED.signal(());
 }
 
-/// Plain generic async worker — NOT a `#[embassy_executor::task]`; the graph's
+/// Plain generic async worker, not an `#[embassy_executor::task]`: the graph's
+/// `task:` clause stamps the concrete shell, and its `resources:` clause hands
+/// the LED in as `&mut Output`, itself a `StatefulOutputPin`. `discover` derives
+/// the node's dataflow (the `PERIOD_MS` read) from this body.
 #[embassy_supervisor::dataflow]
 pub async fn heartbeat_task<L: StatefulOutputPin>(node: &'static TaskNode, mut led: L) {
     loop {

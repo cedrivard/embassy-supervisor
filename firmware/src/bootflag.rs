@@ -5,7 +5,9 @@
 //! last supervisor breadcrumb from one boot to the next, bootloader in between.
 //! Neither the bootloader nor embassy-boot-rp/embassy-rp touch them. The boot
 //! ROM reads 4..7 as a watchdog-boot vector only while SCRATCH4 holds its
-//! magic (0xb007c0d3), which nothing here writes; 5 and 6 are otherwise free.
+//! magic (0xb007c0d3), which nothing here writes. Something outside the
+//! firmware can still write them: after a probe-rs reset SCRATCH6 has read
+//! 0x2 (every recorded probe boot), which `decode_crumb` rejects.
 
 use embassy_rp::pac::WATCHDOG;
 

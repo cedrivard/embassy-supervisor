@@ -133,7 +133,7 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn readiness_propagates_across_bound_edges_only() {
-    let clock = MockDriver::get();
+    let _clock = MockDriver::get();
 
     std::thread::spawn(|| {
         let executor: &'static mut embassy_executor::Executor =
@@ -146,7 +146,6 @@ fn readiness_propagates_across_bound_edges_only() {
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
     while !DONE.load(Ordering::SeqCst) {
         assert!(StdInstant::now() < deadline, "did not complete");
-        clock.advance(embassy_time::Duration::from_millis(100));
         std::thread::sleep(StdDuration::from_millis(2));
     }
 }

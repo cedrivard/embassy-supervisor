@@ -20,8 +20,10 @@ thread_local! {
 
 static ON_THREAD_TIER: AtomicU8 = AtomicU8::new(0);
 static ON_SUP_TIER: AtomicU8 = AtomicU8::new(0);
+static LOCAL_P_TIER: AtomicU8 = AtomicU8::new(0);
 static LOCAL_TIER: AtomicU8 = AtomicU8::new(0);
 static LOCAL_SEEN: AtomicU32 = AtomicU32::new(0);
+static START_ENTERED: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
 
 fn tier() -> u8 {
@@ -43,6 +45,7 @@ async fn on_sup_worker(node: &'static TaskNode) {
 }
 
 async fn local_provider(node: &'static TaskNode) {
+    LOCAL_P_TIER.store(tier(), Ordering::Release);
     BLOB.provide(Rc::new(Cell::new(7)));
     let _ = node
         .run_cancellable_acked(core::future::pending::<()>())
@@ -50,8 +53,9 @@ async fn local_provider(node: &'static TaskNode) {
 }
 
 async fn local_consumer(node: &'static TaskNode, blob: Rc<Cell<u32>>) {
-    LOCAL_TIER.store(tier(), Ordering::Release);
+    // The value before the tier: the driver waits on the tier, then reads it.
     LOCAL_SEEN.store(blob.get(), Ordering::Release);
+    LOCAL_TIER.store(tier(), Ordering::Release);
     let _ = node
         .run_cancellable_acked(core::future::pending::<()>())
         .await;
@@ -67,14 +71,31 @@ supervisor_graph! {
         resources: [BLOB: local consume Rc<Cell<u32>>];
 }
 
+/// Executor passes: the probe is polled once per pass, so a move of N means
+/// every task woken before it has been polled N times over.
+static PASSES: AtomicU32 = AtomicU32::new(0);
+static PROBE_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Ends after the test's last barrier, so the executor idles instead of
+/// spinning for the life of the binary.
+#[embassy_executor::task]
+async fn pass_probe() {
+    while !PROBE_STOP.load(Ordering::SeqCst) {
+        PASSES.fetch_add(1, Ordering::SeqCst);
+        embassy_futures::yield_now().await;
+    }
+}
+
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
+    START_ENTERED.store(true, Ordering::Release);
     sup.start(&spawner)
         .await
         .expect("start rendezvouses with thread A's late publish");
     while ON_THREAD_TIER.load(Ordering::Acquire) == 0
         || ON_SUP_TIER.load(Ordering::Acquire) == 0
+        || LOCAL_P_TIER.load(Ordering::Acquire) == 0
         || LOCAL_TIER.load(Ordering::Acquire) == 0
     {
         embassy_futures::yield_now().await;
@@ -88,6 +109,11 @@ async fn driver(spawner: Spawner) {
         ON_SUP_TIER.load(Ordering::Acquire),
         2,
         "explicit slot wins over the default"
+    );
+    assert_eq!(
+        LOCAL_P_TIER.load(Ordering::Acquire),
+        1,
+        "the local provider ran on tier A too"
     );
     assert_eq!(
         LOCAL_TIER.load(Ordering::Acquire),
@@ -110,13 +136,36 @@ async fn driver(spawner: Spawner) {
     DONE.store(true, Ordering::Release);
 }
 
+/// Holds the late slot publish until the driver is inside `start` and its
+/// executor has run 50 more passes: `start` is then parked on the empty
+/// slot, so the rendezvous branch is the one taken.
+fn wait_until_start_parked() {
+    let deadline = StdInstant::now() + StdDuration::from_secs(10);
+    while !START_ENTERED.load(Ordering::Acquire) {
+        assert!(
+            StdInstant::now() < deadline,
+            "the driver never entered start()"
+        );
+        std::thread::sleep(StdDuration::from_millis(1));
+    }
+    let seen = PASSES.load(Ordering::Acquire);
+    while PASSES.load(Ordering::Acquire) < seen + 50 {
+        assert!(
+            StdInstant::now() < deadline,
+            "the driver's executor stalled"
+        );
+        std::thread::sleep(StdDuration::from_millis(1));
+    }
+    PROBE_STOP.store(true, Ordering::SeqCst);
+}
+
 #[test]
 fn supervisor_on_its_own_tier_places_the_default_elsewhere() {
-    // Thread A: the graph's default tier, published 50 ms late so `start`
-    // exercises the slot rendezvous.
+    // Thread A: the graph's default tier, published only once `start` is parked
+    // on its empty slot, so `start` exercises the rendezvous.
     std::thread::spawn(|| {
         TIER.with(|t| t.set(1));
-        std::thread::sleep(StdDuration::from_millis(50));
+        wait_until_start_parked();
         let executor: &'static mut embassy_executor::Executor =
             Box::leak(Box::new(embassy_executor::Executor::new()));
         executor.run(|spawner| THREAD.set(spawner.make_send()));
@@ -130,6 +179,7 @@ fn supervisor_on_its_own_tier_places_the_default_elsewhere() {
         executor.run(|spawner| {
             SUP.set(spawner.make_send());
             spawner.spawn(driver(spawner).unwrap());
+            spawner.spawn(pass_probe().unwrap());
         });
     });
 

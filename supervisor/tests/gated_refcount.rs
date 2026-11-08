@@ -19,6 +19,8 @@ pub static EST: Backed<AtomicU32> = Backed::new(AtomicU32::new(0));
 const COOLDOWN: Duration = Duration::from_millis(500);
 
 static SPAWNS: AtomicU32 = AtomicU32::new(0);
+/// The producer instance (its spawn number) each reader's last `open` read.
+static SERVED_BY: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static DONE: AtomicBool = AtomicBool::new(false);
 
 // Reader script: 0 idle, 1 open requested, 2 holding, 3 drop requested.
@@ -48,8 +50,8 @@ async fn until(cond: impl Fn() -> bool) {
 
 #[dataflow]
 async fn producer(node: &'static TaskNode) {
-    SPAWNS.fetch_add(1, Ordering::SeqCst);
-    node.writer(&crate::EST).store(42, Ordering::SeqCst);
+    let spawn = SPAWNS.fetch_add(1, Ordering::SeqCst) + 1;
+    node.writer(&crate::EST).store(spawn, Ordering::SeqCst);
     node.set_ready();
     if PROD_CMD.load(Ordering::SeqCst) != 1 {
         // The real thing: retire after the cooldown, or stop when told to.
@@ -77,11 +79,7 @@ async fn reader(node: &'static TaskNode, i: usize) {
     loop {
         until(|| CMD[i].load(Ordering::SeqCst) == OPEN).await;
         let guard = node.open(&crate::EST).await;
-        assert_eq!(
-            guard.load(Ordering::SeqCst),
-            42,
-            "served by a ready producer"
-        );
+        SERVED_BY[i].store(guard.load(Ordering::SeqCst), Ordering::SeqCst);
         CMD[i].store(HOLDING, Ordering::SeqCst);
         until(|| CMD[i].load(Ordering::SeqCst) == DROP).await;
         drop(guard);
@@ -95,6 +93,21 @@ async fn reader_a(node: &'static TaskNode) {
 
 async fn reader_b(node: &'static TaskNode) {
     reader(node, 1).await;
+}
+
+/// Executor passes: the probe is polled once per pass, so a move of N means
+/// every task woken before it has been polled N times over.
+static PASSES: AtomicU32 = AtomicU32::new(0);
+static PROBE_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Ends after the test's last barrier instead of spinning for the life of the
+/// binary.
+#[embassy_executor::task]
+async fn pass_probe() {
+    while !PROBE_STOP.load(Ordering::SeqCst) {
+        PASSES.fetch_add(1, Ordering::SeqCst);
+        embassy_futures::yield_now().await;
+    }
 }
 
 #[embassy_executor::task]
@@ -115,6 +128,7 @@ fn the_producer_retires_after_the_last_reader_leaves() {
             Box::leak(Box::new(embassy_executor::Executor::new()));
         executor.run(|spawner| {
             spawner.spawn(runner(spawner).unwrap());
+            spawner.spawn(pass_probe().unwrap());
         });
     });
 
@@ -132,6 +146,13 @@ fn the_producer_retires_after_the_last_reader_leaves() {
             std::thread::sleep(StdDuration::from_millis(2));
         }
     };
+    // A barrier in executor progress, not wall time.
+    let executor_settles = || {
+        let seen = PASSES.load(Ordering::SeqCst);
+        wait_for("100 executor passes", &|| {
+            PASSES.load(Ordering::SeqCst) >= seen + 100
+        });
+    };
     let spawns = || SPAWNS.load(Ordering::SeqCst);
     let cmd = |i: usize, c: u8| CMD[i].store(c, Ordering::SeqCst);
     let reader_is = |i: usize, c: u8| move || CMD[i].load(Ordering::SeqCst) == c;
@@ -141,10 +162,16 @@ fn the_producer_retires_after_the_last_reader_leaves() {
     // ── two readers, one start, the count follows the guards ────────────
     cmd(0, OPEN);
     wait_for("A opened", &reader_is(0, HOLDING));
+    assert_eq!(
+        SERVED_BY[0].load(Ordering::SeqCst),
+        1,
+        "served by the first instance"
+    );
     assert_eq!(spawns(), 1);
     assert_eq!(EST.openers(), 1);
     cmd(1, OPEN);
     wait_for("B opened", &reader_is(1, HOLDING));
+    assert_eq!(SERVED_BY[1].load(Ordering::SeqCst), 1);
     assert_eq!(spawns(), 1, "the second opener joins a running producer");
     assert_eq!(EST.openers(), 2);
     cmd(0, DROP);
@@ -157,23 +184,27 @@ fn the_producer_retires_after_the_last_reader_leaves() {
 
     // ── the cooldown is hysteresis: a reader inside it cancels the stop ──
     clock.advance(Duration::from_millis(200));
-    std::thread::sleep(StdDuration::from_millis(20));
+    executor_settles();
     assert!(PRODUCER.is_running(), "200 ms into a 500 ms cooldown");
     cmd(0, OPEN);
     wait_for("A reopened inside the cooldown", &reader_is(0, HOLDING));
+    assert_eq!(SERVED_BY[0].load(Ordering::SeqCst), 1, "and read its value");
     assert_eq!(spawns(), 1, "served by the still-running producer");
     clock.advance(Duration::from_secs(2));
-    std::thread::sleep(StdDuration::from_millis(20));
+    executor_settles();
     assert!(
         PRODUCER.is_running() && PRODUCER.is_ready(),
         "held: never retires"
     );
     cmd(0, DROP);
     wait_for("A dropped again", &reader_is(0, IDLE));
+    // The producer starts its cooldown timer on its own poll; advancing the
+    // clock before that would put the deadline past the 600 ms below.
+    executor_settles();
 
     // ── nobody for a whole cooldown: the producer stops itself ──────────
     clock.advance(Duration::from_millis(200));
-    std::thread::sleep(StdDuration::from_millis(20));
+    executor_settles();
     assert!(PRODUCER.is_running(), "the flap restarted the cooldown");
     clock.advance(Duration::from_millis(400));
     wait_for("retirement", &|| !PRODUCER.is_running());
@@ -187,6 +218,11 @@ fn the_producer_retires_after_the_last_reader_leaves() {
     PROD_CMD.store(1, Ordering::SeqCst); // the respawn follows the hand-rolled script
     cmd(1, OPEN);
     wait_for("B reopened after retirement", &reader_is(1, HOLDING));
+    assert_eq!(
+        SERVED_BY[1].load(Ordering::SeqCst),
+        2,
+        "read from the fresh start"
+    );
     assert_eq!(spawns(), 2, "a fresh start");
     assert!(!PRODUCER.is_disabled());
     cmd(1, DROP);
@@ -201,16 +237,20 @@ fn the_producer_retires_after_the_last_reader_leaves() {
     wait_for("the window", &|| IN_WINDOW.load(Ordering::SeqCst));
     assert!(PRODUCER.is_running() && !PRODUCER.is_ready());
     cmd(0, OPEN);
-    std::thread::sleep(StdDuration::from_millis(30));
+    wait_for("A admitted, so a retiring producer would see it", &|| {
+        EST.openers() == 1
+    });
+    executor_settles();
+    PROBE_STOP.store(true, Ordering::SeqCst);
     assert_eq!(CMD[0].load(Ordering::SeqCst), OPEN, "parked: not serving");
-    assert_eq!(
-        EST.openers(),
-        1,
-        "but admitted, so a retiring producer would see it"
-    );
     PROD_CMD.store(3, Ordering::SeqCst);
     // (The respawn reads a command other than 1 at spawn: back to auto.)
     wait_for("A served by the respawn", &reader_is(0, HOLDING));
+    assert_eq!(
+        SERVED_BY[0].load(Ordering::SeqCst),
+        3,
+        "read from the respawn, never from the retiring instance"
+    );
     assert_eq!(
         spawns(),
         3,

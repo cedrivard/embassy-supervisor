@@ -13,7 +13,7 @@
 pub mod find;
 /// Collecting input files from directories, Cargo manifests, and dependency sources.
 pub mod inputs;
-/// Dataflow linting: orphan reads and dead writes.
+/// Linting: orphan reads, dead writes and public gates.
 pub mod lint;
 pub mod model;
 /// Output helpers: mermaid.live links, HTML pages, and markdown updates.
@@ -24,13 +24,13 @@ pub mod render;
 pub mod states;
 
 use embassy_supervisor_syntax::{
-    Item, apply_default_executor, normalize_fragment_crate, substitute_dollar_crate,
+    Item, TaskSource, apply_default_executor, normalize_fragment_crate, substitute_dollar_crate,
 };
 use proc_macro2::TokenStream;
 use quote::quote;
 use std::str::FromStr;
 
-pub use embassy_supervisor_syntax::{Access, scan_dataflow};
+pub use embassy_supervisor_syntax::Access;
 pub use find::{Decl, DeclKind, Error, parse_source};
 pub use lint::{LintCats, dataflow_lints, gate_lints};
 pub use model::{FullModel, TaskKind, full_model};
@@ -39,35 +39,101 @@ pub use render::{Options, legend_diagram};
 /// A dataflow access discovered in a scanned source file.
 #[derive(Debug, Clone)]
 pub struct Discovered {
-    /// The module name inferred from the source file path.
-    pub module: String,
+    /// The module path of the fn holding the access: the file's (see
+    /// [`scan_source`]), then the inline `mod`s around the fn.
+    pub module: Vec<String>,
+    /// `true` when the file's path was resolved under a `src/` component;
+    /// `false` for the stem fallback (`t.rs`, `-`).
+    pub rooted: bool,
+    /// The directory above `src/`, `-` mapped to `_`, when the file's path has
+    /// one (`common/src/x.rs` gives `common`).
+    pub crate_dir: Option<String>,
     /// The access details: function, verb, signal path, and direction.
     pub access: Access,
     /// `true` if the path was relative (`self::`, `super::`, or bare).
     pub relative: bool,
 }
 
-/// Scan Rust source for `#[dataflow]` accesses and append them to `out`.
+/// Scan a parsed source file for `#[dataflow]` accesses and append them to `out`.
 ///
-/// `origin` is the file path; it is used to infer the module name and to
-/// resolve relative signal paths.
-pub fn scan_source(src: &str, origin: &str, out: &mut Vec<Discovered>) {
-    let mut accesses = Vec::new();
-    scan_dataflow(src, &mut accesses);
-    if accesses.is_empty() {
+/// `origin` is the file path. Each access gets a module path: the file's
+/// place after its last `src` directory (`src/imu/driver.rs` is
+/// `imu::driver`; `main.rs`, `lib.rs` and the `src/bin/` roots are the crate
+/// root; a `mod.rs` is its directory) or, outside a `src/` tree, the file's
+/// stem, then the inline `mod`s around the fn. It qualifies relative signal
+/// paths and binds the fn to a declaration.
+pub fn scan_source(file: &syn::File, origin: &str, out: &mut Vec<Discovered>) {
+    let start = out.len();
+    let FileModule {
+        mut path,
+        rooted,
+        crate_dir,
+    } = file_module(origin);
+    walk_dataflow(&file.items, &mut path, rooted, crate_dir.as_ref(), out);
+    if out.len() == start {
         return;
     }
-    let module = module_of(origin);
-    let aliases = use_aliases(src);
-    for mut access in accesses {
-        let (path, relative) = resolve_path(&access.path, &aliases);
-        access.path = path;
-        out.push(Discovered {
-            module: module.clone(),
-            access,
-            relative,
-        });
+    let aliases = use_aliases(file);
+    for d in &mut out[start..] {
+        (d.access.path, d.relative) = resolve_path(&d.access.path, &aliases);
     }
+}
+
+/// Every `#[dataflow]` fn's accesses, inline modules and `impl` blocks
+/// included, in the order `embassy_supervisor_syntax::scan_dataflow` visits
+/// them. Paths come back as written: [`scan_source`] resolves them and sets
+/// `relative`.
+fn walk_dataflow(
+    items: &[syn::Item],
+    module: &mut Vec<String>,
+    rooted: bool,
+    crate_dir: Option<&String>,
+    out: &mut Vec<Discovered>,
+) {
+    for item in items {
+        match item {
+            syn::Item::Fn(f) => {
+                dataflow_fn(&f.attrs, &f.sig, &f.block, module, rooted, crate_dir, out)
+            }
+            syn::Item::Impl(im) => {
+                for ii in &im.items {
+                    if let syn::ImplItem::Fn(f) = ii {
+                        dataflow_fn(&f.attrs, &f.sig, &f.block, module, rooted, crate_dir, out);
+                    }
+                }
+            }
+            syn::Item::Mod(m) => {
+                if let Some((_, inner)) = &m.content {
+                    module.push(m.ident.to_string());
+                    walk_dataflow(inner, module, rooted, crate_dir, out);
+                    module.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One fn's accesses, from the syntax crate's walker, each tagged with the
+/// fn's module.
+fn dataflow_fn(
+    attrs: &[syn::Attribute],
+    sig: &syn::Signature,
+    block: &syn::Block,
+    module: &[String],
+    rooted: bool,
+    crate_dir: Option<&String>,
+    out: &mut Vec<Discovered>,
+) {
+    let mut accesses = Vec::new();
+    embassy_supervisor_syntax::scan_fn_accesses(attrs, sig, block, &mut accesses);
+    out.extend(accesses.into_iter().map(|access| Discovered {
+        module: module.to_vec(),
+        rooted,
+        crate_dir: crate_dir.cloned(),
+        access,
+        relative: false,
+    }));
 }
 
 /// A `static` whose type is one of the supervisor's gates (`Backed`, `Leased`,
@@ -86,9 +152,9 @@ pub struct GateStatic {
     pub public: bool,
 }
 
-/// Scan Rust source for statics wrapped in a supervisor gate and append them
-/// to `out`, walking inline modules.
-pub fn scan_gate_statics(src: &str, file: &str, out: &mut Vec<GateStatic>) {
+/// Scan a parsed source file for statics wrapped in a supervisor gate and
+/// append them to `out`, walking inline modules.
+pub fn scan_gate_statics(file: &syn::File, origin: &str, out: &mut Vec<GateStatic>) {
     fn walk(items: &[syn::Item], file: &str, out: &mut Vec<GateStatic>) {
         for item in items {
             match item {
@@ -120,29 +186,74 @@ pub fn scan_gate_statics(src: &str, file: &str, out: &mut Vec<GateStatic>) {
             }
         }
     }
-    if let Ok(parsed) = syn::parse_file(src) {
-        walk(&parsed.items, file, out);
-    }
+    walk(&file.items, origin, out);
 }
 
-pub(crate) fn module_of(origin: &str) -> String {
+/// Where a file sits: its module path and what the path revealed about the crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileModule {
+    /// The module path of the file's top-level items.
+    pub(crate) path: Vec<String>,
+    /// `true` when the path was resolved under a `src/` component; `false` for
+    /// the stem fallback (`t.rs`, `-`).
+    pub(crate) rooted: bool,
+    /// The directory above `src/`, `-` mapped to `_`, when the path has one
+    /// (`common/src/x.rs` gives `common`).
+    pub(crate) crate_dir: Option<String>,
+}
+
+/// Where a file's top-level items sit, from the file's path (see
+/// [`scan_source`]).
+pub(crate) fn file_module(origin: &str) -> FileModule {
     let path = std::path::Path::new(origin);
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    if matches!(stem, "mod" | "lib" | "main")
-        && let Some(dir) = path
+    let parts: Vec<&str> = path.iter().filter_map(|p| p.to_str()).collect();
+    let Some(src) = parts.iter().rposition(|p| *p == "src") else {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let dir = path
             .parent()
             .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
+            .and_then(|s| s.to_str());
+        let name = match dir {
+            Some(dir) if matches!(stem, "mod" | "lib" | "main") => dir,
+            _ => stem,
+        };
+        return FileModule {
+            path: vec![name.to_string()],
+            rooted: false,
+            crate_dir: None,
+        };
+    };
+    let crate_dir = (src > 0).then(|| parts[src - 1].replace('-', "_"));
+    let mut rest = &parts[src + 1..];
+    if let ["bin", tail @ ..] = rest
+        && !tail.is_empty()
     {
-        return dir.to_string();
+        rest = &tail[1..];
     }
-    stem.to_string()
+    let Some((file, dirs)) = rest.split_last() else {
+        return FileModule {
+            path: Vec::new(),
+            rooted: true,
+            crate_dir,
+        };
+    };
+    let mut out: Vec<String> = dirs.iter().map(|d| (*d).to_string()).collect();
+    match file.strip_suffix(".rs").unwrap_or(file) {
+        "mod" => {}
+        "main" | "lib" if dirs.is_empty() => {}
+        stem => out.push(stem.to_string()),
+    }
+    FileModule {
+        path: out,
+        rooted: true,
+        crate_dir,
+    }
 }
 
-fn use_aliases(src: &str) -> std::collections::BTreeMap<String, String> {
+fn use_aliases(file: &syn::File) -> std::collections::BTreeMap<String, String> {
     fn collect(
         tree: &syn::UseTree,
         prefix: &mut Vec<String>,
@@ -186,9 +297,7 @@ fn use_aliases(src: &str) -> std::collections::BTreeMap<String, String> {
         }
     }
     let mut map = std::collections::BTreeMap::new();
-    if let Ok(file) = syn::parse_file(src) {
-        walk(&file.items, &mut map);
-    }
+    walk(&file.items, &mut map);
     map
 }
 
@@ -381,54 +490,107 @@ fn clone_decl(d: &Decl) -> Decl {
     }
 }
 
-/// Find all `#[dataflow]` functions in Rust source and append `(module, name)` pairs.
-pub fn scan_fns(src: &str, origin: &str, out: &mut Vec<(String, String)>) {
-    fn walk(items: &[syn::Item], module: &str, out: &mut Vec<(String, String)>) {
+/// A `#[dataflow]` fn found in a scanned file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedFn {
+    /// Its module path: the file's (see [`scan_source`]), then the inline `mod`s around it.
+    pub module: Vec<String>,
+    /// `true` when the file's path was resolved under a `src/` component;
+    /// `false` for the stem fallback (`t.rs`, `-`).
+    pub rooted: bool,
+    /// The directory above `src/`, `-` mapped to `_`, when the file's path has
+    /// one (`common/src/x.rs` gives `common`).
+    pub crate_dir: Option<String>,
+    /// Its name.
+    pub name: String,
+}
+
+impl std::fmt::Display for ScannedFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.module.is_empty() {
+            write!(f, "crate::{}", self.name)
+        } else {
+            write!(f, "{}::{}", self.module.join("::"), self.name)
+        }
+    }
+}
+
+/// Find every `#[dataflow]` fn in a parsed file, inline modules included, and
+/// append it to `out` with its module path.
+pub fn scan_fns(file: &syn::File, origin: &str, out: &mut Vec<ScannedFn>) {
+    fn walk(
+        items: &[syn::Item],
+        module: &mut Vec<String>,
+        rooted: bool,
+        crate_dir: Option<&String>,
+        out: &mut Vec<ScannedFn>,
+    ) {
         for item in items {
             match item {
-                syn::Item::Fn(f) => {
+                syn::Item::Fn(f)
                     if f.attrs
                         .iter()
-                        .any(embassy_supervisor_syntax::is_dataflow_attr)
-                    {
-                        out.push((module.to_string(), f.sig.ident.to_string()));
-                    }
+                        .any(embassy_supervisor_syntax::is_dataflow_attr) =>
+                {
+                    out.push(ScannedFn {
+                        module: module.clone(),
+                        rooted,
+                        crate_dir: crate_dir.cloned(),
+                        name: f.sig.ident.to_string(),
+                    });
                 }
                 syn::Item::Mod(m) => {
-                    if let Some((_, items)) = &m.content {
-                        walk(items, module, out);
+                    if let Some((_, inner)) = &m.content {
+                        module.push(m.ident.to_string());
+                        walk(inner, module, rooted, crate_dir, out);
+                        module.pop();
                     }
                 }
                 _ => {}
             }
         }
     }
-    if let Ok(file) = syn::parse_file(src) {
-        walk(&file.items, &module_of(origin), out);
-    }
+    let FileModule {
+        mut path,
+        rooted,
+        crate_dir,
+    } = file_module(origin);
+    walk(&file.items, &mut path, rooted, crate_dir.as_ref(), out);
 }
 
 /// A `#[dataflow_bundle]` module and the `#[dataflow]` functions it contains.
 #[derive(Clone, Debug)]
 pub struct Bundle {
-    /// The module name inferred from the source file path.
-    pub module: String,
-    /// The Rust identifier of the module carrying the attribute.
-    pub mod_name: String,
+    /// The bundle module's path: the file's module path, then the inline
+    /// `mod`s down to and including the bundle's own.
+    pub path: Vec<String>,
+    /// `true` when the file's path was resolved under a `src/` component;
+    /// `false` for the stem fallback (`t.rs`, `-`).
+    pub rooted: bool,
+    /// The directory above `src/`, `-` mapped to `_`, when the file's path has
+    /// one (`common/src/x.rs` gives `common`).
+    pub crate_dir: Option<String>,
     /// The bundle name given in the attribute, or `"BUNDLE"` if empty.
     pub name: String,
     /// The names of the `#[dataflow]` functions inside the module.
     pub fns: Vec<String>,
 }
 
-/// Scan Rust source for `#[dataflow_bundle]` modules and append them to `out`.
-pub fn scan_bundles(src: &str, origin: &str, out: &mut Vec<Bundle>) {
-    fn walk(items: &[syn::Item], module: &str, out: &mut Vec<Bundle>) {
+/// Scan a parsed source file for `#[dataflow_bundle]` modules and append them to `out`.
+pub fn scan_bundles(file: &syn::File, origin: &str, out: &mut Vec<Bundle>) {
+    fn walk(
+        items: &[syn::Item],
+        module: &mut Vec<String>,
+        rooted: bool,
+        crate_dir: Option<&String>,
+        out: &mut Vec<Bundle>,
+    ) {
         for item in items {
             let syn::Item::Mod(m) = item else { continue };
             let Some((_, inner)) = &m.content else {
                 continue;
             };
+            module.push(m.ident.to_string());
             if let Some(attr) = m.attrs.iter().find(|a| {
                 a.path()
                     .segments
@@ -458,118 +620,149 @@ pub fn scan_bundles(src: &str, origin: &str, out: &mut Vec<Bundle>) {
                     })
                     .collect();
                 out.push(Bundle {
-                    module: module.to_string(),
-                    mod_name: m.ident.to_string(),
+                    path: module.clone(),
+                    rooted,
+                    crate_dir: crate_dir.cloned(),
                     name,
                     fns,
                 });
             }
-            walk(inner, module, out);
+            walk(inner, module, rooted, crate_dir, out);
+            module.pop();
         }
     }
-    if let Ok(file) = syn::parse_file(src) {
-        walk(&file.items, &module_of(origin), out);
-    }
+    let FileModule {
+        mut path,
+        rooted,
+        crate_dir,
+    } = file_module(origin);
+    walk(&file.items, &mut path, rooted, crate_dir.as_ref(), out);
 }
 
-/// Expand bundle names into their member function names.
-///
-/// Any `(name, hint)` pair that matches a bundle is replaced by the bundle's
-/// member functions; non-bundle names pass through unchanged.
-pub fn expand_bundles(
-    pairs: Vec<(String, Option<String>)>,
-    bundles: &[Bundle],
-) -> Vec<(String, Option<String>)> {
-    pairs
+/// Replace each binding that names a bundle with bindings of the bundle's
+/// member fns, which keep its `#[cfg]`; other bindings pass through.
+pub(crate) fn expand_bundles(bindings: Vec<FnBinding>, bundles: &[Bundle]) -> Vec<FnBinding> {
+    bindings
         .into_iter()
-        .flat_map(|(name, hint)| {
-            let hit = bundles.iter().find(|b| {
-                b.name == name
-                    && hint
-                        .as_deref()
-                        .is_none_or(|h| h == b.mod_name || h == b.module)
-            });
-            match hit {
-                Some(b) => b
+        .flat_map(|b| {
+            match bundles.iter().find(|bundle| {
+                bundle.name == b.name
+                    && b.module_matches(&bundle.path, bundle.rooted, bundle.crate_dir.as_deref())
+            }) {
+                Some(bundle) => bundle
                     .fns
                     .iter()
-                    .map(|f| (f.clone(), Some(b.module.clone())))
+                    .map(|f| FnBinding {
+                        name: f.clone(),
+                        module: bundle.path.clone(),
+                        absolute: true,
+                        cfg: b.cfg.clone(),
+                    })
                     .collect(),
-                None => vec![(name, hint)],
+                None => vec![b],
             }
         })
         .collect()
 }
 
-fn bound_fns(decl: &Decl) -> Vec<(String, String, Option<String>)> {
-    use embassy_supervisor_syntax::TaskSource;
-    let mut wanted = Vec::new();
-    for item in &decl.spec.items {
-        let (name, discover, source, adopted) = match item {
-            Item::Node(n) => (
-                n.ident.to_string(),
-                n.discover.is_some(),
-                n.source.as_ref(),
-                &n.dataflow,
-            ),
-            Item::Pool(p) => (
-                p.ident.to_string(),
-                p.discover.is_some(),
-                Some(&p.source),
-                &p.dataflow,
-            ),
-            Item::Executor(_) => continue,
-        };
-        let split = |segments: Vec<String>| -> Option<(String, Option<String>)> {
-            let fn_name = segments.last()?.clone();
-            let hint = if segments.len() >= 2 {
-                let m = &segments[segments.len() - 2];
-                (!matches!(m.as_str(), "crate" | "self" | "super")).then(|| m.clone())
-            } else {
-                None
-            };
-            Some((fn_name, hint))
-        };
-        if discover && let Some(TaskSource::Shell(e) | TaskSource::Spawn(e)) = source {
-            fn segments(e: &syn::Expr) -> Option<Vec<String>> {
-                match e {
-                    syn::Expr::Path(p) => Some(
-                        p.path
-                            .segments
-                            .iter()
-                            .map(|s| s.ident.to_string())
-                            .collect(),
-                    ),
-                    syn::Expr::Call(c) => segments(&c.func),
-                    _ => None,
-                }
-            }
-            if let Some((f, h)) = segments(e).and_then(split) {
-                wanted.push((name.clone(), f, h));
-            }
-        }
-        for a in adopted {
-            let segs: Vec<String> = a
-                .path
-                .segments
-                .iter()
-                .map(|s| s.ident.to_string())
-                .collect();
-            if let Some((f, h)) = split(segs) {
-                wanted.push((name.clone(), f, h));
-            }
-        }
-    }
-    wanted
+/// A fn a declaration binds for its dataflow: an item's `task:`/`spawn:` fn
+/// under `discover`, or one of its `dataflow:` adoptions.
+#[derive(Clone, Debug)]
+pub(crate) struct FnBinding {
+    /// The fn's name: the path's last segment.
+    pub(crate) name: String,
+    /// The path's module segments as written, `crate`, `self` and `super` dropped.
+    pub(crate) module: Vec<String>,
+    /// Written from `crate::`, so no crate name can precede `module`.
+    pub(crate) absolute: bool,
+    /// The `#[cfg]` texts on the `discover` clause or the adoption.
+    pub(crate) cfg: Vec<String>,
 }
 
-fn fn_matches(
-    scanned: &(String, String),
-    fn_name: &str,
-    hint: Option<&str>,
-    graph_module: &str,
-) -> bool {
-    scanned.1 == fn_name && hint.is_none_or(|h| h == scanned.0 || scanned.0 == graph_module)
+impl FnBinding {
+    fn from_path(path: &syn::Path, cfg: &[syn::Attribute]) -> Option<Self> {
+        let mut module: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+        let name = module.pop()?;
+        let absolute = module.first().is_some_and(|s| s == "crate");
+        module.retain(|s| !matches!(s.as_str(), "crate" | "self" | "super"));
+        Some(Self {
+            name,
+            module,
+            absolute,
+            cfg: model::cfg_texts(cfg),
+        })
+    }
+
+    /// Can a scanned fn at `module` be the one this binding names?
+    /// * written `crate::` and the file is under `src/`: the paths must be equal;
+    /// * otherwise the binding's segments must end the module path;
+    /// * or, for a path not written `crate::`, one leading segment more names the crate
+    ///   (`common::tasks::rate::entry` for `common/src/tasks/rate.rs`). That form reaches a
+    ///   crate-root fn only when the file's crate directory is known and equals that segment,
+    ///   so `imu::run` never binds the root `fn run` beside it.
+    fn module_matches(&self, module: &[String], rooted: bool, crate_dir: Option<&str>) -> bool {
+        if self.absolute && rooted {
+            return module == self.module;
+        }
+        if module.ends_with(&self.module) {
+            return true;
+        }
+        !self.absolute
+            && self.module.len() == module.len() + 1
+            && self.module[1..] == *module
+            && (!module.is_empty() || crate_dir == Some(self.module[0].as_str()))
+    }
+
+    fn binds(&self, f: &ScannedFn) -> bool {
+        self.name == f.name && self.module_matches(&f.module, f.rooted, f.crate_dir.as_deref())
+    }
+}
+
+impl std::fmt::Display for FnBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for m in &self.module {
+            write!(f, "{m}::")?;
+        }
+        f.write_str(&self.name)
+    }
+}
+
+/// The fns `item` binds. Its task fn counts only under `discover`: that is
+/// the only case the macro takes the fn's tables.
+pub(crate) fn fn_bindings(item: &Item) -> Vec<FnBinding> {
+    let (discover, source, adopted) = match item {
+        Item::Node(n) => (n.discover.as_ref(), n.source.as_ref(), &n.dataflow),
+        Item::Pool(p) => (p.discover.as_ref(), Some(&p.source), &p.dataflow),
+        Item::Executor(_) => return Vec::new(),
+    };
+    let task = discover
+        .zip(source)
+        .and_then(|(d, TaskSource::Shell(e) | TaskSource::Spawn(e))| {
+            Some((callee_path(e)?, d.cfg.as_slice()))
+        });
+    task.into_iter()
+        .chain(adopted.iter().map(|a| (&a.path, a.cfg.as_slice())))
+        .filter_map(|(path, cfg)| FnBinding::from_path(path, cfg))
+        .collect()
+}
+
+fn callee_path(e: &syn::Expr) -> Option<&syn::Path> {
+    match e {
+        syn::Expr::Path(p) => Some(&p.path),
+        syn::Expr::Call(c) => callee_path(&c.func),
+        _ => None,
+    }
+}
+
+/// The binding `d` came through, if one of `bindings` names its fn; an
+/// ungated binding wins over a gated one.
+pub(crate) fn binding_for<'a>(bindings: &'a [FnBinding], d: &Discovered) -> Option<&'a FnBinding> {
+    bindings
+        .iter()
+        .filter(|b| {
+            b.name == d.access.func && b.module_matches(&d.module, d.rooted, d.crate_dir.as_deref())
+        })
+        .min_by_key(|b| b.cfg.len())
 }
 
 /// Check that every `discover` / `dataflow:` binding has a scanned function,
@@ -578,48 +771,37 @@ fn fn_matches(
 /// Returns human-readable warnings for mismatches.
 pub fn coverage_warnings(
     decls: &[Decl],
-    scanned: &[(String, String)],
-    dep_scanned: &[(String, String)],
+    scanned: &[ScannedFn],
+    dep_scanned: &[ScannedFn],
     bundles: &[Bundle],
 ) -> Vec<String> {
     let mut warnings = Vec::new();
     let mut used: Vec<bool> = vec![false; scanned.len()];
-    for decl in decls {
-        let graph_module = module_of(&decl.origin);
-        let bound = bound_fns(decl).into_iter().flat_map(|(node, f, h)| {
-            expand_bundles(vec![(f, h)], bundles)
-                .into_iter()
-                .map(move |(f, h)| (node.clone(), f, h))
-        });
-        for (node, fn_name, hint) in bound {
+    for item in decls.iter().flat_map(|d| &d.spec.items) {
+        let Some(node) = item_name(item) else {
+            continue;
+        };
+        for b in expand_bundles(fn_bindings(item), bundles) {
             let mut any = false;
             for (i, sf) in scanned.iter().enumerate() {
-                if fn_matches(sf, &fn_name, hint.as_deref(), &graph_module) {
+                if b.binds(sf) {
                     used[i] = true;
                     any = true;
                 }
             }
-            for sf in dep_scanned {
-                if fn_matches(sf, &fn_name, hint.as_deref(), &graph_module) {
-                    any = true;
-                }
-            }
+            any |= dep_scanned.iter().any(|sf| b.binds(sf));
             if !any {
-                let shown = match &hint {
-                    Some(h) => format!("{h}::{fn_name}"),
-                    None => fn_name.clone(),
-                };
                 warnings.push(format!(
-                    "{node}: no `#[dataflow]` fn `{shown}` among the scanned files — \
+                    "{node}: no `#[dataflow]` fn `{b}` among the scanned files — \
                      its derived edges will not draw; pass the file that defines it"
                 ));
             }
         }
     }
-    for (i, (module, fn_name)) in scanned.iter().enumerate() {
+    for (i, sf) in scanned.iter().enumerate() {
         if !used[i] {
             warnings.push(format!(
-                "`#[dataflow]` fn `{module}::{fn_name}` is not bound by any \
+                "`#[dataflow]` fn `{sf}` is not bound by any \
                  declaration (no `discover` task or `dataflow:` adoption names it)"
             ));
         }
@@ -629,9 +811,8 @@ pub fn coverage_warnings(
 
 /// Build a JSON representation of the declarations and discovered accesses.
 ///
-/// This is the machine-readable model consumed by the HTML renderer and other
-/// tooling. It is a projection of [`full_model`]: every clause the typed model
-/// carries appears here, so the two cannot drift.
+/// This is the machine-readable model `supervisor-mermaid --json` prints, for
+/// tooling that is not a diagram. It projects [`full_model`] field for field.
 pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Value {
     use model::{ItemModel, TaskKind};
     let lit_json = |l: &Option<model::LitValue>| match l {
@@ -665,6 +846,7 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
     let res_json = |r: &model::ResourceModel| {
         serde_json::json!({
             "name": r.name,
+            "ty": r.ty.as_ref().map(|t| t.text.clone()),
             "local": r.local,
             "consume": r.consume,
             "shared": r.shared,
@@ -707,7 +889,8 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                         })).collect::<Vec<_>>(),
                         "discover": n.discover.is_some(),
                         "discover_cfg": n.discover.clone().unwrap_or_default(),
-                        "dataflow": n.dataflow,
+                        "dataflow": n.dataflow.iter().map(|a| &a.path).collect::<Vec<_>>(),
+                        "dataflow_cfg": n.dataflow.iter().map(|a| &a.cfg).collect::<Vec<_>>(),
                         "reads": n.reads.iter().map(sig_json).collect::<Vec<_>>(),
                         "writes": n.writes.iter().map(sig_json).collect::<Vec<_>>(),
                         "disabled": n.disabled.is_some(),
@@ -746,7 +929,8 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                         "resources": p.resources.iter().map(res_json).collect::<Vec<_>>(),
                         "discover": p.discover.is_some(),
                         "discover_cfg": p.discover.clone().unwrap_or_default(),
-                        "dataflow": p.dataflow,
+                        "dataflow": p.dataflow.iter().map(|a| &a.path).collect::<Vec<_>>(),
+                        "dataflow_cfg": p.dataflow.iter().map(|a| &a.cfg).collect::<Vec<_>>(),
                         "reads": p.reads.iter().map(sig_json).collect::<Vec<_>>(),
                         "writes": p.writes.iter().map(sig_json).collect::<Vec<_>>(),
                         "task": task_json(&p.task),
@@ -765,6 +949,7 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                         "kind": "executor",
                         "name": x.name,
                         "default": x.default,
+                        "cfg": x.cfg,
                     }),
                 })
                 .collect();
@@ -773,6 +958,8 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                 "name": g.name,
                 "origin": g.origin,
                 "line": g.line,
+                "observe_writes": g.observe_writes.as_ref().map(|e| e.text.clone()),
+                "observe_reads": g.observe_reads.as_ref().map(|e| e.text.clone()),
                 "items": items,
             })
         })
@@ -781,7 +968,7 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
         .iter()
         .map(|d| {
             serde_json::json!({
-                "module": d.module,
+                "module": d.module.join("::"),
                 "fn": d.access.func,
                 "verb": d.access.verb,
                 "write": d.access.write,
@@ -829,6 +1016,10 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no node {name}"))
+    }
+
+    fn parsed(src: &str) -> syn::File {
+        syn::parse_file(src).expect("the test source parses")
     }
 
     #[test]
@@ -931,7 +1122,7 @@ mod tests {
         "#;
         let d = parse_source(src, "t.rs").unwrap();
         let mut discovered = Vec::new();
-        scan_source(src, "t.rs", &mut discovered);
+        scan_source(&parsed(src), "t.rs", &mut discovered);
         assert_eq!(discovered.len(), 2, "{discovered:?}");
         let text = render(
             &d[0],
@@ -978,14 +1169,16 @@ mod tests {
             embassy_supervisor::supervisor_graph! {
                 node A = Terminate, deps: [], dataflow: [crate::cfg::set_period];
             }
-            #[embassy_supervisor::dataflow]
-            pub fn set_period(node: &'static TaskNode, ms: i32) {
-                node.put(&PERIOD, ms);
+            pub mod cfg {
+                #[embassy_supervisor::dataflow]
+                pub fn set_period(node: &'static TaskNode, ms: i32) {
+                    node.put(&PERIOD, ms);
+                }
             }
         "#;
         let d = parse_source(src, "t.rs").unwrap();
         let mut discovered = Vec::new();
-        scan_source(src, "t.rs", &mut discovered);
+        scan_source(&parsed(src), "t.rs", &mut discovered);
         let text = render(
             &d[0],
             &Options {
@@ -995,7 +1188,7 @@ mod tests {
             },
         );
         assert!(
-            text.contains("n_A -- \"discovered\" --> s_t__PERIOD"),
+            text.contains("n_A -- \"discovered\" --> s_t__cfg__PERIOD"),
             "the accessor's write draws on the adopter, its box keyed by the \
              defining module: {text}"
         );
@@ -1009,9 +1202,45 @@ mod tests {
             },
         );
         assert!(
-            signals.contains("n_A -. \"discovered\" .-> s_t__PERIOD"),
+            signals.contains("n_A -. \"discovered\" .-> s_t__cfg__PERIOD"),
             "{signals}"
         );
+    }
+
+    #[test]
+    fn the_access_walk_threads_inline_modules() {
+        let source = r#"
+            #[cfg(feature = "a")]
+            #[embassy_supervisor::dataflow]
+            async fn top(node: &'static TaskNode) {
+                node.put(&crate::X, 1);
+                #[cfg(feature = "b")]
+                let _ = node.get(&crate::Y);
+                node.put(&crate::X, 2);
+            }
+            mod inner {
+                #[cfg_attr(feature = "c", embassy_supervisor::dataflow)]
+                pub fn wrapped(node: &'static TaskNode) {
+                    node.put(&crate::Z, 1);
+                }
+                struct S;
+                impl S {
+                    #[embassy_supervisor::dataflow]
+                    fn method(&self, node: &'static TaskNode) {
+                        let _ = node.open(&crate::W);
+                    }
+                }
+            }
+            fn plain(node: &'static TaskNode) {
+                node.put(&crate::NOT_SCANNED, 1);
+            }
+        "#;
+        let mut found = Vec::new();
+        scan_source(&parsed(source), "t.rs", &mut found);
+        let accesses: Vec<Access> = found.iter().map(|d| d.access.clone()).collect();
+        assert_eq!(accesses.len(), 4, "{accesses:?}");
+        let modules: Vec<String> = found.iter().map(|d| d.module.join("::")).collect();
+        assert_eq!(modules, ["t", "t", "t::inner", "t::inner"]);
     }
 
     #[test]
@@ -1038,8 +1267,8 @@ mod tests {
         "#;
         let d = parse_source(graph, "src/main.rs").unwrap();
         let mut discovered = Vec::new();
-        scan_source(rate, "src/tasks/rate.rs", &mut discovered);
-        scan_source(eskf, "src/tasks/eskf.rs", &mut discovered);
+        scan_source(&parsed(rate), "src/tasks/rate.rs", &mut discovered);
+        scan_source(&parsed(eskf), "src/tasks/eskf.rs", &mut discovered);
         let text = render(
             &d[0],
             &Options {
@@ -1065,6 +1294,410 @@ mod tests {
             1,
             "two aliases, one box: {text}"
         );
+    }
+
+    #[test]
+    fn a_files_module_path_comes_from_its_place_under_src() {
+        let m = |o: &str| file_module(o).path.join("::");
+        for root in [
+            "fw/src/main.rs",
+            "fw/src/lib.rs",
+            "fw/src/bin/tool.rs",
+            "fw/src/bin/tool/main.rs",
+        ] {
+            assert_eq!(m(root), "", "{root} is a crate root");
+        }
+        assert_eq!(m("fw/src/imu/driver.rs"), "imu::driver");
+        assert_eq!(m("fw/src/imu/mod.rs"), "imu");
+        assert_eq!(m("fw/src/bin/tool/args.rs"), "args");
+        assert_eq!(m("sensors.rs"), "sensors");
+        assert_eq!(m("inline/main.rs"), "inline");
+        assert_eq!(m("-"), "-");
+        assert_eq!(
+            file_module("common/src/tasks/rate.rs").crate_dir.as_deref(),
+            Some("common")
+        );
+        assert_eq!(
+            file_module("my-fw/src/main.rs").crate_dir.as_deref(),
+            Some("my_fw")
+        );
+        assert!(!file_module("t.rs").rooted);
+    }
+
+    #[test]
+    fn inline_module_fns_bind_by_their_full_path() {
+        let graph = r#"
+            embassy_supervisor::supervisor_graph! {
+                node PUB = Terminate, task: sensors::estimate::publish, discover;
+                node SUB = Terminate, task: sensors::estimate::subscribe, discover;
+            }
+        "#;
+        let sensors = parsed(
+            r#"
+            pub mod estimate {
+                static ESTIMATE: Backed<Watch<u32>> = Backed::new(Watch::new());
+                #[dataflow]
+                pub async fn publish(node: &'static TaskNode, e: u32) {
+                    node.writer(&ESTIMATE).send(e);
+                }
+                #[dataflow]
+                pub async fn subscribe(node: &'static TaskNode) {
+                    let _ = node.open(&ESTIMATE).await;
+                }
+            }
+        "#,
+        );
+        let d = parse_source(graph, "src/main.rs").unwrap();
+        let mut fns = Vec::new();
+        scan_fns(&sensors, "src/sensors.rs", &mut fns);
+        assert_eq!(fns[0].module, ["sensors", "estimate"]);
+        let coverage = coverage_warnings(&d, &fns, &[], &[]);
+        assert!(coverage.is_empty(), "{coverage:?}");
+
+        let mut discovered = Vec::new();
+        scan_source(&sensors, "src/sensors.rs", &mut discovered);
+        let text = render(
+            &d[0],
+            &Options {
+                runtime: true,
+                discovered: discovered.clone(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            text.contains("n_PUB -- \"discovered\" --> s_sensors__estimate__ESTIMATE"),
+            "{text}"
+        );
+        assert!(
+            text.contains("s_sensors__estimate__ESTIMATE -- \"gated\" --> n_SUB"),
+            "{text}"
+        );
+        let lints = dataflow_lints(&d, &discovered, &[], &LintCats::all(), &[]);
+        assert!(lints.is_empty(), "{lints:?}");
+    }
+
+    #[test]
+    fn same_named_fns_in_same_named_files_bind_by_their_directories() {
+        let graph = r#"
+            embassy_supervisor::supervisor_graph! {
+                node IMU = Terminate, task: crate::imu::driver::run, discover;
+                node BARO = Terminate, task: crate::baro::driver::run, discover;
+            }
+        "#;
+        let imu = "#[dataflow]\npub async fn run(node: &'static TaskNode) { node.put(&crate::sig::ACCEL, 1); }";
+        let baro = "#[dataflow]\npub async fn run(node: &'static TaskNode) { node.put(&crate::sig::PRESSURE, 1); }";
+        let d = parse_source(graph, "src/main.rs").unwrap();
+        let (mut fns, mut discovered) = (Vec::new(), Vec::new());
+        for (src, origin) in [(imu, "src/imu/driver.rs"), (baro, "src/baro/driver.rs")] {
+            let file = parsed(src);
+            scan_fns(&file, origin, &mut fns);
+            scan_source(&file, origin, &mut discovered);
+        }
+        let coverage = coverage_warnings(&d, &fns, &[], &[]);
+        assert!(coverage.is_empty(), "{coverage:?}");
+        let text = render(
+            &d[0],
+            &Options {
+                runtime: true,
+                discovered,
+                ..Default::default()
+            },
+        );
+        assert!(
+            text.contains("n_IMU -- \"discovered\" --> s_crate__sig__ACCEL"),
+            "{text}"
+        );
+        assert!(
+            text.contains("n_BARO -- \"discovered\" --> s_crate__sig__PRESSURE"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("n_IMU -- \"discovered\" --> s_crate__sig__PRESSURE"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("n_BARO -- \"discovered\" --> s_crate__sig__ACCEL"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_graph_files_own_fns_bind_only_by_their_path() {
+        let rooted = r#"
+            embassy_supervisor::supervisor_graph! {
+                node IMU = Terminate, task: crate::imu::run, discover;
+            }
+            #[embassy_supervisor::dataflow]
+            async fn run(node: &'static TaskNode) { node.put(&crate::sig::LOCAL, 1); }
+        "#;
+        let relative = rooted.replace("task: crate::imu::run", "task: imu::run");
+        let imu = "#[dataflow]\npub async fn run(node: &'static TaskNode) { node.put(&crate::sig::ACCEL, 1); }";
+        for main in [rooted, relative.as_str()] {
+            let d = parse_source(main, "src/main.rs").unwrap();
+            let (mut fns, mut discovered) = (Vec::new(), Vec::new());
+            for (src, origin) in [(main, "src/main.rs"), (imu, "src/imu.rs")] {
+                let file = parsed(src);
+                scan_fns(&file, origin, &mut fns);
+                scan_source(&file, origin, &mut discovered);
+            }
+            let text = render(
+                &d[0],
+                &Options {
+                    runtime: true,
+                    discovered,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                text.contains("n_IMU -- \"discovered\" --> s_crate__sig__ACCEL"),
+                "{main}\n{text}"
+            );
+            assert!(!text.contains("LOCAL"), "{main}\n{text}");
+            let coverage = coverage_warnings(&d, &fns, &[], &[]);
+            assert_eq!(coverage.len(), 1, "{main}\n{coverage:?}");
+            assert!(
+                coverage[0].contains("`crate::run` is not bound"),
+                "{main}\n{coverage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_crate_root_fn_binds_through_the_crate_dir() {
+        let by_crate = r#"
+            embassy_supervisor::supervisor_graph! {
+                node RUN = Terminate, task: fw::run, discover;
+            }
+            #[embassy_supervisor::dataflow]
+            async fn run(node: &'static TaskNode) { node.put(&crate::sig::OUT, 1); }
+        "#;
+        let by_module = by_crate.replace("task: fw::run", "task: imu::run");
+        let scan = |main: &str| {
+            let origin = "fw/src/main.rs";
+            let d = parse_source(main, origin).unwrap();
+            let file = parsed(main);
+            let (mut fns, mut discovered) = (Vec::new(), Vec::new());
+            scan_fns(&file, origin, &mut fns);
+            scan_source(&file, origin, &mut discovered);
+            let text = render(
+                &d[0],
+                &Options {
+                    runtime: true,
+                    discovered,
+                    ..Default::default()
+                },
+            );
+            (text, coverage_warnings(&d, &fns, &[], &[]))
+        };
+
+        let (text, coverage) = scan(by_crate);
+        assert!(
+            text.contains("n_RUN -- \"discovered\" --> s_crate__sig__OUT"),
+            "the crate's own name reaches its root fn: {text}"
+        );
+        assert!(coverage.is_empty(), "{coverage:?}");
+
+        let (text, coverage) = scan(&by_module);
+        assert!(!text.contains("OUT"), "{text}");
+        assert_eq!(coverage.len(), 2, "{coverage:?}");
+        assert!(
+            coverage[0].contains("RUN: no `#[dataflow]` fn `imu::run`"),
+            "{coverage:?}"
+        );
+        assert!(
+            coverage[1].contains("`crate::run` is not bound"),
+            "{coverage:?}"
+        );
+    }
+
+    #[test]
+    fn a_rooted_crate_binding_matches_exactly() {
+        let main = r#"
+            embassy_supervisor::supervisor_graph! {
+                node TOP = Terminate, task: crate::run, discover;
+            }
+            #[embassy_supervisor::dataflow]
+            fn run(node: &'static TaskNode) { node.put(&crate::A, 1); }
+        "#;
+        let imu = "#[dataflow]\nfn run(node: &'static TaskNode) { node.put(&crate::B, 1); }";
+        let d = parse_source(main, "src/main.rs").unwrap();
+        let (mut fns, mut discovered) = (Vec::new(), Vec::new());
+        for (src, origin) in [(main, "src/main.rs"), (imu, "src/sensors/imu.rs")] {
+            let file = parsed(src);
+            scan_fns(&file, origin, &mut fns);
+            scan_source(&file, origin, &mut discovered);
+        }
+        let text = render(
+            &d[0],
+            &Options {
+                runtime: true,
+                discovered,
+                ..Default::default()
+            },
+        );
+        assert!(
+            text.contains("n_TOP -- \"discovered\" --> s_crate__A"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("s_crate__B"),
+            "`crate::run` names the root fn only: {text}"
+        );
+        let coverage = coverage_warnings(&d, &fns, &[], &[]);
+        assert_eq!(coverage.len(), 1, "{coverage:?}");
+        assert!(
+            coverage[0].contains("`sensors::imu::run` is not bound"),
+            "{coverage:?}"
+        );
+    }
+
+    #[test]
+    fn a_task_fn_binds_only_under_discover() {
+        let body = parsed(
+            r#"
+            #[embassy_supervisor::dataflow]
+            async fn worker(node: &'static TaskNode) { node.put(&crate::OUT, 1); }
+        "#,
+        );
+        let (mut fns, mut discovered) = (Vec::new(), Vec::new());
+        scan_fns(&body, "t.rs", &mut fns);
+        scan_source(&body, "t.rs", &mut discovered);
+
+        let adopted = parse_source(
+            r#"
+            embassy_supervisor::supervisor_graph! {
+                node A = Terminate, task: worker;
+                node B = Terminate, task: b, dataflow: [worker];
+                node R = Terminate, task: r, reads: [crate::OUT];
+            }
+        "#,
+            "t.rs",
+        )
+        .unwrap();
+        let text = render(
+            &adopted[0],
+            &Options {
+                runtime: true,
+                discovered: discovered.clone(),
+                ..Default::default()
+            },
+        );
+        assert!(!text.contains("n_A -- \"discovered\""), "{text}");
+        assert!(
+            text.contains("n_B -- \"discovered\" --> s_crate__OUT"),
+            "{text}"
+        );
+        let coverage = coverage_warnings(&adopted, &fns, &[], &[]);
+        assert!(coverage.is_empty(), "{coverage:?}");
+
+        let bare = parse_source(
+            r#"
+            embassy_supervisor::supervisor_graph! {
+                node A = Terminate, task: worker;
+                node R = Terminate, task: r, reads: [crate::OUT];
+            }
+        "#,
+            "t.rs",
+        )
+        .unwrap();
+        let lints = dataflow_lints(&bare, &discovered, &[], &LintCats::all(), &[]);
+        assert!(
+            lints
+                .iter()
+                .any(|w| w.contains("orphan read: `crate::OUT` is read by R")),
+            "{lints:?}"
+        );
+        let coverage = coverage_warnings(&bare, &fns, &[], &[]);
+        assert!(
+            coverage
+                .iter()
+                .any(|w| w.contains("`t::worker` is not bound")),
+            "{coverage:?}"
+        );
+    }
+
+    #[test]
+    fn a_gated_discover_or_adoption_draws_its_predicate() {
+        let src = r#"
+            embassy_supervisor::supervisor_graph! {
+                node A = Terminate, task: worker, #[cfg(feature = "x")] discover;
+                node B = Terminate, task: b, dataflow: [#[cfg(feature = "y")] crate::setter];
+            }
+            #[embassy_supervisor::dataflow]
+            async fn worker(node: &'static TaskNode) { node.put(&crate::OUT, 1); }
+            #[embassy_supervisor::dataflow]
+            fn setter(node: &'static TaskNode) { node.put(&crate::SET, 1); }
+        "#;
+        let d = parse_source(src, "t.rs").unwrap();
+        let mut discovered = Vec::new();
+        scan_source(&parsed(src), "t.rs", &mut discovered);
+        let mut opts = Options {
+            runtime: true,
+            discovered,
+            ..Default::default()
+        };
+        let text = render(&d[0], &opts);
+        assert!(
+            text.contains(
+                "n_A -- \"discovered · <small>cfg(feature=#quot;x#quot;)</small>\" --> s_crate__OUT"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "n_B -- \"discovered · <small>cfg(feature=#quot;y#quot;)</small>\" --> s_crate__SET"
+            ),
+            "{text}"
+        );
+        opts.show_cfg = false;
+        let hidden = render(&d[0], &opts);
+        assert!(!hidden.contains("cfg("), "{hidden}");
+    }
+
+    #[test]
+    fn a_discovered_edge_keeps_its_shortest_cfg_set() {
+        let src = r#"
+            embassy_supervisor::supervisor_graph! {
+                node W = Terminate, task: worker, #[cfg(feature = "x")] discover,
+                    dataflow: [crate::setter];
+            }
+            #[embassy_supervisor::dataflow]
+            async fn worker(node: &'static TaskNode) { node.put(&crate::S, 1); }
+            #[embassy_supervisor::dataflow]
+            fn setter(node: &'static TaskNode) { node.put(&crate::S, 1); }
+        "#;
+        let gated_call = src.replace(
+            "fn setter(node: &'static TaskNode) { node.put",
+            "fn setter(node: &'static TaskNode) { #[cfg(feature = \"y\")] node.put",
+        );
+        let edge = |src: &str| {
+            let d = parse_source(src, "t.rs").unwrap();
+            let mut discovered = Vec::new();
+            scan_source(&parsed(src), "t.rs", &mut discovered);
+            let text = render(
+                &d[0],
+                &Options {
+                    runtime: true,
+                    show_cfg: true,
+                    discovered,
+                    ..Default::default()
+                },
+            );
+            let edges: Vec<String> = text
+                .lines()
+                .filter(|l| l.trim_start().starts_with("n_W --") && l.ends_with("--> s_crate__S"))
+                .map(str::to_string)
+                .collect();
+            assert_eq!(edges.len(), 1, "one edge per direction and signal: {text}");
+            edges[0].clone()
+        };
+        let ungated = edge(src);
+        assert!(
+            !ungated.contains("cfg("),
+            "the ungated adoption labels the edge the gated task fn also draws: {ungated}"
+        );
+        let tie = edge(&gated_call);
+        assert_eq!(tie.matches("cfg(").count(), 1, "{tie}");
     }
 
     #[test]
@@ -1613,14 +2246,16 @@ mod tests {
             async fn discovered(node: &'static TaskNode) {
                 let _ = node.get(&crate::DISCOVERED_SIGNAL);
             }
-            #[embassy_supervisor::dataflow]
-            fn set_value(node: &'static TaskNode, value: u32) {
-                node.put(&crate::ADOPTED_SIGNAL, value);
+            mod cfg {
+                #[embassy_supervisor::dataflow]
+                pub fn set_value(node: &'static TaskNode, value: u32) {
+                    node.put(&crate::ADOPTED_SIGNAL, value);
+                }
             }
         "#;
         let d = parse_source(src, "t.rs").unwrap();
         let mut discovered = Vec::new();
-        scan_source(src, "t.rs", &mut discovered);
+        scan_source(&parsed(src), "t.rs", &mut discovered);
         let out = render(
             &d[0],
             &Options {
@@ -1645,6 +2280,29 @@ mod tests {
         assert!(
             !out.contains("n_ROOT -. \"spawn\" .-> n_ADOPTED"),
             "the adopted writer has runtime coupling: {out}"
+        );
+    }
+
+    #[test]
+    fn anchoring_counts_a_drawn_provides_edge_as_coupling() {
+        let taken = anchored(
+            "embassy_supervisor::supervisor_graph! { \
+             node NET = Terminate, deps: [], task: n, provides: [STACK]; \
+             node APP = Terminate, deps: [NET], task: a, resources: [STACK: Stack]; }",
+        );
+        assert!(
+            taken.contains("n_NET -- \"provides\" --> r_STACK"),
+            "{taken}"
+        );
+        assert!(!taken.contains("spawn"), "{taken}");
+        let untaken = anchored(
+            "embassy_supervisor::supervisor_graph! { \
+             node NET = Terminate, deps: [], task: n, provides: [STACK]; \
+             node APP = Terminate, deps: [NET], task: a; }",
+        );
+        assert!(
+            untaken.contains("n_NET -. \"spawn\" .-> n_APP"),
+            "{untaken}"
         );
     }
 
@@ -1875,6 +2533,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_legend_styles_its_own_links_after_an_open_link() {
+        let src = r#"
+            embassy_supervisor::supervisor_graph! {
+                node W = Terminate, task: w, writes: [crate::sig::ARR[0]];
+                node R = Terminate, task: r, reads: [crate::sig::ARR];
+            }
+        "#;
+        let out = legended(src, |o| o.runtime = true);
+        assert!(
+            out.contains("  linkStyle 3,4,5,6,7,8,9,10,11,12,13 font-size:10px;"),
+            "graph links 0-2, then the legend's 11: {out}"
+        );
+    }
+
     fn regex_like(s: &str, head: &str, tail: &str) -> bool {
         s.split(head).skip(1).any(|rest| {
             rest.lines()
@@ -1931,10 +2604,16 @@ mod tests {
     fn a_state_diagram_takes_the_same_setting() {
         let out = spaced(None, Some(80), |o| o.states = true);
         assert!(
-            out.contains("{\"flowchart\": {\"rankSpacing\": 80}}"),
+            out.contains("%%{init: {\"state\": {\"rankSpacing\": 80}} }%%"),
             "{out}"
         );
+        assert!(!out.contains("\"flowchart\""), "{out}");
         assert!(out.contains("stateDiagram-v2"), "{out}");
+        let legend = spaced(None, None, |o| {
+            o.states = true;
+            o.legend = true;
+        });
+        assert!(!legend.contains("nodeSpacing"), "{legend}");
     }
 
     #[test]
@@ -2150,10 +2829,85 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("OnDemand · pool member — P members 1..2"),
+            out.contains("OnDemand · pool member — P members 1..=2"),
             "{out}"
         );
         assert!(out.contains("the pool grows under load"), "{out}");
+    }
+
+    #[test]
+    fn a_start_predicate_and_a_restart_budget_reach_the_lifecycle() {
+        let out = states(
+            r#"
+            embassy_supervisor::supervisor_graph! {
+                node A = Terminate, deps: [], task: f, enabled_if: crate::on,
+                    restart_budget: 3 in 60000;
+                node B = Terminate, deps: [], task: g;
+            }
+        "#,
+        );
+        assert!(
+            out.contains("Terminate · enabled_if · restarts 3/60000ms — A"),
+            "{out}"
+        );
+        assert!(out.contains("Terminate — B"), "{out}");
+        assert!(
+            regex_like(
+                &out,
+                "_down --> ",
+                "_off: start · the enabled_if predicate returned false"
+            ),
+            "{out}"
+        );
+        assert!(
+            regex_like(
+                &out,
+                "_off --> ",
+                "activate · the one path that clears the latch"
+            ),
+            "{out}"
+        );
+        assert!(!regex_like(&out, "[*] --> ", "_off"), "{out}");
+    }
+
+    #[test]
+    fn a_bound_on_demand_member_waits_for_the_pool_policy() {
+        let out = states(
+            r#"
+            embassy_supervisor::supervisor_graph! {
+                node P = Terminate, deps: [], task: f;
+                pool W = [OnDemand], deps: [P ready bound], task: w,
+                    policy: Pol::new(), min: 0, max: 1;
+                node N = OnDemand, deps: [P ready bound], task: n;
+            }
+        "#,
+        );
+        assert!(
+            out.contains("that dep is ready again · regrow-eligible, the pool policy restarts it"),
+            "{out}"
+        );
+        assert!(
+            out.contains("that dep is ready again · eligible again, start_node brings it up"),
+            "{out}"
+        );
+        assert!(!out.contains("brought back through the gates"), "{out}");
+    }
+
+    #[test]
+    fn interleaved_member_modes_list_their_members() {
+        let out = states(
+            r#"
+            embassy_supervisor::supervisor_graph! {
+                pool P = [Terminate, OnDemand, Terminate], deps: [], task: f,
+                    policy: Pol::new(), min: 1, max: 3;
+            }
+        "#,
+        );
+        assert!(
+            out.contains("Terminate · pool member — P members 0 and 2"),
+            "{out}"
+        );
+        assert!(out.contains("OnDemand · pool member — P member 1"), "{out}");
     }
 
     #[test]
@@ -2320,6 +3074,29 @@ mod tests {
     }
 
     #[test]
+    fn a_predicate_fact_keeps_what_is_not_a_plain_path() {
+        let src = r#"
+            embassy_supervisor::supervisor_graph! {
+                node A = Terminate, task: f,
+                    enabled_if: || crate::cfg::radio_on() && !crate::cfg::low_battery();
+                node B = Terminate, task: g, enabled_if: crate::cfg::flags::<Radio>;
+                node C = Terminate, task: h, enabled_if: crate::cfg::radio_on;
+                pool P = [Terminate], task: p, policy: Pol::new(), min: 1,
+                    max: crate::cfg::cap::<4>();
+            }
+        "#;
+        let out = render(&parse_source(src, "t.rs").unwrap()[0], &Options::default());
+        for fact in [
+            "if ||crate::cfg::radio_on()#amp;#amp;!crate::cfg::low_battery()",
+            "if flags::#lt;Radio#gt;",
+            "· if radio_on\"]",
+            "1..crate::cfg::cap::#lt;4#gt;()",
+        ] {
+            assert!(out.contains(fact), "{fact}: {out}");
+        }
+    }
+
+    #[test]
     fn gated_clause_facts_and_provides_edges_carry_the_predicate() {
         let src = r#"
             embassy_supervisor::supervisor_graph! {
@@ -2384,8 +3161,8 @@ mod tests {
         let end = out[high..].find("\n  end").unwrap() + high;
         assert!(out[high..end].contains("n_HEARTBEAT"), "{out}");
         assert!(
-            out.contains("[\"thread mode\"]"),
-            "default-executor nodes share the thread-mode box: {out}"
+            out.contains("[\"supervisor's executor\"]"),
+            "nodes with no executor share the supervisor's executor box: {out}"
         );
         assert!(!out[high..end].contains("n_WATCHDOG"), "{out}");
     }
@@ -2399,6 +3176,7 @@ mod tests {
                 node A = Terminate, task: a;
                 node B = Terminate, deps: [A], executor: HIGH, task: b;
                 node PARKED = Pause, deps: [];
+                pool W = [Terminate], task: w, policy: P::new(), min: 1, max: 1;
             }
         "#;
         let g = parse_source(src, "t.rs").unwrap().remove(0);
@@ -2420,7 +3198,17 @@ mod tests {
             !out[thread..end].contains("n_PARKED"),
             "a parked node stays with the supervisor: {out}"
         );
-        assert!(out.contains("[\"thread mode\"]"), "{out}");
+        assert!(out.contains("[\"supervisor's executor\"]"), "{out}");
+        assert!(out.contains("n_A[\"A<br/>Terminate · task\"]"), "{out}");
+        let plain = render(&g, &Options::default());
+        for label in [
+            "n_A[\"A<br/>Terminate · task · @THREAD\"]",
+            "n_B[\"B<br/>Terminate · task · @HIGH\"]",
+            "n_PARKED[\"PARKED<br/>Pause · parked\"]",
+            "n_W[[\"W<br/>pool ×1 · task · 1..1 · @THREAD\"]]",
+        ] {
+            assert!(plain.contains(label), "{label}: {plain}");
+        }
     }
 
     #[test]
@@ -2476,7 +3264,7 @@ mod tests {
             "HB keeps HIGH: {drawn}"
         );
         assert!(
-            !drawn.contains("[\"thread mode\"]"),
+            !drawn.contains("[\"supervisor's executor\"]"),
             "nothing left unrouted: {drawn}"
         );
     }
@@ -2628,8 +3416,18 @@ mod tests {
             }
         "#;
         let decls = parse_source(src, "t.rs").unwrap();
-        let entry = ("tasks".to_string(), "entry".to_string());
-        let stray = ("m".to_string(), "unused".to_string());
+        let entry = ScannedFn {
+            module: vec!["tasks".to_string()],
+            rooted: true,
+            crate_dir: None,
+            name: "entry".to_string(),
+        };
+        let stray = ScannedFn {
+            module: vec!["m".to_string()],
+            rooted: true,
+            crate_dir: None,
+            name: "unused".to_string(),
+        };
 
         let missing = coverage_warnings(&decls, &[], &[], &[]);
         assert!(
@@ -2670,7 +3468,7 @@ mod tests {
         "#;
         let decls = parse_source(src, "t.rs").unwrap();
         let mut discovered = Vec::new();
-        scan_source(src, "t.rs", &mut discovered);
+        scan_source(&parsed(src), "t.rs", &mut discovered);
         let m = model_json(&decls, &discovered);
         let item = &m["graphs"][0]["items"][0];
         assert_eq!(item["name"], "A");
@@ -2687,17 +3485,23 @@ mod tests {
     const FULL_GRAPH: &str = r#"
         embassy_supervisor::supervisor_graph! {
             name: RIG;
+            observe writes: it.load(core::sync::atomic::Ordering::Relaxed);
+            observe reads: it.get();
             node GNSS = Terminate, task: crate::gnss_task,
                 slot_timeout: 5000, ack_timeout: 100,
                 beat_timeout: 500, beat_window: 2, ready_on_write,
                 exit: Result<(), FixError>, state: u32 = 7, cancel,
-                writes: [FIX observed beat];
+                writes: [FIX observed beat],
+                resources: [UART: crate::Uart, POWER: divisible],
+                dataflow: [#[cfg(feature = "log")] crate::log::emit];
             node PARKED = Terminate, deps: [GNSS ready];
             node RAW = Terminate, spawn: crate::raw_task;
             pool WORKERS = [Terminate, OnDemand], task: crate::worker,
                 policy: DeferredShrink = DeferredShrink::new(Duration::from_secs(2)),
                 min: 1, max: 2, slot_timeout: 1000, ack_timeout: 50,
                 state: zeroed u8, cancel, reads: [FIX];
+            #[cfg(feature = "tiers")]
+            executor HIGH;
         }
     "#;
 
@@ -2739,6 +3543,25 @@ mod tests {
         };
         assert!(parked.task.is_none());
         assert!(!parked.cancel);
+        assert_eq!(
+            g.observe_writes.as_ref().unwrap().text.replace(' ', ""),
+            "it.load(core::sync::atomic::Ordering::Relaxed)"
+        );
+        assert_eq!(
+            g.observe_reads.as_ref().unwrap().text.replace(' ', ""),
+            "it.get()"
+        );
+        assert_eq!(
+            n.resources[0].ty.as_ref().unwrap().text.replace(' ', ""),
+            "crate::Uart"
+        );
+        assert!(n.resources[1].divisible && n.resources[1].ty.is_none());
+        assert_eq!(n.dataflow[0].path, "crate::log::emit");
+        assert_eq!(n.dataflow[0].cfg, ["feature=\"log\""]);
+        let ItemModel::Executor(x) = &g.items[4] else {
+            panic!("executor")
+        };
+        assert_eq!(x.cfg, ["feature=\"tiers\""]);
     }
 
     #[test]
@@ -2804,6 +3627,21 @@ mod tests {
         assert_eq!(j["cancel"], n.cancel);
         assert_eq!(m["graphs"][0]["items"][1]["parked"], true);
         assert_eq!(m["graphs"][0]["items"][1]["task"], serde_json::Value::Null);
+        assert_eq!(
+            j["resources"][0]["ty"],
+            n.resources[0].ty.as_ref().unwrap().text
+        );
+        assert_eq!(j["resources"][1]["ty"], serde_json::Value::Null);
+        assert_eq!(j["dataflow"][0], "crate::log::emit");
+        assert_eq!(j["dataflow_cfg"][0][0], "feature=\"log\"");
+        assert_eq!(m["graphs"][0]["items"][4]["cfg"][0], "feature=\"tiers\"");
+        assert_eq!(
+            m["graphs"][0]["observe_reads"]
+                .as_str()
+                .unwrap()
+                .replace(' ', ""),
+            "it.get()"
+        );
         let ItemModel::Pool(p) = &full.graphs[0].items[3] else {
             panic!("pool")
         };
@@ -2865,12 +3703,20 @@ mod tests {
         "#;
         let d = parse_source(src, "t.rs").unwrap();
         let mut scanned = Vec::new();
-        scan_fns(src, "t.rs", &mut scanned);
-        assert_eq!(scanned, [("t".to_string(), "worker".to_string())]);
+        scan_fns(&parsed(src), "t.rs", &mut scanned);
+        assert_eq!(
+            scanned,
+            [ScannedFn {
+                module: vec!["t".to_string()],
+                rooted: false,
+                crate_dir: None,
+                name: "worker".to_string()
+            }]
+        );
         assert!(coverage_warnings(&d, &scanned, &[], &[]).is_empty());
 
         let mut discovered = Vec::new();
-        scan_source(src, "t.rs", &mut discovered);
+        scan_source(&parsed(src), "t.rs", &mut discovered);
         let text = render(
             &d[0],
             &Options {
@@ -2909,12 +3755,13 @@ mod tests {
         "#;
         let d = parse_source(src, "t.rs").unwrap();
         let mut discovered = Vec::new();
-        scan_source(src, "t.rs", &mut discovered);
+        scan_source(&parsed(src), "t.rs", &mut discovered);
         let mut bundles = Vec::new();
-        scan_bundles(src, "t.rs", &mut bundles);
+        scan_bundles(&parsed(src), "t.rs", &mut bundles);
         assert_eq!(bundles.len(), 1);
         assert_eq!(bundles[0].name, "BUNDLE");
         assert_eq!(bundles[0].fns, ["set_a", "read_b"]);
+        assert_eq!(bundles[0].path, ["t", "api"]);
 
         let text = render(
             &d[0],
@@ -2935,7 +3782,7 @@ mod tests {
         );
 
         let mut scanned = Vec::new();
-        scan_fns(src, "t.rs", &mut scanned);
+        scan_fns(&parsed(src), "t.rs", &mut scanned);
         assert!(coverage_warnings(&d, &scanned, &[], &bundles).is_empty());
         assert!(
             !coverage_warnings(&d, &scanned, &[], &[])

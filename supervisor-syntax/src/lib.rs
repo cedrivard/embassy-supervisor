@@ -64,7 +64,7 @@ pub mod kw {
 pub enum StateInit {
     /// An explicit expression, e.g. `state: Type = expr;`.
     Expr(Expr),
-    /// The `zeroed` shorthand, e.g. `state: Type zeroed;`.
+    /// The `zeroed` shorthand, e.g. `state: zeroed Type;`.
     Zeroed(kw::zeroed),
 }
 
@@ -88,6 +88,9 @@ pub fn parse_dep_list(input: ParseStream) -> SynResult<Vec<Dep>> {
     let mut deps = Vec::new();
     while !content.is_empty() {
         let cfg = content.call(Attribute::parse_outer)?;
+        for a in &cfg {
+            require_cfg_list(a, "`deps:` entry")?;
+        }
         let ident: Ident = content.parse()?;
         let mut ready: Option<Ident> = None;
         let mut bound: Option<Ident> = None;
@@ -126,7 +129,7 @@ pub fn parse_dep_list(input: ParseStream) -> SynResult<Vec<Dep>> {
             ready,
             bound,
         });
-        if content.peek(Token![,]) {
+        if !content.is_empty() {
             content.parse::<Token![,]>()?;
         }
     }
@@ -182,6 +185,9 @@ pub fn parse_signal_list(input: ParseStream) -> SynResult<Vec<SignalDecl>> {
     let mut decls = Vec::new();
     while !content.is_empty() {
         let cfg = content.call(Attribute::parse_outer)?;
+        for a in &cfg {
+            require_cfg_list(a, "`reads:`/`writes:` entry")?;
+        }
         let path: syn::Path = content.parse()?;
         let index = if content.peek(syn::token::Bracket) {
             let idx;
@@ -435,6 +441,9 @@ pub fn parse_resource_list(input: ParseStream) -> SynResult<Vec<ResourceDecl>> {
     let mut resources = Vec::new();
     while !content.is_empty() {
         let cfg = content.call(Attribute::parse_outer)?;
+        for a in &cfg {
+            require_cfg_list(a, "`resources:` entry")?;
+        }
         let ident: Ident = content.parse()?;
         content.parse::<Token![:]>()?;
         let mut markers: [Option<Ident>; 5] = Default::default();
@@ -502,7 +511,7 @@ pub fn parse_resource_list(input: ParseStream) -> SynResult<Vec<ResourceDecl>> {
             divisible,
             serialized,
         });
-        if content.peek(Token![,]) {
+        if !content.is_empty() {
             content.parse::<Token![,]>()?;
         }
     }
@@ -917,6 +926,23 @@ fn dup_clause<T: quote::ToTokens>(tok: &T, name: &str) -> syn::Error {
     )
 }
 
+/// Parse a clause's integer literal, refusing a suffix: the diagram tool and
+/// parts of the macro read only the digits, so `5s` or `3u8` would let the
+/// build and the diagram disagree.
+fn parse_unsuffixed(input: ParseStream, what: &str) -> SynResult<LitInt> {
+    let lit: LitInt = input.parse()?;
+    if !lit.suffix().is_empty() {
+        return Err(syn::Error::new_spanned(
+            &lit,
+            format!(
+                "{what} takes an unsuffixed integer literal; remove the `{}` suffix",
+                lit.suffix()
+            ),
+        ));
+    }
+    Ok(lit)
+}
+
 /// The `#[cfg]` attributes' token text, normalized for predicate comparison.
 pub fn cfg_text(attrs: &[Attribute]) -> String {
     attrs
@@ -1063,7 +1089,7 @@ impl CommonClauses {
             if self.slot_timeout.is_some() {
                 return Err(dup_clause(&k, "slot_timeout"));
             }
-            let st: LitInt = input.parse()?;
+            let st = parse_unsuffixed(input, "`slot_timeout:` (milliseconds)")?;
             if st.base10_parse::<u64>()? == 0 {
                 return Err(syn::Error::new_spanned(
                     &st,
@@ -1081,7 +1107,7 @@ impl CommonClauses {
             if self.ack_timeout.is_some() {
                 return Err(dup_clause(&k, "ack_timeout"));
             }
-            let at: LitInt = input.parse()?;
+            let at = parse_unsuffixed(input, "`ack_timeout:` (milliseconds)")?;
             if at.base10_parse::<u64>()? == 0 {
                 return Err(syn::Error::new_spanned(
                     &at,
@@ -1121,6 +1147,9 @@ impl CommonClauses {
             let mut fns: Vec<AdoptedFn> = Vec::new();
             while !content.is_empty() {
                 let cfg = content.call(Attribute::parse_outer)?;
+                for a in &cfg {
+                    require_cfg_list(a, "`dataflow:` entry")?;
+                }
                 let path: syn::Path = content.parse()?;
                 if fns
                     .iter()
@@ -1132,7 +1161,7 @@ impl CommonClauses {
                     ));
                 }
                 fns.push(AdoptedFn { cfg, path });
-                if content.peek(Token![,]) {
+                if !content.is_empty() {
                     content.parse::<Token![,]>()?;
                 }
             }
@@ -1252,7 +1281,7 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
             beat_timeout = Some(Gated {
                 cfg: clause_cfg,
                 kw: k,
-                value: input.parse::<LitInt>()?,
+                value: parse_unsuffixed(input, "`beat_timeout:` (milliseconds)")?,
             });
         } else if input.peek(kw::beat_window) {
             let k = input.parse::<kw::beat_window>()?;
@@ -1282,9 +1311,9 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
             if restart_budget.is_some() {
                 return Err(dup_clause(&k, "restart_budget"));
             }
-            let max: LitInt = input.parse()?;
+            let max = parse_unsuffixed(input, "`restart_budget:` max")?;
             input.parse::<Token![in]>()?;
-            let window: LitInt = input.parse()?;
+            let window = parse_unsuffixed(input, "`restart_budget:` window (milliseconds)")?;
             let max_n = max.base10_parse::<u64>()?;
             if max_n == 0 {
                 return Err(syn::Error::new_spanned(
@@ -1313,10 +1342,16 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
         } else if input.peek(kw::exit) {
             let k = input.parse::<kw::exit>()?;
             input.parse::<Token![:]>()?;
+            if exit.is_some() {
+                return Err(dup_clause(&k, "exit"));
+            }
             exit = Some((k, input.parse::<syn::Type>()?));
         } else if input.peek(kw::provides) {
             let k = input.parse::<kw::provides>()?;
             input.parse::<Token![:]>()?;
+            if provides_kw.is_some() {
+                return Err(dup_clause(&k, "provides"));
+            }
             let content;
             bracketed!(content in input);
             while !content.is_empty() {
@@ -1335,7 +1370,7 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
                     cfg: entry_cfg,
                     ident: slot,
                 });
-                if content.peek(Token![,]) {
+                if !content.is_empty() {
                     content.parse::<Token![,]>()?;
                 }
             }
@@ -1675,6 +1710,14 @@ pub fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem
         dataflow,
     } = common;
     let source = task_source(spawn, task)?;
+    if let Some((k, decls)) = &resources
+        && decls.is_empty()
+    {
+        return Err(syn::Error::new_spanned(
+            k,
+            "`resources:` must declare at least one `NAME: Type` entry",
+        ));
+    }
     let resources = resources.map(|(_, decls)| decls).unwrap_or_default();
 
     if let Some(bad) = resources
@@ -2017,6 +2060,10 @@ fn rewrite_verb_calls_in(
     use proc_macro2::{Delimiter, Group, TokenTree};
 
     let toks: Vec<TokenTree> = body.into_iter().collect();
+    let punct_at = |j: usize| match &toks[j] {
+        TokenTree::Punct(p) => Some(p.as_char()),
+        _ => None,
+    };
     let mut out = TokenStream2::new();
     let mut i = 0;
     let mut pending: Vec<TokenStream2> = Vec::new();
@@ -2053,9 +2100,14 @@ fn rewrite_verb_calls_in(
             current.clear();
             continue;
         }
+        // `x.node` is a field and `a::node` a path, so neither receiver is this
+        // fn's node param. A lone `:` (`field: node.verb(..)`) qualifies nothing.
         let own_receiver = i == 0
-            || !matches!(&toks[i - 1], TokenTree::Punct(p)
-                if p.as_char() == '.' || p.as_char() == ':');
+            || match punct_at(i - 1) {
+                Some('.') => false,
+                Some(':') => i == 1 || punct_at(i - 2) != Some(':'),
+                _ => true,
+            };
         let matched = if own_receiver && i + 3 < toks.len() {
             match (&toks[i], &toks[i + 1], &toks[i + 2], &toks[i + 3]) {
                 (
@@ -2285,7 +2337,7 @@ pub fn scan_dataflow(src: &str, out: &mut Vec<Access>) {
 
 fn scan_item(item: &syn::Item, out: &mut Vec<Access>) {
     match item {
-        syn::Item::Fn(f) => scan_fn(&f.attrs, &f.sig, &f.block, out),
+        syn::Item::Fn(f) => scan_fn_accesses(&f.attrs, &f.sig, &f.block, out),
         syn::Item::Mod(m) => {
             if let Some((_, items)) = &m.content {
                 for i in items {
@@ -2296,7 +2348,7 @@ fn scan_item(item: &syn::Item, out: &mut Vec<Access>) {
         syn::Item::Impl(im) => {
             for ii in &im.items {
                 if let syn::ImplItem::Fn(f) = ii {
-                    scan_fn(&f.attrs, &f.sig, &f.block, out);
+                    scan_fn_accesses(&f.attrs, &f.sig, &f.block, out);
                 }
             }
         }
@@ -2304,7 +2356,16 @@ fn scan_item(item: &syn::Item, out: &mut Vec<Access>) {
     }
 }
 
-fn scan_fn(attrs: &[Attribute], sig: &syn::Signature, block: &syn::Block, out: &mut Vec<Access>) {
+/// One fn's dataflow accesses, as [`scan_dataflow`] records them: nothing when
+/// the fn has no `#[dataflow]` attribute or node parameter; otherwise each
+/// signal once per direction with the fn's `#[cfg]`s, its `cfg_attr` predicate
+/// and the call site's `#[cfg]`s.
+pub fn scan_fn_accesses(
+    attrs: &[Attribute],
+    sig: &syn::Signature,
+    block: &syn::Block,
+    out: &mut Vec<Access>,
+) {
     let Some((attr, wrap_cfg)) = attrs.iter().find_map(dataflow_attr) else {
         return;
     };
@@ -3353,6 +3414,18 @@ mod tests {
                  beat_timeout: 100, ready_on_write, ready_on_write;",
                 "duplicate `ready_on_write` marker",
             ),
+            (
+                "node A = Terminate, deps: [], task: f, exit: u32, exit: u8;",
+                "duplicate `exit:` clause",
+            ),
+            (
+                "node A = Terminate, deps: [], task: f, provides: [R], provides: [S];",
+                "duplicate `provides:` clause",
+            ),
+            (
+                "node A = Terminate, deps: [], task: f, provides: [R], provides: [];",
+                "duplicate `provides:` clause",
+            ),
         ] {
             match syn::parse_str::<GraphSpec>(src) {
                 Ok(_) => panic!("duplicate accepted: {src}"),
@@ -3363,10 +3436,20 @@ mod tests {
 
     #[test]
     fn malformed_cfg_attribute_rejected() {
-        for attr in ["#[cfg]", "#[cfg = \"x\"]", "#[cfg] #[cfg(feature = \"x\")]"] {
+        for attr in [
+            "#[cfg]",
+            "#[cfg = \"x\"]",
+            "#[cfg] #[cfg(feature = \"x\")]",
+            "#[allow(dead_code)]",
+        ] {
             for decl in [
                 format!("node A = Terminate, deps: [], {attr} disabled;"),
                 format!("node A = Terminate, deps: [], provides: [{attr} R];"),
+                format!("node A = Terminate, deps: [{attr} B];"),
+                format!("node A = Terminate, deps: [], task: f, resources: [{attr} R: u32];"),
+                format!("node A = Terminate, deps: [], reads: [{attr} crate::S];"),
+                format!("node A = Terminate, deps: [], writes: [{attr} crate::S];"),
+                format!("node A = Terminate, deps: [], task: f, dataflow: [{attr} crate::g];"),
             ] {
                 match syn::parse_str::<GraphSpec>(&decl) {
                     Ok(_) => panic!("malformed cfg accepted: {decl}"),
@@ -3454,7 +3537,15 @@ mod tests {
         let body = quote!({
             self.node.put(&NOT_OURS, 1);
             foo::node.get(&ALSO_NOT);
+            ::node.get(&ROOTED_NOT);
             node.put(&OURS, 2);
+            let r = Rates {
+                gyro: node.reader(&FIELD),
+                accel: foo::node.reader(&FIELD_NOT),
+            };
+            Wrap {
+                inner: node.get(&FIRST_FIELD),
+            }
         });
         let mut seen = Vec::new();
         rewrite_verb_calls(body, "node", &VerbTable::builtin(), &mut |call| {
@@ -3462,7 +3553,89 @@ mod tests {
             Ok(None)
         })
         .unwrap();
-        assert_eq!(seen, ["OURS"]);
+        assert_eq!(seen, ["OURS", "FIELD", "FIRST_FIELD"]);
+    }
+
+    #[test]
+    fn struct_literal_fields_are_scanned() {
+        let mut out = Vec::new();
+        scan_dataflow(
+            "#[dataflow]\nfn rates(node: &'static TaskNode) -> Rates { \
+             Rates { gyro: node.reader(&crate::GYRO), accel: node.reader(&crate::ACCEL) } }",
+            &mut out,
+        );
+        let paths: Vec<&str> = out.iter().map(|a| a.path.as_str()).collect();
+        assert_eq!(paths, ["crate::GYRO", "crate::ACCEL"], "{out:?}");
+    }
+
+    #[test]
+    fn pool_resources_must_declare_an_entry() {
+        let err = parse_err(
+            "pool P = [Terminate], deps: [], task: w, resources: [], \
+             policy: Pol::new(), min: 1, max: 1;",
+        );
+        assert!(
+            err.contains("`resources:` must declare at least one"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn list_entries_need_separators() {
+        for src in [
+            "node A = Terminate, deps: [B #[cfg(feature = \"x\")] C];",
+            "node A = Terminate, deps: [], task: f, resources: [R: u32 S: u8];",
+            "node A = Terminate, deps: [], task: f, provides: [R S];",
+            "node A = Terminate, deps: [], task: f, dataflow: [crate::g crate::h];",
+        ] {
+            let err = parse_err(src);
+            assert!(err.contains("expected `,`"), "{src}: {err}");
+        }
+        for src in [
+            "node A = Terminate, deps: [B, #[cfg(feature = \"x\")] C,];",
+            "node A = Terminate, deps: [], task: f, resources: [R: u32, S: u8,];",
+            "node A = Terminate, deps: [], task: f, provides: [R, S,];",
+            "node A = Terminate, deps: [], task: f, dataflow: [crate::g, crate::h,];",
+        ] {
+            if let Err(err) = syn::parse_str::<GraphSpec>(src) {
+                panic!("{src}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn integer_clauses_take_no_suffix() {
+        for (src, needle) in [
+            (
+                "node A = Terminate, deps: [], slot_timeout: 5s;",
+                "`slot_timeout:` (milliseconds) takes an unsuffixed integer literal; \
+                 remove the `s` suffix",
+            ),
+            (
+                "node A = Terminate, deps: [], ack_timeout: 100ms;",
+                "remove the `ms` suffix",
+            ),
+            (
+                "node A = Terminate, deps: [], beat_timeout: 100u64;",
+                "remove the `u64` suffix",
+            ),
+            (
+                "node A = Terminate, deps: [], restart_budget: 3u8 in 100;",
+                "`restart_budget:` max takes",
+            ),
+            (
+                "node A = Terminate, deps: [], restart_budget: 3 in 60s;",
+                "`restart_budget:` window (milliseconds) takes",
+            ),
+            (
+                "pool P = [Terminate], deps: [], task: w, policy: Pol::new(), \
+                 min: 1, max: 1, slot_timeout: 5u32;",
+                "remove the `u32` suffix",
+            ),
+        ] {
+            let err = parse_err(src);
+            assert!(err.contains(needle), "{src}: {err}");
+        }
     }
 
     fn parse_err(src: &str) -> String {

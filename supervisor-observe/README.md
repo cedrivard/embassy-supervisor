@@ -47,6 +47,8 @@ ESTIMATE.w().send(est); // counted write; `.r()` counts a read; `.inner()` count
 the one thing a value-as-token accessor cannot promise. The atomic integer
 types and `AtomicBool`, in both the `core` and `portable-atomic` families,
 implement `Observable` directly (value as token), with exactly that caveat.
+A 64-bit (or 64-bit pointer-width) value folds its high half into the token
+with a wrapping add, so a write that changes only the high bits still moves it.
 
 ## The value verbs
 
@@ -56,3 +58,10 @@ and `Source` (`fn get(&self) -> Item`) is its snapshot-read counterpart. Both
 are minimal on purpose: read-modify-write and consuming reads stay with the
 signal's own API through the pass-through accessors (`writer`/`reader`). The
 atomics implement both.
+
+## Targets without atomic compare-and-swap
+
+On a target with no native CAS (thumbv6m, riscv32imc) the facade needs
+portable-atomic's `critical-section` feature or its `unsafe-assume-single-core`
+feature; without one the build stops with a `compile_error!` naming them. An
+application linking `embassy-supervisor` already gets `critical-section`.

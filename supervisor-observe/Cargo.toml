@@ -4,7 +4,7 @@ name = "embassy-supervisor-observe"
 # a primitive in `Counted`) against this crate alone, so it must stay small,
 # dependency-light, and semver-stable. Depend on it by version range; it is
 # never `=`-pinned by anything.
-version = "0.1.1"
+version = "0.1.2"
 description = "Observation facade for embassy-supervisor: implement it where your signals live, without depending on the supervisor"
 edition.workspace = true
 authors.workspace = true
@@ -21,6 +21,7 @@ categories = ["embedded", "asynchronous", "no-std"]
 
 [dependencies]
 # The one dependency, for targets without native atomics (thumbv6 needs the
-# critical-section fallback, which the final binary enables). Precise minimum
-# (the lock-proven version) so minimal-versions resolution stays tested.
+# critical-section fallback, which the final binary enables; `lib.rs` turns its
+# absence into a `compile_error!`). Precise minimum (the lock-proven version)
+# so minimal-versions resolution stays tested.
 portable-atomic = "1.15.0"

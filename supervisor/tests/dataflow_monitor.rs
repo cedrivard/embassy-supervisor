@@ -76,6 +76,7 @@ async fn driver(spawner: Spawner) {
     // ── The verb is what makes a write a heartbeat ───────────────────────
     // Neither body calls beat(). Over six sweeps spanning well past the
     // budget, BEATER's flag→check conversion keeps it alive, while SCOUT is
+    // reported stale: its plain `put` never claims a beat.
     for i in 1..=6 {
         pulse_out(&BEATER, i);
         pulse_scratch(&SCOUT, i);

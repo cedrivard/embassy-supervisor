@@ -10,13 +10,22 @@ use embassy_supervisor::{
 supervisor_graph! {
     node PARK = Pause, deps: [], task: park;
     node LEAF = Terminate, deps: [PARK], task: leaf;
+    node EARLY = Terminate, deps: [], task: leaf;
 }
 
 static DONE: AtomicBool = AtomicBool::new(false);
 static SEEN: Mutex<Vec<(&'static str, &'static str)>> = Mutex::new(Vec::new());
+static OTHER: Mutex<Vec<(&'static str, &'static str)>> = Mutex::new(Vec::new());
 
 fn record(ev: LifecycleEvent) {
     SEEN.lock()
+        .unwrap()
+        .push((ev.node.name(), ev.kind.as_str()));
+}
+
+fn record_other(ev: LifecycleEvent) {
+    OTHER
+        .lock()
         .unwrap()
         .push((ev.node.name(), ev.kind.as_str()));
 }
@@ -47,6 +56,7 @@ async fn settle() {
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
+    sup.start_node(&EARLY, &spawner).await.expect("start early");
     set_lifecycle_sink(record);
 
     sup.start(&spawner).await.expect("start");
@@ -54,7 +64,7 @@ async fn driver(spawner: Spawner) {
     assert_eq!(
         take(),
         [("park", "started"), ("leaf", "started")],
-        "bring-up reaches the sink in dependency order"
+        "bring-up reaches the sink in dependency order; EARLY's Started came before the install and never does"
     );
 
     sup.stop_node(&LEAF).await.expect("stop leaf");
@@ -104,6 +114,15 @@ async fn driver(spawner: Spawner) {
         );
         assert_eq!(take(), [("leaf", "started")]);
     }
+
+    set_lifecycle_sink(record_other);
+    sup.stop_node(&PARK).await.expect("stop park");
+    assert!(take().is_empty(), "the replaced sink hears nothing more");
+    assert_eq!(
+        core::mem::take(&mut *OTHER.lock().unwrap()),
+        [("park", "stop_requested"), ("park", "stopped")],
+        "a second install replaces the first"
+    );
 
     DONE.store(true, Ordering::SeqCst);
 }

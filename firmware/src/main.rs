@@ -58,6 +58,8 @@ unsafe fn SWI_IRQ_0() {
     if on_core1() {
         return relay_to_core0(RELAY_HIGH);
     }
+    // SAFETY: only this vector calls it, only on core 0 (core 1 returned above),
+    // and core 0 enables the IRQ in `start()`, so never before it.
     unsafe { EXECUTOR_HIGH.on_interrupt() }
 }
 
@@ -108,6 +110,8 @@ unsafe fn SWI_IRQ_1() {
     if on_core1() {
         return relay_to_core0(RELAY_SUP);
     }
+    // SAFETY: only this vector calls it, only on core 0 (core 1 returned above),
+    // and core 0 enables the IRQ in `start()`, so never before it.
     unsafe { EXECUTOR_SUP.on_interrupt() }
 }
 
@@ -182,12 +186,18 @@ async fn main(spawner: Spawner) {
 
     embassy_supervisor::trace::set_core_id_fn(|| embassy_rp::pac::SIO.cpuid().read() as usize);
 
+    // SAFETY: the only reference to CORE1_STACK, taken once before core 1
+    // starts. `&mut *&raw mut` makes it from a raw pointer, which keeps rustc's
+    // `static_mut_refs` lint quiet.
     #[allow(clippy::deref_addrof)]
     let core1_stack = unsafe { &mut *&raw mut CORE1_STACK };
     // Core 0 handles doorbells; core 1 enables the interrupt SWIs so a
     // pend from there is relayed instead of lost.
+    // SAFETY: no critical section here is built on NVIC masks (embassy-rp's uses
+    // PRIMASK and a spinlock), so unmasking cannot break one.
     unsafe { interrupt::SIO_IRQ_BELL.enable() };
     embassy_rp::multicore::spawn_core1(p.CORE1, core1_stack, || {
+        // SAFETY: as for SIO_IRQ_BELL; on core 1 these handlers only relay to core 0.
         unsafe {
             interrupt::SWI_IRQ_0.enable();
             interrupt::SWI_IRQ_1.enable();
@@ -210,6 +220,8 @@ async fn main(spawner: Spawner) {
 
 #[embassy_executor::task]
 async fn app_supervisor() {
+    // SAFETY: awaited inside this task, whose Context comes from EXECUTOR_SUP,
+    // an embassy executor.
     let spawner = unsafe { Spawner::for_current_executor() }.await;
     let sup = embassy_supervisor::Supervisor::new(&GRAPH);
     // Before the first wave, so bring-up is recorded too.
@@ -224,14 +236,23 @@ async fn app_supervisor() {
     }
 }
 
+/// Confirm the running image once it has shown it can take the next update:
+/// the USB link is up and a worker has answered an HTTP request. Until then a
+/// reset rolls a fresh update back. Runs last (`deps: [HTTP, NET ready]`),
+/// detached, and exits once done.
 async fn ota_confirm(node: &'static embassy_supervisor::TaskNode) {
     node.set_detached(true);
     let Some(held) = net::stack_ready(node).await else {
         return;
     };
-    held.wait_config_up().await;
+    held.wait_link_up().await;
+    // The lease covers only the link wait: held across the HTTP wait it would
+    // keep `net`'s teardown waiting on this task.
+    drop(held);
+    http::first_response().await;
     match ota::mark_booted() {
-        Ok(()) => defmt::info!("ota: image confirmed"),
+        Ok(true) => defmt::info!("ota: image confirmed"),
+        Ok(false) => defmt::info!("ota: image confirmed by ota"),
         Err(e) => defmt::warn!("ota: mark_booted failed: {}", e),
     }
 }

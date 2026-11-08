@@ -3,7 +3,8 @@
  * `.start_block` is filled by embassy-rp's `binary-info` feature). The other
  * regions are referenced only to export the partition symbols that
  * `BootLoaderConfig::from_linkerfile_blocking` reads. Keep these addresses in sync
- * with `firmware/memory-ota.x`. */
+ * with `firmware/memory.x`, which also places the firmware's OTA_SCRATCH
+ * (0x101E0000, 256K) right after DFU; the bootloader never touches it. */
 MEMORY {
     /* FLASH == the BOOTLOADER partition (cortex-m-rt places code here). */
     FLASH            : ORIGIN = 0x10000000, LENGTH = 128K

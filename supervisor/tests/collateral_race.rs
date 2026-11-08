@@ -58,6 +58,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 #[embassy_executor::task]
@@ -80,7 +81,9 @@ async fn driver(spawner: Spawner) {
     // releases the parked gate and the in-flight spawn completes — by which
     // point LINK is deactivated and the member is collateral.
     let recovery = async {
-        let _ = sup.start_node(&CREW[0], &spawner).await;
+        sup.start_node(&CREW[0], &spawner)
+            .await
+            .expect("the parked recovery start completes once LINK re-asserts");
     };
     let deactivate_mid_gate = async {
         // Let start_node reach its gate wait first.
@@ -91,11 +94,13 @@ async fn driver(spawner: Spawner) {
     };
     embassy_futures::join::join(recovery, deactivate_mid_gate).await;
 
-    // start_node's ready-dep wait may instead fault out ReadyDepTimeout on a
-    // bound dep (the provider parked it) — that path is also fine: the point
-    // is only that no instance ever runs unheld. Give any spawned instance a
-    // pass to poll.
-    settle(|| CREW_SPAWNS.load(Ordering::SeqCst) >= 2 || !LINK.is_ready()).await;
+    // The clock never moves, so the parked gate resolves only through LINK's
+    // set_ready: the recovery spawn completes and its instance runs flagged.
+    settle(|| CREW_SPAWNS.load(Ordering::SeqCst) == 2).await;
+    assert!(
+        CREW[0].is_running() && CREW[0].is_collateral(),
+        "the member runs, still held by the mid-flight deactivate"
+    );
 
     DONE.store(true, Ordering::SeqCst);
 }

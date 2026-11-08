@@ -8,6 +8,7 @@ use embassy_time::{Duration, MockDriver};
 supervisor_graph! {
     node POLICED = Terminate, deps: [], task: worker, beat_timeout: 100;
     node FREE = Terminate, deps: [], task: worker;
+    node SELFMAN = Terminate, deps: [], task: worker, beat_timeout: 100;
 }
 
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -35,12 +36,18 @@ async fn driver(spawner: Spawner) {
     sup.start(&spawner).await.expect("start");
     settle().await;
     assert!(GRAPH.all_fresh(), "the spawn stamps a beat");
+    // Self-managed from here: running and stale by its own budget, but detached.
+    SELFMAN.set_detached(true);
 
     clock.advance(Duration::from_millis(150));
+    assert!(
+        SELFMAN.is_running() && SELFMAN.is_stale(Duration::from_millis(100)),
+        "SELFMAN is past its own budget"
+    );
     assert_eq!(
         stale(),
         ["policed"],
-        "past its budget the policed node withholds the feed; FREE never does"
+        "past its budget the policed node withholds the feed; FREE never does, nor does the detached SELFMAN"
     );
     assert!(!GRAPH.all_fresh());
 

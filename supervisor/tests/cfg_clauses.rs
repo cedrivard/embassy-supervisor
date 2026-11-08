@@ -42,10 +42,15 @@ async fn driver(spawner: Spawner) {
         PARKED.slot_timeout(),
         embassy_time::Duration::from_millis(250)
     );
-    assert_ne!(
+    assert_eq!(
         LIVE.slot_timeout(),
-        embassy_time::Duration::from_millis(250),
-        "the stripped clause leaves the default gate wait"
+        embassy_time::Duration::from_millis(100),
+        "the stripped clause leaves the 100 ms default gate wait"
+    );
+    assert_eq!(
+        LIVE.ack_timeout(),
+        embassy_time::Duration::from_millis(2_000),
+        "the stripped `ack_timeout:` leaves the 2 s default"
     );
 
     let sup = Supervisor::new(&GRAPH);

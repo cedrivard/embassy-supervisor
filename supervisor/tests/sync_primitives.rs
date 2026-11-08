@@ -109,12 +109,20 @@ fn a_channel_and_a_mutex_are_couplings_like_any_other() {
     assert_eq!(COUNTED_CHAN.change_token(), 0);
     COUNTED_CHAN.w().try_send(1).expect("room");
     assert_eq!(COUNTED_CHAN.change_token(), 1);
-    let _ = COUNTED_CHAN.r().try_receive();
+    assert_eq!(
+        COUNTED_CHAN.r().try_receive(),
+        Ok(1),
+        "the counted channel hands back what was sent"
+    );
     assert_eq!(
         COUNTED_CHAN.change_token(),
         1,
         "drained back to empty, and the token still does not go backwards — \
          which is what `len()` could not promise across a sweep"
     );
-    assert_eq!(CHAN.len(), 0, "the same round trip, invisible in `len()`");
+    assert_eq!(
+        COUNTED_CHAN.r().len(),
+        0,
+        "the same round trip leaves `len()` where it started"
+    );
 }

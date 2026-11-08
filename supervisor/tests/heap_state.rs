@@ -24,10 +24,17 @@ supervisor_graph! {
         state: Scratch = Scratch { buf: [0; STATE_SIZE], cursor: 0 }, disabled;
     node ZERO = Terminate, deps: [], task: zero_worker,
         state: zeroed Zeroed, disabled;
+    node LOST = Terminate, deps: [], task: lost_worker,
+        state: Scratch = Scratch { buf: [0; STATE_SIZE], cursor: 0 },
+        resources: [R: u32], disabled;
 }
 
 static STATE_BYTES_LIVE: AtomicI64 = AtomicI64::new(0);
 static DENY_STATE_ALLOC: AtomicBool = AtomicBool::new(false);
+/// While set, every tracked free records whether LOST had its exit record at
+/// that moment.
+static WATCH_LOST: AtomicBool = AtomicBool::new(false);
+static EXITED_AT_DEALLOC: AtomicBool = AtomicBool::new(false);
 
 fn tracked(layout: Layout) -> bool {
     layout.size() == core::mem::size_of::<Scratch>()
@@ -48,6 +55,9 @@ unsafe impl GlobalAlloc for Ledger {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if tracked(layout) {
             STATE_BYTES_LIVE.fetch_sub(layout.size() as i64, Ordering::SeqCst);
+            if WATCH_LOST.load(Ordering::SeqCst) {
+                EXITED_AT_DEALLOC.store(LOST.has_exited(), Ordering::SeqCst);
+            }
         }
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -73,6 +83,7 @@ async fn settle(mut f: impl FnMut() -> bool) {
         }
         embassy_futures::yield_now().await;
     }
+    assert!(f(), "did not settle");
 }
 
 static ZERO_RUNS: AtomicU32 = AtomicU32::new(0);
@@ -86,6 +97,14 @@ async fn zero_worker(_node: &'static TaskNode, state: &mut Zeroed) {
     );
     state.buf.fill(0xFF);
     ZERO_RUNS.fetch_add(1, Ordering::SeqCst);
+}
+
+static LOST_RAN: AtomicBool = AtomicBool::new(false);
+
+/// Never runs: its resource is taken between the gate and the shell's first
+/// poll.
+async fn lost_worker(_node: &'static TaskNode, _r: &mut u32, _state: &mut Scratch) {
+    LOST_RAN.store(true, Ordering::SeqCst);
 }
 
 #[embassy_executor::task]
@@ -142,6 +161,20 @@ async fn driver(spawner: Spawner) {
     assert!(matches!(err.kind, FaultKind::Spawn(_)), "{err}");
     assert!(!ZERO.is_running());
     DENY_STATE_ALLOC.store(false, Ordering::SeqCst);
+
+    // A resource stolen between the gate and the shell's first poll: the lost
+    // path frees the state box before it records the exit.
+    R.provide(1);
+    WATCH_LOST.store(true, Ordering::SeqCst);
+    sup.start_node(&LOST, &spawner).await.expect("start");
+    assert!(R.take().is_some(), "steal before the shell's first poll");
+    settle(|| LOST.has_exited()).await;
+    assert!(!LOST_RAN.load(Ordering::SeqCst), "the worker ran");
+    assert!(
+        !EXITED_AT_DEALLOC.load(Ordering::SeqCst),
+        "the state box is freed before the exit record"
+    );
+    assert_eq!(STATE_BYTES_LIVE.load(Ordering::SeqCst), 0);
 
     DONE.store(true, Ordering::SeqCst);
 }

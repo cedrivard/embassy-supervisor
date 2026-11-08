@@ -42,6 +42,8 @@ impl<T> Leased<T> {
     }
 
     /// Close the value to new leases and wait until all current leases drop.
+    /// Single waiter: the producer draining its own signal; a second task parked
+    /// here makes the two wake each other on every poll.
     pub async fn drain(&self) {
         self.state.fetch_or(CLOSED, Ordering::AcqRel);
         while self.state.load(Ordering::Acquire) & COUNT != 0 {

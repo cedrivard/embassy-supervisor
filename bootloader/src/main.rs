@@ -11,7 +11,9 @@ use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_time::Duration;
 use {defmt_rtt as _, panic_probe as _};
 
-const FLASH_SIZE: usize = 2 * 1024 * 1024;
+/// The flash `WatchdogFlash` may address; matches `FLASH_SIZE` in
+/// firmware/src/ota.rs. The partitions themselves come from memory.x.
+const FLASH_SIZE: usize = 4 * 1024 * 1024;
 
 #[entry]
 fn main() -> ! {
@@ -24,6 +26,9 @@ fn main() -> ! {
     let active_offset = config.active.offset();
     let bl: BootLoader<4096> = BootLoader::prepare(config);
 
+    // SAFETY: `prepare` has finished any swap, so ACTIVE holds a whole image
+    // linked at this address (firmware/memory.x FLASH); `load` points VTOR and
+    // the stack at it and jumps.
     unsafe { bl.load(FLASH_BASE as u32 + active_offset) }
 }
 

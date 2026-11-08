@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use embassy_supervisor_syntax::{
-    Dep, Item, NodeItem, PoolItem, ResourceDecl, SignalDecl, TaskSource, path_to_string,
+    Dep, Item, NodeItem, PoolItem, ProvideDecl, ResourceDecl, SignalDecl, TaskSource,
+    path_to_string,
 };
 use quote::ToTokens;
 
@@ -144,7 +145,7 @@ pub fn render(decl: &Decl, opts: &Options) -> String {
     out.push_str(&frontmatter(&title, opts));
     out.push_str(&spacing_init(opts));
     let kind = if opts.runtime {
-        "runtime coupling — "
+        "runtime coupling: "
     } else {
         ""
     };
@@ -166,7 +167,7 @@ pub fn render(decl: &Decl, opts: &Options) -> String {
         if opts.executors {
             Some(match executor_of(item) {
                 Some(e) => format!("@{e}"),
-                None => "thread mode".to_string(),
+                None => "supervisor's executor".to_string(),
             })
         } else if opts.fragments {
             fragment_of(item).map(str::to_string)
@@ -235,15 +236,22 @@ pub fn render(decl: &Decl, opts: &Options) -> String {
         }
     }
 
-    let graph_module = crate::module_of(&decl.origin);
     let runtime_dep_edges = runtime_dep_edges(opts);
     let uncoupled: Vec<String> = if opts.runtime && runtime_dep_edges == RuntimeDepEdges::Anchors {
+        let taken: Vec<String> = items
+            .iter()
+            .flat_map(resources_of)
+            .map(|r| r.ident.to_string())
+            .collect();
         items
             .iter()
             .filter(|i| {
                 signals_of(i).is_empty()
                     && resources_of(i).is_empty()
-                    && !has_discovered_access(i, &graph_module, &opts.discovered, &opts.bundles)
+                    && !provides_of(i)
+                        .iter()
+                        .any(|p| taken.contains(&p.ident.to_string()))
+                    && !has_discovered_access(i, &opts.discovered, &opts.bundles)
             })
             .filter_map(boxed_name)
             .collect()
@@ -344,24 +352,57 @@ pub fn render(decl: &Decl, opts: &Options) -> String {
             }
         }
         let declared_boxes = emitted.clone();
+        /// One drawn discovered edge: the access standing for its direction
+        /// and signal, and that access's `cfg` set.
+        struct Edge<'a> {
+            write: bool,
+            path: String,
+            d: &'a crate::Discovered,
+            cfgs: Vec<String>,
+        }
         for item in items {
             let Some(name) = boxed_name(item) else {
                 continue;
             };
-            let funcs = crate::expand_bundles(dataflow_fn_sources(item), &opts.bundles);
-            if funcs.is_empty() {
+            let bindings = crate::expand_bundles(crate::fn_bindings(item), &opts.bundles);
+            if bindings.is_empty() {
                 continue;
             }
             let node = ids.get("n", &name);
-            let mut drawn: Vec<(bool, String)> = Vec::new();
+            // Several bound fns can draw one edge; the access with the fewest
+            // predicates labels it, so an ungated binding is never shown gated.
+            let mut edges: Vec<Edge> = Vec::new();
             for d in &opts.discovered {
                 let a = &d.access;
-                let matched = discovered_access_matches(&funcs, d, &graph_module);
-                if !matched || drawn.iter().any(|(w, p)| *w == a.write && *p == a.path) {
+                let Some(binding) = crate::binding_for(&bindings, d) else {
                     continue;
+                };
+                let mut cfgs: Vec<String> = Vec::new();
+                for c in binding.cfg.iter().chain(&a.cfgs) {
+                    if !cfgs.contains(c) {
+                        cfgs.push(c.clone());
+                    }
                 }
-                drawn.push((a.write, a.path.clone()));
-                let key = discovered_key(d, &emitted, &declared_boxes);
+                match edges
+                    .iter_mut()
+                    .find(|e| e.write == a.write && e.path == a.path)
+                {
+                    Some(e) => {
+                        if cfgs.len() < e.cfgs.len() {
+                            e.d = d;
+                            e.cfgs = cfgs;
+                        }
+                    }
+                    None => edges.push(Edge {
+                        write: a.write,
+                        path: a.path.clone(),
+                        d,
+                        cfgs,
+                    }),
+                }
+            }
+            for e in &edges {
+                let key = discovered_key(e.d, &emitted, &declared_boxes);
                 if !emitted.contains(&key) {
                     emitted.push(key.clone());
                     let id = ids.get("s", &key);
@@ -373,8 +414,8 @@ pub fn render(decl: &Decl, opts: &Options) -> String {
                     let _ = writeln!(out, "  {id}[/\"{}\"/]", esc(&label));
                 }
                 let s = ids.get("s", &key);
-                let (from, to) = if a.write { (&node, &s) } else { (&s, &node) };
-                let mut label = match a.verb.as_str() {
+                let (from, to) = if e.write { (&node, &s) } else { (&s, &node) };
+                let mut label = match e.d.access.verb.as_str() {
                     "open" => "gated",
                     "beat_put" | "beat_writer" => "beat",
                     "get" | "put" | "reader" | "writer" => "discovered",
@@ -382,12 +423,12 @@ pub fn render(decl: &Decl, opts: &Options) -> String {
                 }
                 .to_string();
                 if opts.show_cfg {
-                    for c in &a.cfgs {
+                    for c in &e.cfgs {
                         label = format!("{label} · <small>cfg({c})</small>");
                     }
                 }
                 let edge = signal_edge(from, to, &label, dotted_signal_edges);
-                if a.write {
+                if e.write {
                     let _ = writeln!(out, "  {edge}");
                 } else {
                     readers.push((s.clone(), name.clone(), edge));
@@ -549,8 +590,26 @@ const CLASSDEFS: &str = "  classDef parked stroke-dasharray:4 3;
   classDef resource stroke-width:1px,stroke-dasharray:0,font-size:10px;
 ";
 
+/// Mermaid numbers every link and `linkStyle` addresses that number, so count
+/// each link's closing operator as written, open links (`.-`) included. Only
+/// statements hold links: the frontmatter (whose `---` fences are no link),
+/// `%%` lines and the `accDescr` text are skipped.
 fn count_links(s: &str) -> usize {
-    s.matches("-->").count() + s.matches("==>").count() + s.matches(".->").count()
+    let body = match s.strip_prefix("---\n") {
+        Some(rest) => rest.split_once("\n---\n").map_or(rest, |(_, body)| body),
+        None => s,
+    };
+    body.lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with("%%") && !l.starts_with("accDescr"))
+        .flat_map(str::split_whitespace)
+        .filter(|t| {
+            matches!(
+                *t,
+                "-->" | "==>" | "-.->" | ".->" | ".-" | "---" | "-.-" | "~~~"
+            )
+        })
+        .count()
 }
 
 const MAIN: &str = "__sv_graph";
@@ -723,7 +782,12 @@ pub(crate) fn spacing_init(opts: &Options) -> String {
     } else {
         (opts.h_spacing, opts.v_spacing)
     };
-    let node = node.or(if opts.legend { Some(12) } else { None });
+    // The legend's tight rows are a flowchart default.
+    let node = node.or(if opts.legend && !opts.states {
+        Some(12)
+    } else {
+        None
+    });
     let mut set = Vec::new();
     if let Some(n) = node {
         set.push(format!("\"nodeSpacing\": {n}"));
@@ -734,7 +798,9 @@ pub(crate) fn spacing_init(opts: &Options) -> String {
     if set.is_empty() {
         return String::new();
     }
-    format!("%%{{init: {{\"flowchart\": {{{}}}}} }}%%\n", set.join(", "))
+    // Mermaid reads a state diagram's spacing from `state`, a flowchart's from `flowchart`.
+    let key = if opts.states { "state" } else { "flowchart" };
+    format!("%%{{init: {{\"{key}\": {{{}}}}} }}%%\n", set.join(", "))
 }
 
 const STATES_SMALL: &str = "%%{init: {\"themeVariables\": {\"fontSize\": \"11px\"}} }%%\n";
@@ -803,15 +869,20 @@ fn resources_of(item: &Item) -> &[ResourceDecl] {
     }
 }
 
-/// `(is_write, entry)` for every declared coupling entry.
-/// Do two path spellings plausibly name one signal? Exact, or one is a
-/// segment-suffix of the other (`PERIOD_MS` written at a call site,
-/// `crate::heartbeat::PERIOD_MS` declared elsewhere). Textual and therefore
-/// best-effort: identity at runtime is the address, which source cannot see.
+/// The `provides:` slots an item fills; only nodes provide.
+fn provides_of(item: &Item) -> &[ProvideDecl] {
+    match item {
+        Item::Node(n) => &n.provides,
+        Item::Pool(_) | Item::Executor(_) => &[],
+    }
+}
+
 /// The signal box a discovered access lands in. An alias-resolved path merges
 /// with a declared spelling by segment suffix. A relative one tries its
 /// module-qualified spelling first (so `params::TABLE` in `controller_rate.rs`
-/// finds `…::controller_rate::params::TABLE` and never a sibling module's);
+/// finds `…::controller_rate::params::TABLE` and never a sibling module's),
+/// then the one declared spelling it matches, and otherwise keeps the
+/// qualified spelling.
 pub(crate) fn discovered_key(
     d: &crate::Discovered,
     emitted: &[String],
@@ -825,7 +896,10 @@ pub(crate) fn discovered_key(
             .cloned()
             .unwrap_or_else(|| raw.clone());
     }
-    let qualified = format!("{}::{raw}", d.module);
+    let qualified = match d.module.as_slice() {
+        [] => format!("crate::{raw}"),
+        module => format!("{}::{raw}", module.join("::")),
+    };
     if let Some(k) = emitted.iter().find(|k| paths_alias(k, &qualified)) {
         return k.clone();
     }
@@ -836,91 +910,28 @@ pub(crate) fn discovered_key(
     }
 }
 
+/// Do two path spellings plausibly name one signal? Exact, or one is a
+/// segment-suffix of the other (`PERIOD_MS` written at a call site,
+/// `crate::heartbeat::PERIOD_MS` declared elsewhere). Textual and therefore
+/// best-effort: identity at runtime is the address, which source cannot see.
 fn paths_alias(a: &str, b: &str) -> bool {
     let a = a.strip_prefix("crate::").unwrap_or(a);
     let b = b.strip_prefix("crate::").unwrap_or(b);
     a == b || a.ends_with(&format!("::{b}")) || b.ends_with(&format!("::{a}"))
 }
 
-pub(crate) fn dataflow_fn_sources(item: &Item) -> Vec<(String, Option<String>)> {
-    fn split(segments: Vec<String>) -> Option<(String, Option<String>)> {
-        let name = segments.last()?.clone();
-        let hint = if segments.len() >= 2 {
-            let m = &segments[segments.len() - 2];
-            (!matches!(m.as_str(), "crate" | "self" | "super")).then(|| m.clone())
-        } else {
-            None
-        };
-        Some((name, hint))
-    }
-    let mut out: Vec<(String, Option<String>)> =
-        task_fn_segments(item).and_then(split).into_iter().collect();
-    let adopted = match item {
-        Item::Node(n) => &n.dataflow,
-        Item::Pool(p) => &p.dataflow,
-        Item::Executor(_) => return out,
-    };
-    out.extend(adopted.iter().filter_map(|f| {
-        split(
-            f.path
-                .segments
-                .iter()
-                .map(|s| s.ident.to_string())
-                .collect(),
-        )
-    }));
-    out
-}
-
 fn has_discovered_access(
     item: &Item,
-    graph_module: &str,
     discovered: &[crate::Discovered],
     bundles: &[crate::Bundle],
 ) -> bool {
-    let funcs = crate::expand_bundles(dataflow_fn_sources(item), bundles);
+    let bindings = crate::expand_bundles(crate::fn_bindings(item), bundles);
     discovered
         .iter()
-        .any(|access| discovered_access_matches(&funcs, access, graph_module))
+        .any(|d| crate::binding_for(&bindings, d).is_some())
 }
 
-pub(crate) fn discovered_access_matches(
-    funcs: &[(String, Option<String>)],
-    discovered: &crate::Discovered,
-    graph_module: &str,
-) -> bool {
-    let access = &discovered.access;
-    funcs.iter().any(|(fn_name, hint)| {
-        fn_name == &access.func
-            && hint
-                .as_deref()
-                .is_none_or(|hint| hint == discovered.module || discovered.module == graph_module)
-    })
-}
-
-fn task_fn_segments(item: &Item) -> Option<Vec<String>> {
-    fn segments(e: &syn::Expr) -> Option<Vec<String>> {
-        match e {
-            syn::Expr::Path(p) => Some(
-                p.path
-                    .segments
-                    .iter()
-                    .map(|s| s.ident.to_string())
-                    .collect(),
-            ),
-            syn::Expr::Call(c) => segments(&c.func),
-            _ => None,
-        }
-    }
-    let source = match item {
-        Item::Node(n) => n.source.as_ref()?,
-        Item::Pool(p) => &p.source,
-        Item::Executor(_) => return None,
-    };
-    let (TaskSource::Shell(e) | TaskSource::Spawn(e)) = source;
-    segments(e)
-}
-
+/// `(is_write, entry)` for every declared coupling entry.
 pub(crate) fn signals_of(item: &Item) -> Vec<(bool, &SignalDecl)> {
     let (reads, writes) = match item {
         Item::Node(n) => (&n.reads, &n.writes),
@@ -936,17 +947,18 @@ pub(crate) fn signals_of(item: &Item) -> Vec<(bool, &SignalDecl)> {
 
 fn shape(id: &str, item: &Item, opts: &Options) -> String {
     match item {
-        Item::Node(n) => format!("{id}[\"{}\"]", esc(&node_label(n, opts.show_cfg))),
-        Item::Pool(p) => format!("{id}[[\"{}\"]]", esc(&pool_label(p, opts.show_cfg))),
+        Item::Node(n) => format!("{id}[\"{}\"]", esc(&node_label(n, opts))),
+        Item::Pool(p) => format!("{id}[[\"{}\"]]", esc(&pool_label(p, opts))),
         Item::Executor(_) => String::new(),
     }
 }
 
-fn node_label(n: &NodeItem, show_cfg: bool) -> String {
+fn node_label(n: &NodeItem, opts: &Options) -> String {
+    let show_cfg = opts.show_cfg;
     let mut facts = vec![n.mode.to_string(), body_kind(n.source.as_ref())];
-    // Only show explicit executors; inherited tiers use the banner.
+    // Under --executors an inherited tier is the group box's title.
     if let Some(e) = &n.executor
-        && !n.executor_defaulted
+        && !(n.executor_defaulted && opts.executors)
     {
         facts.push(format!("@{e}"));
     }
@@ -958,7 +970,7 @@ fn node_label(n: &NodeItem, show_cfg: bool) -> String {
         facts.push(gated_fact("ready_on_write".to_string(), &r.cfg, show_cfg));
     }
     if let Some(e) = &n.enabled_if {
-        let pred = tail(&e.value);
+        let pred = expr_label(&e.value);
         facts.push(gated_fact(format!("if {pred}"), &e.cfg, show_cfg));
     }
     if let Some(b) = &n.restart_budget {
@@ -983,21 +995,21 @@ fn node_label(n: &NodeItem, show_cfg: bool) -> String {
     format!("{}<br/>{}", n.ident, facts.join(" · "))
 }
 
-fn pool_label(p: &PoolItem, show_cfg: bool) -> String {
+fn pool_label(p: &PoolItem, opts: &Options) -> String {
     let mut facts = vec![
         format!("pool ×{}", p.modes.len()),
         body_kind(Some(&p.source)),
     ];
-    facts.push(format!("{}..{}", tail(&p.min), tail(&p.max)));
+    facts.push(format!("{}..{}", expr_label(&p.min), expr_label(&p.max)));
     if let Some(e) = &p.executor
-        && !p.executor_defaulted
+        && !(p.executor_defaulted && opts.executors)
     {
         facts.push(format!("@{e}"));
     }
     if p.cancel {
         facts.push("cancel".to_string());
     }
-    if let Some(c) = cfg_note(&p.cfg, show_cfg) {
+    if let Some(c) = cfg_note(&p.cfg, opts.show_cfg) {
         facts.push(c);
     }
     format!("{}<br/>{}", p.ident, facts.join(" · "))
@@ -1053,9 +1065,23 @@ fn body_kind(source: Option<&TaskSource>) -> String {
     .to_string()
 }
 
-fn tail(e: &syn::Expr) -> String {
-    let text = e.to_token_stream().to_string().replace(' ', "");
-    text.rsplit("::").next().unwrap_or(&text).to_string()
+/// An expression as label text, spaces dropped: a plain path by its last
+/// segment (`crate::cfg::radio_on` is `radio_on`), anything else whole, with
+/// `&`, `<` and `>` as Mermaid entities so the HTML label keeps them.
+fn expr_label(e: &syn::Expr) -> String {
+    let text = match e {
+        syn::Expr::Path(p) if p.qself.is_none() => p
+            .path
+            .segments
+            .last()
+            .map(|s| s.to_token_stream().to_string())
+            .unwrap_or_default(),
+        other => other.to_token_stream().to_string(),
+    };
+    text.replace(' ', "")
+        .replace('&', "#amp;")
+        .replace('<', "#lt;")
+        .replace('>', "#gt;")
 }
 
 fn signal_labels(items: &[Item], full: bool) -> BTreeMap<String, String> {

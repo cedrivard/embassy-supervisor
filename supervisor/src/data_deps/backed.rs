@@ -1,24 +1,24 @@
-use core::cell::RefCell;
 use core::ops::Deref;
 use core::task::Poll;
 
-use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_sync::waitqueue::MultiWakerRegistration;
 use embassy_time::Duration;
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::{Gated, producer_of};
+use crate::wake::WakerSet;
 use crate::{Coupling, Sig, TaskNode};
 
-static SERVING_EVT: Mutex<CriticalSectionRawMutex, RefCell<MultiWakerRegistration<4>>> =
-    Mutex::new(RefCell::new(MultiWakerRegistration::new()));
+/// Readers parked in `open`, woken on every readiness or ack change. A reader
+/// the four slots cannot hold waits out `GATE_RETRY` instead, so a fifth
+/// concurrent opener costs latency, never a wake storm.
+static SERVING_EVT: WakerSet<4> = WakerSet::new();
 
 const GATE_RETRY: embassy_time::Duration = embassy_time::Duration::from_millis(250);
 
 pub(crate) fn notify_serving() {
-    SERVING_EVT.lock(|w| w.borrow_mut().wake());
+    SERVING_EVT.signal();
 }
 
 fn serving(producer: &TaskNode) -> bool {
@@ -36,9 +36,10 @@ async fn wait_serving(producer: &'static TaskNode) -> bool {
         if settled() {
             return Poll::Ready(());
         }
-        SERVING_EVT.lock(|w| w.borrow_mut().register(cx.waker()));
+        let _ = SERVING_EVT.register(cx.waker());
         // Registered-then-recheck closes the race against a concurrent
-        // `set_ready` or `ack_dropped`: after this the event cannot fire unseen.
+        // `set_ready` or `ack_dropped`. A full set leaves this wait to the
+        // `GATE_RETRY` timer below.
         if settled() {
             Poll::Ready(())
         } else {
@@ -78,6 +79,9 @@ impl<T> Backed<T> {
     }
 
     /// Resolve once no reader has held the gate for `cooldown`, continuously.
+    ///
+    /// Single waiter: the producer's [`TaskNode::retire`] loop; a second task
+    /// waiting here makes the two wake each other on every poll.
     pub async fn unwatched(&self, cooldown: Duration) {
         use embassy_futures::select::{Either, select};
         loop {
