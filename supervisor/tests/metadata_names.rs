@@ -6,13 +6,21 @@ use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
 use embassy_time::MockDriver;
 
+/// The executor's handle on a task's metadata: `Metadata` in embassy-executor
+/// 0.10, `MetadataRef` in the post-0.10 API that `embassy_supervisor_trace_v2`
+/// selects (the trace canary builds against it).
+#[cfg(not(embassy_supervisor_trace_v2))]
+use embassy_executor::Metadata as TaskMetadata;
+#[cfg(embassy_supervisor_trace_v2)]
+use embassy_executor::MetadataRef as TaskMetadata;
+
 static RUNS: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
 /// The name the running shell finds in its own task Metadata.
 static STAMPED: Mutex<Option<&'static str>> = Mutex::new(None);
 
 async fn worker(node: &'static TaskNode) {
-    let name = embassy_executor::Metadata::for_current_task().await.name();
+    let name = TaskMetadata::for_current_task().await.name();
     *STAMPED.lock().unwrap() = name;
     RUNS.fetch_add(1, Ordering::SeqCst);
     let _ = node
