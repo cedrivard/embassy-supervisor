@@ -1,161 +1,178 @@
+<div align="center">
+
 # embassy-supervisor
 
+**Run-time supervision for bare-metal async Rust.**
 
-[![crates.io](https://img.shields.io/crates/v/embassy-supervisor.svg)](https://crates.io/crates/embassy-supervisor)
-[![docs.rs](https://docs.rs/embassy-supervisor/badge.svg)](https://docs.rs/embassy-supervisor)
-[![docs](https://img.shields.io/badge/docs-embassy--supervisor.github.io-blue)](https://embassy-supervisor.github.io/)
-[<img src="https://embassy-supervisor.github.io/og.png" alt="embassy-supervisor.github.io — docs, guides and an in-browser playground" width="640">](https://embassy-supervisor.github.io/)
+Dependency-ordered task lifecycle, elastic pools, runtime control and verified dataflow
+for [embassy](https://embassy.dev) firmware. No kernel, no per-task stacks, no allocator.
 
-**[embassy-supervisor.github.io](https://embassy-supervisor.github.io/)** — docs and guides,
-plus an [in-browser playground](https://embassy-supervisor.github.io/playground/) that runs the
-real crate compiled to WebAssembly: declare a graph, wire behaviors to it, and watch the
-supervisor drive lifecycle, couplings and dataflow live.
+[![crates.io](https://img.shields.io/crates/v/embassy-supervisor.svg)](https://crates.io/crates/embassy-supervisor) [![docs.rs](https://docs.rs/embassy-supervisor/badge.svg)](https://docs.rs/embassy-supervisor) [![CI](https://github.com/cedrivard/embassy-supervisor/actions/workflows/ci.yml/badge.svg)](https://github.com/cedrivard/embassy-supervisor/actions/workflows/ci.yml) [![MSRV](https://img.shields.io/crates/msrv/embassy-supervisor.svg)](#compatibility) [![no_std](https://img.shields.io/badge/no__std-yes-success.svg)](#compatibility) [![license](https://img.shields.io/crates/l/embassy-supervisor.svg)](#license)
 
----
+[Website](https://embassy-supervisor.github.io/) · [Playground](https://embassy-supervisor.github.io/playground/) · [Library reference](supervisor/README.md) · [API docs](https://docs.rs/embassy-supervisor) · [Demo firmware](firmware/README.md)
 
-**Run-time supervision for bare-metal async Rust.** A composable architecture for real
-[embassy](https://embassy.dev) firmware — a dependency-ordered task lifecycle over layered
-executors, and a declared-and-verified dataflow between the tasks, with a governed heap and
-coordinated power and OTA — the structure and guarantees of an RTOS with none of its kernel,
-stacks, or overhead. The `no_std` **`embassy-supervisor`** crate is its drop-in core.
+[<img src=".github/assets/playground.png" alt="The embassy-supervisor playground running the cellular asset tracker scenario: the graph declaration beside the live task graph" width="800">](https://embassy-supervisor.github.io/playground/)
+
+</div>
+
+## Overview
+
+embassy gives firmware an RTOS-like task model at close to bare-metal cost. It does not
+provide the lifecycle: which task starts before which, what stops before sleep, how workers
+scale under load, how an update is applied safely.
+
+`embassy-supervisor` is that layer. You declare the task graph once; the supervisor brings
+it up in dependency order, tears it down in reverse, scales pools, and serves runtime
+control, across thread-mode executors, interrupt executors and a second core.
+
+- **Checked at compile time.** Cycles, unknown or duplicate deps, duplicate names and bad
+  pool bounds are compile errors. The topological order is computed during expansion.
+- **Fails closed.** A missing resource, a dependency that never becomes ready and a missed
+  shutdown ack each return a `NodeFault` naming the node. None of them panics.
+- **Small and portable.** `no_std`, `#![forbid(unsafe_code)]`, no allocator, HAL-agnostic.
+  Depends only on embassy crates and `portable-atomic`.
+- **Pay for what you use.** Control plane, pools, dataflow, tracing and health are Cargo
+  features. A minimal build is the dependency-ordered core.
+
+## Quick start
+
+```sh
+cargo add embassy-supervisor
+```
 
 ```rust
-use embassy_supervisor::{supervisor_graph, Supervisor};
+use embassy_executor::Spawner;
+use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
 
-// One declaration generates the node `static`s and a single `GRAPH` bundling the
-// node slots, deps, and compile-time order. `app` depends on `net`, so it starts after it.
+// One declaration generates the node statics and a single `GRAPH` bundling the
+// node slots, deps and compile-time order. APP depends on NET, so it starts after it.
 supervisor_graph! {
     node NET = Terminate, task: net_task;
     node APP = Terminate, deps: [NET], task: app_task;
 }
 
-// in your supervisor task (an async context):
-let sup = Supervisor::new(&GRAPH);                    // infallible — a cycle is a compile error
-sup.start(&spawner).await.expect("spawn");            // brings up net, then app
+async fn net_task(node: &'static TaskNode) { /* ... */ }
+async fn app_task(node: &'static TaskNode) { /* ... */ }
+
+#[embassy_executor::task]
+async fn supervisor_task(spawner: Spawner) {
+    let sup = Supervisor::new(&GRAPH); // infallible: a cycle is a compile error
+    if let Err(fault) = sup.start(&spawner).await {
+        panic!("supervisor: {fault}"); // names the node and the cause
+    }
+}
 ```
 
-[<img src="https://i.ytimg.com/vi_webp/rlLaaMKMPWo/maxresdefault.webp" alt="Video: embassy-supervisor — RTOS-grade Lifecycle for Async Rust Firmware" width="640">](https://youtu.be/rlLaaMKMPWo)
+### With runtime control and pools
 
-▶ **[RTOS-grade Lifecycle for Async Rust Firmware](https://youtu.be/rlLaaMKMPWo)** — video walkthrough
-of the architecture: the graph declaration and its compile-time guarantees, executor tiers, the
-lifecycle matrix, and where it fits.
-📖 **[`supervisor/README.md`](supervisor/README.md)** — the library reference: model, lifecycle
-matrix, `supervisor_graph!` DSL, dataflow supervision, recipes, and feature matrix.
+`start()` brings the graph up and returns. With the `control` or `pool` feature, `run()`
+replaces it: it brings the graph up, then serves control commands and pool scaling until
+a fault.
 
----
+```sh
+cargo add embassy-supervisor --features control,pool
+```
 
-## Table of Contents
+```rust
+use embassy_supervisor::{ControlOp, request_control};
 
-- [Why a supervision layer](#why-a-supervision-layer)
-- [One chip, many gears: executor versatility](#one-chip-many-gears-executor-versatility)
-- [Architecture at a glance](#architecture-at-a-glance)
-- [What the supervisor adds](#what-the-supervisor-adds)
-- [Plays well with the rest of the stack](#plays-well-with-the-rest-of-the-stack)
-- [Where it fits](#where-it-fits)
-- [The demo firmware in action](#the-demo-firmware-in-action)
-- [What's in this repo](#whats-in-this-repo)
+// In the supervisor task:
+let fault = sup.run(&spawner).await;
+panic!("supervisor: {fault}");
 
-## Why a supervision layer
+// Anywhere else, such as an HTTP handler. Stopping NET stops APP first.
+request_control(&NET, ControlOp::Deactivate).await;
+```
 
-Two ideas have quietly changed what embedded development feels like. The first is **Rust**: memory
-safety without a garbage collector, data-race freedom checked at compile time, zero-cost
-abstractions, and a first-class `no_std` story — whole categories of the bugs that haunt C firmware
-simply don't compile. The second is **[embassy](https://embassy.dev)**: you write `async fn`s, the
-compiler turns them into state machines, and a tiny executor runs them with no kernel, no per-task
-stacks, and no busy-waiting. When nothing is ready, the core sleeps — exactly what a battery wants.
+Next steps:
 
-Embedded projects usually pick one of two extremes: **hand-rolled bare metal** (fast and lean, but
-the super-loop turns to spaghetti as features pile up) or a **preemptive RTOS** (a pleasant task
-model, but you take on a kernel, a stack per task, and the RAM and latency overhead that come with
-it). embassy lands right in between — RTOS-like task ergonomics at close-to-bare-metal cost.
+- Try a graph in the [in-browser playground](https://embassy-supervisor.github.io/playground/),
+  which runs the real crate compiled to WebAssembly.
+- Read the [library reference](supervisor/README.md): model, lifecycle matrix,
+  `supervisor_graph!` DSL, dataflow supervision and recipes.
+- Flash the [demo firmware](firmware/README.md) on an RP2350.
 
-What embassy doesn't hand you is the **lifecycle**: which task starts before which, what to stop
-when you go to sleep, how to scale workers under load, how to apply an update safely. With one or
-two tasks you don't notice. On a real product — several sensors, a radio, a couple of network
-services, a power budget, field updates — coordinating *when* each piece comes up, pauses, scales,
-and tears down becomes the hard part. That coordination layer, extracted from a real-world
-climate/environmental device and made HAL-agnostic, is **`embassy-supervisor`**.
+## Architecture
 
-## One chip, many gears: executor versatility
-
-A standout embassy capability is that a single firmware can run **multiple executors at different
-priorities** — and the supervisor orchestrates tasks across all of them:
-
-- A **cooperative thread-mode executor** runs the bulk of the work (networking, servers,
-  housekeeping). Tasks yield at `.await`; no preemption, no locking headaches.
-- A separate **interrupt-driven executor** runs a latency-sensitive tier at a priority that
-  **preempts** the cooperative tier — a quick sensor read never waits behind a long request —
-  while staying below the raw hardware interrupt handlers.
-- A **second core** can run its own thread executor; the supervisor places tasks on it through the
-  graph (multi-core: each task lives on one core; nothing migrates).
-- **Per-task priority ordering** inside an executor keeps, for example, a radio/driver runner ahead
-  of the request handlers that depend on it.
-
-Preemptive priority tiers *and* cooperative scheduling from one async codebase, dialed in per task.
-
-## Architecture at a glance
-
-The shape, in three views: how a declaration becomes a running graph, what the supervisor does to
-it at run time, and what an individual node carries (the [demo firmware](firmware/README.md) is a
-concrete, flashable instantiation of all three).
-
-**1. From declaration to running tasks.**
+### From declaration to running tasks
 
 ```mermaid
 flowchart LR
     FRAG["supervisor_fragment!<br/>one per module or crate"]
     DSL["supervisor_graph!<br/>or compose_graph!"]
-    GEN["static GRAPH<br/>node slots · deps · order · task shells"]
+    GEN["static GRAPH and task shells<br/>node slots · deps · order · pools"]
     SUP["Supervisor task<br/>one per graph"]
 
     FRAG -- composed into --> DSL
     DSL -- generates --> GEN
     GEN --> SUP
 
-    subgraph TIERS["Spawn targets — picked per node with executor:"]
+    subgraph TIERS["Spawn targets, picked per node with executor:"]
         T0["Thread executor<br/>cooperative tier, the default"]
         IE["Interrupt executor<br/>preemptive tier"]
         C1["Second core<br/>no migration"]
-        POOL["Elastic pool<br/>min..max workers"]
     end
+    POOL["Elastic pool<br/>min..max workers, on any tier"]
 
     SUP --> T0
     SUP --> IE
     SUP --> C1
-    SUP <--> POOL
+    SUP <-- scales --> POOL
 ```
 
-The graph is validated where it is written: a cycle, an unknown or duplicate dep, bad pool bounds
-are all *compile errors*, and the topological order is computed at compile time. Fragments let a
-module or a whole crate declare its own slice; `name:` lets one binary hold several graphs, so a
-subsystem can be a sub-graph an app state machine brings up and drops per phase.
+The graph is validated where it is written. Fragments let a module or a whole crate declare
+its own slice, and `name:` lets one binary hold several graphs, so a subsystem can be a
+sub-graph that an app state machine brings up and drops per phase.
 
-**2. What the supervisor does with it.**
+Each node runs on the executor its `executor:` annotation names:
+
+| Tier | Scheduling | Typical use |
+|------|------------|-------------|
+| Thread executor (default) | Cooperative, yields at `.await` | Networking, servers, housekeeping |
+| Interrupt executor | Preempts the thread tier | Latency-sensitive sensor and control work |
+| Second core | Own thread executor, no task migration | Compute load, whole pools |
+
+The supervisor never runs task code itself. It spawns, parks and tears down tasks on these
+tiers and scales the pools.
+
+### Run-time behavior
 
 ```mermaid
 flowchart TD
     APP["Anywhere in the app<br/>an HTTP handler, a button, an ISR"]
     MBOX["Control mailbox<br/>request_control, or try_request_control"]
-    SUP["Supervisor"]
-    UP["start / run<br/>dependency order, every spawn gated"]
-    DOWN["stop_node / teardown<br/>reverse order, cascades to dependents"]
-    SCALE["run_pools<br/>grow under load, shrink after a cooldown"]
-    BUSY["Resource or readiness missing<br/>→ fail closed with Busy"]
+    PROV["A provider on a bound edge<br/>set_ready or clear_ready"]
+    SUP["Supervisor<br/>run: start, then one driver loop"]
+    UP["start / activate<br/>dependency order, every spawn gated"]
+    DOWN["deactivate / teardown<br/>dependents first, every stop acked"]
+    SCALE["pool_pass<br/>grow under load, shrink after a cooldown"]
+    BIND["apply_bind<br/>stops bound dependents, brings them back"]
+    MON["monitor<br/>polices beat_timeout: beside the loop"]
+    BUSY["Resource or readiness missing<br/>→ ResourceMissing or ReadyDepTimeout, naming the node"]
     TO["Ack missed<br/>→ ShutdownTimeout naming the node"]
+    HEALTH["wait_health<br/>Stale or Recovered, report only"]
 
     APP --> MBOX --> SUP
+    PROV --> SUP
     SUP --> UP
     SUP --> DOWN
     SUP --> SCALE
+    SUP --> BIND
+    SUP --> MON
     UP -.-> BUSY
     DOWN -.-> TO
+    MON -.-> HEALTH
 ```
 
-Both failure edges are *returned values*, never a panic inside the library: bring-up refuses to
-spawn a task whose peripherals or dependencies are not ready yet, and a node that misses its
-shutdown ack is named to the application, which decides whether to retry, log, or reset.
+Both failure edges are returned values. Bring-up refuses to spawn a task whose peripherals
+or dependencies are not ready, and a node that misses its shutdown ack is named to the
+application, which decides whether to retry, log or reset. The monitor only reports: a
+stalled node arrives as a `Stale` event, and the supervisor does not stop it.
 
-**3. What a node carries.**
+The mailbox needs the `control` feature, pools `pool`, bound edges `bound-deps` and the
+monitor `liveness-monitor`.
+
+### Anatomy of a node
 
 ```mermaid
 flowchart LR
@@ -175,125 +192,109 @@ flowchart LR
     NODE -.-> TRACE
 ```
 
-Everything below the mode is optional and mostly feature-gated — a minimal build is just the
-dependency-ordered core.
+Only the mode is required. What each operation does per mode is in the
+[lifecycle reference](supervisor/README.md#lifecycle-reference).
 
-App tasks are the graph *nodes* — each hangs off whichever executor slot its `executor:` annotation
-names (unannotated → the default thread executor). The supervisor never runs task code itself; it
-only spawns, parks, and tears down tasks onto the tiers, and scales the pool. A **detached** node is
-a self-managed daemon the supervisor starts once and then leaves alone; a **`cancel`** node is the
-other extreme — a plain worker that knows nothing of the supervisor, whose future the generated
-shell drops in place on stop.
+## Features
 
-## What the supervisor adds
+Rows marked *default* need no extra Cargo feature.
 
-`embassy-supervisor` is a small, `no_std`, `#![forbid(unsafe_code)]` library. You declare the graph
-once with the `supervisor_graph!` macro; the supervisor does the rest:
+| Capability | Cargo feature | Description |
+|------------|---------------|-------------|
+| Ordered bring-up and teardown | *default* | Compile-time order up, reverse order down |
+| Lifecycle modes | *default* | `Terminate`, `Pause` and `OnDemand` |
+| Executor placement | *default* | `executor:` targets an interrupt tier or a second core |
+| Resource threading | *default* | `resources:` hands owned values to a task at spawn |
+| Runtime control | `control` | A stop cascades to dependents, a start to dependencies |
+| Elastic pools | `pool` | Workers grow under load and shrink after a cooldown |
+| Readiness gating | `readiness` | `deps: [NET ready]` waits for `set_ready()` |
+| Restart | `restart` | Restarts a node together with its dependents |
+| Restart budget | `restart-intensity` | `restart_budget: 3 in 60000` faults a crash loop |
+| Settings-gated bring-up | `enabled-if` | `enabled_if:` decides at `start()` if a node comes up |
+| Declared dataflow | `coupling` | `reads:` and `writes:` name the signals tasks exchange |
+| Derived dataflow | `dataflow` | `#[dataflow]` derives the tables from the task body |
+| Polled liveness | `coupling-observe` | A declared write is polled as the node's heartbeat |
+| Heartbeat | `liveness` | `beat()` and a staleness check per node |
+| Watchdog gate | `liveness-monitor` | `GRAPH.all_fresh()` gates the hardware watchdog feed |
+| Lifecycle events | `lifecycle-events` | Every start, stop, exit and fault, named by node |
+| Bring-up breadcrumb | `breadcrumb` | Names the node that hung bring-up, after the reset |
+| Tracing | `trace` | CPU ticks and poll counts per task, idle time per executor |
 
-- **Dependency-ordered bring-up and reverse teardown** — the topological order is computed **at
-  compile time**, and the whole graph is validated there too: cycles, unknown or duplicate deps,
-  duplicate names, bad pool bounds are all *compile errors*. Bring-up follows the order, teardown
-  reverses it, and bring-up is `async`: it awaits each cross-executor spawn rendezvous instead of
-  blocking.
-- **Lifecycle modes** — `Terminate` (exit and respawn), `Pause` (park and resume while keeping a
-  held resource like an open bus or socket), `OnDemand` (started on demand to scale a pool) — plus
-  `disabled` (control-started) and `detached` (self-managed daemon) node states.
-- **Elastic pools** — grow workers under load, shrink them after a cooldown, within a fixed budget.
-- **Multi-executor, multi-core placement** — `executor:` slots put nodes on an interrupt-priority
-  tier or a second core, straight from the graph declaration.
-- **Safe resource threading** — `resources:` entries hand owned values to workers through
-  `ResourceSlot`s: peripherals moved in from `main` (compile-time exclusive ownership, no
-  `steal()` in tasks) or values another node builds at runtime and `provides:`. The consumer's
-  spawn waits for the value; a lent one is restored on exit so a respawn re-takes the same
-  instance. Signals are the other relation: `'static`s that outlive every task and are
-  declared as dataflow, below, never threaded as resources.
-- **Dependency- and pool-honoring runtime control** — start/stop/pause/resume a task (or a whole
-  pool) from anywhere; a stop cascades through dependents, a start through dependencies.
-- **Declared and verified dataflow (feature-gated)** — `reads:`/`writes:` entries name the
-  signal statics tasks exchange data through, declared beside the dependency edges; entries
-  can drive the node's heartbeat by polling (`observed beat`) or at the access (`beat`),
-  and the `#[dataflow]` attribute derives a task's tables straight from its body, so the
-  declaration cannot drift from the code.
-- **Trace observability (feature-gated)** — per-task CPU ticks, poll counts, and per-executor
-  idle/in-poll stats, with zero cost when the features are off.
-- **Lifecycle events (feature-gated)** — a lossy queue of every start, resume, stop, exit and
-  fault the supervisor drives, named by node, for logs, dashboards and telemetry.
-- **Bring-up breadcrumb (feature-gated)** — the last lifecycle phase per node plus one packed
-  word to stash across a reset, so the next boot can name the node that hung bring-up.
-- **Watchdog feed gate** — `GRAPH.all_fresh()` turns `beat_timeout:` policing into one
-  `bool`, so the hardware watchdog is fed only while every policed node is beating.
-- **Restart intensity (feature-gated)** — `restart_budget: 3 in 60000` turns a crash loop into a
-  `RestartStorm` fault the app must handle, instead of an endless restart cycle.
-- **Settings-gated bring-up (feature-gated)** — `enabled_if: crate::settings::lora_on` decides at
-  `start()` whether a node comes up, latching the same `disabled` state as the static marker.
+The complete list is under
+[Cargo features](supervisor/README.md#cargo-features).
 
-The library is feature-gated — the control plane, pools, and tracing are optional, so a minimal
-build is just the dependency-ordered core. The full model — lifecycle matrix (what each operation
-does per mode), the `supervisor_graph!` DSL, and the recipes — lives in
-[`supervisor/README.md`](supervisor/README.md).
+The supervisor does not allocate, own a HAL, manage power states or catch panics. Pair it
+with a hardware watchdog for crashes and the liveness heartbeat for stalled tasks.
 
-## Plays well with the rest of the stack
+## When to use it
 
-The supervisor focuses on *lifecycle*; it composes naturally with the patterns a real device needs:
+The supervisor pays off on devices that run several interdependent services and have to
+manage power and updates:
 
-- **Fallible heap allocation.** A heap whose allocations can *fail gracefully* — return nothing,
-  shed load, answer "busy" — instead of aborting the firmware, plus a reservation gate for code
-  paths that need a guaranteed-free block. The supervisor's start/stop is the admission control
-  that keeps total usage inside the budget: stop a subsystem and its memory comes back.
-- **Deep-sleep power management.** A light dormant sleep (wake on an external event) and a deeper
-  sleep that powers the core down while retaining RAM and warm-resuming where it left off. The
-  supervisor *coordinates the transition* — drain services in dependency order before the rails
-  drop, then resume paused tasks and respawn the rest on wake.
-- **OTA firmware update** with a safe A/B swap and automatic rollback — demonstrated end-to-end in
-  the demo firmware.
+- **Battery-powered sensor nodes**: bring the radio and stack up in order, sample, publish,
+  tear down, deep-sleep.
+- **Gateways and edge hubs**: strict start-up order, elastic worker pools, runtime
+  reconfiguration.
+- **Building and motion controllers**: a preemptive control tier beside cooperative
+  telemetry, with graceful degradation.
+- **Field-updatable products**: an update drains live services, frees resources, swaps,
+  and rolls back on failure.
 
-## Where it fits
+It composes with a fallible heap (stopping a subsystem returns its memory), deep-sleep
+power management (services drain in dependency order before the rails drop) and A/B OTA
+update with rollback. The demo firmware runs the OTA path end to end.
 
-The supervisor earns its keep on devices that run **several interdependent services** and have to
-**manage power and updates** — not on a single-task blinky. Some sweet spots:
+## Demo firmware
 
-- **Battery-powered field sensor nodes**: wake → bring the radio and stack up in order → sample →
-  publish → tear it all down cleanly → deep-sleep. The supervisor sequences exactly that.
-- **Connected gateways and edge hubs**: many concurrent services with strict start-up order,
-  elastic worker/connection pools, runtime reconfiguration, and fleet-wide OTA.
-- **Smart-building climate, lighting, and safety controllers**: multiple sensors, control loops,
-  and connectivity that must come up in order and degrade gracefully — the family the supervisor
-  was born in.
-- **Field-updatable connected products**: OTA-first devices where an update has to drain live
-  services, free resources, swap, and roll back on failure.
-- **Robotics and motion control**: a preemptive sensor/control tier alongside cooperative telemetry
-  and comms, with mission-phase lifecycle (arm/disarm, mode changes).
+[`firmware/`](firmware/) is a complete RP2350 application that exercises every part of the
+supervisor:
 
-## The demo firmware in action
+- USB networking with an HTTP control and observability plane
+- An elastic pool of keep-alive workers
+- A heartbeat on the interrupt-priority tier and a control-started compute load on the
+  second core
+- OTA update with A/B swap and rollback
 
-The [`firmware/`](firmware/) crate is a complete, flash-it-today application on an RP2350, built to
-put every part of the supervisor through its paces:
+Build and run steps, the per-task breakdown and a guide to the observability data are in
+[`firmware/README.md`](firmware/README.md).
 
-- **USB networking** and an **HTTP control and observability plane** — drive the supervisor's
-  runtime control (start/stop/pause/resume) and watch the task graph respond live.
-- an **elastic pool of keep-alive workers** that grows under load and shrinks after a cooldown.
-- **multi-executor and multi-core placement** — a heartbeat on the interrupt-priority tier, a
-  control-started compute load on the second core.
-- **OTA firmware update** with a safe A/B swap and rollback, orchestrated as a lifecycle
-  transition.
+## Tooling
 
-It's the approachable, runnable example — clone the repo and follow
-[`firmware/README.md`](firmware/README.md) for the build and run steps, the per-task breakdown,
-and how to read the observability data.
+Two host tools read a graph straight out of its Rust source: `supervisor-mermaid` draws it
+as a Mermaid flowchart, and `supervisor-lint` reports signals that are read but never
+written, or written but never read.
 
-## What's in this repo
+```sh
+cargo install embassy-supervisor-tools
+cd firmware && supervisor-mermaid
+```
 
-| Crate | What |
-|-------|------|
-| [`supervisor/`](supervisor/) | the `embassy-supervisor` library — HAL-agnostic, `no_std`; model, lifecycle matrix, DSL, recipes, feature matrix in [`supervisor/README.md`](supervisor/README.md) |
-| [`firmware/`](firmware/) | the demo application — build/run, per-task breakdown, heap budget, observability in [`firmware/README.md`](firmware/README.md) |
-| [`bootloader/`](bootloader/) | the embassy-boot A/B bootloader the demo's OTA swaps against |
-| [`supervisor-syntax/`](supervisor-syntax/) | the graph DSL's parser and AST, shared by the proc-macro and the tooling |
-| [`supervisor-observe/`](supervisor-observe/) | the observation facade (`Observable`, `Counted`) a signal library implements without depending on the supervisor |
-| [`supervisor-tools/`](supervisor-tools/) | host tools over a graph declaration: `supervisor-mermaid` draws it as a Mermaid flowchart, `supervisor-lint` reports its one-sided signals, see [`supervisor-tools/README.md`](supervisor-tools/README.md) |
+Prebuilt binaries for Linux, macOS and Windows are attached to each
+`embassy-supervisor-tools-v*` [release](https://github.com/cedrivard/embassy-supervisor/releases).
+Options and output formats are in [`supervisor-tools/README.md`](supervisor-tools/README.md).
 
-Dual-licensed under **MIT OR Apache-2.0**.
+## Workspace
 
----
+| Crate | Description |
+|-------|-------------|
+| [`supervisor/`](supervisor/) | The `embassy-supervisor` library. [Reference](supervisor/README.md) |
+| [`supervisor-macros/`](supervisor-macros/) | Proc-macros: the graph declaration and the `#[dataflow]` attribute |
+| [`supervisor-syntax/`](supervisor-syntax/) | The graph DSL's parser and AST, shared by the proc-macros and the tooling |
+| [`supervisor-observe/`](supervisor-observe/) | Observation traits and the `Counted` wrapper for signal libraries |
+| [`supervisor-tools/`](supervisor-tools/) | The `supervisor-mermaid` and `supervisor-lint` host tools |
+| [`firmware/`](firmware/) | The demo application |
+| [`bootloader/`](bootloader/) | The embassy-boot A/B bootloader the demo's OTA swaps against |
 
-*Modern async, RTOS-grade lifecycle, bare-metal footprint — pick all three.*
+## Compatibility
+
+`#![no_std]` and `#![forbid(unsafe_code)]`. The minimum Rust version and the embassy
+versions each release targets are listed under
+[no_std / MSRV](supervisor/README.md#no_std--msrv) in the library reference.
+
+Upgrade notes are in the [migration guide](supervisor/README.md#migration) and the crate
+changelogs.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
