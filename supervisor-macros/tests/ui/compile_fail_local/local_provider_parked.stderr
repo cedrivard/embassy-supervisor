@@ -1,0 +1,5 @@
+error: `BLOB` is `local`: its provider's executor must be known to the graph, but `P` is spawned by the application. Give `P` a `task:` or a path-form `spawn:` (with `executor:` if it runs on another tier)
+ --> tests/ui/compile_fail_local/local_provider_parked.rs:9:46
+  |
+9 |     node P = Terminate, deps: [], provides: [BLOB];
+  |                                              ^^^^

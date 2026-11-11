@@ -1,0 +1,5 @@
+error: `H` is declared as a take-kind resource and as `shared`/`divisible`: a name has one kind
+  --> tests/ui/compile_fail/shared_after_take.rs:12:61
+   |
+12 |     node B = Terminate, deps: [], task: sharer, resources: [H: shared Handle];
+   |                                                             ^

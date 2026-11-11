@@ -1,9 +1,10 @@
+mod support;
+
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{DeferredShrink, Supervisor, TaskNode, supervisor_graph};
-use embassy_time::MockDriver;
+use support::settle;
 
 trait Probe {
     fn counter() -> &'static AtomicU32;
@@ -52,23 +53,13 @@ supervisor_graph! {
         min: 1, max: 2;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
 
     // start(): both shell nodes + the pool floor (its shell is sized K=2) come up.
     sup.start(&spawner).await.expect("start");
-    settle(|| {
+    settle("all three shells ran once", || {
         FAST_RUNS.load(Ordering::SeqCst) == 1
             && SLOW_RUNS.load(Ordering::SeqCst) == 1
             && POOL_RUNS.load(Ordering::SeqCst) == 1
@@ -99,7 +90,7 @@ async fn driver(spawner: Spawner) {
     );
 
     sup.respawn_terminate(&spawner).await.expect("respawn");
-    settle(|| {
+    settle("all three shells ran twice", || {
         FAST_RUNS.load(Ordering::SeqCst) == 2
             && SLOW_RUNS.load(Ordering::SeqCst) == 2
             && POOL_RUNS.load(Ordering::SeqCst) == 2
@@ -118,25 +109,18 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn generated_shells_spawn_ack_and_respawn() {
-    let _clock = MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (fast={}, slow={}, pool={})",
-            FAST_RUNS.load(Ordering::SeqCst),
-            SLOW_RUNS.load(Ordering::SeqCst),
-            POOL_RUNS.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (fast={}, slow={}, pool={})",
+                FAST_RUNS.load(Ordering::SeqCst),
+                SLOW_RUNS.load(Ordering::SeqCst),
+                POOL_RUNS.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

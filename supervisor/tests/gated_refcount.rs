@@ -100,8 +100,6 @@ async fn reader_b(node: &'static TaskNode) {
 static PASSES: AtomicU32 = AtomicU32::new(0);
 static PROBE_STOP: AtomicBool = AtomicBool::new(false);
 
-/// Ends after the test's last barrier instead of spinning for the life of the
-/// binary.
 #[embassy_executor::task]
 async fn pass_probe() {
     while !PROBE_STOP.load(Ordering::SeqCst) {

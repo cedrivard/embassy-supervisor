@@ -1,10 +1,12 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
+use support::settle;
 
 #[derive(Clone, Copy)]
 struct Handle {
@@ -101,21 +103,11 @@ supervisor_graph! {
     node GONE = Terminate, deps: [], task: gone_worker, resources: [GBUF: u32];
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..100_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
     sup.start(&spawner).await.expect("start");
-    settle(|| READ_RUNS.load(Ordering::SeqCst) == 2).await;
+    settle("second read run", || READ_RUNS.load(Ordering::SeqCst) == 2).await;
     assert_eq!(
         READ_SUM.load(Ordering::SeqCst),
         2,
@@ -125,13 +117,13 @@ async fn driver(spawner: Spawner) {
     assert!(PHANDLE.get().is_some());
     assert!(GHANDLE.get().is_some());
 
-    settle(|| XHANDLE.get().is_some()).await;
+    settle("XHANDLE published", || XHANDLE.get().is_some()).await;
     assert!(
         XHANDLE.get().is_some(),
         "the Pause provider published its value"
     );
     PEXIT_QUIT.signal(());
-    settle(|| PEXIT.has_exited()).await;
+    settle("PEXIT exited", || PEXIT.has_exited()).await;
     assert!(PEXIT.has_exited() && !PEXIT.is_running());
     assert!(
         XHANDLE.get().is_none(),
@@ -153,7 +145,7 @@ async fn driver(spawner: Spawner) {
     );
 
     sup.respawn_terminate(&spawner).await.expect("respawn");
-    settle(|| READ_RUNS.load(Ordering::SeqCst) == 4).await;
+    settle("fourth read run", || READ_RUNS.load(Ordering::SeqCst) == 4).await;
     assert_eq!(
         READ_SUM.load(Ordering::SeqCst),
         6,
@@ -165,23 +157,18 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn a_providers_ack_clears_what_it_fills() {
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (gen={}, runs={}, sum={})",
-            GENERATION.load(Ordering::SeqCst),
-            READ_RUNS.load(Ordering::SeqCst),
-            READ_SUM.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(1));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (gen={}, runs={}, sum={})",
+                GENERATION.load(Ordering::SeqCst),
+                READ_RUNS.load(Ordering::SeqCst),
+                READ_SUM.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

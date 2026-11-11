@@ -1,4 +1,4 @@
-error: expected identifier
+error: pool members cannot be `#[cfg]`-gated individually; gate the pool
  --> tests/ui/compile_fail/cfg_on_pool_mode.rs:6:26
   |
 6 |     pool P = [Terminate, #[cfg(all())] OnDemand], deps: [A],

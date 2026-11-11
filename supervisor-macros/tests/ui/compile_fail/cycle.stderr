@@ -8,7 +8,7 @@ error[E0080]: evaluation panicked: supervisor_graph!: dependency cycle
   | |_^ evaluation of `GRAPH` failed inside this call
   |
 note: inside `Ordered::<2, 0>::new`
- --> $WORKSPACE/supervisor/src/lib.rs
+ --> $WORKSPACE/supervisor/src/graph.rs
   |
   |             order: topo_sort_const(deps),
   |                    ^^^^^^^^^^^^^^^^^^^^^
@@ -18,7 +18,7 @@ note: inside `embassy_supervisor::topo_sort_const::<2>`
   |         $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
   |
- ::: $WORKSPACE/supervisor/src/lib.rs
+ ::: $WORKSPACE/supervisor/src/graph.rs
   |
   |         core::panic!("supervisor_graph!: dependency cycle");
   |         --------------------------------------------------- in this macro invocation

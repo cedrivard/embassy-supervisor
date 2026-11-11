@@ -27,9 +27,32 @@ one).
 **Implement the trait** where your signal type lives:
 
 ```rust
-impl<T> Observable for Watch<T> {
-    fn change_token(&self) -> u32 { self.msg_id() }
+use core::sync::atomic::{AtomicU32, Ordering};
+use embassy_supervisor_observe::Observable;
+
+/// A signal type the application owns: a value plus a write count.
+pub struct Reading {
+    value: AtomicU32,
+    writes: AtomicU32,
 }
+
+impl Reading {
+    pub fn set(&self, v: u32) {
+        self.value.store(v, Ordering::Relaxed);
+        self.writes.fetch_add(1, Ordering::Release);
+    }
+}
+
+impl Observable for Reading {
+    fn change_token(&self) -> u32 {
+        self.writes.load(Ordering::Acquire)
+    }
+}
+
+let r = Reading { value: AtomicU32::new(0), writes: AtomicU32::new(0) };
+let before = r.change_token();
+r.set(7);
+assert_ne!(r.change_token(), before);
 ```
 
 A graph entry marked `observed` resolves its accessor in order: a per-entry
@@ -39,8 +62,16 @@ A graph entry marked `observed` resolves its accessor in order: a per-entry
 **Wrap a primitive in `Counted`** when the type counts nothing itself:
 
 ```rust
-static ESTIMATE: Counted<Watch<Estimate>> = Counted::new(Watch::new());
-ESTIMATE.w().send(est); // counted write; `.r()` counts a read; `.inner()` counts nothing
+use core::sync::atomic::{AtomicU32, Ordering};
+use embassy_supervisor_observe::{Counted, Observable, Sink};
+
+static ESTIMATE: Counted<AtomicU32> = Counted::new(AtomicU32::new(0));
+
+ESTIMATE.put(21); // counted write, through the `Sink` verb
+ESTIMATE.put(21); // the same value again still counts
+ESTIMATE.w().store(4, Ordering::Relaxed); // counted borrow; `.r()` counts a read
+assert_eq!(ESTIMATE.inner().load(Ordering::Relaxed), 4); // `.inner()` counts nothing
+assert_eq!(ESTIMATE.change_token(), 3);
 ```
 
 `Counted` counts calls, so even a rewrite carrying the same value registers,
@@ -61,7 +92,5 @@ atomics implement both.
 
 ## Targets without atomic compare-and-swap
 
-On a target with no native CAS (thumbv6m, riscv32imc) the facade needs
-portable-atomic's `critical-section` feature or its `unsafe-assume-single-core`
-feature; without one the build stops with a `compile_error!` naming them. An
-application linking `embassy-supervisor` already gets `critical-section`.
+On a target without atomic compare-and-swap, enable one of `portable-atomic`'s
+`critical-section` or `unsafe-assume-single-core` features in the application.

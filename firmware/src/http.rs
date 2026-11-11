@@ -503,13 +503,12 @@ pub(crate) fn record_lifecycle(ev: embassy_supervisor::LifecycleEvent) {
         K::Stopped => 3,
         K::Exited => 4,
         K::Faulted(kind) => {
-            defmt::warn!(
-                "lifecycle: {}",
-                embassy_supervisor::NodeFault {
-                    node: ev.node,
-                    kind
-                }
-            );
+            let fault = embassy_supervisor::NodeFault {
+                node: ev.node,
+                kind,
+            };
+            defmt::warn!("lifecycle: {}", fault);
+            crate::record_fault(&fault);
             5
         }
         _ => 6,

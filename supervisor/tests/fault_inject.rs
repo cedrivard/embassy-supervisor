@@ -2,8 +2,10 @@
 //! polls, wedge hides the request and swallows the ack, crash drops the
 //! worker, hog busy-spins the executor. Nothing in the workers cooperates.
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
+use std::time::Duration as StdDuration;
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
@@ -15,6 +17,8 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, MockDriver, Timer};
 
+use support::settle;
+
 static STALLER_TICKS: AtomicU32 = AtomicU32::new(0);
 static SIBLING_TICKS: AtomicU32 = AtomicU32::new(0);
 static HOGGER_TICKS: AtomicU32 = AtomicU32::new(0);
@@ -23,26 +27,22 @@ static DROPPER_GO: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static LEAVER_GO: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static DONE: AtomicBool = AtomicBool::new(false);
 
-/// Set while the driver steps mock time itself: the test thread holds its own
-/// advance, so a wall-clock stall of this executor cannot read as a gap.
-static DRIVER_CLOCK: AtomicBool = AtomicBool::new(false);
+/// Set while the executor steps mock time itself (`clock_ticker`), so a
+/// wall-clock stall of this executor cannot read as a gap or overshoot a
+/// window. Cleared only around the hog measurement: a hog freezes the
+/// executor, so the test thread has to move time for it.
+static DRIVER_CLOCK: AtomicBool = AtomicBool::new(true);
 
-/// `max_gap`, with the driver stepping the clock 10 ms per yield.
-async fn self_clocked_gap(ms: u64) -> Duration {
+/// Steps mock time 10 ms per executor pass while `DRIVER_CLOCK` is set.
+#[embassy_executor::task]
+async fn clock_ticker() {
     let clock = MockDriver::get();
-    DRIVER_CLOCK.store(true, Ordering::Release);
-    let t0 = Instant::now();
-    let mut prev = t0;
-    let mut gap = Duration::from_ticks(0);
-    while Instant::now() - t0 < Duration::from_millis(ms) {
-        clock.advance(Duration::from_millis(10));
+    while !DONE.load(Ordering::Acquire) {
+        if DRIVER_CLOCK.load(Ordering::Acquire) {
+            clock.advance(Duration::from_millis(10));
+        }
         embassy_futures::yield_now().await;
-        let now = Instant::now();
-        gap = gap.max(now - prev);
-        prev = now;
     }
-    DRIVER_CLOCK.store(false, Ordering::Release);
-    gap
 }
 
 /// Beats every 20 ms and counts; answers a stop through `wait_shutdown`.
@@ -149,7 +149,7 @@ async fn monitor_task() {
     SUP.monitor().await;
 }
 
-/// Let mock time pass (the test thread advances the clock) while yielding.
+/// Let mock time pass (the executor steps the clock) while yielding.
 async fn pass(ms: u64) {
     let t0 = Instant::now();
     while Instant::now() - t0 < Duration::from_millis(ms) {
@@ -170,16 +170,6 @@ async fn max_gap(ms: u64) -> Duration {
         prev = now;
     }
     gap
-}
-
-async fn settle(what: &str, mut f: impl FnMut() -> bool) {
-    for _ in 0..20_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    panic!("never held: {what}");
 }
 
 fn drain() -> Vec<(&'static str, HealthKind)> {
@@ -203,7 +193,7 @@ async fn driver(spawner: Spawner) {
     spawner.spawn(monitor_task().unwrap());
     SUP.start(&spawner).await.expect("bring-up");
     settle("#1", || STALLER.is_running() && HAND.is_running()).await;
-    self_clocked_gap(300).await;
+    max_gap(300).await;
     assert!(drain().is_empty(), "healthy graph, no events");
 
     // ── stall: the worker is not polled ────────────────────────────────────
@@ -332,7 +322,7 @@ async fn driver(spawner: Spawner) {
     settle("#7", || CRASHER.is_running()).await;
 
     // ── hog: the whole executor freezes with it ────────────────────────────
-    let quiet = self_clocked_gap(300).await;
+    let quiet = max_gap(300).await;
     assert!(
         quiet < Duration::from_millis(100),
         "control: no freeze without a hog ({quiet})"
@@ -343,7 +333,9 @@ async fn driver(spawner: Spawner) {
     // The grace, then the spin: this driver, the sibling and the monitor are
     // all on the hogged executor, so none of them is polled for 400 ms of mock
     // time. The driver sees that as one jump between two yields.
+    DRIVER_CLOCK.store(false, Ordering::Release);
     let frozen = max_gap(1_000).await;
+    DRIVER_CLOCK.store(true, Ordering::Release);
     assert!(
         frozen >= Duration::from_millis(400),
         "the executor froze for the bound ({frozen})"
@@ -420,22 +412,24 @@ async fn driver(spawner: Spawner) {
 fn faults_are_done_to_the_task() {
     let clock = MockDriver::get();
 
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    // Mock time runs from here, 10 ms per 2 ms of wall time, except while the
-    // driver holds `DRIVER_CLOCK` and steps it itself.
-    let deadline = StdInstant::now() + StdDuration::from_secs(60);
-    while !DONE.load(Ordering::Acquire) {
-        if !DRIVER_CLOCK.load(Ordering::Acquire) {
-            clock.advance(Duration::from_millis(10));
+    // Mock time is stepped by the executor, except while the driver clears
+    // `DRIVER_CLOCK` around the hog: then it runs 10 ms per 2 ms of wall time.
+    std::thread::spawn(move || {
+        loop {
+            if !DRIVER_CLOCK.load(Ordering::Acquire) {
+                clock.advance(Duration::from_millis(10));
+            }
+            std::thread::sleep(StdDuration::from_millis(2));
         }
-        assert!(StdInstant::now() < deadline, "did not complete");
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    });
+    support::run(
+        |spawner| {
+            spawner.spawn(driver(spawner).unwrap());
+            spawner.spawn(clock_ticker().unwrap());
+        },
+        &DONE,
+        support::Clock::Frozen,
+        60,
+        || "did not complete".to_owned(),
+    );
 }

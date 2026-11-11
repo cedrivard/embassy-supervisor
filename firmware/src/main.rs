@@ -3,7 +3,7 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_rp::interrupt;
@@ -66,9 +66,12 @@ unsafe fn SWI_IRQ_0() {
 // Cross-core pend relay.
 //
 // An InterruptExecutor wakes by pending its IRQ in the local NVIC. A wake
-// issued from core 1 would pend core 1's IRQ copy, where no executor runs,
-// and the task would stall. The vector table is shared, so on core 1 the SWI
-// handler rings core 0's doorbell; the bell handler re-pends the IRQ there.
+// issued on the other core pends that core's IRQ copy, where the executor does
+// not run, and the task would stall. The vector table is shared, so the SWI
+// handler rings the other core's doorbell when it runs on the wrong core; the
+// bell handler there re-pends the IRQ. `HIGH` and the supervisor run on core 0
+// (`RELAY`), `CORE1` on core 1 (`RELAY_TO_CORE1`). Each core has its own
+// doorbell register, so the two directions do not share a bit.
 static RELAY: AtomicU32 = AtomicU32::new(0);
 const RELAY_HIGH: u32 = 1 << 0;
 const RELAY_SUP: u32 = 1 << 1;
@@ -84,11 +87,40 @@ fn relay_to_core0(bit: u32) {
         .write(|w| w.set_doorbell_out_set(1));
 }
 
+/// Core 1's executor. Interrupt-driven, so core 1 sleeps in `WFI` between
+/// polls: a thread executor's `WFE` would be woken by every `SEV` that core 0's
+/// thread pender broadcasts, one empty pass per core-0 wake.
+static EXECUTOR_CORE1: embassy_executor::InterruptExecutor =
+    embassy_executor::InterruptExecutor::new();
+static RELAY_TO_CORE1: AtomicBool = AtomicBool::new(false);
+
+#[interrupt]
+unsafe fn SWI_IRQ_2() {
+    if !on_core1() {
+        // A wake issued on core 0 (a spawn or a stop signal from the
+        // supervisor) pended core 0's copy: hand it to core 1.
+        RELAY_TO_CORE1.store(true, Ordering::Release);
+        embassy_rp::pac::SIO
+            .doorbell_out_set()
+            .write(|w| w.set_doorbell_out_set(1));
+        return;
+    }
+    // SAFETY: only this vector calls it, only on core 1 (core 0 returned
+    // above), and core 1 enables the IRQ in `start()`, so never before it.
+    unsafe { EXECUTOR_CORE1.on_interrupt() }
+}
+
 #[interrupt]
 unsafe fn SIO_IRQ_BELL() {
     embassy_rp::pac::SIO
         .doorbell_in_clr()
         .write(|w| w.set_doorbell_in_clr(1));
+    if on_core1() {
+        if RELAY_TO_CORE1.swap(false, Ordering::AcqRel) {
+            interrupt::SWI_IRQ_2.pend();
+        }
+        return;
+    }
     let bits = RELAY.swap(0, Ordering::AcqRel);
     if bits & RELAY_HIGH != 0 {
         interrupt::SWI_IRQ_0.pend();
@@ -115,14 +147,14 @@ unsafe fn SWI_IRQ_1() {
     unsafe { EXECUTOR_SUP.on_interrupt() }
 }
 
-/// The last fault `Supervisor::run` returned, for `/api/tasks`.
+/// The last fault the supervisor reported, for `/api/tasks`.
 /// Written from the supervisor tier, read by the HTTP worker tier.
 pub(crate) static LAST_FAULT: embassy_sync::blocking_mutex::Mutex<
     embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
     core::cell::Cell<Option<(&'static str, &'static str)>>,
 > = embassy_sync::blocking_mutex::Mutex::new(core::cell::Cell::new(None));
 
-fn record_fault(fault: &embassy_supervisor::NodeFault) {
+pub(crate) fn record_fault(fault: &embassy_supervisor::NodeFault) {
     use embassy_supervisor::FaultKind;
     let kind = match fault.kind {
         FaultKind::ShutdownTimeout => "shutdown ack timeout",
@@ -191,20 +223,28 @@ async fn main(spawner: Spawner) {
     // `static_mut_refs` lint quiet.
     #[allow(clippy::deref_addrof)]
     let core1_stack = unsafe { &mut *&raw mut CORE1_STACK };
-    // Core 0 handles doorbells; core 1 enables the interrupt SWIs so a
-    // pend from there is relayed instead of lost.
+    // Each core handles its doorbell and enables the SWIs of the other core's
+    // executors, so a pend issued on the wrong core is relayed instead of lost.
     // SAFETY: no critical section here is built on NVIC masks (embassy-rp's uses
     // PRIMASK and a spinlock), so unmasking cannot break one.
-    unsafe { interrupt::SIO_IRQ_BELL.enable() };
+    unsafe {
+        interrupt::SIO_IRQ_BELL.enable();
+        interrupt::SWI_IRQ_2.enable();
+    }
     embassy_rp::multicore::spawn_core1(p.CORE1, core1_stack, || {
-        // SAFETY: as for SIO_IRQ_BELL; on core 1 these handlers only relay to core 0.
+        // SAFETY: as on core 0; on core 1 the SWI_IRQ_0/1 handlers only relay
+        // to core 0, and the bell handler only re-pends SWI_IRQ_2.
         unsafe {
             interrupt::SWI_IRQ_0.enable();
             interrupt::SWI_IRQ_1.enable();
+            interrupt::SIO_IRQ_BELL.enable();
         }
-        let executor =
-            alloc::boxed::Box::leak(alloc::boxed::Box::new(embassy_executor::Executor::new()));
-        executor.run(|sp| CORE1.set(sp.make_send()))
+        // Lowest priority, so the relay handlers preempt a long `bench` poll.
+        interrupt::SWI_IRQ_2.set_priority(Priority::P3);
+        CORE1.set(EXECUTOR_CORE1.start(interrupt::SWI_IRQ_2));
+        loop {
+            cortex_m::asm::wfi();
+        }
     });
     defmt::info!(
         "boot: heap {}/{} B free",
@@ -228,8 +268,10 @@ async fn app_supervisor() {
     #[cfg(feature = "lifecycle-sink")]
     embassy_supervisor::set_lifecycle_sink(crate::http::record_lifecycle);
     loop {
-        // `run` returns startup/activation faults or a shutdown timeout. Report
-        // and re-enter; a wedged node stays marked running until it acks.
+        // `run` keeps driving through bring-up and activation faults (logged,
+        // and recorded by the lifecycle sink) and returns only on a missed
+        // shutdown ack or a refused restart. Report and re-enter; a wedged node
+        // stays marked running until it acks.
         let fault = sup.run(&spawner).await;
         defmt::error!("supervisor: {}", fault);
         record_fault(&fault);

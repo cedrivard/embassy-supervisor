@@ -1,22 +1,27 @@
 //! An elastic pool must regrow on its own once its provider recovers: the
-//! readiness poke (`set_ready` re-evaluates scaling), the
-//! `restart` cycle (whose up-wave deliberately excludes OnDemand members),
-//! and `apply_bind`'s OnDemand recovery arm. Before these pokes existed the
-//! pool driver parked on `wait_scale` with a declined Grow and nobody left
-//! to wake it. The plain-dep pool in the second half has no `ready` marker
-//! on its provider, so its regrow can only ride on restart's own poke.
+//! readiness poke (`set_ready` re-evaluates scaling), the `restart` cycle
+//! (whose up-wave brings back the members that were running), and
+//! `apply_bind`'s OnDemand recovery arm. Before these pokes existed the pool
+//! driver parked on `wait_scale` with a declined Grow and nobody left to wake
+//! it. A restart of the `ready` provider races its up-wave against the pool
+//! driver that the readiness poke wakes: whichever starts the member first,
+//! the other finds it running and leaves it be. The plain-dep pool in the
+//! second half has no `ready` marker on its provider, so the up-wave alone
+//! brings its member back.
 //!
 //! The script never calls `request_scale` itself, and every settle waits on
 //! worker-side counters (a member's `is_running` flips inside the driver's
 //! own poll, before the member task has run — racing an assert against it
 //! reads a half-spawned world).
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_supervisor::{DeferredShrink, Supervisor, TaskNode, supervisor_graph};
+use support::settle;
 
 static LINK_SPAWNS: AtomicU32 = AtomicU32::new(0);
 static POOL_SPAWNS: AtomicU32 = AtomicU32::new(0);
@@ -68,16 +73,6 @@ supervisor_graph! {
         min: 0, max: 2;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 fn pool_spawns() -> u32 {
     POOL_SPAWNS.load(Ordering::SeqCst)
 }
@@ -97,17 +92,25 @@ async fn driver(spawner: Spawner) {
         // Bring-up: the freshly asserted readiness is the only wake signal
         // the parked driver gets, and it must be enough.
         sup.start(&spawner).await.expect("bring-up");
-        settle(|| pool_spawns() == 1 && SESSIONS[0].is_running()).await;
+        settle("first pool spawn", || {
+            pool_spawns() == 1 && SESSIONS[0].is_running()
+        })
+        .await;
         assert!(
             pool_spawns() == 1 && SESSIONS[0].is_running(),
             "the pool grows once LINK asserts readiness"
         );
 
-        // Restart: the down-wave stops the member, the up-wave excludes
-        // OnDemand — the respawned LINK's set_ready must regrow the pool.
+        // Restart: the down-wave stops the member and LINK. The up-wave
+        // respawns LINK and waits for its readiness to bring the member back;
+        // the set_ready that ends the wait also wakes the pool driver, and the
+        // member is started once, by whichever gets there first.
         sup.restart(&LINK, &spawner).await.expect("restart");
-        settle(|| LINK_SPAWNS.load(Ordering::SeqCst) == 2).await;
-        settle(|| pool_spawns() == 2 && SESSIONS[0].is_running()).await;
+        settle("LINK respawned", || LINK_SPAWNS.load(Ordering::SeqCst) == 2).await;
+        settle("second pool spawn", || {
+            pool_spawns() == 2 && SESSIONS[0].is_running()
+        })
+        .await;
         assert!(
             pool_spawns() == 2 && SESSIONS[0].is_running(),
             "the pool regrows after a restart of its provider"
@@ -117,26 +120,31 @@ async fn driver(spawner: Spawner) {
         // recovery hands it back to the policy with a poke.
         LINK.clear_ready();
         sup.apply_bind(&spawner).await.expect("bound stop");
-        settle(|| !SESSIONS[0].is_running()).await;
+        settle("member stopped", || !SESSIONS[0].is_running()).await;
         assert!(
             SESSIONS[0].is_bound_stopped(),
             "the member follows the withdrawn readiness"
         );
         LINK.set_ready();
         sup.apply_bind(&spawner).await.expect("bound recovery");
-        settle(|| pool_spawns() == 3 && SESSIONS[0].is_running()).await;
+        settle("third pool spawn", || {
+            pool_spawns() == 3 && SESSIONS[0].is_running()
+        })
+        .await;
         assert!(
             pool_spawns() == 3 && SESSIONS[0].is_running(),
             "the pool regrows after the bound provider recovers"
         );
 
         // Plain-dep pool (no `ready` marker on the provider): the readiness
-        // poke can never fire for it, so the regrow after a restart rides on
-        // restart's own poke alone. PLAIN came up with the boot `start()`
-        // above and the awake driver grew CREW at boot; the interesting half
-        // is the restart.
+        // poke can never fire for it. PLAIN came up with the boot `start()`
+        // above and the awake driver grew CREW at boot; a restart of PLAIN
+        // cycles the running member with it, and the up-wave brings it back.
         assert!(PLAIN.is_running(), "PLAIN came up at boot");
-        settle(|| CREW_SPAWNS.load(Ordering::SeqCst) == 1 && CREW[0].is_running()).await;
+        settle("CREW grew at boot", || {
+            CREW_SPAWNS.load(Ordering::SeqCst) == 1 && CREW[0].is_running()
+        })
+        .await;
         assert!(
             CREW_SPAWNS.load(Ordering::SeqCst) == 1 && CREW[0].is_running(),
             "the plain-dep pool grew at boot"
@@ -144,8 +152,14 @@ async fn driver(spawner: Spawner) {
         sup.restart(&PLAIN, &spawner)
             .await
             .expect("restart plain provider");
-        settle(|| PLAIN_SPAWNS.load(Ordering::SeqCst) == 2).await;
-        settle(|| CREW_SPAWNS.load(Ordering::SeqCst) == 2 && CREW[0].is_running()).await;
+        settle("PLAIN respawned", || {
+            PLAIN_SPAWNS.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        settle("CREW regrew", || {
+            CREW_SPAWNS.load(Ordering::SeqCst) == 2 && CREW[0].is_running()
+        })
+        .await;
         assert!(
             CREW_SPAWNS.load(Ordering::SeqCst) == 2 && CREW[0].is_running(),
             "the plain-dep pool regrows after a restart of its provider"
@@ -160,24 +174,19 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn pool_regrows_without_manual_pokes() {
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (link spawns={}, pool spawns={}, crew spawns={}, member running={})",
-            LINK_SPAWNS.load(Ordering::SeqCst),
-            POOL_SPAWNS.load(Ordering::SeqCst),
-            CREW_SPAWNS.load(Ordering::SeqCst),
-            SESSIONS[0].is_running(),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (link spawns={}, pool spawns={}, crew spawns={}, member running={})",
+                LINK_SPAWNS.load(Ordering::SeqCst),
+                POOL_SPAWNS.load(Ordering::SeqCst),
+                CREW_SPAWNS.load(Ordering::SeqCst),
+                SESSIONS[0].is_running(),
+            )
+        },
+    );
 }

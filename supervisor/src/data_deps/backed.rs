@@ -54,6 +54,10 @@ async fn wait_serving(producer: &'static TaskNode) -> bool {
 /// [`open`](crate::TaskNode::open). The value is not handed out until the
 /// producer is running and ready. The gate counts readers so the producer can
 /// retire once none are left ([`unwatched`](Self::unwatched), [`TaskNode::retire`]).
+///
+/// With `control`, opening a gate sends `Activate` for a producer that is
+/// down, which also clears a `disabled` latch set by an operator or by
+/// `enabled_if:`.
 #[repr(C)]
 pub struct Backed<T> {
     inner: T,
@@ -114,6 +118,7 @@ impl<T> Backed<T> {
 /// A reader's hold on a [`Backed`] signal, from [`open`](crate::TaskNode::open).
 /// `Deref` gives the wrapped signal's API; dropping the guard lets the producer
 /// notice the last reader has left.
+#[must_use = "dropping the guard releases the hold at once"]
 pub struct Open<T: 'static> {
     target: &'static Backed<T>,
 }
@@ -158,8 +163,9 @@ impl<T: Sync + 'static> Gated for Backed<T> {
     async fn ensure(&'static self, caller: &'static TaskNode, entry: &'static Coupling) {
         let Some(producer) = producer_of(caller, entry) else {
             warn!(
-                "supervisor: {} is gated but no graph declares a writer for it",
-                entry.name()
+                "supervisor: {} is gated but {}'s graph declares no writer for it",
+                entry.name(),
+                caller.name()
             );
             return;
         };
@@ -179,14 +185,19 @@ impl<T: Sync + 'static> Gated for Backed<T> {
             }
             #[cfg(not(feature = "control"))]
             warn!(
-                "supervisor: {} gates on {}, which is not running, and without \
-                 `control` there is nothing that can start it: this read will \
-                 not return",
+                "supervisor: {} gates on {}, which is not running yet; without \
+                 `control` only a bring-up wave, a pool or an explicit start \
+                 brings it up",
                 entry.name(),
                 producer.name()
             );
         }
         loop {
+            // Store-then-load on two words: both sides need a full fence so
+            // at least one sees the other. `admit` bumped `openers` before
+            // this load of the producer's readiness; `retire` clears that
+            // readiness before it loads `openers`.
+            core::sync::atomic::fence(Ordering::SeqCst);
             if serving(producer) {
                 break;
             }
@@ -212,6 +223,11 @@ impl TaskNode {
         loop {
             s.target.unwatched(cooldown).await;
             self.clear_ready();
+            // Store-then-load on two words: both sides need a full fence so
+            // at least one sees the other. This store of readiness precedes
+            // the load of `openers`; a reader's `admit` stores `openers`
+            // before `ensure` loads the readiness.
+            core::sync::atomic::fence(Ordering::SeqCst);
             if s.target.openers() == 0 {
                 break;
             }

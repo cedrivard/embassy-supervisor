@@ -1,16 +1,18 @@
 error[E0277]: the trait bound `Silent: Observable` is not satisfied
-  --> tests/ui/compile_fail/observed_without_accessor.rs:9:1
+  --> tests/ui/compile_fail/observed_without_accessor.rs:10:53
    |
  9 | / supervisor_graph! {
 10 | |     node A = Terminate, deps: [], task: w, writes: [crate::X observed];
+   | |                                                     ^^^^^^^^ unsatisfied trait bound
 11 | | }
-   | |_^ unsatisfied trait bound
+   | |_- required by a bound introduced by this call
    |
 help: the trait `Observable` is not implemented for `Silent`
   --> tests/ui/compile_fail/observed_without_accessor.rs:4:1
    |
  4 | pub struct Silent;
    | ^^^^^^^^^^^^^^^^^
+   = note: add `via <expr>` to the entry, an `observe writes:` default to the graph, or wrap the signal in `Counted`
    = help: the following other types implement trait `Observable`:
              Atomic<bool>
              Atomic<i16>
@@ -21,4 +23,3 @@ help: the trait `Observable` is not implemented for `Silent`
              Atomic<u16>
              Atomic<u32>
            and $N others
-   = note: this error originates in the macro `supervisor_graph` (in Nightly builds, run with -Z macro-backtrace for more info)

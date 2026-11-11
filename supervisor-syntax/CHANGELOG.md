@@ -7,6 +7,60 @@ This crate is pinned by exact version from `embassy-supervisor-macros`: its AST 
 internal contract between the two, not a stable public API, and it changes whenever the
 graph syntax does. Publish it before the macro crate that depends on it.
 
+## [0.7.0] - 2026-11-11
+
+Pool and fragment rules checked by the parser, `cfg_if!`-shaped chains, and a shared
+derived-table builder. Requires `embassy-supervisor-macros` 0.13.0 and
+`embassy-supervisor-tools` 0.9.0.
+
+### Added
+
+- `check_fragment_body(&GraphSpec)`: rejects what a `supervisor_fragment!` body may not
+  set (`name:`, the `observe` defaults, `default executor`), for the macro and the tools.
+- `SignalDecl::stem` and `signal_stem`: a signal's last path segment plus any index, cut
+  before the index so an index holding `::` stays whole.
+- `DerivedEntry`, `record_derived` and `derived_predicate`: the derived coupling table
+  builder `#[dataflow]` and `#[dataflow_bundle]` use, shared with `scan_fn_accesses`.
+- LICENSE-MIT and LICENSE-APACHE ship in the package.
+
+### Changed
+
+- `parse_pool` checks what needs only the pool: literal `min:`/`max:` against each other
+  and the member count, and `resources:`/`state:` requiring `task:`. Both parsers reject
+  a dep repeated in one `deps:` list under the same `#[cfg]`s. These were checked by
+  `embassy-supervisor-macros` alone, with the same messages.
+- `SignalDecl::display` and `VerbCall::path` keep one space between two adjacent
+  identifiers or literals, so `LEDS[Led::Status as usize]` no longer reads
+  `LEDS[Led::Statusasusize]`.
+- `rewrite_verb_calls` takes an element target only over a path-named array at a literal
+  or path index (`&ARR[0]`, `&ARR[CONST]`), and names a registered verb called with no
+  argument.
+- The `cancel` with `Pause` message names the modes as written (`Terminate`, not
+  `Mode::Terminate`).
+- **Breaking:** `scan_dataflow` no longer descends into `impl` blocks: `#[dataflow]` is
+  rejected on a method.
+
+### Fixed
+
+- `rewrite_verb_calls` gates the arms of an `if #[cfg(p)] { .. } else if #[cfg(q)]
+  { .. } else { .. }` chain (the `cfg_if!` shape) on `p`, then `not(p), q`, then
+  `not(p), not(q)`, where every arm took the first arm's predicate. A block followed by
+  `..` or `..=` ends a `#[cfg]`-gated match arm: only `else`, `?`, or a `.` before a
+  method, field or `.await` continues its expression.
+- `parse_pool` applies the rules `parse_node` applied alone: `beat` or `veto` on a
+  `reads:` entry, an unmarked entry beside `discover`, a resource name repeated in one
+  `resources:` list. An empty member list and a `#[cfg]` on one member are rejected.
+- `ready_on_write` needs an `observed beat` write gated like it or not at all: a write
+  under another `#[cfg]` can be compiled out while the clause stays.
+- `beat_window:` refuses a suffixed literal, like the other integer clauses.
+- `default executor` takes a doc comment or a lint attribute; only `cfg` and `cfg_attr`
+  count as a gate.
+- An `observe` default inside `@fragment` markers is rejected, as `default executor` was.
+- `scan_fn_accesses` and `scan_dataflow` fold every call site of a signal in one
+  direction: `Access::cfgs` ends with the sites' combined condition (nothing when any
+  site is ungated, `any(..)` across several conditions) and `Access::verb` is the
+  strongest verb (a `beat_*` site wins), where the first call site alone decided both.
+
 ## [0.6.0] - 2026-11-07
 
 Stricter graph parsing and one shared access walker. Requires
@@ -183,7 +237,8 @@ tooling that wants it.
   against a whole graph by the macro. A fragment legitimately names nodes it does not
   contain, so parsing one in isolation has to succeed.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.6.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.7.0...HEAD
+[0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.6.0...embassy-supervisor-syntax-v0.7.0
 [0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.5.0...embassy-supervisor-syntax-v0.6.0
 [0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.4.0...embassy-supervisor-syntax-v0.5.0
 [0.4.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.3.1...embassy-supervisor-syntax-v0.4.0

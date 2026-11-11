@@ -5,14 +5,16 @@
 //! deactivation survives its ancestor's cycle, and pool members become grow
 //! candidates again instead of staying latched forever.
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
     DeferredShrink, Pool, PoolAction, Supervisor, TaskNode, supervisor_graph,
 };
 use embassy_time::Instant;
+use support::settle;
 
 static DONE: AtomicBool = AtomicBool::new(false);
 
@@ -33,28 +35,20 @@ supervisor_graph! {
         min: 0, max: 2;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
     let now = Instant::from_ticks(0);
 
     sup.start(&spawner).await.expect("bring-up");
-    settle(|| ROOT.is_running() && LINK.is_running() && MID.is_running() && DIAMOND.is_running())
-        .await;
+    settle("all nodes running", || {
+        ROOT.is_running() && LINK.is_running() && MID.is_running() && DIAMOND.is_running()
+    })
+    .await;
 
     // Grow one member by hand so the deactivation has a running member to stop.
     sup.start_node(&CREW[0], &spawner).await.expect("grow");
-    settle(|| CREW[0].is_running()).await;
+    settle("member 0 running", || CREW[0].is_running()).await;
 
     // Deactivate LINK: the seed alone is disabled; dependents are held
     // collateral — stopped, but never deactivated in their own right.
@@ -80,7 +74,10 @@ async fn driver(spawner: Spawner) {
     sup.activate(&LINK, &spawner)
         .await
         .expect("activate LINK and release collateral");
-    settle(|| LINK.is_running() && MID.is_running()).await;
+    settle("LINK and MID running", || {
+        LINK.is_running() && MID.is_running()
+    })
+    .await;
     assert!(MID.is_running() && !MID.is_collateral());
     assert!(!CREW[0].is_collateral() && !CREW[1].is_collateral());
     assert!(
@@ -97,7 +94,7 @@ async fn driver(spawner: Spawner) {
     sup.activate(&ROOT, &spawner)
         .await
         .expect("activate ROOT and revive diamond");
-    settle(|| DIAMOND.is_running()).await;
+    settle("DIAMOND running", || DIAMOND.is_running()).await;
     assert!(DIAMOND.is_running() && !DIAMOND.is_collateral());
 
     // A node deactivated in its own right survives its ancestor's cycle.
@@ -106,7 +103,7 @@ async fn driver(spawner: Spawner) {
     sup.activate(&LINK, &spawner)
         .await
         .expect("reactivate LINK without MID");
-    settle(|| LINK.is_running()).await;
+    settle("LINK running", || LINK.is_running()).await;
     assert!(
         MID.is_disabled() && !MID.is_running(),
         "a direct deactivation is not undone by the ancestor's activate"
@@ -114,7 +111,7 @@ async fn driver(spawner: Spawner) {
     sup.activate(&MID, &spawner)
         .await
         .expect("activate directly disabled MID");
-    settle(|| MID.is_running()).await;
+    settle("MID running", || MID.is_running()).await;
     assert!(MID.is_running());
 
     // A member-targeted deactivate latches the whole pool disabled; only its
@@ -133,24 +130,19 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn collateral_hold_released_by_activate() {
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (link={}, mid={}, diamond={}, member0={})",
-            LINK.is_running(),
-            MID.is_running(),
-            DIAMOND.is_running(),
-            CREW[0].is_running(),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (link={}, mid={}, diamond={}, member0={})",
+                LINK.is_running(),
+                MID.is_running(),
+                DIAMOND.is_running(),
+                CREW[0].is_running(),
+            )
+        },
+    );
 }

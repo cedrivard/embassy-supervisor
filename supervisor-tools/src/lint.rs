@@ -1,7 +1,7 @@
 //! Dataflow linting: finding one-sided signal couplings.
 
 use crate::render::{boxed_name, discovered_key, signals_of};
-use crate::{Bundle, Decl, Discovered, GateStatic, binding_for, expand_bundles, fn_bindings};
+use crate::{Bundle, Decl, Discovered, GateStatic, binding_for, decl_bindings};
 use std::collections::BTreeMap;
 
 /// Enabled lint categories for a `supervisor-lint` run.
@@ -124,7 +124,7 @@ pub fn dataflow_lints(
             let Some(name) = boxed_name(item) else {
                 continue;
             };
-            let bindings = expand_bundles(fn_bindings(item), bundles);
+            let bindings = decl_bindings(decl, item, bundles);
             if bindings.is_empty() {
                 continue;
             }
@@ -159,22 +159,34 @@ pub fn dataflow_lints(
                 Some((key.clone(), whole.clone()))
             })
             .collect();
+        // Merge from a snapshot of each key's own sides: an element gains only
+        // the whole array's sides, and the whole array the union of its
+        // elements', so one element never inherits a sibling's through it.
+        let own: BTreeMap<String, (Vec<String>, Vec<String>)> = element_links
+            .iter()
+            .flat_map(|(elem, whole)| [elem, whole])
+            .map(|k| {
+                (
+                    k.clone(),
+                    (sides[k].writers.clone(), sides[k].readers.clone()),
+                )
+            })
+            .collect();
+        let merge = |from: &str, to: &str, sides: &mut BTreeMap<String, Sides>| {
+            let (w, r) = &own[from];
+            let dst = sides.get_mut(to).expect("both keys are in `order`");
+            for n in w {
+                if !dst.writers.contains(n) {
+                    dst.writers.push(n.clone());
+                }
+            }
+            for n in r {
+                if !dst.readers.contains(n) {
+                    dst.readers.push(n.clone());
+                }
+            }
+        };
         for (elem, whole) in &element_links {
-            let merge = |from: &str, to: &str, sides: &mut BTreeMap<String, Sides>| {
-                let src = &sides[from];
-                let (w, r) = (src.writers.clone(), src.readers.clone());
-                let dst = sides.get_mut(to).expect("both keys are in `order`");
-                for n in w {
-                    if !dst.writers.contains(&n) {
-                        dst.writers.push(n);
-                    }
-                }
-                for n in r {
-                    if !dst.readers.contains(&n) {
-                        dst.readers.push(n);
-                    }
-                }
-            };
             merge(elem, whole, &mut sides);
             merge(whole, elem, &mut sides);
         }
@@ -185,8 +197,14 @@ pub fn dataflow_lints(
             if !(orphan || dead) {
                 continue;
             }
-            if let Some(i) = allow.iter().position(|a| allow_matches(key, a)) {
-                allow_hit[i] = true;
+            let mut allowed = false;
+            for (i, a) in allow.iter().enumerate() {
+                if allow_matches(key, a) {
+                    allow_hit[i] = true;
+                    allowed = true;
+                }
+            }
+            if allowed {
                 continue;
             }
             if orphan && cats.orphan_reads {
@@ -343,6 +361,38 @@ mod tests {
                 .any(|w| w.contains("orphan read") || w.contains("dead write")),
             "{w:?}"
         );
+    }
+
+    #[test]
+    fn an_element_does_not_inherit_a_sibling_through_the_whole_array() {
+        let src = r#"
+            embassy_supervisor::supervisor_graph! {
+                node W = Terminate, task: w_entry, writes: [crate::sig::ARR[0]];
+                node R = Terminate, task: r_entry, reads: [crate::sig::ARR[1]];
+                node X = Terminate, task: x_entry, reads: [crate::sig::ARR];
+            }
+        "#;
+        let decls = parse_source(src, "t.rs").unwrap();
+        let w = dataflow_lints(&decls, &[], &[], &all(), &[]);
+        assert!(
+            w.iter()
+                .any(|w| w.contains("orphan read") && w.contains("ARR[1]")),
+            "{w:?}"
+        );
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    #[test]
+    fn every_allow_entry_matching_a_signal_counts_as_used() {
+        let src = r#"
+            embassy_supervisor::supervisor_graph! {
+                node W = Terminate, task: w_entry, writes: [crate::sig::OUT];
+            }
+        "#;
+        let decls = parse_source(src, "t.rs").unwrap();
+        let allow = ["OUT".to_string(), "crate::sig::OUT".to_string()];
+        let w = dataflow_lints(&decls, &[], &[], &all(), &allow);
+        assert!(w.is_empty(), "{w:?}");
     }
 
     #[test]

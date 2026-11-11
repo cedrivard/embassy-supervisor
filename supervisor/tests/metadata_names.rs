@@ -1,10 +1,11 @@
+mod support;
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
-use embassy_time::MockDriver;
+use support::settle;
 
 /// The executor's handle on a task's metadata: `Metadata` in embassy-executor
 /// 0.10, `MetadataRef` in the post-0.10 API that `embassy_supervisor_trace_v2`
@@ -32,23 +33,13 @@ supervisor_graph! {
     node NAMED = Terminate, deps: [], task: worker;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
     // start() spawns NAMED through the name-only glue (`stamp_name`; with
     // `trace` on, `adopt` stamps the same name).
     sup.start(&spawner).await.expect("start");
-    settle(|| RUNS.load(Ordering::SeqCst) == 1).await;
+    settle("first run", || RUNS.load(Ordering::SeqCst) == 1).await;
     assert!(NAMED.is_running(), "named node up after start");
     assert_eq!(
         *STAMPED.lock().unwrap(),
@@ -61,23 +52,11 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn metadata_names_only_spawns_without_trace_hooks() {
-    let _clock = MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (runs={})",
-            RUNS.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || format!("did not complete (runs={})", RUNS.load(Ordering::SeqCst)),
+    );
 }

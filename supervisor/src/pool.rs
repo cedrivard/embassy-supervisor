@@ -4,7 +4,7 @@ use core::cell::Cell;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::{Duration, Instant};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 /// Snapshot of an elastic pool's current load.
 pub struct PoolStats {
     /// Number of currently running members.
@@ -23,7 +23,7 @@ impl PoolStats {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 /// Decision an elastic scaling policy can return.
 pub enum ScaleAction {
     /// No change.
@@ -45,7 +45,8 @@ pub trait ScalingPolicy {
     }
 }
 
-/// A scaling policy that grows immediately but shrinks only after a cooldown.
+/// A scaling policy that grows immediately, when every member is busy or the
+/// pool is below its `min`, but shrinks only after a cooldown.
 pub struct DeferredShrink {
     cooldown: Duration,
     pending: Mutex<CriticalSectionRawMutex, Cell<Option<Instant>>>,
@@ -61,7 +62,7 @@ impl DeferredShrink {
 }
 impl ScalingPolicy for DeferredShrink {
     fn decide(&self, s: PoolStats, now: Instant) -> ScaleAction {
-        if s.idle() == 0 && s.running < s.max {
+        if (s.idle() == 0 || s.running < s.min) && s.running < s.max {
             self.pending.lock(|p| p.set(None));
             return ScaleAction::Grow;
         }
@@ -90,6 +91,7 @@ impl ScalingPolicy for DeferredShrink {
 }
 
 /// Action the supervisor should take for a pool member.
+#[derive(Debug)]
 pub enum PoolAction {
     /// No action.
     None,

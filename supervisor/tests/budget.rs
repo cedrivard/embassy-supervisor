@@ -2,12 +2,14 @@
 //! holders claim shares, and the supervisor gives a share back whenever its
 //! holder stops — cleanly, by missing its ack, or not at all when it parks.
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Claimant, FairShare, FaultKind, Supervisor, TaskNode, supervisor_graph};
-use embassy_time::{Duration, Instant, MockDriver};
+use embassy_time::{Duration, Instant};
+use support::settle;
 
 static REBALANCES: AtomicU32 = AtomicU32::new(0);
 /// What each holder's own loop last saw its grant as, by slot.
@@ -33,7 +35,8 @@ async fn allocator(node: &'static TaskNode) {
         .run_cancellable_acked(async {
             loop {
                 POWER.wait_change().await;
-                POWER.rebalance(&FairShare, Instant::now());
+                // `FairShare` settles in one pass: nothing to come back for.
+                let _ = POWER.rebalance(&FairShare, Instant::now());
                 REBALANCES.fetch_add(1, Ordering::SeqCst);
             }
         })
@@ -67,16 +70,6 @@ async fn parked(node: &'static TaskNode, power: Claimant) {
     .await
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..20_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 fn grants() -> [u32; 5] {
     core::array::from_fn(|i| POWER.grant(i as u8))
 }
@@ -91,14 +84,17 @@ async fn driver(spawner: Spawner) {
     sup.start(&spawner).await.expect("bring-up");
 
     // 30 + 30 + 20 + 20 over 80: proportional, 24/24/16/16.
-    settle(|| grants() == [24, 24, 16, 16, 0]).await;
+    settle("grants 24/24/16/16", || grants() == [24, 24, 16, 16, 0]).await;
     assert_eq!(
         grants(),
         [24, 24, 16, 16, 0],
         "after {} rebalances",
         REBALANCES.load(Ordering::SeqCst)
     );
-    settle(|| seen()[..4] == [24, 24, 16, 16]).await;
+    settle("holders saw 24/24/16/16", || {
+        seen()[..4] == [24, 24, 16, 16]
+    })
+    .await;
     assert_eq!(
         &seen()[..4],
         &[24, 24, 16, 16],
@@ -108,7 +104,10 @@ async fn driver(spawner: Spawner) {
     // A clean stop gives the share back, and the survivors regrow.
     sup.deactivate(&S1).await.expect("S1 acks");
     assert_eq!(POWER.want_of(0), 0, "released on the ack");
-    settle(|| grants() == [0, 30, 20, 20, 0]).await;
+    settle("grants regrown after S1 stop", || {
+        grants() == [0, 30, 20, 20, 0]
+    })
+    .await;
     assert_eq!(grants(), [0, 30, 20, 20, 0]);
 
     // An unprovided budget is a missing resource, like any other slot.
@@ -127,7 +126,10 @@ async fn driver(spawner: Spawner) {
     sup.start_node(&LATE, &spawner)
         .await
         .expect("provided: starts");
-    settle(|| grants() == [0, 30, 20, 20, 10]).await;
+    settle("LATE joined at its want", || {
+        grants() == [0, 30, 20, 20, 10]
+    })
+    .await;
     assert_eq!(
         grants(),
         [0, 30, 20, 20, 10],
@@ -144,9 +146,9 @@ async fn driver(spawner: Spawner) {
         (0, 0),
         "the supervisor released the wedged holder's share"
     );
-    settle(|| grants() == [0, 30, 0, 20, 10]).await;
+    settle("WEDGED share released", || grants() == [0, 30, 0, 20, 10]).await;
     assert_eq!(grants(), [0, 30, 0, 20, 10]);
-    settle(|| seen()[2] == 0).await;
+    settle("WEDGED loop saw zero", || seen()[2] == 0).await;
     assert_eq!(
         seen()[2],
         0,
@@ -172,31 +174,23 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn a_divisible_resource_is_released_when_its_holder_stops() {
-    let clock = MockDriver::get();
     assert_eq!(
         (POWER.slots(), POWER.capacity()),
         (5, 0),
         "five holders, one slot each, unprovided until the allocator runs"
     );
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "timed out: grants={:?} seen={:?} rebalances={}",
-            grants(),
-            seen(),
-            REBALANCES.load(Ordering::SeqCst)
-        );
-        if ADVANCE.load(Ordering::SeqCst) {
-            clock.advance(Duration::from_millis(10));
-        }
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::While(&ADVANCE, Duration::from_millis(10)),
+        10,
+        || {
+            format!(
+                "timed out: grants={:?} seen={:?} rebalances={}",
+                grants(),
+                seen(),
+                REBALANCES.load(Ordering::SeqCst)
+            )
+        },
+    );
 }

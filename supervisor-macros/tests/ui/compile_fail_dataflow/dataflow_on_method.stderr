@@ -1,0 +1,5 @@
+error: `#[dataflow]` goes on free fns: the tables it derives are module statics
+ --> tests/ui/compile_fail_dataflow/dataflow_on_method.rs:9:17
+  |
+9 |     pub fn send(&self, node: &'static TaskNode) {
+  |                 ^^^^^

@@ -1,10 +1,12 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{DeferredShrink, Supervisor, supervisor_graph};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
+use support::settle;
 
 struct Conn {
     id: u32,
@@ -37,16 +39,6 @@ async fn worker(conn: &mut Conn) -> ! {
     }
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 async fn drive_until<const N: usize, T: embassy_supervisor::Topology<N>>(
     sup: &Supervisor<N, T>,
     spawner: Spawner,
@@ -75,7 +67,10 @@ async fn driver(spawner: Spawner) {
     CONN[0].provide(Conn { id: 0, uses: 0 });
     CONN[1].provide(Conn { id: 1, uses: 0 });
     sup.start(&spawner).await.expect("floor member starts");
-    settle(|| SPAWNS[0].load(Ordering::SeqCst) == 1).await;
+    settle("floor member spawned", || {
+        SPAWNS[0].load(Ordering::SeqCst) == 1
+    })
+    .await;
     PHASE.store(1, Ordering::SeqCst);
 
     WORKERS[0].mark_busy();
@@ -123,27 +118,19 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn cancel_pool_members_shrink_and_restore() {
-    let clock = embassy_time::MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        // The shrink is deferred on a cooldown against this clock.
-        clock.advance(embassy_time::Duration::from_millis(50));
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (phase={}, spawns=[{},{}])",
-            PHASE.load(Ordering::SeqCst),
-            SPAWNS[0].load(Ordering::SeqCst),
-            SPAWNS[1].load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    // The shrink is deferred on a cooldown against this clock.
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Free(embassy_time::Duration::from_millis(50)),
+        10,
+        || {
+            format!(
+                "did not complete (phase={}, spawns=[{},{}])",
+                PHASE.load(Ordering::SeqCst),
+                SPAWNS[0].load(Ordering::SeqCst),
+                SPAWNS[1].load(Ordering::SeqCst),
+            )
+        },
+    );
 }

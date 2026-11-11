@@ -59,7 +59,7 @@ fn a_producer_drains_before_it_may_free() {
 
     let mut drain = pin!(HANDLE.drain());
     assert!(!polled(&mut drain), "two leases are live");
-    assert!(HANDLE.is_drained(), "but the signal is already closed");
+    assert!(HANDLE.is_closed(), "but the signal is already closed");
 
     assert!(
         take(&CONS).is_none(),
@@ -75,7 +75,7 @@ fn a_producer_drains_before_it_may_free() {
 
     assert!(take(&CONS).is_none(), "still closed");
     HANDLE.reopen();
-    assert!(!HANDLE.is_drained());
+    assert!(!HANDLE.is_closed());
 
     let c = take(&CONS).expect("reopened");
     let d = take(&CONS).expect("two again");
@@ -89,5 +89,18 @@ fn a_producer_drains_before_it_may_free() {
     assert!(polled(&mut idle), "nothing to wait for");
     HANDLE.reopen();
 
+    assert_eq!(HANDLE.leases(), 0);
+
+    // A lease taken and dropped before the drain starts must not leave an idle
+    // latch behind that releases the drain while a later lease is still live.
+    let c = take(&CONS).expect("open");
+    drop(c);
+    let d = take(&CONS).expect("open again");
+    let mut late = pin!(HANDLE.drain());
+    assert!(!polled(&mut late), "a live lease holds the drain");
+    assert!(!polled(&mut late), "still held on a second poll");
+    drop(d);
+    assert!(polled(&mut late), "the last drop released it");
+    HANDLE.reopen();
     assert_eq!(HANDLE.leases(), 0);
 }

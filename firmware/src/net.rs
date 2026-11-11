@@ -158,7 +158,8 @@ unsafe fn publish_stack(node: &'static TaskNode, s: Stack<'_>) {
     let s: Stack<'static> = unsafe { core::mem::transmute(s) };
     node.writer(&crate::net::STACK).set(Some(s));
     // The spawn-time fan-out: the http pool's glue copies this out per member.
-    crate::NET_STACK.provide(s);
+    // SAFETY: `net` runs on THREAD, the executor every `NET_STACK` declaration runs on.
+    unsafe { crate::NET_STACK.provide(s) };
 }
 
 fn unpublish_stack() {

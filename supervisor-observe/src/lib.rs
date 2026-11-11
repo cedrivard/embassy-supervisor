@@ -1,30 +1,12 @@
 #![no_std]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
-
-//! Observation facade for [`embassy-supervisor`](https://docs.rs/embassy-supervisor).
-//!
-//! This crate defines the minimal traits a signal library must implement so the
-//! supervisor can verify declared dataflow against live behaviour. The signal
-//! library depends only on this tiny crate, and the supervisor depends only on
-//! this crate for its observation hooks — the same layering used by `log` and
-//! `defmt`.
+#![doc = include_str!("../README.md")]
 
 use portable_atomic::{
     AtomicBool, AtomicI8, AtomicI16, AtomicI32, AtomicI64, AtomicIsize, AtomicU8, AtomicU16,
     AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
-
-// Without native CAS, portable-atomic provides it only through its
-// `critical-section` or `unsafe-assume-single-core` feature: say so first.
-portable_atomic::cfg_no_atomic_cas! {
-    compile_error!(
-        "embassy-supervisor-observe needs atomic compare-and-swap, which this target \
-         lacks natively: enable portable-atomic's `critical-section` feature (an \
-         application linking embassy-supervisor already does) or its \
-         `unsafe-assume-single-core` feature"
-    );
-}
 
 /// A type whose writes can be observed without interpreting the value.
 ///
@@ -36,12 +18,16 @@ portable_atomic::cfg_no_atomic_cas! {
 /// be counting: each write must advance it, because the heartbeat machinery
 /// folds multiple beat entries into a single wrapping sum. Plain value-as-token
 /// works for ordinary observation but is unsuitable for beats.
+#[diagnostic::on_unimplemented(
+    note = "add `via <expr>` to the entry, an `observe writes:` default to the graph, or wrap the signal in `Counted`"
+)]
 pub trait Observable {
     /// Return a token that changes when the signal is written.
     fn change_token(&self) -> u32;
 }
 
 /// A signal that can be written through the supervisor's `put` verb.
+#[diagnostic::on_unimplemented(note = "use `writer()` or wrap the signal in `Counted`")]
 pub trait Sink {
     /// The value type written into the signal.
     type Item;
@@ -51,6 +37,7 @@ pub trait Sink {
 }
 
 /// A signal that can be read through the supervisor's `get` verb.
+#[diagnostic::on_unimplemented(note = "use `reader()` or wrap the signal in `Counted`")]
 pub trait Source {
     /// The value type read from the signal.
     type Item;
@@ -215,6 +202,9 @@ impl<T> Counted<T> {
     }
 
     /// Borrow the inner signal, counting this as one write.
+    ///
+    /// It counts at the borrow, before the write it hands out; prefer
+    /// [`put`](Sink::put), which counts after the write lands.
     pub fn w(&self) -> &T {
         self.writes.fetch_add(1, Ordering::Relaxed);
         &self.inner
@@ -233,7 +223,7 @@ impl<T> Counted<T> {
 
     /// Return the number of counted writes.
     pub fn writes(&self) -> u32 {
-        self.writes.load(Ordering::Relaxed)
+        self.writes.load(Ordering::Acquire)
     }
 
     /// Return the number of counted reads.
@@ -251,7 +241,9 @@ impl<T> Observable for Counted<T> {
 impl<T: Sink> Sink for Counted<T> {
     type Item = T::Item;
     fn put(&self, v: T::Item) {
-        self.w().put(v);
+        // Write, then count: a reader that sees the new count also sees the value.
+        self.inner.put(v);
+        self.writes.fetch_add(1, Ordering::Release);
     }
 }
 

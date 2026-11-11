@@ -13,4 +13,6 @@ supervisor_graph! {
         resources: [BUS: shared serialized Bus];
 }
 
-fn main() {}
+fn main() {
+    assert_eq!(GRAPH.nodes.len(), 2);
+}

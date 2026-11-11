@@ -1,11 +1,12 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Aborted, Resumed, Supervisor, TaskNode, supervisor_graph};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_time::MockDriver;
+use support::settle;
 
 supervisor_graph! {
     node WORKER = Terminate, deps: [], task: worker;
@@ -68,26 +69,16 @@ async fn looper(node: &'static TaskNode) {
     .await
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
     sup.start(&spawner).await.expect("start");
-    settle(|| ROUNDS.load(Ordering::SeqCst) == 1).await;
+    settle("first round", || ROUNDS.load(Ordering::SeqCst) == 1).await;
 
     WORK.signal(7);
-    settle(|| OUTCOME.signaled()).await;
+    settle("worker outcome", || OUTCOME.signaled()).await;
     assert_eq!(OUTCOME.try_take(), Some(7), "Ok path carries the output");
-    settle(|| ROUNDS.load(Ordering::SeqCst) == 2).await;
+    settle("second round", || ROUNDS.load(Ordering::SeqCst) == 2).await;
     PHASE.store(1, Ordering::SeqCst);
 
     sup.stop_node(&WORKER)
@@ -107,7 +98,7 @@ async fn driver(spawner: Spawner) {
     PHASE.store(2, Ordering::SeqCst);
 
     P_WORK.signal(5);
-    settle(|| P_OUT.signaled()).await;
+    settle("pauser output", || P_OUT.signaled()).await;
     assert_eq!(P_OUT.try_take(), Some(5), "Ok path before any pause");
 
     for round in 1..=2u32 {
@@ -122,12 +113,15 @@ async fn driver(spawner: Spawner) {
         );
 
         sup.resume_node(&PAUSER);
-        settle(|| P_RESUMES.load(Ordering::SeqCst) == round).await;
+        settle("pauser resumed", || {
+            P_RESUMES.load(Ordering::SeqCst) == round
+        })
+        .await;
         assert_eq!(P_RESUMES.load(Ordering::SeqCst), round, "resume surfaced");
         assert!(PAUSER.is_running());
 
         P_WORK.signal(10 + round);
-        settle(|| P_OUT.signaled()).await;
+        settle("pauser output after resume", || P_OUT.signaled()).await;
         assert_eq!(P_OUT.try_take(), Some(10 + round));
     }
     PHASE.store(3, Ordering::SeqCst);
@@ -146,12 +140,12 @@ async fn driver(spawner: Spawner) {
         "a stale resume latch surfaced as a spurious Err(Resumed)"
     );
     sup.resume_pausable();
-    settle(|| P_RESUMES.load(Ordering::SeqCst) == 3).await;
+    settle("third resume", || P_RESUMES.load(Ordering::SeqCst) == 3).await;
     assert!(PAUSER.is_running());
     PHASE.store(4, Ordering::SeqCst);
 
     L_WORK.signal(3);
-    settle(|| L_OUT.signaled()).await;
+    settle("looper cycle 1", || L_OUT.signaled()).await;
     assert_eq!(L_OUT.try_take(), Some(31), "cycle 1 before the pause");
 
     sup.stop_node(&LOOPER).await.expect("acked inside the loop");
@@ -159,7 +153,7 @@ async fn driver(spawner: Spawner) {
     sup.resume_node(&LOOPER);
 
     L_WORK.signal(4);
-    settle(|| L_OUT.signaled()).await;
+    settle("looper cycle 2", || L_OUT.signaled()).await;
     assert_eq!(
         L_OUT.try_take(),
         Some(42),
@@ -171,25 +165,19 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn run_cancellable_races_and_acks() {
-    let _clock = MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (phase={}, rounds={}, p_resumes={})",
-            PHASE.load(Ordering::SeqCst),
-            ROUNDS.load(Ordering::SeqCst),
-            P_RESUMES.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    // Frozen mock clock: nothing in this scenario waits on time.
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (phase={}, rounds={}, p_resumes={})",
+                PHASE.load(Ordering::SeqCst),
+                ROUNDS.load(Ordering::SeqCst),
+                P_RESUMES.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

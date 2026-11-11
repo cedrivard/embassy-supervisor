@@ -4,8 +4,9 @@
 //! a gate timeout is `Faulted` on the single-node verb and the start wave alike,
 //! and a missed ack is the stop wave's `Faulted`.
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
@@ -14,7 +15,8 @@ use embassy_supervisor::{
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, MockDriver};
+use embassy_time::Duration;
+use support::settle;
 
 supervisor_graph! {
     node PARK = Pause, deps: [], task: park;
@@ -55,16 +57,6 @@ async fn gated(node: &'static TaskNode, _slot: &mut u32) {
 /// Never acks.
 async fn deaf(_node: &'static TaskNode) {
     core::future::pending::<()>().await;
-}
-
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
 }
 
 fn drain() -> Vec<(&'static str, LifecycleKind)> {
@@ -111,7 +103,7 @@ async fn driver(spawner: Spawner) {
     );
 
     SOLO_GO.signal(());
-    settle(|| SOLO.has_exited()).await;
+    settle("SOLO exited", || SOLO.has_exited()).await;
     assert!(
         try_wait_lifecycle().is_none(),
         "a body that returns unasked is not evented"
@@ -229,22 +221,11 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn the_waves_and_verbs_report_every_transition() {
-    let clock = MockDriver::get();
-    let thread = std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| spawner.spawn(driver(spawner).unwrap()));
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(StdInstant::now() < deadline, "did not complete");
-        if ADVANCE.load(Ordering::SeqCst) {
-            clock.advance(Duration::from_millis(10));
-        }
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::While(&ADVANCE, Duration::from_millis(10)),
+        10,
+        || "did not complete".to_owned(),
+    );
 }

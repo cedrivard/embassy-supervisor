@@ -39,8 +39,9 @@ jobs:
           - { target: x86_64-pc-windows-msvc, runner: windows-latest }
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Install musl linker
@@ -51,26 +52,28 @@ jobs:
       # ones. The workspace release profile keeps `debug = 2` for probe-rs on
       # the firmware; the env override strips it here (16 MB -> 1.6 MB) without
       # touching the shared profile.
-      - run: cargo build --release -p embassy-supervisor-tools --target ${{ matrix.target }}
+      - run: cargo build --release --locked -p embassy-supervisor-tools --target ${{ matrix.target }}
         env:
           CARGO_PROFILE_RELEASE_STRIP: symbols
       - name: Package
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           case "$GITHUB_REF_NAME" in
             embassy-supervisor-tools-*) version="${GITHUB_REF_NAME#embassy-supervisor-tools-}" ;;
             *) version="dev" ;;  # workflow_dispatch from a branch
           esac
-          name="embassy-supervisor-tools-${version}-${{ matrix.target }}"
-          bindir="target/${{ matrix.target }}/release"
+          name="embassy-supervisor-tools-${version}-${TARGET}"
+          bindir="target/${TARGET}/release"
           mkdir "$name"
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
+          if [[ "$TARGET" == *windows* ]]; then
             cp "$bindir"/supervisor-mermaid.exe "$bindir"/supervisor-lint.exe "$name/"
           else
             cp "$bindir"/supervisor-mermaid "$bindir"/supervisor-lint "$name/"
           fi
           cp supervisor-tools/README.md LICENSE-MIT LICENSE-APACHE "$name/"
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
+          if [[ "$TARGET" == *windows* ]]; then
             7z a "$name.zip" "$name"
           else
             tar czf "$name.tar.gz" "$name"
@@ -108,7 +111,7 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Checksums
-        run: cd dist && sha256sum * > SHA256SUMS
+        run: cd dist && sha256sum -- * > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           name: embassy-supervisor-tools ${{ steps.version.outputs.version }}

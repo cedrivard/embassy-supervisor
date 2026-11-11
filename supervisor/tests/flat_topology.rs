@@ -1,10 +1,13 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
     Mode, NodeCfg, Supervisor, TaskHandle, TaskNode, Topology, shape, supervisor_graph,
 };
+
+use support::settle;
 
 static SPAWNS: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -47,28 +50,18 @@ static HAND_CFG: NodeCfg = NodeCfg::new("hand", Mode::Terminate, None).with_disa
 static HAND_HANDLE: TaskHandle = TaskHandle::new();
 static HAND: TaskNode = TaskNode::new(&HAND_CFG, &HAND_HANDLE);
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
     sup.start(&spawner).await.expect("start");
-    settle(|| SPAWNS.load(Ordering::SeqCst) == 3).await;
+    settle("three spawns", || SPAWNS.load(Ordering::SeqCst) == 3).await;
     assert!(A.is_running() && B.is_running() && C.is_running());
 
     sup.teardown().await.expect("teardown");
     assert!(!A.is_running() && !B.is_running() && !C.is_running());
 
     sup.respawn_terminate(&spawner).await.expect("respawn");
-    settle(|| SPAWNS.load(Ordering::SeqCst) == 6).await;
+    settle("six spawns", || SPAWNS.load(Ordering::SeqCst) == 6).await;
     assert!(A.is_running() && B.is_running() && C.is_running());
 
     DONE.store(true, Ordering::SeqCst);
@@ -76,8 +69,6 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn flat_graph_lifecycle_and_shape() {
-    let _clock = embassy_time::MockDriver::get();
-
     assert_eq!(core::mem::size_of::<GRAPH_TOPOLOGY>(), 0);
     assert_eq!(<GRAPH_TOPOLOGY as Topology<3>>::SHAPE, 0);
     assert!(GRAPH.order().eq(0..3));
@@ -96,21 +87,16 @@ fn flat_graph_lifecycle_and_shape() {
 
     assert!(HAND.is_disabled());
 
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (spawns={})",
-            SPAWNS.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (spawns={})",
+                SPAWNS.load(Ordering::SeqCst)
+            )
+        },
+    );
 }

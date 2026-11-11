@@ -2,8 +2,10 @@
 //! 250 ms grace: the cleared fault's timer is dropped, never reused, so the
 //! spin cannot start the moment the second hog lands.
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
+use std::time::Duration as StdDuration;
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Fault, Supervisor, TaskNode, supervisor_graph};
@@ -66,29 +68,29 @@ async fn driver(spawner: Spawner) {
 #[test]
 fn a_reinjected_hog_gets_a_fresh_grace() {
     let clock = MockDriver::get();
-    let thread = std::thread::spawn(|| {
-        let executor = Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| spawner.spawn(driver(spawner).unwrap()));
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(
-            StdInstant::now() < deadline,
-            "the re-injected hog skipped its grace (phase={})",
-            PHASE.load(Ordering::SeqCst)
-        );
-        match PHASE.load(Ordering::SeqCst) {
-            1 => {
-                clock.advance(Duration::from_millis(300));
-                PHASE.store(2, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        loop {
+            match PHASE.load(Ordering::SeqCst) {
+                1 => {
+                    clock.advance(Duration::from_millis(300));
+                    PHASE.store(2, Ordering::SeqCst);
+                }
+                3 => clock.advance(Duration::from_millis(10)),
+                _ => {}
             }
-            3 => clock.advance(Duration::from_millis(10)),
-            _ => {}
+            std::thread::sleep(StdDuration::from_millis(2));
         }
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    });
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "the re-injected hog skipped its grace (phase={})",
+                PHASE.load(Ordering::SeqCst)
+            )
+        },
+    );
 }

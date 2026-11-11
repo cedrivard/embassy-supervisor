@@ -1,0 +1,5 @@
+error: put `#[dataflow]` above `#[embassy_executor::task]`: here the task macro has already replaced this fn's body with its spawner, so no access can be derived
+  --> tests/ui/compile_fail_dataflow/dataflow_below_task.rs:10:10
+   |
+10 | async fn net(node: &'static TaskNode) {
+   |          ^^^

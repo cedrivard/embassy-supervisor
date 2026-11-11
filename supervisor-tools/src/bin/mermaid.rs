@@ -146,11 +146,15 @@ fn parse_args_from(raw_args: impl IntoIterator<Item = String>) -> Result<Option<
         exclude: Vec::new(),
     };
     let mut it = raw_args.into_iter();
-    while let Some(arg) = it.next() {
-        let mut value = |what: &str| -> Result<String, String> {
-            it.next()
-                .ok_or_else(|| format!("`{what}` needs a value; see --help"))
+    while let Some(raw) = it.next() {
+        // `--opt=value` carries its value inline; that is also how a value
+        // starting with `-` is written.
+        let (arg, mut inline) = match raw.split_once('=') {
+            Some((opt, v)) if opt.starts_with("--") => (opt.to_string(), Some(v.to_string())),
+            _ => (raw, None),
         };
+        let mut value =
+            |what: &str| -> Result<String, String> { option_value(what, inline.take(), &mut it) };
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -219,6 +223,9 @@ fn parse_args_from(raw_args: impl IntoIterator<Item = String>) -> Result<Option<
             }
             other => args.files.push(other.to_string()),
         }
+        if inline.is_some() {
+            return Err(format!("`{arg}` takes no value; see --help"));
+        }
     }
     if args.opts.states && args.opts.runtime {
         return Err("`--states` and `--runtime` are different diagrams; pick one".to_string());
@@ -258,6 +265,25 @@ fn parse_args_from(raw_args: impl IntoIterator<Item = String>) -> Result<Option<
         );
     }
     Ok(Some(args))
+}
+
+/// An option's value: the inline `--opt=value` one, else the next argument,
+/// which may not look like an option (a lone `-` excepted).
+fn option_value(
+    opt: &str,
+    inline: Option<String>,
+    rest: &mut impl Iterator<Item = String>,
+) -> Result<String, String> {
+    if let Some(v) = inline {
+        return Ok(v);
+    }
+    match rest.next() {
+        Some(next) if next.starts_with('-') && next != "-" => {
+            Err(format!("`{opt}` needs a value, found `{next}`"))
+        }
+        Some(v) => Ok(v),
+        None => Err(format!("`{opt}` needs a value; see --help")),
+    }
 }
 
 fn spacing(v: &str) -> Result<u32, String> {
@@ -333,37 +359,79 @@ fn run() -> Result<(), String> {
     for note in ignored_flags(&args) {
         eprintln!("{TOOL}: warning: {note}");
     }
-    let files = inputs::gather(&args.files, args.deps, TOOL)?;
+    let files = inputs::gather(&args.files, args.deps)?;
+    if args.files.is_empty() {
+        eprintln!(
+            "{TOOL}: no inputs given; scanning this crate ({} files)",
+            files.graph.len()
+        );
+    }
     if args.watch {
-        watch(&args, &files)
+        watch(&args, files)
     } else {
         generate(&args, &files)
     }
 }
 
-fn watch(args: &Args, files: &Sources) -> Result<(), String> {
-    let all: Vec<&String> = files.graph.iter().chain(&files.scan_only).collect();
-    if all.iter().any(|f| *f == "-") {
-        return Err("`--watch` cannot watch stdin".to_string());
-    }
-    let stamp = |f: &&String| std::fs::metadata(f).and_then(|m| m.modified()).ok();
+/// Re-render whenever an input file changes, or the input list itself does
+/// (a file added to a scanned directory, a new `mod` declaration).
+fn watch(args: &Args, mut files: Sources) -> Result<(), String> {
+    let stamps = |files: &Sources| -> Vec<_> {
+        files
+            .graph
+            .iter()
+            .chain(&files.scan_only)
+            .map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok())
+            .collect()
+    };
+    let mut last_err = None;
     loop {
-        let seen: Vec<_> = all.iter().map(stamp).collect();
-        match generate(args, files) {
-            Ok(()) => eprintln!("{TOOL}: rendered; watching {} files", all.len()),
+        if files.graph.iter().chain(&files.scan_only).any(|f| f == "-") {
+            return Err("`--watch` cannot watch stdin".to_string());
+        }
+        let seen = stamps(&files);
+        match generate(args, &files) {
+            Ok(()) => eprintln!(
+                "{TOOL}: rendered; watching {} files",
+                files.graph.len() + files.scan_only.len()
+            ),
             Err(e) => eprintln!("{TOOL}: {e}"),
         }
-        while all.iter().map(stamp).collect::<Vec<_>>() == seen {
+        loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
+            match inputs::gather(&args.files, args.deps) {
+                Ok(next) => {
+                    last_err = None;
+                    if next != files || stamps(&next) != seen {
+                        files = next;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if last_err.as_ref() != Some(&e) {
+                        eprintln!("{TOOL}: {e}");
+                    }
+                    last_err = Some(e);
+                }
+            }
         }
     }
 }
 
 fn generate(args: &Args, files: &Sources) -> Result<(), String> {
+    // Every lex registers its file in this thread's span table; a watch run
+    // would grow it forever. Nothing from an earlier run is alive here.
+    proc_macro2::extra::invalidate_current_thread_spans();
     let scan = inputs::scan(files)?;
     let (decls, discovered) = (scan.decls, scan.scanned_accesses);
     let (scanned, dep_scanned, bundles) = (scan.fns, scan.dep_fns, scan.bundles);
     let mut warned = 0usize;
+    let mut all_warnings = Vec::new();
+    for w in scan.warnings {
+        eprintln!("{TOOL}: warning: {w}");
+        all_warnings.push(w);
+        warned += 1;
+    }
     if decls.is_empty() {
         return Err("no graph declaration found in the given files".to_string());
     }
@@ -372,7 +440,7 @@ fn generate(args: &Args, files: &Sources) -> Result<(), String> {
     // Over every declaration, before -x or a selection narrows what is drawn:
     // whether a fn is bound is a fact of the sources, not of the view.
     let coverage = coverage_warnings(&resolved, &scanned, &dep_scanned, &bundles);
-    let mut all_warnings = warnings.clone();
+    all_warnings.extend(warnings.iter().cloned());
     for w in &warnings {
         eprintln!("{TOOL}: warning: {w}");
         warned += 1;
@@ -724,6 +792,27 @@ mod tests {
     }
 
     #[test]
+    fn an_option_value_is_never_another_option() {
+        let err = parse(&["--title", "--no-title"]).err();
+        assert_eq!(
+            err.as_deref(),
+            Some("`--title` needs a value, found `--no-title`")
+        );
+        let err = parse(&["-o", "-s"]).err();
+        assert_eq!(err.as_deref(), Some("`--output` needs a value, found `-s`"));
+        assert_eq!(parse(&["-o", "-"]).unwrap().output.as_deref(), Some("-"));
+
+        let inline = parse(&["--title=-dash first", "--max-fanout=3"]).unwrap();
+        assert_eq!(inline.opts.title.as_deref(), Some("-dash first"));
+        assert_eq!(inline.opts.max_fanout, 3);
+        assert_eq!(
+            parse(&["--signals=yes"]).err().as_deref(),
+            Some("`--signals` takes no value; see --help")
+        );
+        assert!(parse(&["--bogus=1"]).err().unwrap().contains("`--bogus`"));
+    }
+
+    #[test]
     fn version_prints_and_stops() {
         assert!(
             parse_args_from(["--version".to_string()])
@@ -751,7 +840,7 @@ mod tests {
         .unwrap();
         let files = Sources {
             graph: vec![file.display().to_string()],
-            scan_only: Vec::new(),
+            ..Sources::default()
         };
         for flags in [
             &["--check"][..],

@@ -1,0 +1,5 @@
+error: pool `resources:` requires `task:` — the values are handed to the generated shell as arguments (and lend entries restored by it); a `spawn:` task fn manages its own arguments
+ --> tests/ui/compile_fail/pool_resources_with_spawn.rs:6:21
+  |
+6 |         resources: [UART: Uart],
+  |                     ^^^^

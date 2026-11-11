@@ -27,8 +27,9 @@ the working directory is in is scanned (its `src/` roots, expanded through
 `public-gate` alone needs none. `--allow` is how a known, accepted absence is
 written down where it gets reviewed.
 
-Exit status: 0 for no findings, 1 for findings (a stale `--allow` included),
-2 when the run itself fails (a bad option, an unreadable input, no graph).
+Exit status: 0 for no findings, 1 for findings (a stale `--allow` included)
+or an input file that does not parse, 2 when the run itself fails (a bad
+option, an unreadable input, no graph).
 
 OPTIONS:
         --deps             also scan the workspace's path dependencies (via
@@ -44,7 +45,7 @@ OPTIONS:
         --allow <SIGNALS>  accept these signals' findings (comma separated,
                            repeatable; matched like signal labels, by
                            `::`-suffix); an entry suppressing nothing is
-                           itself reported
+                           reported whenever `--only` keeps a signal category
     -h, --help             show this
     -V, --version          print the version
 ";
@@ -75,10 +76,24 @@ fn parse_args_from(raw_args: impl IntoIterator<Item = String>) -> Result<Option<
         allow: Vec::new(),
     };
     let mut it = raw_args.into_iter();
-    while let Some(arg) = it.next() {
+    while let Some(raw) = it.next() {
+        // `--opt=value` carries its value inline; that is also how a value
+        // starting with `-` is written.
+        let (arg, mut inline) = match raw.split_once('=') {
+            Some((opt, v)) if opt.starts_with("--") => (opt.to_string(), Some(v.to_string())),
+            _ => (raw, None),
+        };
         let mut value = |what: &str| -> Result<String, String> {
-            it.next()
-                .ok_or_else(|| format!("`{what}` needs a value; see --help"))
+            if let Some(v) = inline.take() {
+                return Ok(v);
+            }
+            match it.next() {
+                Some(next) if next.starts_with('-') && next != "-" => {
+                    Err(format!("`{what}` needs a value, found `{next}`"))
+                }
+                Some(v) => Ok(v),
+                None => Err(format!("`{what}` needs a value; see --help")),
+            }
         };
         match arg.as_str() {
             "-h" | "--help" => {
@@ -103,6 +118,9 @@ fn parse_args_from(raw_args: impl IntoIterator<Item = String>) -> Result<Option<
             }
             other => args.files.push(other.to_string()),
         }
+        if inline.is_some() {
+            return Err(format!("`{arg}` takes no value; see --help"));
+        }
     }
     if !args.only.any() {
         args.only = LintCats::all();
@@ -124,14 +142,26 @@ fn run() -> Result<usize, String> {
     if let Some(note) = ignored_allow(&args) {
         eprintln!("{TOOL}: warning: {note}");
     }
-    let files = inputs::gather(&args.files, args.deps, TOOL)?;
+    let files = inputs::gather(&args.files, args.deps)?;
+    if args.files.is_empty() {
+        eprintln!(
+            "{TOOL}: no inputs given; scanning this crate ({} files)",
+            files.graph.len()
+        );
+    }
     lint(&args, &files, &mut std::io::stderr())
 }
 
 /// Lint `files`, reporting to `err` (stderr outside tests), and return the
-/// number of findings.
+/// number of findings plus the inputs that could not be scanned in full.
 fn lint(args: &Args, files: &Sources, err: &mut dyn std::io::Write) -> Result<usize, String> {
     let scan = inputs::scan(files)?;
+    // A file that does not parse hides its accesses and gates: the lint's
+    // silence about it would be a false all-clear, so it fails the run.
+    let unscanned = scan.warnings.len();
+    for w in &scan.warnings {
+        let _ = writeln!(err, "{TOOL}: warning: {w}");
+    }
     if args.only.dataflow() && scan.decls.is_empty() {
         return Err("no graph declaration found in the given files".to_string());
     }
@@ -168,13 +198,20 @@ fn lint(args: &Args, files: &Sources, err: &mut dyn std::io::Write) -> Result<us
 
     let _ = writeln!(
         err,
-        "{TOOL}: {} declaration{}, {}{}",
+        "{TOOL}: {} declaration{}, {}{}{}",
         resolved.len(),
         if resolved.len() == 1 { "" } else { "s" },
         match findings {
             0 => "no findings".to_string(),
             1 => "1 finding".to_string(),
             n => format!("{n} findings"),
+        },
+        match unscanned {
+            0 => String::new(),
+            n => format!(
+                ", {n} input{} not scanned in full",
+                if n == 1 { "" } else { "s" }
+            ),
         },
         match warned {
             0 => String::new(),
@@ -185,7 +222,7 @@ fn lint(args: &Args, files: &Sources, err: &mut dyn std::io::Write) -> Result<us
             ),
         }
     );
-    Ok(findings)
+    Ok(findings + unscanned)
 }
 
 #[cfg(test)]
@@ -273,6 +310,22 @@ mod tests {
     }
 
     #[test]
+    fn an_option_value_is_never_another_option() {
+        let err = parse(&["--allow", "--deps"]).err();
+        assert_eq!(
+            err.as_deref(),
+            Some("`--allow` needs a value, found `--deps`")
+        );
+        let inline = parse(&["--only=dead-writes", "--allow=-ODD"]).unwrap();
+        assert!(inline.only.dead_writes && !inline.only.orphan_reads);
+        assert_eq!(inline.allow, ["-ODD"]);
+        assert_eq!(
+            parse(&["--deps=1"]).err().as_deref(),
+            Some("`--deps` takes no value; see --help")
+        );
+    }
+
+    #[test]
     fn version_prints_and_stops() {
         assert!(
             parse_args_from(["--version".to_string()])
@@ -302,7 +355,7 @@ mod tests {
         .unwrap();
         let mut files = Sources {
             graph: vec![path.display().to_string()],
-            scan_only: Vec::new(),
+            ..Sources::default()
         };
         let run = |only: &str, files: &Sources| {
             let mut err = Vec::new();

@@ -1,3 +1,5 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
@@ -6,6 +8,7 @@ use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::MockDriver;
+use support::settle;
 
 supervisor_graph! {
     node HELD = Terminate, deps: [], task: held_worker;
@@ -28,16 +31,6 @@ async fn held_worker(node: &'static TaskNode) {
     RELEASE.wait().await;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 /// Executor passes: the probe is polled once per pass, so a move of N means
 /// every task woken before it has been polled N times over.
 static PASSES: AtomicU32 = AtomicU32::new(0);
@@ -57,13 +50,19 @@ async fn pass_probe() {
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
     sup.start(&spawner).await.expect("start");
-    settle(|| ACTIVATIONS.load(Ordering::SeqCst) == 1).await;
+    settle("first activation", || {
+        ACTIVATIONS.load(Ordering::SeqCst) == 1
+    })
+    .await;
 
     for round in 1..=2 {
         sup.restart(&HELD, &spawner)
             .await
             .expect("the restart waits for the held activation to finish");
-        settle(|| ACTIVATIONS.load(Ordering::SeqCst) == round + 1).await;
+        settle("the restart's activation", || {
+            ACTIVATIONS.load(Ordering::SeqCst) == round + 1
+        })
+        .await;
         assert!(HELD.is_running());
         assert!(
             !HELD.has_exited(),

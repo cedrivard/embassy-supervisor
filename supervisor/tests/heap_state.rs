@@ -1,9 +1,12 @@
+mod support;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{FaultKind, Supervisor, TaskNode, Zeroable, supervisor_graph};
+
+use support::settle;
 
 const STATE_SIZE: usize = 4096;
 
@@ -76,16 +79,6 @@ async fn crunch_worker(_node: &'static TaskNode, state: &mut Scratch) {
     RUNS.fetch_add(1, Ordering::SeqCst);
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 static ZERO_RUNS: AtomicU32 = AtomicU32::new(0);
 
 /// Finds its state all-zero on EVERY activation and dirties it, so a reused
@@ -115,8 +108,11 @@ async fn driver(spawner: Spawner) {
 
     for cycle in 1..=5u32 {
         sup.start_node(&CRUNCH, &spawner).await.expect("activate");
-        settle(|| RUNS.load(Ordering::SeqCst) == cycle).await;
-        settle(|| !CRUNCH.is_running()).await;
+        settle("crunch ran this cycle", || {
+            RUNS.load(Ordering::SeqCst) == cycle
+        })
+        .await;
+        settle("crunch stopped", || !CRUNCH.is_running()).await;
         assert!(CRUNCH.has_exited());
         assert_eq!(
             STATE_BYTES_LIVE.load(Ordering::SeqCst),
@@ -143,14 +139,17 @@ async fn driver(spawner: Spawner) {
     sup.start_node(&CRUNCH, &spawner)
         .await
         .expect("retry works");
-    settle(|| RUNS.load(Ordering::SeqCst) == 6).await;
-    settle(|| !CRUNCH.is_running()).await;
+    settle("crunch ran six times", || RUNS.load(Ordering::SeqCst) == 6).await;
+    settle("crunch stopped after retry", || !CRUNCH.is_running()).await;
     assert_eq!(STATE_BYTES_LIVE.load(Ordering::SeqCst), 0);
 
     for cycle in 1..=3u32 {
         sup.start_node(&ZERO, &spawner).await.expect("activate");
-        settle(|| ZERO_RUNS.load(Ordering::SeqCst) == cycle).await;
-        settle(|| !ZERO.is_running()).await;
+        settle("zero ran this cycle", || {
+            ZERO_RUNS.load(Ordering::SeqCst) == cycle
+        })
+        .await;
+        settle("zero stopped", || !ZERO.is_running()).await;
         assert_eq!(STATE_BYTES_LIVE.load(Ordering::SeqCst), 0, "cycle {cycle}");
     }
     DENY_STATE_ALLOC.store(true, Ordering::SeqCst);
@@ -168,7 +167,7 @@ async fn driver(spawner: Spawner) {
     WATCH_LOST.store(true, Ordering::SeqCst);
     sup.start_node(&LOST, &spawner).await.expect("start");
     assert!(R.take().is_some(), "steal before the shell's first poll");
-    settle(|| LOST.has_exited()).await;
+    settle("lost exited", || LOST.has_exited()).await;
     assert!(!LOST_RAN.load(Ordering::SeqCst), "the worker ran");
     assert!(
         !EXITED_AT_DEALLOC.load(Ordering::SeqCst),
@@ -181,27 +180,19 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn state_boxes_are_reclaimed_and_fallible() {
-    let clock = embassy_time::MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
     // A refused allocation is retried, one executor pass per attempt, until the
     // node's slot_timeout: the clock has to move for the denial to fault.
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (runs={}, live={})",
-            RUNS.load(Ordering::SeqCst),
-            STATE_BYTES_LIVE.load(Ordering::SeqCst),
-        );
-        clock.advance(embassy_time::Duration::from_millis(20));
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Free(embassy_time::Duration::from_millis(20)),
+        10,
+        || {
+            format!(
+                "did not complete (runs={}, live={})",
+                RUNS.load(Ordering::SeqCst),
+                STATE_BYTES_LIVE.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

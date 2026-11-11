@@ -46,7 +46,8 @@ impl GraphRef {
     }
 }
 
-#[cfg(feature = "data-deps")]
+/// The graph of a hand-built node or [`Graph`](crate::Graph): empty, so it
+/// resolves nothing.
 pub(crate) static NO_GRAPH: GraphRef = GraphRef {
     nodes: &[],
     #[cfg(feature = "trace")]
@@ -106,6 +107,9 @@ mod chain {
                 self.chain.next.lock(|next| next.set(head.get()));
                 head.set(Some(self));
             });
+            // Linked first: a miss cached before this point is looked up
+            // again, and finds this graph's nodes.
+            crate::trace::bump_adopt_epoch();
         }
     }
 

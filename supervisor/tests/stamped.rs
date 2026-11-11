@@ -1,5 +1,6 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Observable, Stamped, Supervisor, TaskNode, dataflow, supervisor_graph};
@@ -9,6 +10,13 @@ use embassy_time::{Duration, MockDriver};
 pub static S: Stamped<Counted<AtomicU32>> = Stamped::new(Counted::new(AtomicU32::new(0)));
 static GO: AtomicBool = AtomicBool::new(false);
 static PUT_DONE: AtomicBool = AtomicBool::new(false);
+
+/// One `Stamped` unit in ticks: the largest power of two not above a
+/// millisecond's worth of ticks (one tick below 1 kHz).
+const UNIT: u64 = {
+    let per_ms = embassy_time::TICK_HZ / 1000;
+    if per_ms > 1 { 1 << per_ms.ilog2() } else { 1 }
+};
 
 supervisor_graph! {
     node W = Terminate, deps: [], task: writer, discover;
@@ -43,8 +51,8 @@ fn a_stamped_signal_knows_how_old_its_value_is() {
     S.w().w().store(3, Ordering::SeqCst);
     assert_eq!(S.age(), Some(Duration::from_ticks(0)));
     assert!(S.is_fresh(Duration::from_ticks(0)));
-    clock.advance(Duration::from_millis(100));
-    assert_eq!(S.age(), Some(Duration::from_millis(100)));
+    clock.advance(Duration::from_ticks(200 * UNIT));
+    assert_eq!(S.age(), Some(Duration::from_ticks(200 * UNIT)));
     assert!(
         !S.is_fresh(Duration::from_millis(50)),
         "older than the bound"
@@ -62,32 +70,30 @@ fn a_stamped_signal_knows_how_old_its_value_is() {
 
     // Ages saturate instead of wrapping: a dead signal never reads fresh again.
     let age = S.age().expect("written").as_ticks();
-    clock.advance(Duration::from_ticks(1 << 31));
-    assert_eq!(S.age(), Some(Duration::from_ticks(u64::from(u32::MAX / 2))));
-    clock.advance(Duration::from_ticks((1 << 31) - age));
+    clock.advance(Duration::from_ticks((1 << 31) * UNIT));
+    assert_eq!(
+        S.age(),
+        Some(Duration::from_ticks(u64::from(u32::MAX / 2) * UNIT))
+    );
+    clock.advance(Duration::from_ticks((1 << 31) * UNIT - age));
     assert!(
         !S.is_fresh(Duration::from_secs(1)),
-        "2^32 ticks after the write, still stale"
+        "2^32 units after the write, still stale"
     );
     assert!(
-        !S.is_fresh(Duration::from_ticks(1 << 40)),
+        !S.is_fresh(Duration::from_ticks((1 << 32) * UNIT)),
         "a bound past the cap is clamped"
     );
 
     // Through the node's verb: `put` stamps after its write.
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(runner(spawner).unwrap());
-        });
-    });
     GO.store(true, Ordering::SeqCst);
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !PUT_DONE.load(Ordering::SeqCst) {
-        assert!(StdInstant::now() < deadline, "the writer never ran");
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    support::run(
+        |spawner| spawner.spawn(runner(spawner).unwrap()),
+        &PUT_DONE,
+        support::Clock::Frozen,
+        10,
+        || "the writer never ran".to_owned(),
+    );
     assert_eq!(S.age(), Some(Duration::from_ticks(0)), "stamped by the put");
     assert_eq!(S.r().r().load(Ordering::SeqCst), 7);
     assert_eq!(S.change_token(), 2);

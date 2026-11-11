@@ -66,8 +66,8 @@ async fn supervisor_task(spawner: Spawner) {
 ### With runtime control and pools
 
 `start()` brings the graph up and returns. With the `control` or `pool` feature, `run()`
-replaces it: it brings the graph up, then serves control commands and pool scaling until
-a fault.
+replaces it: it brings the graph up best-effort, then serves control commands and pool
+scaling. It returns only when a node misses its shutdown ack or a restart is refused.
 
 ```sh
 cargo add embassy-supervisor --features control,pool
@@ -88,7 +88,7 @@ Next steps:
 
 - Try a graph in the [in-browser playground](https://embassy-supervisor.github.io/playground/),
   which runs the real crate compiled to WebAssembly.
-- Read the [library reference](supervisor/README.md): model, lifecycle matrix,
+- Read the [reference guide](https://docs.rs/embassy-supervisor/latest/embassy_supervisor/guide/index.html): model, lifecycle matrix,
   `supervisor_graph!` DSL, dataflow supervision and recipes.
 - Flash the [demo firmware](firmware/README.md) on an RP2350.
 
@@ -193,7 +193,7 @@ flowchart LR
 ```
 
 Only the mode is required. What each operation does per mode is in the
-[lifecycle reference](supervisor/README.md#lifecycle-reference).
+[lifecycle reference](https://docs.rs/embassy-supervisor/latest/embassy_supervisor/guide/model/index.html#lifecycle-reference).
 
 ## Features
 

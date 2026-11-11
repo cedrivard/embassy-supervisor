@@ -1,4 +1,4 @@
-error: `cancel` cannot be combined with `Mode::Pause` — a Pause worker must survive the stop and park on `wait_resume()`, but `cancel` drops its future and records an exit; use `Mode::Terminate` (or `OnDemand`), or drive the pause by hand in the worker
+error: `cancel` needs mode `Terminate` (or `OnDemand`): a `Pause` worker must survive the stop and park on `wait_resume()`, but `cancel` drops its future and records an exit. Drive the pause by hand in the worker instead
   --> tests/ui/compile_fail/cancel_on_pause.rs:11:49
    |
 11 |     node PROBE = Pause, deps: [], task: worker, cancel;

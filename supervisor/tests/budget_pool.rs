@@ -1,14 +1,16 @@
 //! A pool over a `divisible` resource: every member holds its own slot, and a
 //! member's stop releases that slot alone.
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
     Claimant, DeferredShrink, FairShare, Supervisor, TaskNode, supervisor_graph,
 };
-use embassy_time::{Instant, MockDriver};
+use embassy_time::Instant;
+use support::settle;
 
 static SLOTS_SEEN: [AtomicU32; 3] = [const { AtomicU32::new(u32::MAX) }; 3];
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -42,16 +44,6 @@ async fn link(node: &'static TaskNode, band: Claimant) {
         .await;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..20_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 fn grants() -> [u32; 4] {
     core::array::from_fn(|i| BAND.grant(i as u8))
 }
@@ -61,7 +53,7 @@ async fn driver(spawner: Spawner) {
     BAND.provide(100);
     let sup = Supervisor::new(&GRAPH);
     sup.start(&spawner).await.expect("bring-up");
-    settle(|| {
+    settle("every member saw its slot", || {
         SLOTS_SEEN
             .iter()
             .all(|s| s.load(Ordering::SeqCst) != u32::MAX)
@@ -77,7 +69,7 @@ async fn driver(spawner: Spawner) {
         "one slot per member, after the node declared first"
     );
 
-    BAND.rebalance(&FairShare, Instant::now());
+    assert!(BAND.rebalance(&FairShare, Instant::now()).is_none());
     assert_eq!(grants(), [40, 20, 20, 20]);
 
     sup.stop_node(&LINKS[1]).await.expect("acks");
@@ -86,7 +78,7 @@ async fn driver(spawner: Spawner) {
         0,
         "the stopped member's slot, and only that one"
     );
-    BAND.rebalance(&FairShare, Instant::now());
+    assert!(BAND.rebalance(&FairShare, Instant::now()).is_none());
     assert_eq!(grants(), [40, 20, 0, 20]);
 
     DONE.store(true, Ordering::SeqCst);
@@ -94,21 +86,11 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn pool_members_hold_their_own_budget_slots() {
-    let _clock = MockDriver::get();
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "timed out: grants={:?}",
-            grants()
-        );
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || format!("timed out: grants={:?}", grants()),
+    );
 }

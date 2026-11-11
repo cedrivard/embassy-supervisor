@@ -1,11 +1,14 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
+use std::time::Duration as StdDuration;
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{FaultKind, Supervisor, TaskNode, supervisor_graph};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, MockDriver};
+use support::settle;
 
 static PHASE: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -28,29 +31,27 @@ supervisor_graph! {
     node SLOW = Terminate, deps: [], task: slow_worker, ack_timeout: 5000;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
     sup.start(&spawner).await.expect("bring-up");
-    settle(|| WEDGE.is_running() && SLOW.is_running()).await;
+    settle("WEDGE and SLOW running", || {
+        WEDGE.is_running() && SLOW.is_running()
+    })
+    .await;
     PHASE.store(1, Ordering::SeqCst);
 
     let t0 = Instant::now();
     let err = sup.stop_node(&WEDGE).await.expect_err("never acks");
     assert_eq!(err.node.name(), "wedge");
     assert!(matches!(err.kind, FaultKind::ShutdownTimeout));
+    let elapsed = Instant::now() - t0;
     assert!(
-        Instant::now() - t0 < Duration::from_millis(2_000),
+        elapsed >= Duration::from_millis(100),
+        "the fault waited out the 100 ms window"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2_000),
         "the 100 ms window applied, not the 2 s default"
     );
     PHASE.store(2, Ordering::SeqCst);
@@ -74,8 +75,13 @@ async fn driver(spawner: Spawner) {
         .expect_err("the wedge is still the reported fault");
     assert_eq!(err.node.name(), "wedge");
     assert!(matches!(err.kind, FaultKind::ShutdownTimeout));
+    let elapsed = Instant::now() - t0;
     assert!(
-        Instant::now() - t0 < Duration::from_millis(2_000),
+        elapsed >= Duration::from_millis(100),
+        "the wave waited out the wedge's 100 ms window"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2_000),
         "the wave budgeted the wedge at 100 ms, not the 2 s default"
     );
 
@@ -84,31 +90,30 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn ack_timeout_bounds_both_stop_paths() {
+    // Steps well under WEDGE's 100 ms window, so a fault always lands
+    // within one 25 ms step of its window, far from the 2 s default the
+    // elapsed-time asserts rule out.
     let clock = MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        // Steps well under WEDGE's 100 ms window, so a fault always lands
-        // within one 25 ms step of its window, far from the 2 s default the
-        // elapsed-time asserts rule out.
-        if PHASE.load(Ordering::SeqCst) >= 1 {
-            clock.advance(embassy_time::Duration::from_millis(25));
+    std::thread::spawn(move || {
+        loop {
+            if PHASE.load(Ordering::SeqCst) >= 1 {
+                clock.advance(embassy_time::Duration::from_millis(25));
+            }
+            std::thread::sleep(StdDuration::from_millis(5));
         }
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (phase={}, wedge_running={}, slow_running={})",
-            PHASE.load(Ordering::SeqCst),
-            WEDGE.is_running(),
-            SLOW.is_running(),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    });
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (phase={}, wedge_running={}, slow_running={})",
+                PHASE.load(Ordering::SeqCst),
+                WEDGE.is_running(),
+                SLOW.is_running(),
+            )
+        },
+    );
 }

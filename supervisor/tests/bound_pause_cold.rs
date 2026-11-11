@@ -2,12 +2,12 @@
 //! the provider's assertion spawns it through the gates (never a "resume"
 //! into no task), and a later bound flap resumes the parked instance in place.
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
-use embassy_time::MockDriver;
 
 supervisor_graph! {
     node LINK = Terminate, task: link;
@@ -90,19 +90,11 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn a_cold_pause_node_behind_a_bound_edge_is_spawned_not_resumed() {
-    let clock = MockDriver::get();
-    let thread = std::thread::spawn(|| {
-        let executor = Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| spawner.spawn(driver(spawner).unwrap()));
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(StdInstant::now() < deadline, "did not complete");
-        clock.advance(embassy_time::Duration::from_millis(100));
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Free(embassy_time::Duration::from_millis(100)),
+        10,
+        || "did not complete".to_owned(),
+    );
 }

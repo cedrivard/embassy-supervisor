@@ -40,16 +40,30 @@ use crate::ResourceGate;
 /// proportional, ramped) is the policy's, and *when* to re-divide is the
 /// allocator's — usually on [`wait_change`](Self::wait_change), which fires on
 /// every want, release and capacity change. Costs `4 + 8N` bytes of atomics,
-/// two `Signal`s and `N` single-waker slots per budget: `28 + 16N` bytes on a
+/// one `Signal` and `N` single-waker slots per budget: `16 + 16N` bytes on a
 /// 32-bit target.
+///
+/// One allocator task per budget: `provide` and `rebalance` are not
+/// serialized against a second caller. Its loop re-divides on every change,
+/// and also at the instant `rebalance` returns while a ramping policy is
+/// still converging:
+///
+/// ```ignore
+/// loop {
+///     let next = BUDGET.rebalance(&POLICY, Instant::now());
+///     match next {
+///         Some(t) => {
+///             select(BUDGET.wait_change(), Timer::at(t)).await;
+///         }
+///         None => BUDGET.wait_change().await,
+///     }
+/// }
+/// ```
 pub struct Budget<const N: usize> {
     /// `0` is "not provided": the gate reads empty.
     capacity: AtomicU32,
     wants: [AtomicU32; N],
     grants: [AtomicU32; N],
-    /// The [`ResourceGate`] latch, for one app-side waiter. The supervisor's
-    /// pre-spawn wait watches the shared gate event instead.
-    filled: Signal<CriticalSectionRawMutex, ()>,
     /// Holders parked in `wait_grant_change`, at most one per slot.
     claimants: [AtomicWaker; N],
     /// The allocator's wake, single waiter: anything that should trigger a
@@ -71,7 +85,6 @@ impl<const N: usize> Budget<N> {
             capacity: AtomicU32::new(0),
             wants: [const { AtomicU32::new(0) }; N],
             grants: [const { AtomicU32::new(0) }; N],
-            filled: Signal::new(),
             claimants: [const { AtomicWaker::new() }; N],
             watch: Signal::new(),
         }
@@ -82,7 +95,6 @@ impl<const N: usize> Budget<N> {
     pub fn provide(&self, capacity: u32) {
         self.capacity.store(capacity, Ordering::Release);
         if capacity > 0 {
-            self.filled.signal(());
             crate::__sv_gate_event();
         }
         self.watch.signal(());
@@ -136,12 +148,24 @@ impl<const N: usize> Budget<N> {
     /// Re-divide the capacity over the current wants with `policy`, publish the
     /// new grants (every cut before any increase, so no reader sees an increase
     /// ahead of the cut that pays for it), and wake every holder whose grant moved.
+    ///
+    /// Returns what the policy's [`divide`](BudgetPolicy::divide) returned.
+    /// `Some(t)`: call `rebalance` again at `t` even if nothing changes, which
+    /// is how a ramping policy advances. `None`: the division is settled until
+    /// the next change.
+    #[must_use = "the instant the policy wants the next rebalance at"]
     pub fn rebalance(&self, policy: &impl BudgetPolicy, now: Instant) -> Option<Instant> {
         let capacity = self.capacity();
         let wants: [u32; N] = core::array::from_fn(|i| self.wants[i].load(Ordering::Acquire));
         let mut grants: [u32; N] = core::array::from_fn(|i| self.grants[i].load(Ordering::Acquire));
         let next = policy.divide(capacity, &wants, &mut grants, now);
         for cuts in [true, false] {
+            // A capacity that dropped since the division was computed cannot
+            // pay for its increases: publish only the cuts, and the stale
+            // check below re-wakes the allocator to divide again.
+            if !cuts && self.capacity() < capacity {
+                break;
+            }
             for (i, &g) in grants.iter().enumerate() {
                 let prev = self.grants[i].load(Ordering::Acquire);
                 if g == prev || (g < prev) != cuts {
@@ -187,10 +211,6 @@ impl<const N: usize> ResourceGate for Budget<N> {
         self.capacity() > 0
     }
 
-    fn filled_signal(&self) -> &Signal<CriticalSectionRawMutex, ()> {
-        &self.filled
-    }
-
     /// Empty the budget: no capacity, no grants. Holders are woken so a loop
     /// parked on its grant sees the zero.
     fn clear(&self) {
@@ -198,7 +218,6 @@ impl<const N: usize> ResourceGate for Budget<N> {
         for g in &self.grants {
             g.store(0, Ordering::Release);
         }
-        self.filled.reset();
         self.wake_claimants();
         self.watch.signal(());
     }
@@ -296,10 +315,15 @@ impl Claimant {
 /// `&self`, like [`ScalingPolicy`](crate::ScalingPolicy): a policy that keeps
 /// state (a ramp deadline) holds it in interior mutability so the impl can
 /// live in a `static`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a budget policy",
+    note = "implement `BudgetPolicy::divide` for it, or pass a policy that does"
+)]
 pub trait BudgetPolicy {
     /// Write the new grants into `grants`, which arrives holding the previous
     /// division. Return when to run again while the division is converging,
     /// `None` once it is settled.
+    #[must_use = "the instant the policy wants the next rebalance at"]
     fn divide(
         &self,
         capacity: u32,

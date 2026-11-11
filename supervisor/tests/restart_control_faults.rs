@@ -2,14 +2,15 @@
 //! the way back up is returned by `restart` but logged and absorbed by the
 //! control path, while a missed shutdown ack is returned by both.
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
     ControlCommand, ControlOp, FaultKind, Supervisor, TaskNode, supervisor_graph,
 };
-use embassy_time::{Duration, MockDriver};
+use embassy_time::Duration;
 
 supervisor_graph! {
     node SOURCE = Terminate, deps: [], task: worker;
@@ -88,22 +89,11 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn restart_absorbs_startup_faults_and_returns_missed_acks() {
-    let clock = MockDriver::get();
-    let thread = std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| spawner.spawn(driver(spawner).unwrap()));
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(StdInstant::now() < deadline, "did not complete");
-        if ADVANCE.load(Ordering::SeqCst) {
-            clock.advance(Duration::from_millis(10));
-        }
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::While(&ADVANCE, Duration::from_millis(10)),
+        10,
+        || "did not complete".to_owned(),
+    );
 }

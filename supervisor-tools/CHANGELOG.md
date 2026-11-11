@@ -3,6 +3,73 @@
 All notable changes to `embassy-supervisor-tools` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.0] - 2026-11-11
+
+Pins `embassy-supervisor-syntax` 0.7.0.
+
+### Added
+
+- A `cli` feature (default) carries the binaries, `inputs`, `out` and `model_json`
+  and their `flate2`/`serde_json` dependencies; without it the library parses,
+  models, renders and lints from source text alone.
+- `--json` carries a top-level `"schema": 1`, a `"fragment"` on each node and pool,
+  and a `"cfg"` array on each graph.
+- `#[cfg]` attributes on a `supervisor_graph!`/`supervisor_fragment!`/`compose_graph!`
+  invocation are read into `Decl::cfg`: a gated graph shows its predicate in the
+  diagram title, and fragment declarations of one name under different `#[cfg]` sets
+  are all spliced, each item gated by its fragment's predicates.
+- An option value may be given as `--opt=value`.
+- LICENSE-MIT and LICENSE-APACHE ship in the package.
+
+### Changed
+
+- **Breaking:** `inputs::gather` takes no tool name and prints nothing;
+  `collect_inputs`, `crate_default_inputs`, `dependency_sources` and `expand_modules`
+  take a warnings sink, and `expand_modules` takes `is_root`. `Sources` and `Scan`
+  carry `warnings`; `Decl` derives `Clone` and carries `cfg`, `crate_dir` and
+  `fragment_crate_dirs`.
+- Inputs are stored as absolute paths; diagnostics and diagrams show them relative to
+  the working directory. `--deps` drops a file already given as a graph source.
+- `--deps` runs `cargo metadata --no-deps` and scans only the workspace packages the
+  current package reaches through `path` dependencies (every member from a virtual
+  manifest's directory).
+- A file that does not parse is reported, not skipped: `supervisor-mermaid --check` and
+  `supervisor-lint` fail on it.
+- A directory named `target` is skipped only when it carries Cargo's `CACHEDIR.TAG`; an
+  unreadable directory is reported.
+- `--html` pages pin mermaid 11.17.2 and `@mermaid-js/layout-elk` 0.2.3, and load ELK
+  only for a diagram that asks for it.
+- `--update` leaves an unchanged file untouched, writes through a temporary file and a
+  rename, keeps the file's CRLF line endings, ignores markers inside fenced code blocks,
+  and refuses a second start marker after the managed block.
+- `--links` substitutes `{file}` with the absolute path, symlinks unresolved.
+- `--watch` re-gathers its inputs every cycle, so a new file or `mod` is picked up.
+- `impl` blocks are not scanned for `#[dataflow]` fns: the attribute is rejected on a
+  method.
+
+### Fixed
+
+- A resource edge label with a `#[cfg]` predicate is escaped for Mermaid.
+- `supervisor-lint`: an array element no longer inherits a sibling element's sides
+  through the whole array, and every `--allow` entry matching a signal counts as used.
+- `use` imports resolve per inline module, from the access's own module outward.
+- A `crate::` binding never binds a fn of another crate when both crate directories are
+  known.
+- A `src/bin/*.rs` root finds its `mod` files beside it, and `mod b;` inside an inline
+  `mod a { .. }` is followed to `a/b.rs`.
+- An option given another option as its value (`--title --no-title`) is an error.
+- `mmdc` is run as `mmdc.cmd` on Windows.
+- A signal's short label keeps its index whole (`LEDS[led::STATUS]`, not `STATUS]`): it
+  is cut at the last `::` before the index.
+- A fragment declaration that sets an `observe` default or a `default executor` is
+  rejected, as the macro rejects it. Through `embassy-supervisor-syntax`, a graph the
+  build rejects for its pool bounds, a pool `resources:`/`state:` without `task:`, a
+  repeated dep or a `ready_on_write` without a matching `observed beat` write is
+  rejected here too.
+- A signal one `#[dataflow]` fn accesses at several call sites is discovered under the
+  sites' combined condition and the strongest verb: an ungated site makes the edge
+  ungated, and a `beat_*` site makes it a beat edge, where the first site alone decided.
+
 ## [0.8.0] - 2026-11-07
 
 Pins `embassy-supervisor-syntax` 0.6.0.
@@ -108,7 +175,8 @@ Pins `embassy-supervisor-syntax = "=0.3.0"`.
 
 Baseline for this changelog.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.8.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.9.0...HEAD
+[0.9.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.8.0...embassy-supervisor-tools-v0.9.0
 [0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.7.0...embassy-supervisor-tools-v0.8.0
 [0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.6.0...embassy-supervisor-tools-v0.7.0
 [0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.5.0...embassy-supervisor-tools-v0.6.0

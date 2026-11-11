@@ -1,5 +1,6 @@
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
+mod support;
+
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Backed, Supervisor, TaskNode, dataflow, supervisor_graph};
@@ -9,6 +10,14 @@ pub static ESTIMATE: Backed<AtomicU32> = Backed::new(AtomicU32::new(0));
 static PRODUCER_SPAWNS: AtomicU32 = AtomicU32::new(0);
 static FIRST_SAW: AtomicU32 = AtomicU32::new(0);
 static SECOND_SAW: AtomicU32 = AtomicU32::new(0);
+/// Set once both openers have read their value.
+static DONE: AtomicBool = AtomicBool::new(false);
+
+fn note_saw() {
+    if FIRST_SAW.load(Ordering::SeqCst) != 0 && SECOND_SAW.load(Ordering::SeqCst) != 0 {
+        DONE.store(true, Ordering::SeqCst);
+    }
+}
 
 supervisor_graph! {
     node ESTIMATOR = Terminate, deps: [], task: estimator, disabled, discover;
@@ -33,6 +42,7 @@ async fn estimator(node: &'static TaskNode) {
 async fn first_consumer(node: &'static TaskNode) {
     let est = node.open(&crate::ESTIMATE).await;
     FIRST_SAW.store(est.load(Ordering::SeqCst), Ordering::SeqCst);
+    note_saw();
     let _ = node
         .run_cancellable_acked(core::future::pending::<()>())
         .await;
@@ -42,6 +52,7 @@ async fn first_consumer(node: &'static TaskNode) {
 async fn second_consumer(node: &'static TaskNode) {
     let est = node.open(&crate::ESTIMATE).await;
     SECOND_SAW.store(est.load(Ordering::SeqCst), Ordering::SeqCst);
+    note_saw();
     let _ = node
         .run_cancellable_acked(core::future::pending::<()>())
         .await;
@@ -57,25 +68,20 @@ async fn runner(spawner: Spawner) {
 
 #[test]
 fn concurrent_openers_both_pass_one_start() {
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(runner(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while FIRST_SAW.load(Ordering::SeqCst) == 0 || SECOND_SAW.load(Ordering::SeqCst) == 0 {
-        assert!(
-            StdInstant::now() < deadline,
-            "an opener is parked (spawns={}, first={}, second={})",
-            PRODUCER_SPAWNS.load(Ordering::SeqCst),
-            FIRST_SAW.load(Ordering::SeqCst),
-            SECOND_SAW.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(runner(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "an opener is parked (spawns={}, first={}, second={})",
+                PRODUCER_SPAWNS.load(Ordering::SeqCst),
+                FIRST_SAW.load(Ordering::SeqCst),
+                SECOND_SAW.load(Ordering::SeqCst),
+            )
+        },
+    );
 
     assert_eq!(PRODUCER_SPAWNS.load(Ordering::SeqCst), 1, "one start");
     assert_eq!(FIRST_SAW.load(Ordering::SeqCst), 42);

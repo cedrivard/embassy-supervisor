@@ -36,8 +36,9 @@ impl<T> Leased<T> {
         self.state.load(Ordering::Acquire) & COUNT
     }
 
-    /// Return `true` if the value has been drained.
-    pub fn is_drained(&self) -> bool {
+    /// True once `drain` has closed the signal to new leases; leases taken
+    /// earlier may still be live.
+    pub fn is_closed(&self) -> bool {
         self.state.load(Ordering::Acquire) & CLOSED != 0
     }
 
@@ -96,6 +97,7 @@ impl<T: crate::Observable> crate::Observable for Leased<T> {
 
 /// A live claim on a [`Leased`] signal: the producer's `drain` does not return
 /// until every `Lease` has been dropped.
+#[must_use = "dropping the guard releases the hold at once"]
 pub struct Lease<T: 'static> {
     target: &'static Leased<T>,
 }

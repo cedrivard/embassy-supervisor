@@ -1,9 +1,11 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{FaultKind, Supervisor, TaskNode, supervisor_graph};
 use embassy_time::MockDriver;
+use support::settle;
 
 static PHASE: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
@@ -24,21 +26,14 @@ supervisor_graph! {
     node WEDGE = Terminate, deps: [DEP], task: wedged_worker;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
     sup.start(&spawner).await.expect("bring-up");
-    settle(|| DEP.is_running() && WEDGE.is_running()).await;
+    settle("DEP and WEDGE running", || {
+        DEP.is_running() && WEDGE.is_running()
+    })
+    .await;
     PHASE.store(1, Ordering::SeqCst);
 
     let err = sup.teardown().await.expect_err("wedge cannot ack");
@@ -66,34 +61,37 @@ async fn driver(spawner: Spawner) {
     DONE.store(true, Ordering::SeqCst);
 }
 
+/// Moves the mock clock 5 ms per executor pass once the stop phases begin, so
+/// device time passes only while the executor runs: a descheduled executor
+/// thread cannot sleep through either 2 s ack window.
+#[embassy_executor::task]
+async fn clock_ticker() {
+    let clock = MockDriver::get();
+    while !DONE.load(Ordering::SeqCst) {
+        if PHASE.load(Ordering::SeqCst) >= 1 {
+            clock.advance(embassy_time::Duration::from_millis(5));
+        }
+        embassy_futures::yield_now().await;
+    }
+}
+
 #[test]
 fn a_wedged_dependent_holds_then_releases_its_dependency() {
-    let clock = MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
+    support::run(
+        |spawner| {
             spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        // Both stop phases park on the 2 s ack window; advance the frozen
-        // clock in small repeated steps so an advance always lands after the
-        // window's timer arms, and small enough that a scheduling stall never
-        // overshoots a window by more than one 250 ms step.
-        if PHASE.load(Ordering::SeqCst) >= 1 {
-            clock.advance(embassy_time::Duration::from_millis(250));
-        }
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (phase={}, dep_running={}, wedge_running={})",
-            PHASE.load(Ordering::SeqCst),
-            DEP.is_running(),
-            WEDGE.is_running(),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+            spawner.spawn(clock_ticker().unwrap());
+        },
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (phase={}, dep_running={}, wedge_running={})",
+                PHASE.load(Ordering::SeqCst),
+                DEP.is_running(),
+                WEDGE.is_running(),
+            )
+        },
+    );
 }

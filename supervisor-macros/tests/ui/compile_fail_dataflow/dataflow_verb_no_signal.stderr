@@ -1,0 +1,5 @@
+error: `is_running` is registered as a dataflow verb but this call passes no signal
+ --> tests/ui/compile_fail_dataflow/dataflow_verb_no_signal.rs:6:20
+  |
+6 |     node.is_running()
+  |                    ^^
