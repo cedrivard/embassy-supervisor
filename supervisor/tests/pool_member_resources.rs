@@ -1,8 +1,12 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
-use embassy_supervisor::{DeferredShrink, Supervisor, TaskNode, supervisor_graph};
+use embassy_supervisor::{
+    DeferredShrink, Pool, PoolAction, Supervisor, TaskNode, supervisor_graph,
+};
+use support::settle;
 
 const FLOOR: usize = 1;
 
@@ -32,16 +36,6 @@ async fn worker(node: &'static TaskNode, conn: &mut Conn) {
     let _ = node
         .run_cancellable_acked(core::future::pending::<()>())
         .await;
-}
-
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
 }
 
 /// Drive the pool until `until()` holds (panicking if a generous yield budget
@@ -81,9 +75,22 @@ async fn driver(spawner: Spawner) {
 
     CONN[0].provide(Conn { id: 10, uses: 0 });
     sup.start(&spawner).await.expect("start with floor element");
-    settle(|| SPAWNS[0].load(Ordering::SeqCst) == 1).await;
+    settle("floor member spawned", || {
+        SPAWNS[0].load(Ordering::SeqCst) == 1
+    })
+    .await;
     assert_eq!(SEEN_ID[0].load(Ordering::SeqCst), 10);
 
+    // The negative check below is only meaningful if the policy is asking
+    // for member 1: the busy floor member leaves no idle capacity.
+    match WORKERS_POOL.evaluate(embassy_time::Instant::now()) {
+        PoolAction::Start(n) => assert!(
+            core::ptr::eq(n, &WORKERS[1]),
+            "the policy grows into member 1, got {}",
+            n.name()
+        ),
+        _ => panic!("the policy must want to grow into member 1"),
+    }
     let mut budget = 0;
     drive_until(&sup, spawner, || {
         budget += 1;
@@ -114,30 +121,22 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn per_member_pool_resources() {
-    let clock = embassy_time::MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        // Keep the mock clock moving: a growth attempt on the still-empty
-        // element 1 waits in the member's resource gate for its `slot_timeout`
-        // (100 ms default) and faults `ResourceMissing`, which the pool driver
-        // discards before waiting for the next scale request; with time
-        // frozen it would stay parked until `drive_until` drops it.
-        clock.advance(embassy_time::Duration::from_millis(50));
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (spawns=[{},{}])",
-            SPAWNS[0].load(Ordering::SeqCst),
-            SPAWNS[1].load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    // Keep the mock clock moving: a growth attempt on the still-empty
+    // element 1 waits in the member's resource gate for its `slot_timeout`
+    // (100 ms default) and faults `ResourceMissing`, which the pool driver
+    // discards before waiting for the next scale request; with time
+    // frozen it would stay parked until `drive_until` drops it.
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Free(embassy_time::Duration::from_millis(50)),
+        10,
+        || {
+            format!(
+                "did not complete (spawns=[{},{}])",
+                SPAWNS[0].load(Ordering::SeqCst),
+                SPAWNS[1].load(Ordering::SeqCst),
+            )
+        },
+    );
 }

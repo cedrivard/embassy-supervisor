@@ -1,12 +1,12 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
     FaultKind, LifecycleKind, Supervisor, TaskNode, lifecycle_events_dropped, supervisor_graph,
     try_wait_lifecycle,
 };
-use embassy_time::MockDriver;
 
 supervisor_graph! {
     node PARK = Pause, deps: [], task: park;
@@ -151,23 +151,12 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn reports_every_driven_transition_and_counts_drops() {
-    let clock = MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
     // Only the missed-ack phase needs mock time.
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(StdInstant::now() < deadline, "did not complete");
-        if ADVANCE.load(Ordering::SeqCst) {
-            clock.advance(embassy_time::Duration::from_millis(50));
-        }
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::While(&ADVANCE, embassy_time::Duration::from_millis(50)),
+        10,
+        || "did not complete".to_owned(),
+    );
 }

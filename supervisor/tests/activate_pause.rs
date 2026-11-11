@@ -1,8 +1,10 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
+use support::settle;
 
 static SPAWNS: AtomicU32 = AtomicU32::new(0);
 static RESUMES: AtomicU32 = AtomicU32::new(0);
@@ -27,16 +29,6 @@ supervisor_graph! {
     node SENSOR = Pause, deps: [], task: sensor_worker;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
@@ -51,7 +43,7 @@ async fn driver(spawner: Spawner) {
     sup.activate(&SENSOR, &spawner)
         .await
         .expect("activate stopped sensor");
-    settle(|| SPAWNS.load(Ordering::SeqCst) == 1).await;
+    settle("first spawn", || SPAWNS.load(Ordering::SeqCst) == 1).await;
     assert!(SENSOR.is_running(), "a real instance, not a ghost");
 
     // A stop parks the instance (ack without exit)...
@@ -62,7 +54,7 @@ async fn driver(spawner: Spawner) {
     sup.activate(&SENSOR, &spawner)
         .await
         .expect("resume parked sensor");
-    settle(|| RESUMES.load(Ordering::SeqCst) == 1).await;
+    settle("first resume", || RESUMES.load(Ordering::SeqCst) == 1).await;
     assert_eq!(
         RESUMES.load(Ordering::SeqCst),
         1,
@@ -81,23 +73,18 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn activate_spawns_when_down_and_resumes_when_parked() {
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (spawns={}, resumes={}, running={})",
-            SPAWNS.load(Ordering::SeqCst),
-            RESUMES.load(Ordering::SeqCst),
-            SENSOR.is_running(),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (spawns={}, resumes={}, running={})",
+                SPAWNS.load(Ordering::SeqCst),
+                RESUMES.load(Ordering::SeqCst),
+                SENSOR.is_running(),
+            )
+        },
+    );
 }

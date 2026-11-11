@@ -1,0 +1,5 @@
+error: pool `state:` requires `task:` — the generated shell owns the boxed state across the worker call; a `spawn:` task fn can Box its own
+ --> tests/ui/compile_fail_heap_state/pool_state_with_spawn.rs:6:16
+  |
+6 |         state: Buf = Buf::new(),
+  |                ^^^

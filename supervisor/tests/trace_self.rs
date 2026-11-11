@@ -1,24 +1,16 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, supervisor_graph};
+use support::settle;
 
 supervisor_graph! {
     node WORKER = Pause, deps: [];
 }
 
 static DONE: AtomicBool = AtomicBool::new(false);
-
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..100_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
 
 #[embassy_executor::task]
 async fn worker_body() {
@@ -37,12 +29,12 @@ async fn driver(spawner: Spawner) {
     assert!(node.is_running() && node.is_detached());
 
     let seen = node.poll_count();
-    settle(|| node.poll_count() > seen).await;
+    settle("host task polled again", || node.poll_count() > seen).await;
     assert!(node.poll_count() > seen, "host-task polls attributed");
 
     assert_eq!(WORKER.task_id(), 0, "parked: nothing auto-mapped");
     spawner.spawn(worker_body().unwrap());
-    settle(|| WORKER.poll_count() > 0).await;
+    settle("WORKER polled", || WORKER.poll_count() > 0).await;
     assert_ne!(WORKER.task_id(), 0, "the body registered itself");
     assert!(WORKER.poll_count() > 0, "and its polls are attributed");
 
@@ -51,22 +43,17 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn start_adopts_its_host_task_into_the_self_node() {
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (self_id={}, worker_id={})",
-            GRAPH.graph_ref.self_node().map_or(0, |n| n.task_id()),
-            WORKER.task_id(),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (self_id={}, worker_id={})",
+                GRAPH.graph_ref.self_node().map_or(0, |n| n.task_id()),
+                WORKER.task_id(),
+            )
+        },
+    );
 }

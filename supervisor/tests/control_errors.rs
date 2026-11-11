@@ -1,5 +1,6 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
@@ -72,22 +73,17 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn control_mailbox_is_lossless() {
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (phase={}, awaited_sent={})",
-            PHASE.load(Ordering::SeqCst),
-            AWAITED_SENT.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (phase={}, awaited_sent={})",
+                PHASE.load(Ordering::SeqCst),
+                AWAITED_SENT.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

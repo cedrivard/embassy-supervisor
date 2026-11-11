@@ -3,14 +3,16 @@
 //! `activate`; `run` hands a storm to the app; with the lifecycle queue the
 //! refusal is a `Faulted(RestartStorm)` event.
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
     ControlOp, FaultKind, Supervisor, TaskNode, request_control, supervisor_graph,
 };
 use embassy_time::{Duration, MockDriver};
+use support::settle;
 
 supervisor_graph! {
     node TARGET = Terminate, deps: [], task: target, restart_budget: 1 in 1000;
@@ -41,31 +43,21 @@ fn runs() -> (u32, u32) {
     )
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let clock = MockDriver::get();
     let sup = Supervisor::new(&GRAPH);
     sup.start(&spawner).await.expect("start");
-    settle(|| runs() == (1, 1)).await;
+    settle("first runs", || runs() == (1, 1)).await;
 
     sup.restart(&TARGET, &spawner)
         .await
         .expect("TARGET's one restart of the window");
-    settle(|| runs() == (2, 2)).await;
+    settle("TARGET restarted with its dependent", || runs() == (2, 2)).await;
     sup.restart(&DEPENDENT, &spawner)
         .await
         .expect("being cycled as TARGET's dependent did not spend DEPENDENT's budget");
-    settle(|| runs() == (2, 3)).await;
+    settle("DEPENDENT restarted", || runs() == (2, 3)).await;
 
     // A fresh window spent only on activations: none of them may count.
     clock.advance(Duration::from_millis(1001));
@@ -73,11 +65,11 @@ async fn driver(spawner: Spawner) {
         sup.deactivate(&TARGET).await.expect("deactivate");
         sup.activate(&TARGET, &spawner).await.expect("activate");
     }
-    settle(|| runs() == (4, 5)).await;
+    settle("activations ran", || runs() == (4, 5)).await;
     sup.restart(&TARGET, &spawner)
         .await
         .expect("activations never count, so the window's one restart is still free");
-    settle(|| runs() == (5, 6)).await;
+    settle("free restart ran", || runs() == (5, 6)).await;
 
     // 2^32 ticks later the window has long closed, whatever a u32 tick counter
     // would make of it.
@@ -85,7 +77,7 @@ async fn driver(spawner: Spawner) {
     sup.restart(&TARGET, &spawner)
         .await
         .expect("a restart 2^32 ticks after the window opened opens a fresh one");
-    settle(|| runs() == (6, 7)).await;
+    settle("fresh-window restart ran", || runs() == (6, 7)).await;
 
     // The window is spent: a Restart through the mailbox is a storm, and `run`
     // returns it instead of absorbing it.
@@ -120,19 +112,11 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn only_the_verbs_target_counts_and_run_returns_the_storm() {
-    let _clock = MockDriver::get();
-    let thread = std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| spawner.spawn(driver(spawner).unwrap()));
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(StdInstant::now() < deadline, "did not complete");
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || "did not complete".to_owned(),
+    );
 }

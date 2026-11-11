@@ -1,11 +1,14 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
+use std::time::Duration as StdDuration;
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
     ControlOp, DeferredShrink, FaultKind, Pool, Supervisor, TaskNode, request_control,
     supervisor_graph,
 };
+use support::settle;
 
 supervisor_graph! {
     node MAIN = Terminate, deps: [], task: main_worker;
@@ -40,16 +43,6 @@ async fn pool_worker(node: &'static TaskNode) {
 async fn wedge_worker(_node: &'static TaskNode) {
     WEDGE_SPAWNS.fetch_add(1, Ordering::SeqCst);
     core::future::pending::<()>().await;
-}
-
-async fn settle(what: &str, mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    panic!("never held: {what}");
 }
 
 /// The whole app: one `run()` call. Its return value is the test's payload.
@@ -114,29 +107,30 @@ async fn scenario() {
 
 #[test]
 fn run_drives_pools_and_control_until_error() {
+    // Phase 5 parks on WEDGE's 2 s ack window; advance in small repeated steps.
     let clock = embassy_time::MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
+    std::thread::spawn(move || {
+        loop {
+            if PHASE.load(Ordering::SeqCst) >= 5 {
+                clock.advance(embassy_time::Duration::from_millis(500));
+            }
+            std::thread::sleep(StdDuration::from_millis(5));
+        }
+    });
+    support::run(
+        |spawner| {
             spawner.spawn(runner(spawner).unwrap());
             spawner.spawn(scenario().unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        // Phase 5 parks on WEDGE's 2 s ack window; advance in small repeated steps.
-        if PHASE.load(Ordering::SeqCst) >= 5 {
-            clock.advance(embassy_time::Duration::from_millis(500));
-        }
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (phase={}, pool_spawns={})",
-            PHASE.load(Ordering::SeqCst),
-            POOL_SPAWNS.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+        },
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (phase={}, pool_spawns={})",
+                PHASE.load(Ordering::SeqCst),
+                POOL_SPAWNS.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

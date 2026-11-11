@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.13.0"
+version = "0.14.0"
 description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
@@ -20,27 +20,29 @@ categories = ["embedded", "asynchronous", "no-std"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(embassy_supervisor_trace_v2)'] }
 
 [dependencies]
-# Pure-embassy dependencies only — no HAL, no allocator, no board crates, so the
-# supervisor compiles for any embassy target.
+# No HAL, no allocator, no board crates: embassy crates plus `portable-atomic`
+# and `pin-project-lite`, so the supervisor compiles for any embassy target.
 # Version set aligned with embassy-rp 0.10 (the firmware's HAL): executor 0.10,
 # sync 0.8, time 0.5. The supervisor and a firmware MUST share these so the
 # `Spawner`/`SpawnError` types match.
-embassy-executor = { version = "0.10" }     # Spawner / SpawnError types only
+embassy-executor = { version = "0.10" }     # Spawner, SendSpawner, SpawnToken, SpawnError and the task-id hooks
 embassy-sync = { version = "0.8" }
 embassy-time = { version = "0.5" }
 embassy-futures = { version = "0.1" }
-portable-atomic = { version = "1.15.0", features = ["critical-section"] }
+# `require-cas`: on a target without native compare-and-swap, portable-atomic
+# stops the build naming its `critical-section` and `unsafe-assume-single-core`
+# features; the application picks one.
+portable-atomic = { version = "1.15.0", features = ["require-cas"] }
 # The observation facade (see the `coupling-observe` feature). Version range,
 # not `=`: it is a stable contract signal libraries also depend on.
-embassy-supervisor-observe = { version = "0.1.2", path = "../supervisor-observe", optional = true }
+embassy-supervisor-observe = { version = "0.1.3", path = "../supervisor-observe", optional = true }
 pin-project-lite = "0.2.17"
 defmt = { version = "1.1.0", optional = true }
-# `default-features = false` keeps it no_std; only its macros are used.
 log = { version = "0.4.33", optional = true, default-features = false }
 # `state: zeroed Type` (heap-state): `Zeroable` is the all-zero-is-valid contract.
 bytemuck = { version = "1.25.0", optional = true, default-features = false }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.12.0", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.13.0", path = "../supervisor-macros", optional = true }
 
 [features]
 # Just the graph macro: everything the supervisor can DO is opt-in, matching the
@@ -163,9 +165,10 @@ restart = ["control"]
 # keeps running as it was. `apply_control`'s Restart arm PROPAGATES that fault
 # (it otherwise absorbs startup faults), so the driver loop hands it to the
 # app: a guardrail the app must see. Costs an AtomicU16 plus a window start as
-# two `AtomicU32` halves per node of RAM (thumbv8m: `TaskHandle` 40 -> 48
-# bytes in the minimal build, the AtomicU16 filling padding), and 24 bytes of
-# flash per node (`NodeCfg` 56 -> 80 bytes).
+# two `AtomicU32` halves per node of RAM (thumbv8m: `TaskHandle` 28 -> 36
+# bytes in the minimal build, the AtomicU16 filling padding), and 4 bytes of
+# flash per node (`NodeCfg` 44 -> 48 bytes, its `u16` likewise filling padding;
+# 8 bytes where no padding is left).
 restart-intensity = ["restart", "embassy-supervisor-macros?/restart-intensity"]
 
 # Settings-gated bring-up: the `enabled_if: <fn() -> bool>` node clause.
@@ -354,11 +357,10 @@ graph-ref = ["embassy-supervisor-macros?/graph-ref"]
 # references it until a signal is wrapped and it links away.
 #
 # The field is a thin `&'static GraphRef` (4 bytes) in each node's flash
-# `NodeCfg`; the RAM `TaskHandle` does not change. `NodeCfg` is 8-aligned (it
-# holds `Duration`s), so padding decides the cost: measured on thumbv8m it
-# stays 72 bytes in the minimal `data-deps` build, and is 136 bytes at the demo
-# firmware's default feature set (`firmware::__SV_CFG_0_NET`; 128 without the
-# field). The indirection is there to share the handle with `trace`, not to
+# `NodeCfg`; the RAM `TaskHandle` does not change. Measured on thumbv8m, the
+# config is 64 bytes in the minimal `data-deps` build, and 96 bytes at the
+# demo firmware's default feature set (`firmware::__SV_CFG_0_NET`; 92 without
+# the field). The indirection is there to share the handle with `trace`, not to
 # save space.
 #
 # Resolution itself is const: no registry, no runtime registration, no bound on
@@ -374,8 +376,8 @@ data-deps = ["graph-ref", "dataflow", "embassy-supervisor-macros?/data-deps"]
 # Lifecycle tie: a stopped holder releases its share on shutdown ack, or on
 # `ShutdownTimeout` if the ack never comes. A paused holder keeps its claim.
 #
-# Cost: 4 + 8 × K atomics, two Signals and K single-waker slots per budget
-# (28 + 16 × K bytes of RAM on a 32-bit target), plus a small flash slice per
+# Cost: 1 + 2 × K atomics, one Signal and K single-waker slots per budget
+# (16 + 16 × K bytes of RAM on a 32-bit target), plus a small flash slice per
 # claimant and one 8-byte slice pointer in EVERY node's flash config once the
 # feature is on, claimant or not. Skip this for exclusive singletons; use a
 # normal `resources:` slot instead.
@@ -419,7 +421,7 @@ epochs = []
 # `trace` (pure atomics + embassy-time; detects a different failure class than
 # the trace stall watermark: not-making-progress vs hogging-the-executor).
 # Off by default: costs 4 bytes of RAM per node (measured, thumbv8m: a
-# `TaskHandle` goes from 40 to 44 bytes, with or without `dataflow`), and a beat
+# `TaskHandle` goes from 28 to 32 bytes, with or without `dataflow`), and a beat
 # is two instructions: `beat` is
 # `#[inline]`, so `beat_put` / `beat_writer` leave no call behind even without
 # LTO. Those two verbs are gated on this feature rather than degrading to plain
@@ -443,9 +445,10 @@ liveness = ["embassy-supervisor-macros?/liveness"]
 # Only nodes carrying `beat_timeout:` are policed; a node whose body doesn't
 # `beat()` would otherwise read permanently stale. Detached and not-running
 # nodes are skipped. With no node opting in the monitor parks forever and an
-# idle system never wakes. Costs one AtomicU8 and one flags bit per node, one
-# 4-slot event channel, and with `coupling-observe` and `readiness` one 24-byte
-# waker set for the readiness probe.
+# idle system never wakes. Costs one AtomicU8 and one flags bit per node,
+# `NodeCfg` +4 bytes of flash per node, one 4-slot event channel, and with
+# `coupling-observe` and `readiness` one 20-byte waker set for the readiness
+# probe.
 liveness-monitor = ["liveness", "embassy-supervisor-macros?/liveness-monitor"]
 # Trace-hook observability: the `trace` module (task-id -> node resolution,
 # per-node exec-tick/poll/max-poll accounting, per-executor idle accounting,
@@ -513,6 +516,7 @@ trace-self = ["trace", "embassy-supervisor-macros?/trace-self"]
 [package.metadata.docs.rs]
 # Document every feature on docs.rs.
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 # Test-only host shims, scoped to non-embedded targets so they never pull `std`
 # into the pinned `thumbv8m` (embedded) build. Dev-dependencies don't propagate to
@@ -522,7 +526,6 @@ all-features = true
 #     state cell (and `Signal`/`Channel`); and
 #   * an embassy-time driver, because the crate links `embassy_time::Timer`, which
 #     requires a registered global driver at link time even if a test never fires one.
-# (If `mock-driver` is ever unavailable, `features = ["std"]` is an equivalent fallback.)
 [target.'cfg(not(target_os = "none"))'.dev-dependencies]
 critical-section = { version = "1", features = ["std"] }
 embassy-time = { version = "0.5", features = ["mock-driver"] }
@@ -546,6 +549,24 @@ required-features = ["trace-self", "trace-hooks", "macros"]
 # storage Busy for one pass; both respawn paths must retry through it.
 [[test]]
 name = "spawn_reclaim"
+required-features = ["macros"]
+
+# A spawn that stays `Busy` gets one executor pass, then a 1 ms backoff per
+# retry: with the clock frozen it is attempted twice, never spun on.
+[[test]]
+name = "busy_backoff"
+required-features = ["macros"]
+
+# A node on an executor slot that is never filled faults `ExecutorSlotEmpty`
+# once its gate budget ends, and not before.
+[[test]]
+name = "executor_slot_empty"
+required-features = ["macros"]
+
+# A stop signal stamped mid-millisecond keeps its full ack window: the wave
+# budget rounds up, never down.
+[[test]]
+name = "wave_budget_boundary"
 required-features = ["macros"]
 
 # Host tests for the `trace-nested` charge-splitting (preemption accounting).
@@ -698,7 +719,9 @@ required-features = ["macros", "liveness"]
 
 # `restart`: rest_for_one cycles the target and its transitive dependents,
 # re-gating them on the way back up, while leaving upstream dependencies and
-# deliberately-disabled nodes alone.
+# deliberately-disabled nodes alone. What was running comes back (a disabled
+# node started by hand, a running OnDemand node), and a parked Pause dependent
+# is resumed only once its `ready` dep asserts.
 [[test]]
 name = "restart"
 required-features = ["macros", "restart", "readiness"]
@@ -1005,9 +1028,10 @@ name = "topo_sort"
 name = "pool_policy"
 required-features = ["macros", "pool"]
 
-# Event pokes that wake a parked pool driver: readiness transitions, the
-# restart cycle of a pool's provider, and a bound-dep flap that apply_bind
-# hands back to the policy.
+# Event pokes that wake a parked pool driver: readiness transitions (also
+# across a restart of a pool's provider, whose up-wave the woken driver races
+# for the member), and a bound-dep flap that apply_bind hands back to the
+# policy.
 [[test]]
 name = "pool_regrow"
 required-features = ["macros", "pool", "readiness", "restart", "bound-deps"]
@@ -1112,9 +1136,8 @@ required-features = ["macros"]
 name = "wave_broadcast"
 required-features = ["macros"]
 
-# The supervisor's gate waits watch the shared gate event, not a slot's
-# single-waker `Signal`: a thief that takes the fill's wake on that `Signal`
-# does not delay the node's start.
+# The supervisor's gate wait re-checks the slot on the shared gate event: a
+# fill that lands during the wait starts the node.
 [[test]]
 name = "gate_wait_recheck"
 required-features = ["macros"]

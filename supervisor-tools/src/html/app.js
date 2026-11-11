@@ -1,9 +1,13 @@
-import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
-import elkLayouts from "https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0/dist/mermaid-layout-elk.esm.min.mjs";
-
-mermaid.registerLayoutLoaders(elkLayouts);
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@__MERMAID_VERSION__/dist/mermaid.esm.min.mjs";
 
 const sources = __SOURCES__;
+// The ELK layout engine is a large module: fetch it only for a diagram that asks for it.
+if (sources.some((source) => source.includes("layout: elk"))) {
+  const { default: elkLayouts } = await import(
+    "https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@__ELK_VERSION__/dist/mermaid-layout-elk.esm.min.mjs"
+  );
+  mermaid.registerLayoutLoaders(elkLayouts);
+}
 const storageKey = "supervisor-mermaid:appearance";
 const modes = new Set(["system", "light", "dark"]);
 const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");

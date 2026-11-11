@@ -281,6 +281,8 @@ pub struct NodeModel {
     pub discover: Option<CfgTexts>,
     /// The `dataflow:` list.
     pub dataflow: Vec<AdoptionModel>,
+    /// The fragment the node was spliced from, if any.
+    pub fragment: Option<String>,
 }
 
 /// A `pool NAME = [Mode, ...], ...;` declaration, fully mapped.
@@ -326,6 +328,8 @@ pub struct PoolModel {
     pub discover: Option<CfgTexts>,
     /// The `dataflow:` list.
     pub dataflow: Vec<AdoptionModel>,
+    /// The fragment the pool was spliced from, if any.
+    pub fragment: Option<String>,
 }
 
 /// An `executor NAME;` declaration.
@@ -362,6 +366,8 @@ pub struct GraphModel {
     pub origin: String,
     /// The declaration's line in its origin.
     pub line: usize,
+    /// `#[cfg(...)]` gates on the macro invocation itself.
+    pub cfg: CfgTexts,
     /// The `observe writes:` default accessor, if any.
     pub observe_writes: Option<ExprValue>,
     /// The `observe reads:` default accessor, if any.
@@ -496,6 +502,7 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                         cancel: n.cancel,
                         discover: n.discover.as_ref().map(|g| cfg_texts(&g.cfg)),
                         dataflow: adoption_models(&n.dataflow),
+                        fragment: n.fragment.clone(),
                     }),
                     Item::Pool(p) => ItemModel::Pool(PoolModel {
                         name: p.ident.to_string(),
@@ -524,6 +531,7 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                         cancel: p.cancel,
                         discover: p.discover.as_ref().map(|g| cfg_texts(&g.cfg)),
                         dataflow: adoption_models(&p.dataflow),
+                        fragment: p.fragment.clone(),
                     }),
                     Item::Executor(x) => ItemModel::Executor(ExecutorModel {
                         name: x.ident.to_string(),
@@ -537,6 +545,7 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                 name: d.name(),
                 origin: d.origin.clone(),
                 line: d.line,
+                cfg: d.cfg.iter().map(|c| c.replace(' ', "")).collect(),
                 observe_writes: d
                     .spec
                     .observe_writes

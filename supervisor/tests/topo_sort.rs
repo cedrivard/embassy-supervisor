@@ -35,3 +35,22 @@ fn unsorted_input_is_sorted() {
     assert!(pos(&ORDER, 1) < pos(&ORDER, 2), "1 before 2");
     assert!(pos(&ORDER, 2) < pos(&ORDER, 0), "2 before 0");
 }
+
+#[test]
+fn repeated_dep_sorts() {
+    const DEPS: [&[u8]; 2] = [&[], &[0, 0]];
+    const ORDER: [u8; 2] = topo_sort_const(&DEPS);
+    assert_eq!(ORDER, [0, 1]);
+}
+
+#[test]
+#[should_panic(expected = "dependency cycle")]
+fn two_node_cycle_panics() {
+    let _ = topo_sort_const(&[&[1], &[0]]);
+}
+
+#[test]
+#[should_panic(expected = "dependency cycle")]
+fn self_loop_panics() {
+    let _ = topo_sort_const(&[&[0]]);
+}

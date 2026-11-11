@@ -18,7 +18,8 @@ fn main() {
     assert_eq!(GRAPH.pools.len(), 1);
     assert_eq!(GRAPH.deps_of(0).len(), 0);
     assert_eq!(GRAPH.deps_of(1), [0u8].as_slice());
-    // The emitted structural constants: usable in const context (a `const` can't
+    // The emitted structural constants are `const`s, so a `const` initializer
+    // can use them.
     const BUDGET: usize = P_MAX + 1;
     assert_eq!(P_MIN, 1);
     assert_eq!(P_MAX, 1);

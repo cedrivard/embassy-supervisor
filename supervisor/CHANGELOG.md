@@ -4,6 +4,96 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-11-11
+
+`run()` keeps driving through bring-up faults, `restart` brings back what was running,
+smaller node statics, `unsafe` accessors for `local` slots, and the reference guide in
+rustdoc. Companion crate versions: macros 0.13.0, syntax 0.7.0, tools 0.9.0, observe
+0.1.3.
+
+### Added
+
+- `NodeFault`, `ControlQueueFull`, `InjectError`, `Aborted` and `Resumed` implement
+  `Display` and `core::error::Error`; a `NodeFault` for a refused spawn gives its
+  `SpawnError` as `source()`.
+- `ControlOp::as_str` ("activate", "deactivate", "restart"), with `Display` and
+  `defmt::Format` built on it.
+- `Debug` for `PoolStats`, `ScaleAction` and `PoolAction`; `defmt::Format` for
+  `trace::ExecutorStats`.
+- `Graph::new(nodes, topo)` with the `const` builders `with_pools` (`pool`) and
+  `with_graph_ref` (`graph-ref`), for a graph built by hand.
+- docs.rs builds with `--cfg docsrs`, which shows each item's feature gate.
+- A generated `local` slot has a safe `is_filled()` and an `unsafe fn clear()`; graphs
+  name it in `resources:` tables through a generated gate view.
+- The reference guide is rustdoc: `embassy_supervisor::guide` has one module per chapter
+  (`supervisor/docs/*.md`), and the README is the crate's front page with the grammar,
+  a quickstart and the Cargo features.
+- `embassy-supervisor-observe` 0.1.3: `portable-atomic` with `require-cas`,
+  `on_unimplemented` notes on `Observable`, `Sink` and `Source`, a doctested README and
+  LICENSE files in the package; the `coupling-observe` dependency requires it.
+
+### Changed
+
+- **Breaking:** `Graph` is `#[non_exhaustive]`: its fields stay public to read, and a
+  graph is built with `Graph::new` and the builders instead of a struct literal.
+- **Breaking:** `CrumbPhase` is `#[non_exhaustive]`.
+- **Breaking:** the macro glue `TaskNode::mark_lost_resource` is renamed
+  `__sv_lost_resource` (`#[doc(hidden)]`; only generated code calls it).
+- `FaultKind`'s `Debug` prints variant names only (`Spawn(Busy)`,
+  `ReadyDepTimeout { dep: "name" }`), without embassy's `pool_size` hint.
+- `Lease` and `Open` are `#[must_use]`: dropping one releases its hold at once.
+  `Gated` and `BudgetPolicy` name what is missing when a type does not implement them.
+- **Breaking:** `Supervisor::run()` never returns on a bring-up or activation fault: the
+  boot wave is best-effort, a faulted node is logged, reported and left down and enabled,
+  and `run()` returns only on `ShutdownTimeout` or `RestartStorm`.
+- **Breaking:** `local` slot accessors `provide`, `take`, `restore` and `get` are
+  `unsafe`: call them only on the executor the slot's declarations run on.
+- **Breaking:** `ResourceGate::filled_signal` is removed; gate waits use the shared gate
+  event. A `Budget` and each `local` slot are 12 B smaller.
+- **Breaking:** `NodeCfg` stores timeouts as `u32` milliseconds or ticks and aligns to 4
+  (12 to 28 B less flash per node); its fields `name`, `mode` and `spawn` are private.
+- **Breaking:** `Leased::is_drained` is renamed `is_closed`.
+- **Breaking:** `portable-atomic` is pulled with `require-cas` (here and in
+  `embassy-supervisor-observe`): a target without CAS enables `critical-section` or
+  `unsafe-assume-single-core` in the application.
+- `TaskHandle` loses its `dropped_wake` signal (12 B less `.bss` per node); ack waits
+  watch the shared stop event.
+- `Budget::rebalance`, `BudgetPolicy::divide` and `ResourceSlot::take` are `#[must_use]`.
+- `set_ready` and `clear_ready` are idempotent: a call that does not change the flag
+  wakes nobody.
+- `run()` logs and drops a control command for a node outside its graph.
+- A `Busy` spawn gets one executor pass, then retries on a 1 ms backoff instead of
+  spinning.
+- `Stamped` stamps in units of about a millisecond, so an age saturates after 12 days or
+  more at any tick rate.
+- `trace` caches a miss per executor for tasks no graph owns (8 B of `.bss` per executor
+  slot), skipping the node scan on each poll.
+- `run_pausable` warns when it parks a node whose mode is not `Pause`.
+
+### Fixed
+
+- `Budget::rebalance` publishes no increase when the capacity dropped while the policy
+  divided it: it publishes the cuts and wakes the allocator to divide again.
+- `Supervisor::restart` brings back every member that was running, including a
+  `disabled` node started by hand and a running `OnDemand` node.
+- A parked `Pause` instance waits for its `ready` deps before it is resumed in place.
+- `resume_node` and `resume_pausable` skip a node stopped by a `bound` provider until
+  that provider serves again; every handoff clears the handoff bits.
+- A resident shell consumes one start signal per park, so a stale start cannot skip the
+  next pause; `wait_shutdown` re-checks the flag on every poll.
+- A member that exits on its own wakes the pool driver; a pool grows to `min` without
+  load.
+- A `#[cfg]`-ed-out dep counts as running in `deps_running`, as the waves treat it.
+- Wave budgets round their start stamp up to the next millisecond and never end early.
+- The topological sort accepts a repeated dep instead of reporting a cycle.
+- `trace-nested` accounting is exact under preemption, idle time is monotonic, and a
+  respawn that adopts a task id before the old instance's end hook keeps it.
+- A heartbeat check stamps before clearing the pending flag, so a checker never misses both.
+- `Backed` fences between store and load, so an opener and a retiring producer always
+  see each other.
+- `Counted::put` counts after the write, and `writes()` loads with `Acquire`.
+- Docs state that a pooled `spawn:` task fn must make its ack its last use of the node.
+
 ## [0.13.0] - 2026-11-07
 
 Node statics split between flash and `.bss`, a one-pass pool entry point, and fixes to
@@ -1303,7 +1393,8 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.13.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.14.0...HEAD
+[0.14.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.13.0...embassy-supervisor-v0.14.0
 [0.13.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.12.0...embassy-supervisor-v0.13.0
 [0.12.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.11.0...embassy-supervisor-v0.12.0
 [0.11.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.10.0...embassy-supervisor-v0.11.0

@@ -1,11 +1,13 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
     ControlCommand, ControlOp, FaultKind, Supervisor, TaskNode, request_control, supervisor_graph,
 };
-use embassy_time::{Duration, MockDriver};
+use embassy_time::Duration;
+use support::settle;
 
 static CONTROL_RUNS: AtomicU32 = AtomicU32::new(0);
 static FIRST_RUNS: AtomicU32 = AtomicU32::new(0);
@@ -71,14 +73,17 @@ supervisor_graph! {
         resources: [QUEUED_SLOT: u32], slot_timeout: 100;
 }
 
-async fn settle(mut condition: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
+/// Wait on mock time (the test thread advances it while `GATE_WAIT` is set),
+/// so a condition that needs a gate budget to expire is reached in clock
+/// steps, not in executor yields.
+async fn tick_until(mut condition: impl FnMut() -> bool) {
+    for _ in 0..200 {
         if condition() {
             return;
         }
-        embassy_futures::yield_now().await;
+        embassy_time::Timer::after(Duration::from_millis(10)).await;
     }
-    assert!(condition(), "worker entries did not settle");
+    panic!("condition not reached in 2 s of mock time");
 }
 
 #[embassy_executor::task]
@@ -116,7 +121,10 @@ async fn driver(spawner: Spawner) {
     )
     .await
     .expect("activate CONTROL after providing resource");
-    settle(|| CONTROL_RUNS.load(Ordering::SeqCst) == 1).await;
+    settle("CONTROL ran once", || {
+        CONTROL_RUNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
     assert!(CONTROL.is_running());
 
     GATE_WAIT.store(true, Ordering::SeqCst);
@@ -130,7 +138,10 @@ async fn driver(spawner: Spawner) {
         "first fault wins: {fault}"
     );
     assert!(matches!(fault.kind, FaultKind::ResourceMissing));
-    settle(|| PEER_RUNS.load(Ordering::SeqCst) == 1 && LEAF_RUNS.load(Ordering::SeqCst) == 1).await;
+    settle("PEER and LEAF ran once", || {
+        PEER_RUNS.load(Ordering::SeqCst) == 1 && LEAF_RUNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
     assert!(!FIRST.is_running() && !SECOND.is_running());
     assert_eq!(FIRST_RUNS.load(Ordering::SeqCst), 0);
     assert_eq!(SECOND_RUNS.load(Ordering::SeqCst), 0);
@@ -141,8 +152,10 @@ async fn driver(spawner: Spawner) {
     sup.activate(&LEAF, &spawner)
         .await
         .expect("repair LEAF dependencies");
-    settle(|| FIRST_RUNS.load(Ordering::SeqCst) == 1 && SECOND_RUNS.load(Ordering::SeqCst) == 1)
-        .await;
+    settle("FIRST and SECOND ran once", || {
+        FIRST_RUNS.load(Ordering::SeqCst) == 1 && SECOND_RUNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
     for node in [&FIRST, &SECOND, &PEER, &LEAF] {
         assert!(node.is_running());
     }
@@ -163,13 +176,25 @@ async fn driver(spawner: Spawner) {
         );
     }
 
+    // The driver absorbs a failed Activate and keeps serving the mailbox: the
+    // queued Deactivate behind it is applied by the same `run()` call.
     request_control(&QUEUED, ControlOp::Activate).await;
+    request_control(&QUEUED, ControlOp::Deactivate).await;
     GATE_WAIT.store(true, Ordering::SeqCst);
-    let fault = sup.run(&spawner).await;
+    let script = async {
+        // Activate clears the latch, then faults once the 100 ms gate budget
+        // on the empty slot is spent; Deactivate latches it again.
+        tick_until(|| !QUEUED.is_disabled()).await;
+        tick_until(|| QUEUED.is_disabled()).await;
+    };
+    match embassy_futures::select::select(sup.run(&spawner), script).await {
+        embassy_futures::select::Either::First(fault) => {
+            panic!("run() returned on a bring-up fault: {fault}")
+        }
+        embassy_futures::select::Either::Second(()) => {}
+    }
     GATE_WAIT.store(false, Ordering::SeqCst);
-    assert!(core::ptr::eq(fault.node, &QUEUED));
-    assert!(matches!(fault.kind, FaultKind::ResourceMissing));
-    assert!(!QUEUED.is_running() && !QUEUED.is_disabled());
+    assert!(!QUEUED.is_running());
     assert_eq!(QUEUED_RUNS.load(Ordering::SeqCst), 0);
 
     sup.teardown()
@@ -183,24 +208,11 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn activation_returns_startup_faults() {
-    let clock = MockDriver::get();
-    let thread = std::thread::spawn(|| {
-        let executor = Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| spawner.spawn(driver(spawner).unwrap()));
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(
-            StdInstant::now() < deadline,
-            "activation scenario did not complete"
-        );
-        if GATE_WAIT.load(Ordering::SeqCst) {
-            clock.advance(Duration::from_millis(10));
-        }
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::While(&GATE_WAIT, Duration::from_millis(10)),
+        10,
+        || "activation scenario did not complete".to_owned(),
+    );
 }

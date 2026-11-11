@@ -1,13 +1,21 @@
-error: the supervisor derives dataflow from the literal path: name the signal directly (`&path::TO_SIGNAL`, `&ARR[i]`)
+error: the supervisor derives dataflow from the literal path: name the signal directly (`&path::TO_SIGNAL`, `&ARR[0]`, `&ARR[CONST]`)
  --> tests/ui/compile_fail_dataflow/dataflow_computed_target.rs:9:17
   |
 9 |     node.reader(hidden);
   |                 ^^^^^^
 
-warning: unused import: `TaskNode`
- --> tests/ui/compile_fail_dataflow/dataflow_computed_target.rs:2:26
+error[E0308]: mismatched types
+ --> tests/ui/compile_fail_dataflow/dataflow_computed_target.rs:9:17
   |
-2 | use embassy_supervisor::{TaskNode, dataflow};
-  |                          ^^^^^^^^
+9 |     node.reader(hidden);
+  |          ------ ^^^^^^ expected `Sig<_>`, found `&u32`
+  |          |
+  |          arguments to this method are incorrect
   |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+  = note: expected struct `Sig<_>`
+          found reference `&u32`
+note: method defined here
+ --> $WORKSPACE/supervisor/src/dataflow.rs
+  |
+  |     pub fn reader<T: Sync + ?Sized>(&self, s: Sig<T>) -> &'static T {
+  |            ^^^^^^

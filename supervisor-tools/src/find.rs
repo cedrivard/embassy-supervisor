@@ -1,6 +1,8 @@
 //! Finding and parsing supervisor graph declarations in Rust source files.
 
-use embassy_supervisor_syntax::{GraphSpec, normalize_fragment_crate, substitute_dollar_crate};
+use embassy_supervisor_syntax::{
+    GraphSpec, check_fragment_body, normalize_fragment_crate, substitute_dollar_crate,
+};
 use proc_macro2::{TokenStream, TokenTree};
 use quote::quote;
 use std::collections::BTreeMap;
@@ -32,6 +34,7 @@ impl DeclKind {
 }
 
 /// One declaration site, with its items already parsed.
+#[derive(Clone)]
 pub struct Decl {
     /// Which macro introduced this declaration.
     pub kind: DeclKind,
@@ -45,10 +48,19 @@ pub struct Decl {
     pub fragments: Vec<String>,
     /// Map from fragment name to the file that declared it.
     pub fragment_origins: BTreeMap<String, String>,
+    /// Map from fragment name to the crate directory of the file that declared
+    /// it, where that is known (see [`Decl::crate_dir`]).
+    pub fragment_crate_dirs: BTreeMap<String, String>,
     /// Source file path containing the declaration.
     pub origin: String,
     /// Line number of the macro invocation.
     pub line: usize,
+    /// The directory above `src/` of the declaring file, `-` read as `_`,
+    /// when its path has one: which crate a `crate::` path in it means.
+    pub crate_dir: Option<String>,
+    /// The `#[cfg(..)]` predicates written directly on the macro invocation,
+    /// as token text, one per attribute.
+    pub cfg: Vec<String>,
 }
 
 impl Decl {
@@ -91,11 +103,29 @@ const MACRO_NAMES: &[(&str, DeclKind)] = &[
 /// This descends into module blocks so declarations inside `mod` bodies are
 /// found too. It ignores `macro_rules!` relays by detecting `$` metavariables.
 pub fn parse_source(src: &str, file: &str) -> Result<Vec<Decl>> {
-    let stream = TokenStream::from_str(src).map_err(|e| Error {
+    parse_tokens(lex(src, file)?, file)
+}
+
+/// Lex a whole source file into one token stream, which [`parse_tokens`] and
+/// `syn::parse2::<syn::File>` can share. A leading shebang line is blanked,
+/// as `syn::parse_file` does, keeping line numbers.
+pub fn lex(src: &str, file: &str) -> Result<TokenStream> {
+    let body = src.strip_prefix('\u{feff}').unwrap_or(src);
+    let body = match body.strip_prefix("#!") {
+        Some(rest) if !rest.trim_start().starts_with('[') => {
+            &body[body.find('\n').unwrap_or(body.len())..]
+        }
+        _ => body,
+    };
+    TokenStream::from_str(body).map_err(|e| Error {
         file: file.to_string(),
         line: e.span().start().line,
         message: format!("could not tokenize the file: {e}"),
-    })?;
+    })
+}
+
+/// [`parse_source`] over an already lexed file.
+pub fn parse_tokens(stream: TokenStream, file: &str) -> Result<Vec<Decl>> {
     let mut out = Vec::new();
     walk(stream, file, &mut out)?;
     Ok(out)
@@ -122,7 +152,9 @@ fn walk(stream: TokenStream, file: &str, out: &mut Vec<Decl>) -> Result<()> {
                 || has_metavariable(inner.clone());
             if !internal {
                 let line = id.span().start().line;
-                out.push(parse_decl(*kind, inner, file, line)?);
+                let mut decl = parse_decl(*kind, inner, file, line)?;
+                decl.cfg = leading_cfgs(&tt, i);
+                out.push(decl);
                 i += 3;
                 continue;
             }
@@ -133,6 +165,37 @@ fn walk(stream: TokenStream, file: &str, out: &mut Vec<Decl>) -> Result<()> {
         i += 1;
     }
     Ok(())
+}
+
+/// The `#[cfg(..)]` predicates on the macro invocation whose name is `tt[at]`:
+/// step back over its path prefix (`embassy_supervisor::`), then over the
+/// outer attributes right before it.
+fn leading_cfgs(tt: &[TokenTree], at: usize) -> Vec<String> {
+    let colon = |t: &TokenTree| matches!(t, TokenTree::Punct(p) if p.as_char() == ':');
+    let mut j = at;
+    while j >= 2 && colon(&tt[j - 1]) && colon(&tt[j - 2]) {
+        j -= 2;
+        if j >= 1 && matches!(tt[j - 1], TokenTree::Ident(_)) {
+            j -= 1;
+        }
+    }
+    let mut out = Vec::new();
+    while j >= 2
+        && matches!(&tt[j - 2], TokenTree::Punct(p) if p.as_char() == '#')
+        && let TokenTree::Group(g) = &tt[j - 1]
+        && g.delimiter() == proc_macro2::Delimiter::Bracket
+    {
+        let mut inner = g.stream().into_iter();
+        if let Some(TokenTree::Ident(id)) = inner.next()
+            && id == "cfg"
+            && let Some(TokenTree::Group(pred)) = inner.next()
+            && pred.delimiter() == proc_macro2::Delimiter::Parenthesis
+        {
+            out.insert(0, pred.stream().to_string());
+        }
+        j -= 2;
+    }
+    out
 }
 
 /// Does the stream carry, at any depth, a `$` followed by anything other than
@@ -185,15 +248,25 @@ fn parse_decl(kind: DeclKind, body: TokenStream, file: &str, line: usize) -> Res
             Vec::new(),
         ),
     };
-    let spec = parse_items(items.clone(), kind, &err)?;
+    let mut spec = parse_items(items.clone(), kind, &err)?;
+    if kind == DeclKind::Fragment {
+        // The fragment's own `name:` heads its body; the rest may not set what
+        // is graph-wide, as the macro also refuses.
+        let name = spec.name.take();
+        check_fragment_body(&spec).map_err(|e| err(format!("supervisor_fragment: {e}")))?;
+        spec.name = name;
+    }
     Ok(Decl {
         kind,
         spec,
         body,
         fragments,
         fragment_origins: BTreeMap::new(),
+        fragment_crate_dirs: BTreeMap::new(),
         origin: file.to_string(),
         line,
+        crate_dir: crate::file_module(file).crate_dir,
+        cfg: Vec::new(),
     })
 }
 

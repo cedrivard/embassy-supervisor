@@ -1,16 +1,5 @@
 #![deny(missing_docs)]
-
-//! Parser and AST for the [`embassy-supervisor`](https://docs.rs/embassy-supervisor)
-//! task-graph DSL.
-//!
-//! This crate exists because a `proc-macro` crate type cannot export anything
-//! other than macros, so the grammar shared between `embassy-supervisor-macros`
-//! and tooling lives here instead. The AST is an internal contract: it is not
-//! a stable API and changes whenever the graph syntax does.
-//!
-//! The parser checks grammatical shape (empty clauses, repeated paths, numeric
-//! ranges, and so on). Semantic checks such as duplicate names, missing
-//! fragments, or feature-gated constructs are left to callers.
+#![doc = include_str!("../README.md")]
 
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
@@ -123,6 +112,17 @@ pub fn parse_dep_list(input: ParseStream) -> SynResult<Vec<Dep>> {
                 "`bound` implies `ready` — write `deps: [X ready bound]`",
             ));
         }
+        // The same dep under different `#[cfg]`s is two alternatives, not a
+        // repeat.
+        if deps
+            .iter()
+            .any(|d: &Dep| d.ident == ident && cfg_text(&d.cfg) == cfg_text(&cfg))
+        {
+            return Err(syn::Error::new_spanned(
+                &ident,
+                format!("duplicate dependency `{ident}`"),
+            ));
+        }
         deps.push(Dep {
             cfg,
             ident,
@@ -171,11 +171,26 @@ impl SignalDecl {
         let mut out = path_to_string(&self.path);
         if let Some(i) = &self.index {
             out.push('[');
-            out.push_str(&quote!(#i).to_string().replace(' ', ""));
+            out.push_str(&tokens_text(i));
             out.push(']');
         }
         out
     }
+
+    /// The signal's short name: its last path segment plus any index, as
+    /// [`signal_stem`] cuts it from [`display`](Self::display).
+    pub fn stem(&self) -> String {
+        signal_stem(&self.display()).to_string()
+    }
+}
+
+/// The last path segment of a signal's text plus any index:
+/// `LEDS[Led::Status as usize]` for `crate::LEDS[Led::Status as usize]`. An
+/// index may itself hold `::`, so the cut is the last `::` before the index.
+pub fn signal_stem(text: &str) -> &str {
+    let head = text.find('[').unwrap_or(text.len());
+    let start = text[..head].rfind("::").map_or(0, |at| at + 2);
+    &text[start..]
 }
 
 /// Parse a bracketed signal list such as `[S, T observed, U beat]`.
@@ -322,12 +337,30 @@ pub fn path_to_string(p: &syn::Path) -> String {
     out
 }
 
-/// Parse a bracketed list of pool member mode identifiers.
+/// Parse a bracketed list of pool member mode identifiers: at least one, and
+/// none `#[cfg]`-gated on its own (other items index the members).
 pub fn parse_mode_list(input: ParseStream) -> SynResult<Vec<Ident>> {
     let content;
-    bracketed!(content in input);
-    let punct = Punctuated::<Ident, Token![,]>::parse_terminated(&content)?;
-    Ok(punct.into_iter().collect())
+    let bracket = bracketed!(content in input);
+    let mut modes = Vec::new();
+    while !content.is_empty() {
+        if content.peek(Token![#]) {
+            return Err(
+                content.error("pool members cannot be `#[cfg]`-gated individually; gate the pool")
+            );
+        }
+        modes.push(content.parse::<Ident>()?);
+        if !content.is_empty() {
+            content.parse::<Token![,]>()?;
+        }
+    }
+    if modes.is_empty() {
+        return Err(syn::Error::new(
+            bracket.span.join(),
+            "a pool needs at least one member mode",
+        ));
+    }
+    Ok(modes)
 }
 
 /// How a node or pool member obtains its task future.
@@ -797,6 +830,9 @@ impl Parse for GraphSpec {
             }
             if input.peek(kw::observe) {
                 let k = input.parse::<kw::observe>()?;
+                if current_fragment.is_some() {
+                    return Err(syn::Error::new_spanned(k, FRAGMENT_OBSERVE));
+                }
                 let (slot, dir) = if input.peek(kw::writes) {
                     input.parse::<kw::writes>()?;
                     (&mut observe_writes, "writes")
@@ -840,7 +876,12 @@ impl Parse for GraphSpec {
                 input.parse::<kw::executor>()?;
                 let ident: Ident = input.parse()?;
                 input.parse::<Token![;]>()?;
-                if let Some(attr) = cfg.first() {
+                // Doc comments and lint attributes pass through to the slot
+                // static; only a gate is refused.
+                if let Some(attr) = cfg
+                    .iter()
+                    .find(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
+                {
                     return Err(syn::Error::new_spanned(
                         attr,
                         "a `default executor` cannot be `#[cfg]`-gated — every \
@@ -849,11 +890,7 @@ impl Parse for GraphSpec {
                     ));
                 }
                 if current_fragment.is_some() {
-                    return Err(syn::Error::new_spanned(
-                        k,
-                        "a fragment cannot declare the graph's default executor; \
-                         declare it at the compose site",
-                    ));
+                    return Err(syn::Error::new_spanned(k, FRAGMENT_DEFAULT_EXECUTOR));
                 }
                 if default_executor.is_some() {
                     return Err(syn::Error::new_spanned(k, "duplicate `default executor`"));
@@ -882,6 +919,30 @@ impl Parse for GraphSpec {
             items,
         })
     }
+}
+
+const FRAGMENT_NAME: &str =
+    "a fragment is named by `name:` in `supervisor_fragment!`, not in its body";
+const FRAGMENT_OBSERVE: &str = "`observe` defaults belong to the composing graph: a \
+     fragment cannot set them for other fragments";
+const FRAGMENT_DEFAULT_EXECUTOR: &str = "a fragment cannot declare the graph's default \
+     executor; declare it at the compose site";
+
+/// Reject what a `supervisor_fragment!` body may not set: a graph `name:`,
+/// the `observe` defaults, and the default executor. Each is graph-wide, and
+/// the compose site pastes every fragment into one graph, so a fragment
+/// setting one would set it for all the others.
+pub fn check_fragment_body(spec: &GraphSpec) -> SynResult<()> {
+    if let Some(name) = &spec.name {
+        return Err(syn::Error::new_spanned(name, FRAGMENT_NAME));
+    }
+    if let Some((k, _)) = spec.observe_writes.as_ref().or(spec.observe_reads.as_ref()) {
+        return Err(syn::Error::new_spanned(k, FRAGMENT_OBSERVE));
+    }
+    if let Some(ex) = &spec.default_executor {
+        return Err(syn::Error::new_spanned(ex, FRAGMENT_DEFAULT_EXECUTOR));
+    }
+    Ok(())
 }
 
 /// Clauses shared between `node` and `pool` declarations.
@@ -1207,6 +1268,58 @@ pub fn task_source(
     })
 }
 
+/// The rules a node and a pool share over their common clauses: `beat` and
+/// `veto` mark `writes:` entries only, beside `discover` every entry carries
+/// a marker, and a `resources:` list names each slot once.
+fn check_common(
+    reads: &[SignalDecl],
+    writes: &[SignalDecl],
+    discover: bool,
+    resources: &[ResourceDecl],
+) -> SynResult<()> {
+    for d in reads {
+        if let Some(b) = &d.beat {
+            return Err(syn::Error::new_spanned(
+                b,
+                "`beat` belongs on a `writes:` entry — a node's heartbeat is \
+                 something it produces, not something it consumes",
+            ));
+        }
+    }
+    for d in reads {
+        if let Some(v) = &d.veto {
+            return Err(syn::Error::new_spanned(
+                v,
+                "`veto` belongs on a `writes:` entry — a veto is something a node \
+                 asserts, not something it consumes",
+            ));
+        }
+    }
+    if discover {
+        for d in reads.iter().chain(writes) {
+            if d.observed.is_none() && d.beat.is_none() && d.veto.is_none() {
+                return Err(syn::Error::new_spanned(
+                    &d.path,
+                    "beside `discover`, a `reads:`/`writes:` entry may only add \
+                     markers (`observed`, `beat` and/or `veto`) to a signal the \
+                     task fn already accesses; this one carries none, so it would \
+                     declare a coupling the scan did not find. Drop the entry, \
+                     or drop `discover` and declare the whole relation",
+                ));
+            }
+        }
+    }
+    for (i, d) in resources.iter().enumerate() {
+        if resources[..i].iter().any(|prev| prev.ident == d.ident) {
+            return Err(syn::Error::new_spanned(
+                &d.ident,
+                format!("duplicate resource name `{}`", d.ident),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parse a `node NAME = Mode, ...;` declaration after the leading `node` keyword.
 pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem> {
     input.parse::<kw::node>()?;
@@ -1292,7 +1405,7 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
             beat_window = Some(Gated {
                 cfg: clause_cfg,
                 kw: k,
-                value: input.parse::<LitInt>()?,
+                value: parse_unsuffixed(input, "`beat_window:` (stale sweeps)")?,
             });
         } else if input.peek(kw::enabled_if) {
             let k = input.parse::<kw::enabled_if>()?;
@@ -1459,58 +1572,45 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
         }
     }
 
-    for d in &reads {
-        if let Some(b) = &d.beat {
-            return Err(syn::Error::new_spanned(
-                b,
-                "`beat` belongs on a `writes:` entry — a node's heartbeat is \
-                 something it produces, not something it consumes",
-            ));
-        }
-    }
-    for d in &reads {
-        if let Some(v) = &d.veto {
-            return Err(syn::Error::new_spanned(
-                v,
-                "`veto` belongs on a `writes:` entry — a veto is something a node \
-                 asserts, not something it consumes",
-            ));
-        }
-    }
+    check_common(
+        &reads,
+        &writes,
+        discover.is_some(),
+        resources.as_ref().map_or(&[][..], |(_, decls)| decls),
+    )?;
 
-    if let Some(k) = &discover {
-        for d in reads.iter().chain(writes.iter()) {
-            if d.observed.is_none() && d.beat.is_none() && d.veto.is_none() {
-                return Err(syn::Error::new_spanned(
-                    &d.path,
-                    "beside `discover`, a `reads:`/`writes:` entry may only add \
-                     markers (`observed`, `beat`) to a signal the task fn \
-                     already accesses — this one carries none, so it would \
-                     declare a coupling the scan did not find. Drop the entry, \
-                     or drop `discover` and declare the whole relation",
-                ));
-            }
-        }
-        if spawn.is_none() && task.is_none() {
-            return Err(syn::Error::new_spanned(
-                k.kw,
-                "`discover` needs a `task:`/`spawn:` fn to take its tables \
-                 from — a parked node has nothing to scan",
-            ));
-        }
+    if let Some(k) = &discover
+        && spawn.is_none()
+        && task.is_none()
+    {
+        return Err(syn::Error::new_spanned(
+            k.kw,
+            "`discover` needs a `task:`/`spawn:` fn to take its tables \
+             from — a parked node has nothing to scan",
+        ));
     }
 
     if let Some(row) = &ready_on_write {
-        if !writes
-            .iter()
-            .any(|w| w.beat.is_some() && w.observed.is_some())
-        {
+        let beats = |w: &&SignalDecl| w.beat.is_some() && w.observed.is_some();
+        if !writes.iter().any(|w| beats(&w)) {
             return Err(syn::Error::new_spanned(
                 &row.kw,
                 "`ready_on_write` requires an `observed beat` entry in \
                  `writes:` — the sweep's own poll of that write is what asserts \
                  the readiness. A body that beats through its verbs asserts \
                  readiness itself, with `set_ready()` at the same write",
+            ));
+        }
+        if !writes
+            .iter()
+            .filter(beats)
+            .any(|w| w.cfg.is_empty() || cfg_text(&w.cfg) == cfg_text(&row.cfg))
+        {
+            return Err(syn::Error::new_spanned(
+                &row.kw,
+                "`ready_on_write` needs an `observed beat` entry gated like it \
+                 or not at all: the sweep asserts readiness by polling that \
+                 write, and the entry's own `#[cfg]` can compile it out",
             ));
         }
         if beat_timeout.is_none() {
@@ -1537,14 +1637,6 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
                 k,
                 "`resources:` must declare at least one `NAME: Type` entry",
             ));
-        }
-        for (i, d) in decls.iter().enumerate() {
-            if decls[..i].iter().any(|prev| prev.ident == d.ident) {
-                return Err(syn::Error::new_spanned(
-                    &d.ident,
-                    format!("duplicate resource name `{}`", d.ident),
-                ));
-            }
         }
     }
     if let Some((k, _, _)) = &state
@@ -1579,10 +1671,10 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
         if mode == "Pause" {
             return Err(syn::Error::new_spanned(
                 k,
-                "`cancel` cannot be combined with `Mode::Pause` — a Pause worker \
+                "`cancel` needs mode `Terminate` (or `OnDemand`): a `Pause` worker \
                  must survive the stop and park on `wait_resume()`, but `cancel` \
-                 drops its future and records an exit; use `Mode::Terminate` (or \
-                 `OnDemand`), or drive the pause by hand in the worker",
+                 drops its future and records an exit. Drive the pause by hand in \
+                 the worker instead",
             ));
         }
     }
@@ -1719,6 +1811,7 @@ pub fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem
         ));
     }
     let resources = resources.map(|(_, decls)| decls).unwrap_or_default();
+    check_common(&reads, &writes, discover.is_some(), &resources)?;
 
     if let Some(bad) = resources
         .iter()
@@ -1778,6 +1871,47 @@ pub fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem
             ));
         }
     }
+    let (min, max) = (
+        min.expect("absence checked above"),
+        max.expect("absence checked above"),
+    );
+    // Literal bounds are checked here; an expression is checked by a const
+    // assert where the graph is expanded.
+    if let (Expr::Lit(lmin), Expr::Lit(lmax)) = (&min, &max)
+        && let (syn::Lit::Int(imin), syn::Lit::Int(imax)) = (&lmin.lit, &lmax.lit)
+    {
+        let (min_v, max_v) = (imin.base10_parse::<u8>()?, imax.base10_parse::<u8>()?);
+        if min_v > max_v {
+            return Err(syn::Error::new_spanned(
+                &min,
+                format!("pool `min:` ({min_v}) must not exceed `max:` ({max_v})"),
+            ));
+        }
+        if usize::from(max_v) > modes.len() {
+            return Err(syn::Error::new_spanned(
+                &max,
+                format!(
+                    "pool `max:` ({max_v}) exceeds the declared member count ({})",
+                    modes.len()
+                ),
+            ));
+        }
+    }
+    if let (Some(first), TaskSource::Spawn(_)) = (resources.first(), &source) {
+        return Err(syn::Error::new_spanned(
+            &first.ident,
+            "pool `resources:` requires `task:` — the values are handed to the \
+             generated shell as arguments (and lend entries restored by it); a \
+             `spawn:` task fn manages its own arguments",
+        ));
+    }
+    if let (Some((_, ty, _)), TaskSource::Spawn(_)) = (&state, &source) {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "pool `state:` requires `task:` — the generated shell owns the boxed \
+             state across the worker call; a `spawn:` task fn can Box its own",
+        ));
+    }
     Ok(PoolItem {
         cfg,
         ident,
@@ -1793,8 +1927,8 @@ pub fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem
         ack_timeout,
         reads,
         writes,
-        min: min.expect("absence checked above"),
-        max: max.expect("absence checked above"),
+        min,
+        max,
         state,
         cancel: cancel.is_some(),
         discover,
@@ -2059,6 +2193,20 @@ fn rewrite_verb_calls_in(
 ) -> SynResult<TokenStream2> {
     use proc_macro2::{Delimiter, Group, TokenTree};
 
+    /// `g` walked under `preds`, keeping its delimiter and span.
+    fn rebuilt(
+        g: &Group,
+        node_param: &str,
+        verbs: &VerbTable,
+        preds: &[TokenStream2],
+        on_call: &mut dyn FnMut(VerbCall) -> SynResult<Option<TokenStream2>>,
+    ) -> SynResult<TokenTree> {
+        let inner = rewrite_verb_calls_in(g.stream(), node_param, verbs, preds, on_call)?;
+        let mut ng = Group::new(g.delimiter(), inner);
+        ng.set_span(g.span());
+        Ok(TokenTree::Group(ng))
+    }
+
     let toks: Vec<TokenTree> = body.into_iter().collect();
     let punct_at = |j: usize| match &toks[j] {
         TokenTree::Punct(p) => Some(p.as_char()),
@@ -2068,6 +2216,11 @@ fn rewrite_verb_calls_in(
     let mut i = 0;
     let mut pending: Vec<TokenStream2> = Vec::new();
     let mut current: Vec<TokenStream2> = Vec::new();
+    // A `cfg_if!`-style chain, `if #[cfg(p)] { .. } else if #[cfg(q)] { .. }
+    // else { .. }`: `cond` is the predicate of the arm whose block comes next,
+    // `negated` those of the arms before it, which every later arm excludes.
+    let mut cond: Option<TokenStream2> = None;
+    let mut negated: Vec<TokenStream2> = Vec::new();
     while i < toks.len() {
         if let TokenTree::Punct(p) = &toks[i]
             && p.as_char() == '#'
@@ -2075,7 +2228,11 @@ fn rewrite_verb_calls_in(
             && g.delimiter() == Delimiter::Bracket
         {
             if let Some(pred) = cfg_attr_predicate(g) {
-                pending.push(pred);
+                if i > 0 && matches!(&toks[i - 1], TokenTree::Ident(id) if *id == "if") {
+                    cond = Some(pred);
+                } else {
+                    pending.push(pred);
+                }
             }
             out.extend([toks[i].clone(), toks[i + 1].clone()]);
             i += 2;
@@ -2084,6 +2241,17 @@ fn rewrite_verb_calls_in(
         if !pending.is_empty() {
             current.append(&mut pending);
         }
+        // Only a block makes `if #[cfg(p)]` an arm; anything else keeps the
+        // attribute's plain meaning.
+        let block = matches!(&toks[i], TokenTree::Group(g) if g.delimiter() == Delimiter::Brace);
+        let arm = match cond.take() {
+            Some(p) if block => Some(p),
+            Some(p) => {
+                current.push(p);
+                None
+            }
+            None => None,
+        };
         if matches!(&toks[i], TokenTree::Ident(id) if *id == "fn")
             && matches!(toks.get(i + 1), Some(TokenTree::Ident(_)))
         {
@@ -2133,9 +2301,9 @@ fn rewrite_verb_calls_in(
             };
             let mut cfgs: Vec<TokenStream2> = inherited.to_vec();
             cfgs.extend(current.iter().cloned());
-            let rebuilt = rewrite_first_arg(g, verb, write, node_param, verbs, &cfgs, on_call)?;
+            let args = rewrite_first_arg(g, verb, write, node_param, verbs, &cfgs, on_call)?;
             out.extend(toks[i..i + 3].iter().cloned());
-            let mut ng = Group::new(Delimiter::Parenthesis, rebuilt);
+            let mut ng = Group::new(Delimiter::Parenthesis, args);
             ng.set_span(g.span());
             out.extend([TokenTree::Group(ng)]);
             i += 4;
@@ -2144,19 +2312,50 @@ fn rewrite_verb_calls_in(
         match &toks[i] {
             TokenTree::Group(g) => {
                 let mut child = inherited.to_vec();
-                child.extend(current.iter().cloned());
-                let inner = rewrite_verb_calls_in(g.stream(), node_param, verbs, &child, on_call)?;
-                let mut ng = Group::new(g.delimiter(), inner);
-                ng.set_span(g.span());
-                out.extend([TokenTree::Group(ng)]);
-                if g.delimiter() == Delimiter::Brace {
-                    let continues = matches!(
-                        toks.get(i + 1),
-                        Some(TokenTree::Ident(id)) if *id == "else"
-                    ) || matches!(
-                        toks.get(i + 1),
-                        Some(TokenTree::Punct(p)) if matches!(p.as_char(), '.' | '?')
-                    );
+                match &arm {
+                    // An arm of the chain: its own predicate, under the
+                    // negation of every arm before it.
+                    Some(p) => {
+                        child.extend(negated.iter().map(|n| quote!(not(#n))));
+                        child.push(p.clone());
+                    }
+                    None => child.extend(current.iter().cloned()),
+                }
+                out.extend([rebuilt(g, node_param, verbs, &child, on_call)?]);
+                let next_is_else =
+                    matches!(toks.get(i + 1), Some(TokenTree::Ident(id)) if *id == "else");
+                if let Some(p) = arm {
+                    current.clear();
+                    if !next_is_else {
+                        negated.clear();
+                    } else {
+                        negated.push(p);
+                        if let Some(TokenTree::Group(last)) = toks.get(i + 2)
+                            && last.delimiter() == Delimiter::Brace
+                        {
+                            // The final `else`: none of the arms before it.
+                            let mut child = inherited.to_vec();
+                            child.extend(negated.drain(..).map(|n| quote!(not(#n))));
+                            let last = rebuilt(last, node_param, verbs, &child, on_call)?;
+                            out.extend([toks[i + 1].clone(), last]);
+                            i += 3;
+                            continue;
+                        }
+                    }
+                } else if g.delimiter() == Delimiter::Brace {
+                    negated.clear();
+                    // `else`, `?`, and a method, field or `.await` continue
+                    // the expression the block ends; `..`/`..=` start a new
+                    // pattern.
+                    let continues = next_is_else
+                        || match toks.get(i + 1) {
+                            Some(TokenTree::Punct(p)) if p.as_char() == '?' => true,
+                            Some(TokenTree::Punct(p)) if p.as_char() == '.' => matches!(
+                                toks.get(i + 2),
+                                Some(TokenTree::Ident(_) | TokenTree::Literal(_))
+                            ),
+                            _ => false,
+                        };
                     if !continues {
                         current.clear();
                     }
@@ -2185,23 +2384,34 @@ fn rewrite_first_arg(
     use proc_macro2::TokenTree;
 
     let toks: Vec<TokenTree> = g.stream().into_iter().collect();
+    if toks.is_empty() {
+        return Err(syn::Error::new(
+            g.span(),
+            format!("`{verb}` is registered as a dataflow verb but this call passes no signal"),
+        ));
+    }
     let split = toks
         .iter()
         .position(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ','))
         .unwrap_or(toks.len());
     let (first, rest) = toks.split_at(split);
     let arg: TokenStream2 = first.iter().cloned().collect();
-    let target = match syn::parse2::<Expr>(arg.clone()) {
-        Ok(Expr::Reference(r))
-            if matches!(*r.expr, Expr::Path(_)) || matches!(*r.expr, Expr::Index(_)) =>
-        {
-            *r.expr
+    // The tables are module statics, so the target must resolve there: a
+    // path, or an element of a path-named array at a literal or path index.
+    let nameable = |e: &Expr| match e {
+        Expr::Path(_) => true,
+        Expr::Index(ix) => {
+            matches!(*ix.expr, Expr::Path(_)) && matches!(*ix.index, Expr::Lit(_) | Expr::Path(_))
         }
+        _ => false,
+    };
+    let target = match syn::parse2::<Expr>(arg.clone()) {
+        Ok(Expr::Reference(r)) if nameable(&r.expr) => *r.expr,
         _ => {
             return Err(syn::Error::new_spanned(
                 &arg,
                 "the supervisor derives dataflow from the literal path: name \
-                 the signal directly (`&path::TO_SIGNAL`, `&ARR[i]`)",
+                 the signal directly (`&path::TO_SIGNAL`, `&ARR[0]`, `&ARR[CONST]`)",
             ));
         }
     };
@@ -2224,8 +2434,49 @@ fn rewrite_first_arg(
     Ok(out)
 }
 
+/// `t`'s token text with one space only between two adjacent identifiers or
+/// literals, so `Led::Status as usize` keeps the spaces its meaning needs and
+/// `crate :: X` loses the ones it does not.
 fn tokens_text<T: quote::ToTokens>(t: &T) -> String {
-    t.to_token_stream().to_string().replace(' ', "")
+    use proc_macro2::{Delimiter, TokenTree};
+
+    fn walk(stream: TokenStream2, out: &mut String, word: &mut bool) {
+        for tt in stream {
+            match tt {
+                TokenTree::Ident(_) | TokenTree::Literal(_) => {
+                    if *word {
+                        out.push(' ');
+                    }
+                    out.push_str(&tt.to_string());
+                    *word = true;
+                }
+                TokenTree::Punct(p) => {
+                    out.push(p.as_char());
+                    *word = false;
+                }
+                // An invisible group adds no text: what touches its edges
+                // is adjacent.
+                TokenTree::Group(g) if g.delimiter() == Delimiter::None => {
+                    walk(g.stream(), out, word);
+                }
+                TokenTree::Group(g) => {
+                    let (open, close) = match g.delimiter() {
+                        Delimiter::Parenthesis => ('(', ')'),
+                        Delimiter::Brace => ('{', '}'),
+                        _ => ('[', ']'),
+                    };
+                    out.push(open);
+                    *word = false;
+                    walk(g.stream(), out, word);
+                    out.push(close);
+                    *word = false;
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(t.to_token_stream(), &mut out, &mut false);
+    out
 }
 
 /// Find the name of the function argument whose type contains `TaskNode`.
@@ -2302,12 +2553,93 @@ fn unwrap_cfg_attr(meta: &Meta) -> Option<(Meta, Vec<String>)> {
     Some((inner, preds))
 }
 
+/// One signal of a derived coupling table: every call site of one direction
+/// that names `path`, folded together. `#[dataflow]`, `#[dataflow_bundle]`
+/// and [`scan_fn_accesses`] build their tables from these.
+#[derive(Clone)]
+pub struct DerivedEntry {
+    /// The signal path as a string.
+    pub path: String,
+    /// The first call site's signal expression.
+    pub target: Expr,
+    /// The strongest verb among the call sites: a `beat_*` site makes the
+    /// entry a beat entry, otherwise the first site's verb stays.
+    pub verb: String,
+    /// One `#[cfg]` predicate list per distinct call-site condition; an empty
+    /// list is an ungated site.
+    pub alts: Vec<Vec<TokenStream2>>,
+}
+
+/// Fold one call site, running under the predicates `cfgs`, into the table
+/// `list` of its direction and return the entry's index. A new signal is
+/// appended; a known one gains `cfgs` as one more alternative (unless an
+/// identical list is already there) and takes a `beat_*` verb over a plain one.
+pub fn record_derived(
+    list: &mut Vec<DerivedEntry>,
+    call: &VerbCall,
+    cfgs: Vec<TokenStream2>,
+) -> usize {
+    let is_beat = |verb: &str| matches!(verb, "beat_put" | "beat_writer");
+    match list.iter().position(|e| e.path == call.path) {
+        Some(k) => {
+            let text = |a: &[TokenStream2]| {
+                a.iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let e = &mut list[k];
+            if !e.alts.iter().any(|a| text(a) == text(&cfgs)) {
+                e.alts.push(cfgs);
+            }
+            if is_beat(&call.verb) && !is_beat(&e.verb) {
+                e.verb = call.verb.clone();
+            }
+            k
+        }
+        None => {
+            list.push(DerivedEntry {
+                path: call.path.clone(),
+                target: call.target.clone(),
+                verb: call.verb.clone(),
+                alts: vec![cfgs],
+            });
+            list.len() - 1
+        }
+    }
+}
+
+/// The condition a derived entry holds under, from its [`DerivedEntry::alts`]:
+/// `None` when any site is ungated (or there is no site), the one site's
+/// predicate (`p`, or `all(p, q)` for several), else `any(..)` of every
+/// site's predicate.
+pub fn derived_predicate(alts: &[Vec<TokenStream2>]) -> Option<TokenStream2> {
+    if alts.iter().any(|a| a.is_empty()) {
+        return None;
+    }
+    let one = |alt: &Vec<TokenStream2>| -> TokenStream2 {
+        match alt.as_slice() {
+            [p] => p.clone(),
+            many => quote!(all(#(#many),*)),
+        }
+    };
+    match alts {
+        [] => None,
+        [alt] => Some(one(alt)),
+        many => {
+            let terms: Vec<TokenStream2> = many.iter().map(one).collect();
+            Some(quote!(any(#(#terms),*)))
+        }
+    }
+}
+
 /// One dataflow access discovered by scanning a `#[dataflow]` fn body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Access {
     /// The name of the function that contains this access.
     pub func: String,
-    /// The verb used, e.g. `put` or `get`.
+    /// The strongest verb among the fn's call sites for this signal and
+    /// direction, e.g. `put` or `get`: a `beat_*` site wins.
     pub verb: String,
     /// `true` for writes, `false` for reads.
     pub write: bool,
@@ -2316,8 +2648,10 @@ pub struct Access {
     /// The predicates this access is conditional on, normalized (token text,
     /// spaces stripped), outermost first: the fn's `#[cfg(...)]`s, the
     /// `cfg_attr` predicate its `#[dataflow]` sits under if any, then the
-    /// call site's own `#[cfg(...)]`s. A predicate repeated across those
-    /// levels appears once.
+    /// call sites' condition. One call-site condition contributes its own
+    /// `#[cfg(...)]`s; several contribute one `any(..)` of them; an ungated
+    /// site contributes nothing. A predicate repeated across those levels
+    /// appears once.
     pub cfgs: Vec<String>,
 }
 
@@ -2345,21 +2679,14 @@ fn scan_item(item: &syn::Item, out: &mut Vec<Access>) {
                 }
             }
         }
-        syn::Item::Impl(im) => {
-            for ii in &im.items {
-                if let syn::ImplItem::Fn(f) = ii {
-                    scan_fn_accesses(&f.attrs, &f.sig, &f.block, out);
-                }
-            }
-        }
         _ => {}
     }
 }
 
 /// One fn's dataflow accesses, as [`scan_dataflow`] records them: nothing when
 /// the fn has no `#[dataflow]` attribute or node parameter; otherwise each
-/// signal once per direction with the fn's `#[cfg]`s, its `cfg_attr` predicate
-/// and the call site's `#[cfg]`s.
+/// signal once per direction, in first-seen order, with the combined
+/// condition and strongest verb of its call sites (see [`Access`]).
 pub fn scan_fn_accesses(
     attrs: &[Attribute],
     sig: &syn::Signature,
@@ -2387,33 +2714,52 @@ pub fn scan_fn_accesses(
         })
         .chain(wrap_cfg)
         .collect();
-    let mut seen: Vec<(bool, String)> = Vec::new();
+    // Per direction, the call-site conditions minus the fn-level predicates,
+    // which every site shares.
+    let mut reads: Vec<DerivedEntry> = Vec::new();
+    let mut writes: Vec<DerivedEntry> = Vec::new();
+    let mut order: Vec<(bool, usize)> = Vec::new();
     let _ = rewrite_verb_calls(quote!(#block), &param.to_string(), &verbs, &mut |call| {
-        if !seen.contains(&(call.write, call.path.clone())) {
-            seen.push((call.write, call.path.clone()));
-            // A predicate repeated at the fn and the call site (the usual
-            // shape once a `cfg_attr` fn also gates its statements) is one
-            // condition, so it is recorded once.
-            let mut cfgs: Vec<String> = Vec::new();
-            for c in fn_cfgs
-                .iter()
-                .cloned()
-                .chain(call.cfgs.iter().map(|c| c.to_string().replace(' ', "")))
-            {
-                if !cfgs.contains(&c) {
-                    cfgs.push(c);
-                }
+        let list = if call.write { &mut writes } else { &mut reads };
+        let mut seen: Vec<String> = fn_cfgs.clone();
+        let mut site: Vec<TokenStream2> = Vec::new();
+        for c in &call.cfgs {
+            let text = c.to_string().replace(' ', "");
+            if !seen.contains(&text) {
+                seen.push(text);
+                site.push(c.clone());
             }
-            out.push(Access {
-                func: func.clone(),
-                verb: call.verb.clone(),
-                write: call.write,
-                path: call.path.clone(),
-                cfgs,
-            });
+        }
+        let len = list.len();
+        let k = record_derived(list, &call, site);
+        if k == len {
+            order.push((call.write, k));
         }
         Ok(None)
     });
+    for (write, k) in order {
+        let e = if write { &writes[k] } else { &reads[k] };
+        let mut cfgs = fn_cfgs.clone();
+        let site: Vec<String> = match e.alts.as_slice() {
+            [one] => one.iter().map(|c| c.to_string().replace(' ', "")).collect(),
+            alts => derived_predicate(alts)
+                .map(|p| p.to_string().replace(' ', ""))
+                .into_iter()
+                .collect(),
+        };
+        for c in site {
+            if !cfgs.contains(&c) {
+                cfgs.push(c);
+            }
+        }
+        out.push(Access {
+            func: func.clone(),
+            verb: e.verb.clone(),
+            write,
+            path: e.path.clone(),
+            cfgs,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -3532,6 +3878,96 @@ mod tests {
         );
     }
 
+    /// Each verb call's path and predicates, in walk order.
+    fn walk_cfgs(body: TokenStream2) -> Vec<(String, Vec<String>)> {
+        let mut seen = Vec::new();
+        rewrite_verb_calls(body, "node", &VerbTable::builtin(), &mut |call| {
+            let cfgs = call
+                .cfgs
+                .iter()
+                .map(|c| c.to_string().replace(' ', ""))
+                .collect();
+            seen.push((call.path.clone(), cfgs));
+            Ok(None)
+        })
+        .unwrap();
+        seen
+    }
+
+    fn owned(rows: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+        rows.iter()
+            .map(|(p, c)| (p.to_string(), c.iter().map(|c| c.to_string()).collect()))
+            .collect()
+    }
+
+    /// A `cfg_if!` body: the `else` block is gated on the negation of the
+    /// `if` arm, and the chain's predicates end with its last block.
+    #[test]
+    fn cfg_if_else_arm_is_gated_on_the_negation() {
+        let seen = walk_cfgs(quote!({
+            cfg_if::cfg_if! {
+                if #[cfg(feature = "bmi")] {
+                    node.put(&crate::RAW, 1);
+                } else {
+                    node.put(&crate::RAW, 2);
+                }
+            }
+            node.put(&crate::TEMP, 3);
+        }));
+        assert_eq!(
+            seen,
+            owned(&[
+                ("crate::RAW", &["feature=\"bmi\""]),
+                ("crate::RAW", &["not(feature=\"bmi\")"]),
+                ("crate::TEMP", &[]),
+            ])
+        );
+    }
+
+    /// Every arm of a chain excludes the arms before it.
+    #[test]
+    fn cfg_if_else_if_arms_negate_the_earlier_arms() {
+        let seen = walk_cfgs(quote!({
+            if #[cfg(p)] {
+                node.put(&A, 1);
+            } else if #[cfg(q)] {
+                node.put(&B, 2);
+            } else {
+                node.put(&C, 3);
+            }
+            node.put(&D, 4);
+        }));
+        assert_eq!(
+            seen,
+            owned(&[
+                ("A", &["p"]),
+                ("B", &["not(p)", "q"]),
+                ("C", &["not(p)", "not(q)"]),
+                ("D", &[]),
+            ])
+        );
+    }
+
+    /// A block ends a gated pattern unless a method, field or `.await`
+    /// continues its expression: `..=` starts the next match arm.
+    #[test]
+    fn a_range_pattern_after_a_gated_arm_starts_a_new_arm() {
+        let seen = walk_cfgs(quote!({
+            match v {
+                #[cfg(a)]
+                0 => node.put(&A, 1),
+                ..=5 => node.put(&T, 2),
+                _ => {}
+            }
+            #[cfg(a)]
+            let _ = unsafe { node.get(&G) }.max(node.get(&H));
+        }));
+        assert_eq!(
+            seen,
+            owned(&[("A", &["a"]), ("T", &[]), ("G", &["a"]), ("H", &["a"])])
+        );
+    }
+
     #[test]
     fn qualified_receiver_is_not_a_verb_call() {
         let body = quote!({
@@ -3626,6 +4062,11 @@ mod tests {
             (
                 "node A = Terminate, deps: [], restart_budget: 3 in 60s;",
                 "`restart_budget:` window (milliseconds) takes",
+            ),
+            (
+                "node A = Terminate, deps: [], beat_timeout: 100, beat_window: 3u16;",
+                "`beat_window:` (stale sweeps) takes an unsuffixed integer literal; \
+                 remove the `u16` suffix",
             ),
             (
                 "pool P = [Terminate], deps: [], task: w, policy: Pol::new(), \
@@ -3857,6 +4298,268 @@ mod tests {
                 "node A = Terminate, deps: [], task: w, discover, writes: [crate::T veto];"
             )
             .is_ok()
+        );
+    }
+
+    /// An element is named through a path-named array at a literal or path
+    /// index; anything computed resolves nowhere a module static can.
+    #[test]
+    fn dataflow_walker_takes_literal_and_path_indices_only() {
+        let walk = |body: TokenStream2| {
+            rewrite_verb_calls(body, "node", &VerbTable::builtin(), &mut |_| Ok(None))
+        };
+        for ok in [
+            quote!({ node.get(&ARR[0]) }),
+            quote!({ node.get(&ARR[K]) }),
+            quote!({ node.get(&a::ARR[b::K]) }),
+        ] {
+            if let Err(e) = walk(ok.clone()) {
+                panic!("{ok}: {e}");
+            }
+        }
+        for bad in [
+            quote!({ node.get(&ARR[i + 1]) }),
+            quote!({ node.get(&ARR[K as usize]) }),
+            quote!({ node.get(&f()[0]) }),
+            quote!({ node.get(&self.a[0]) }),
+        ] {
+            let err = walk(bad.clone()).expect_err("rejected").to_string();
+            assert!(
+                err.ends_with("(`&path::TO_SIGNAL`, `&ARR[0]`, `&ARR[CONST]`)"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// A registered verb called with no argument has nothing to derive.
+    #[test]
+    fn a_verb_call_without_a_signal_is_named() {
+        let verbs: VerbTable = syn::parse_str("read(is_running)").unwrap();
+        let err = rewrite_verb_calls(quote!({ node.is_running() }), "node", &verbs, &mut |_| {
+            Ok(None)
+        })
+        .expect_err("rejected")
+        .to_string();
+        assert_eq!(
+            err,
+            "`is_running` is registered as a dataflow verb but this call passes no signal"
+        );
+    }
+
+    /// Index text keeps the spaces its tokens need, and the stem is cut before
+    /// the index, whose own `::` it skips.
+    #[test]
+    fn an_index_expression_keeps_its_spaces() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "node A = Terminate, deps: [], \
+             writes: [crate::LEDS[Led::Status as usize], crate::B[0], C];",
+        )
+        .unwrap();
+        let Item::Node(n) = &spec.items[0] else {
+            panic!("node")
+        };
+        assert_eq!(n.writes[0].display(), "crate::LEDS[Led::Status as usize]");
+        assert_eq!(n.writes[0].stem(), "LEDS[Led::Status as usize]");
+        assert_eq!(n.writes[1].display(), "crate::B[0]");
+        assert_eq!(n.writes[1].stem(), "B[0]");
+        assert_eq!(n.writes[2].stem(), "C");
+    }
+
+    /// The rules nodes and pools share hold for pools too.
+    #[test]
+    fn pools_share_the_node_rules() {
+        let pool = |rest: &str| {
+            format!(
+                "pool P = [Terminate], deps: [], task: w, {rest}, \
+                 policy: Pol::new(), min: 1, max: 1;"
+            )
+        };
+        for (rest, needle) in [
+            (
+                "reads: [crate::X observed beat]",
+                "`beat` belongs on a `writes:` entry",
+            ),
+            (
+                "reads: [crate::X veto]",
+                "`veto` belongs on a `writes:` entry",
+            ),
+            (
+                "discover, writes: [crate::X]",
+                "markers (`observed`, `beat` and/or `veto`)",
+            ),
+            (
+                "resources: [R: shared u32, R: shared u32]",
+                "duplicate resource name `R`",
+            ),
+        ] {
+            let err = parse_err(&pool(rest));
+            assert!(err.contains(needle), "{rest}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_pool_lists_at_least_one_ungated_member() {
+        let err = parse_err("pool P = [], deps: [], task: w, policy: Pol::new(), min: 0, max: 0;");
+        assert_eq!(err, "a pool needs at least one member mode");
+        let err = parse_err(
+            "pool P = [Terminate, #[cfg(x)] OnDemand], deps: [], task: w, \
+             policy: Pol::new(), min: 1, max: 1;",
+        );
+        assert_eq!(
+            err,
+            "pool members cannot be `#[cfg]`-gated individually; gate the pool"
+        );
+    }
+
+    /// What needs only the pool is checked where the tools see it too.
+    #[test]
+    fn pool_bounds_and_task_clauses_are_checked_at_parse() {
+        for (src, needle) in [
+            (
+                "pool P = [Terminate, OnDemand], deps: [], task: w, policy: Pol::new(), \
+                 min: 2, max: 1;",
+                "pool `min:` (2) must not exceed `max:` (1)",
+            ),
+            (
+                "pool P = [Terminate], deps: [], task: w, policy: Pol::new(), min: 1, max: 2;",
+                "pool `max:` (2) exceeds the declared member count (1)",
+            ),
+            (
+                "pool P = [Terminate], deps: [], spawn: w, resources: [R: u32], \
+                 policy: Pol::new(), min: 1, max: 1;",
+                "pool `resources:` requires `task:`",
+            ),
+            (
+                "pool P = [Terminate], deps: [], spawn: w, state: Buf = Buf::new(), \
+                 policy: Pol::new(), min: 1, max: 1;",
+                "pool `state:` requires `task:`",
+            ),
+        ] {
+            let err = parse_err(src);
+            assert!(err.contains(needle), "{src}: {err}");
+        }
+        // An expression bound is left to the macro's const assert.
+        assert!(
+            syn::parse_str::<GraphSpec>(
+                "pool P = [Terminate], deps: [], task: w, policy: Pol::new(), \
+                 min: FLOOR, max: 1;"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_dep_repeats_only_under_another_cfg() {
+        let err = parse_err("node B = Terminate, deps: [A, A];");
+        assert_eq!(err, "duplicate dependency `A`");
+        let err = parse_err(
+            "pool P = [Terminate], deps: [A ready, A], task: w, \
+             policy: Pol::new(), min: 1, max: 1;",
+        );
+        assert_eq!(err, "duplicate dependency `A`");
+        assert!(
+            syn::parse_str::<GraphSpec>(
+                "node B = Terminate, deps: [#[cfg(x)] A, #[cfg(not(x))] A];"
+            )
+            .is_ok()
+        );
+    }
+
+    /// The write the sweep polls must exist wherever `ready_on_write` does.
+    #[test]
+    fn ready_on_write_needs_its_beat_write_compiled_in() {
+        const X: &str = "#[cfg(feature = \"x\")]";
+        let src = |write_cfg: &str, row_cfg: &str| {
+            format!(
+                "node A = Terminate, deps: [], task: f, \
+                 writes: [{write_cfg} crate::S observed beat], \
+                 {row_cfg} beat_timeout: 100, {row_cfg} ready_on_write;"
+            )
+        };
+        let err = parse_err(&src(X, ""));
+        assert!(err.contains("gated like it or not at all"), "{err}");
+        for (w, r) in [(X, X), ("", X), ("", "")] {
+            let src = src(w, r);
+            if let Err(e) = syn::parse_str::<GraphSpec>(&src) {
+                panic!("{src}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_default_executor_keeps_its_doc_comment() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "/// The main tier.\ndefault executor THREAD;\nnode A = Terminate, deps: [], task: f;",
+        )
+        .unwrap();
+        assert_eq!(
+            spec.default_executor.as_ref().map(ToString::to_string),
+            Some("THREAD".to_string())
+        );
+        let err = parse_err("#[cfg_attr(x, cfg(y))] default executor THREAD;");
+        assert!(err.contains("cannot be `#[cfg]`-gated"), "{err}");
+    }
+
+    #[test]
+    fn cancel_names_the_modes_it_takes() {
+        let err = parse_err("node A = Pause, deps: [], task: f, cancel;");
+        assert!(
+            err.starts_with("`cancel` needs mode `Terminate` (or `OnDemand`)")
+                && !err.contains("Mode::"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn list_and_default_repeats_are_rejected() {
+        let err = parse_err("node A = Terminate, deps: [], reads: [crate::ARR, crate::ARR[0]];");
+        assert!(
+            err.contains("is declared both as a whole array and by element"),
+            "{err}"
+        );
+        let err = parse_err("node A = Terminate, deps: [], task: f, provides: [S, S];");
+        assert!(err.contains("duplicate `provides:` slot"), "{err}");
+        for dir in ["writes", "reads"] {
+            let err = parse_err(&format!(
+                "observe {dir}: it.get();\nobserve {dir}: it.load();"
+            ));
+            assert_eq!(err, format!("duplicate `observe {dir}:` default"));
+        }
+    }
+
+    /// A fragment cannot set what is graph-wide: the compose site pastes every
+    /// fragment into one graph.
+    #[test]
+    fn a_fragment_body_sets_no_graph_wide_default() {
+        for (body, needle) in [
+            (
+                "name: G;\nnode A = Terminate, deps: [];",
+                "a fragment is named by `name:` in `supervisor_fragment!`",
+            ),
+            (
+                "observe writes: it.get();\nnode A = Terminate, deps: [];",
+                "`observe` defaults belong to the composing graph",
+            ),
+            (
+                "observe reads: it.get();",
+                "`observe` defaults belong to the composing graph",
+            ),
+            (
+                "default executor THREAD;",
+                "a fragment cannot declare the graph's default executor",
+            ),
+        ] {
+            let spec = syn::parse_str::<GraphSpec>(body).unwrap();
+            let err = check_fragment_body(&spec).unwrap_err().to_string();
+            assert!(err.contains(needle), "{body}: {err}");
+        }
+        let spec = syn::parse_str::<GraphSpec>("node A = Terminate, deps: [];").unwrap();
+        assert!(check_fragment_body(&spec).is_ok());
+        // Inside `@fragment` markers, as the compose site sees it.
+        let err = parse_err("@fragment F; observe writes: it.get(); @endfragment;");
+        assert!(
+            err.contains("`observe` defaults belong to the composing graph"),
+            "{err}"
         );
     }
 }

@@ -6,6 +6,69 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.13.0] - 2026-11-11
+
+Pins `embassy-supervisor-syntax` 0.7.0; pinned by `embassy-supervisor` 0.14.0.
+
+### Changed
+
+- **Breaking (emitted code):** a `local` slot's `provide`, `take`, `restore` and `get`
+  are `unsafe fn`s whose contract is the slot's executor, beside a new `unsafe fn clear`
+  and a safe `is_filled`. The slot type no longer implements `ResourceGate`: gate and
+  `provides:` tables name its `#[doc(hidden)]` gate view, `__SV_LGATE_<RES>`, and the
+  generated shell wraps its own calls in `unsafe`.
+- **Breaking (emitted code):** the graph static is built with `Graph::new(..)` and the
+  `with_pools`/`with_graph_ref` builders instead of a struct literal (`Graph` is
+  `#[non_exhaustive]`), and a shell that loses a resource calls
+  `TaskNode::__sv_lost_resource`. Both need the matching `embassy-supervisor`.
+- Every macro carries rustdoc: `supervisor_graph!` with the grammar at a glance,
+  `supervisor_fragment!`, `#[dataflow]` and `#[dataflow_bundle]` with what they emit,
+  the feature they need and the attribute-order rule. docs.rs builds with
+  `--cfg docsrs`.
+- A feature-gated construct (a `ready` or `bound` dep, `reads:`/`writes:`, an `observed`
+  or `veto` entry, `discover`, a `dataflow:` entry, `local`, `divisible`, `state:`, and
+  the `beat_timeout:`, `beat_window:`, `enabled_if:`, `restart_budget:` and
+  `ready_on_write` clauses) under a `#[cfg]` on its item, entry or clause is left out
+  instead of rejected; the rejection becomes a `compile_error!` under the same cfgs.
+- A failing `#[dataflow]` keeps its fn and, for a free fn, emits its two tables empty; a
+  failing `#[dataflow_bundle]` keeps its module.
+- A deferred `discover` marker assert and a pool's `min:`/`max:` expression asserts are
+  spanned on the entry or bound they check and name their item (``pool `P`: `min:` must
+  not exceed `max:` ``). An `observed` entry that falls back to `Observable` reports a
+  missing impl at its signal instead of the whole graph.
+- `ready_on_write` without `liveness-monitor` is reported on the clause itself; its
+  `coupling-observe`/`readiness` error has one text at the gate and in the deferred
+  `compile_error!`. `observe writes:`/`observe reads:` without `coupling-observe` is
+  reported under its own name.
+- `it` in an `observe` default or a `via` accessor is replaced only where it names a
+  value: a field, method or path segment named `it` and a closure's own `it` parameter
+  keep their meaning, and a macro call's arguments are rewritten when they parse as
+  expressions. The spawn glue's `s` and `i` bindings are hygienic, so a `spawn:` partial
+  call's arguments cannot name them.
+- A name declared as a take-kind resource and as `shared`/`divisible` gets one message
+  in either order, and resource shape and duplicate-name errors name the fragment the
+  declaration came from.
+- Pool `min:`/`max:` literal bounds, a pool's `resources:`/`state:` without `task:` and a
+  dep repeated in one `deps:` list are reported by `embassy-supervisor-syntax`, with the
+  same messages, so the tools reject them too.
+
+### Fixed
+
+- `provides:` of a `local` slot on a node the graph does not spawn (a parked node or a
+  `spawn:` closure) is rejected: the provider's executor could not be checked.
+- `#[dataflow]` below `#[embassy_executor::task]` is rejected instead of deriving empty
+  tables from the task macro's spawner fn, and `#[dataflow]` on a method is rejected.
+- `#[dataflow]` tables gate each arm of an `if #[cfg(..)] { .. } else { .. }` chain (the
+  `cfg_if!` shape) on its own predicate (see `embassy-supervisor-syntax`).
+- Two items with one runtime name (a node goes by its lower-cased name, a pool member by
+  `<pool><index>`) are rejected: a lookup by name found only the first.
+- A `supervisor_fragment!` body that sets `name:` or an `observe` default is rejected at
+  the fragment, as a `default executor` was: the compose site pasted it into the whole
+  graph.
+- `#[dataflow]` takes an element target only over a path-named array at a literal or path
+  index (`&ARR[0]`, `&ARR[CONST]`), which its module-level tables can name, and a
+  registered verb called with no argument is named in the error.
+
 ## [0.12.0] - 2026-11-07
 
 Pins `embassy-supervisor-syntax` 0.6.0; pinned by `embassy-supervisor` 0.13.0.
@@ -604,7 +667,8 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.12.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.13.0...HEAD
+[0.13.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.12.0...embassy-supervisor-macros-v0.13.0
 [0.12.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.11.0...embassy-supervisor-macros-v0.12.0
 [0.11.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.10.0...embassy-supervisor-macros-v0.11.0
 [0.10.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.9.1...embassy-supervisor-macros-v0.10.0

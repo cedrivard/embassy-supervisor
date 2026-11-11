@@ -1,11 +1,14 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
+use std::time::Duration as StdDuration;
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{DeferredShrink, FaultKind, Supervisor, TaskNode, supervisor_graph};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::MockDriver;
+use support::settle;
 
 supervisor_graph! {
     node PROVIDER = Terminate, deps: [], task: provider_worker;
@@ -60,16 +63,6 @@ async fn pool_worker(node: &'static TaskNode) {
         .await;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn pool_driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
@@ -83,14 +76,20 @@ async fn driver(spawner: Spawner) {
     // ── start() parks on CONSUMER's ready dep until the provider asserts.
     RELEASE_PROVIDER.signal(());
     sup.start(&spawner).await.expect("start");
-    settle(|| CONSUMER_SPAWNS.load(Ordering::SeqCst) == 1).await;
+    settle("consumer spawned", || {
+        CONSUMER_SPAWNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
     assert!(
         CONSUMER_SAW_READY.load(Ordering::SeqCst),
         "consumer's first poll saw the provider ready — spawn was held"
     );
     PHASE.store(1, Ordering::SeqCst);
 
-    settle(|| POOL_SPAWNS.load(Ordering::SeqCst) == 1).await;
+    settle("floor member spawned", || {
+        POOL_SPAWNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
     PROVIDER.clear_ready();
     spawner.spawn(pool_driver(spawner).unwrap());
     embassy_supervisor::request_scale();
@@ -107,7 +106,7 @@ async fn driver(spawner: Spawner) {
 
     PROVIDER.set_ready();
     embassy_supervisor::request_scale();
-    settle(|| POOL_SPAWNS.load(Ordering::SeqCst) == 2).await;
+    settle("pool grew", || POOL_SPAWNS.load(Ordering::SeqCst) == 2).await;
     assert_eq!(
         POOL_SPAWNS.load(Ordering::SeqCst),
         2,
@@ -131,30 +130,29 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn ready_deps_gate_bringup_and_growth() {
+    // Phase 2 parks on LATE's 100 ms ready-dep timeout; advance the frozen
+    // clock in small repeated steps (always landing after the timer arms).
     let clock = MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        // Phase 2 parks on LATE's 100 ms ready-dep timeout; advance the frozen
-        // clock in small repeated steps (always landing after the timer arms).
-        if PHASE.load(Ordering::SeqCst) >= 2 {
-            clock.advance(embassy_time::Duration::from_millis(50));
+    std::thread::spawn(move || {
+        loop {
+            if PHASE.load(Ordering::SeqCst) >= 2 {
+                clock.advance(embassy_time::Duration::from_millis(50));
+            }
+            std::thread::sleep(StdDuration::from_millis(5));
         }
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (phase={}, consumer_spawns={}, pool_spawns={})",
-            PHASE.load(Ordering::SeqCst),
-            CONSUMER_SPAWNS.load(Ordering::SeqCst),
-            POOL_SPAWNS.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    });
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (phase={}, consumer_spawns={}, pool_spawns={})",
+                PHASE.load(Ordering::SeqCst),
+                CONSUMER_SPAWNS.load(Ordering::SeqCst),
+                POOL_SPAWNS.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

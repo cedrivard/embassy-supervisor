@@ -5,7 +5,7 @@ use std::fmt::Write;
 
 use embassy_supervisor_syntax::{
     Dep, Item, NodeItem, PoolItem, ProvideDecl, ResourceDecl, SignalDecl, TaskSource,
-    path_to_string,
+    path_to_string, signal_stem,
 };
 use quote::ToTokens;
 
@@ -224,7 +224,7 @@ pub fn render(decl: &Decl, opts: &Options) -> String {
                 continue;
             };
             let origin = link_origin(decl, item);
-            let file = std::fs::canonicalize(origin)
+            let file = std::path::absolute(origin)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| origin.to_string());
             let line = item_line(item).max(1);
@@ -251,7 +251,7 @@ pub fn render(decl: &Decl, opts: &Options) -> String {
                     && !provides_of(i)
                         .iter()
                         .any(|p| taken.contains(&p.ident.to_string()))
-                    && !has_discovered_access(i, &opts.discovered, &opts.bundles)
+                    && !has_discovered_access(decl, i, &opts.discovered, &opts.bundles)
             })
             .filter_map(boxed_name)
             .collect()
@@ -364,7 +364,7 @@ pub fn render(decl: &Decl, opts: &Options) -> String {
             let Some(name) = boxed_name(item) else {
                 continue;
             };
-            let bindings = crate::expand_bundles(crate::fn_bindings(item), &opts.bundles);
+            let bindings = crate::decl_bindings(decl, item, &opts.bundles);
             if bindings.is_empty() {
                 continue;
             }
@@ -409,7 +409,7 @@ pub fn render(decl: &Decl, opts: &Options) -> String {
                     let label = if opts.full_paths {
                         key.clone()
                     } else {
-                        key.rsplit("::").next().unwrap_or(&key).to_string()
+                        signal_stem(&key).to_string()
                     };
                     let _ = writeln!(out, "  {id}[/\"{}\"/]", esc(&label));
                 }
@@ -749,9 +749,15 @@ fn legend(opts: &Options, chained: bool, links_before: usize) -> String {
 }
 
 pub(crate) fn diagram_title(decl: &Decl, opts: &Options) -> String {
-    opts.title.clone().unwrap_or_else(|| match decl.name() {
-        Some(n) => format!("{} {n}", decl.kind.macro_name()),
-        None => decl.kind.macro_name().to_string(),
+    opts.title.clone().unwrap_or_else(|| {
+        let mut title = match decl.name() {
+            Some(n) => format!("{} {n}", decl.kind.macro_name()),
+            None => decl.kind.macro_name().to_string(),
+        };
+        if opts.show_cfg && !decl.cfg.is_empty() {
+            title.push_str(&format!(" cfg({})", decl.cfg.join(") · cfg(")));
+        }
+        title
     })
 }
 
@@ -838,7 +844,7 @@ pub(crate) fn boxed_name(item: &Item) -> Option<String> {
     }
 }
 
-fn fragment_of(item: &Item) -> Option<&str> {
+pub(crate) fn fragment_of(item: &Item) -> Option<&str> {
     match item {
         Item::Node(n) => n.fragment.as_deref(),
         Item::Pool(p) => p.fragment.as_deref(),
@@ -921,11 +927,12 @@ fn paths_alias(a: &str, b: &str) -> bool {
 }
 
 fn has_discovered_access(
+    decl: &Decl,
     item: &Item,
     discovered: &[crate::Discovered],
     bundles: &[crate::Bundle],
 ) -> bool {
-    let bindings = crate::expand_bundles(crate::fn_bindings(item), bundles);
+    let bindings = crate::decl_bindings(decl, item, bundles);
     discovered
         .iter()
         .any(|d| crate::binding_for(&bindings, d).is_some())
@@ -1186,7 +1193,7 @@ fn resource_edge(slot: &str, node: &str, r: &ResourceDecl, show_cfg: bool) -> St
     if marks.is_empty() {
         format!("{slot} --> {node}")
     } else {
-        format!("{slot} -- \"{}\" --> {node}", marks.join(" · "))
+        format!("{slot} -- \"{}\" --> {node}", esc(&marks.join(" · ")))
     }
 }
 

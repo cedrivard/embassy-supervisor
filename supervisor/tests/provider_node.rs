@@ -1,9 +1,11 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
-use embassy_time::{Duration, MockDriver, Timer};
+use embassy_time::{Duration, Timer};
+use support::settle;
 
 struct Gadget {
     generation: u32,
@@ -68,22 +70,12 @@ supervisor_graph! {
         resources: [HANDLE: shared Handle];
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..100_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
 
     sup.start(&spawner).await.expect("start");
-    settle(|| READ_RUNS.load(Ordering::SeqCst) == 2).await;
+    settle("second read run", || READ_RUNS.load(Ordering::SeqCst) == 2).await;
     assert_eq!(
         OWNER_GEN.load(Ordering::SeqCst),
         1,
@@ -119,7 +111,7 @@ async fn driver(spawner: Spawner) {
     );
 
     sup.respawn_terminate(&spawner).await.expect("respawn");
-    settle(|| READ_RUNS.load(Ordering::SeqCst) == 4).await;
+    settle("fourth read run", || READ_RUNS.load(Ordering::SeqCst) == 4).await;
     assert_eq!(
         OWNER_GEN.load(Ordering::SeqCst),
         2,
@@ -136,30 +128,22 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn provider_node_builds_and_rebuilds_consumer_resources() {
-    let clock = MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
     // Tick mock time: the provider's build delay and the consumers' bounded
     // gate waits are real timers against the mock clock.
-    let deadline = StdInstant::now() + StdDuration::from_secs(20);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (gen={}, owner={}, runs={}, sum={}, dropped={})",
-            GENERATION.load(Ordering::SeqCst),
-            OWNER_GEN.load(Ordering::SeqCst),
-            READ_RUNS.load(Ordering::SeqCst),
-            READ_SUM.load(Ordering::SeqCst),
-            DROPPED.load(Ordering::SeqCst),
-        );
-        clock.advance(Duration::from_millis(10));
-        std::thread::sleep(StdDuration::from_millis(1));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Free(Duration::from_millis(10)),
+        20,
+        || {
+            format!(
+                "did not complete (gen={}, owner={}, runs={}, sum={}, dropped={})",
+                GENERATION.load(Ordering::SeqCst),
+                OWNER_GEN.load(Ordering::SeqCst),
+                READ_RUNS.load(Ordering::SeqCst),
+                READ_SUM.load(Ordering::SeqCst),
+                DROPPED.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

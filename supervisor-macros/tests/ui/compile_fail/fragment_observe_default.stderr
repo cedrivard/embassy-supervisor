@@ -1,0 +1,5 @@
+error: `observe` defaults belong to the composing graph: a fragment cannot set them for other fragments
+ --> tests/ui/compile_fail/fragment_observe_default.rs:8:5
+  |
+8 |     observe writes: it.get();
+  |     ^^^^^^^

@@ -7,6 +7,12 @@ const HTML_DIAGRAM: &str = include_str!("html/diagram.html");
 const HTML_STYLE: &str = include_str!("html/style.css");
 const HTML_SCRIPT: &str = include_str!("html/app.js");
 
+/// The mermaid release `--html` pages load, pinned so a page renders the
+/// same diagram whenever it is opened.
+pub const MERMAID_VERSION: &str = "11.17.2";
+/// The `@mermaid-js/layout-elk` release a page loads for a `layout: elk` diagram.
+pub const ELK_VERSION: &str = "0.2.3";
+
 /// Encode a Mermaid diagram into a shareable mermaid.live URL.
 pub fn live_url(diagram: &str) -> String {
     let state = serde_json::json!({
@@ -42,7 +48,8 @@ fn base64_url(bytes: &[u8]) -> String {
     out
 }
 
-/// Build a self-contained HTML page that renders the given diagrams.
+/// Build an HTML page that renders the given diagrams. The page loads mermaid
+/// (and, for a `layout: elk` diagram, its ELK layout) from a CDN at view time.
 ///
 /// `diagrams` is a list of `(heading, mermaid_source)` pairs.
 pub fn html_page(title: Option<&str>, diagrams: &[(String, String)]) -> String {
@@ -56,7 +63,10 @@ pub fn html_page(title: Option<&str>, diagrams: &[(String, String)]) -> String {
         .as_deref()
         .map(|title| format!("<h1>{title}</h1>\n"))
         .unwrap_or_default();
-    let script = HTML_SCRIPT.replacen("__SOURCES__", &script_sources(diagrams), 1);
+    let script = HTML_SCRIPT
+        .replacen("__MERMAID_VERSION__", MERMAID_VERSION, 1)
+        .replacen("__ELK_VERSION__", ELK_VERSION, 1)
+        .replacen("__SOURCES__", &script_sources(diagrams), 1);
     HTML_PAGE
         .replacen("{{STYLE}}", HTML_STYLE, 1)
         .replacen("{{SCRIPT}}", &script, 1)
@@ -97,7 +107,10 @@ fn html_esc(s: &str) -> String {
 /// Returns an error if `mmdc` is not installed or exits unsuccessfully.
 pub fn mmdc_render(diagram: &str, out_path: &str) -> Result<(), String> {
     let tmp = mmdc_input(diagram)?;
-    let status = std::process::Command::new("mmdc")
+    // npm installs a `.cmd` shim on Windows, which `Command` does not find
+    // under the bare name.
+    let program = if cfg!(windows) { "mmdc.cmd" } else { "mmdc" };
+    let status = std::process::Command::new(program)
         .arg("-i")
         .arg(&tmp)
         .args(["-o", out_path])
@@ -142,19 +155,45 @@ const END: &str = "<!-- supervisor-mermaid:end -->";
 /// Update a markdown file between `<!-- supervisor-mermaid:start -->` and
 /// `<!-- supervisor-mermaid:end -->` marker lines.
 ///
-/// A marker counts only alone on its line, so one quoted in prose or a table
-/// is text. With no markers, the block is appended to the end of the file.
+/// A marker counts only alone on its line and outside a fenced code block, so
+/// one quoted in prose, a table or an example is text. With no markers, the
+/// block is appended to the end of the file. The block takes the file's line
+/// ending (CRLF when its first line ends so). A file that would not change is
+/// not written; otherwise the new text goes to a temporary file beside it,
+/// which is then renamed over it.
 pub fn update_markdown(path: &str, block: &str) -> Result<(), String> {
     let existing = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    let updated =
-        splice(&existing, &format!("{START}\n{block}{END}")).map_err(|e| format!("{path}: {e}"))?;
-    std::fs::write(path, updated).map_err(|e| format!("{path}: {e}"))
+    let crlf = existing
+        .find('\n')
+        .is_some_and(|i| existing[..i].ends_with('\r'));
+    let nl = if crlf { "\r\n" } else { "\n" };
+    let managed = format!("{START}\n{block}{END}")
+        .replace("\r\n", "\n")
+        .replace('\n', nl);
+    let updated = splice(&existing, &managed, nl).map_err(|e| format!("{path}: {e}"))?;
+    if updated == existing {
+        return Ok(());
+    }
+    let tmp = format!("{path}.supervisor-mermaid.tmp");
+    let replaced = std::fs::write(&tmp, &updated).and_then(|()| std::fs::rename(&tmp, path));
+    replaced.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{path}: {e}")
+    })
 }
 
-/// `existing` with `managed` in place of its marked block, or appended.
-fn splice(existing: &str, managed: &str) -> Result<String, String> {
+/// `existing` with `managed` in place of its marked block, or appended after
+/// a line ending `nl`.
+fn splice(existing: &str, managed: &str, nl: &str) -> Result<String, String> {
     match (marker_line(existing, START), marker_line(existing, END)) {
         (Some((s, _)), Some((e, after))) if e > s => {
+            if marker_line(&existing[after..], START).is_some() {
+                return Err(
+                    "a second supervisor-mermaid start marker follows the managed block; \
+                     remove one"
+                        .to_string(),
+                );
+            }
             Ok(format!("{}{managed}{}", &existing[..s], &existing[after..]))
         }
         (Some(_), Some(_)) => Err("the supervisor-mermaid end marker comes before the start \
@@ -162,11 +201,11 @@ fn splice(existing: &str, managed: &str) -> Result<String, String> {
             .to_string()),
         (None, None) => {
             let sep = if existing.ends_with('\n') {
-                "\n"
+                nl.to_string()
             } else {
-                "\n\n"
+                format!("{nl}{nl}")
             };
-            Ok(format!("{existing}{sep}{managed}\n"))
+            Ok(format!("{existing}{sep}{managed}{nl}"))
         }
         _ => Err(
             "found one supervisor-mermaid marker without the other; fix the markers by hand"
@@ -176,13 +215,32 @@ fn splice(existing: &str, managed: &str) -> Result<String, String> {
 }
 
 /// The byte range of `marker` on the first line that holds it alone
-/// (surrounding whitespace allowed).
+/// (surrounding whitespace allowed), outside a fenced code block.
 fn marker_line(text: &str, marker: &str) -> Option<(usize, usize)> {
     let mut at = 0;
+    // The open fence: its character and length.
+    let mut fence: Option<(char, usize)> = None;
     for line in text.split_inclusive('\n') {
-        if line.trim() == marker {
-            let lead = line.len() - line.trim_start().len();
-            return Some((at + lead, at + lead + marker.len()));
+        let trimmed = line.trim_start();
+        let run = |c: char| trimmed.chars().take_while(|&x| x == c).count();
+        let (tick, tilde) = (run('`'), run('~'));
+        let opener = if tick >= 3 {
+            Some(('`', tick))
+        } else if tilde >= 3 {
+            Some(('~', tilde))
+        } else {
+            None
+        };
+        match (fence, opener) {
+            (None, Some(open)) => fence = Some(open),
+            (Some((c, n)), Some((d, m))) if c == d && m >= n && trimmed[m..].trim().is_empty() => {
+                fence = None;
+            }
+            (None, None) if line.trim() == marker => {
+                let lead = line.len() - trimmed.len();
+                return Some((at + lead, at + lead + marker.len()));
+            }
+            _ => {}
         }
         at += line.len();
     }
@@ -245,12 +303,25 @@ mod tests {
         assert!(page.contains("mermaid.render("), "{page}");
         assert!(page.contains("theme: resolvedTheme()"), "{page}");
         assert!(
-            page.contains("@mermaid-js/layout-elk@0/dist/mermaid-layout-elk.esm.min.mjs"),
+            page.contains(&format!(
+                "npm/mermaid@{MERMAID_VERSION}/dist/mermaid.esm.min.mjs"
+            )),
+            "{page}"
+        );
+        assert!(!page.contains("__"), "every placeholder is filled: {page}");
+        assert!(
+            page.contains(&format!(
+                "@mermaid-js/layout-elk@{ELK_VERSION}/dist/mermaid-layout-elk.esm.min.mjs"
+            )),
             "{page}"
         );
         assert!(
             page.contains("mermaid.registerLayoutLoaders(elkLayouts)"),
             "{page}"
+        );
+        assert!(
+            page.contains("await import("),
+            "ELK loads only when a diagram asks for it: {page}"
         );
         assert!(page.contains("A[\\u003c/script\\u003e]"), "{page}");
         assert!(page.contains(".page-header {"), "{page}");
@@ -302,6 +373,50 @@ mod tests {
     }
 
     #[test]
+    fn markdown_update_writes_only_a_change_and_keeps_crlf() {
+        let p = std::env::temp_dir().join(format!("svm_md_crlf_{}.md", std::process::id()));
+        let path = p.display().to_string();
+        std::fs::write(&p, "# Doc\r\n\r\ntext\r\n").unwrap();
+        update_markdown(&path, "ONE\n").unwrap();
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(!s.replace("\r\n", "").contains('\n'), "{s:?}");
+        assert!(s.contains(":start -->\r\nONE\r\n<!--"), "{s:?}");
+
+        // With the temporary path blocked, only a run that changes nothing
+        // can succeed: it writes nothing.
+        let tmp = format!("{path}.supervisor-mermaid.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        update_markdown(&path, "ONE\n").unwrap();
+        assert!(update_markdown(&path, "TWO\n").is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), s);
+        std::fs::remove_dir(&tmp).ok();
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn markers_in_a_fence_are_text_and_a_second_start_is_refused() {
+        let managed = "<!-- supervisor-mermaid:start -->\nX\n<!-- supervisor-mermaid:end -->";
+        let example = "````md\n<!-- supervisor-mermaid:start -->\n```\n````\n\
+                       ~~~\n<!-- supervisor-mermaid:end -->\n~~~\n";
+        assert_eq!(
+            splice(example, managed, "\n").unwrap(),
+            format!("{example}\n{managed}\n")
+        );
+        let twice = splice(
+            "<!-- supervisor-mermaid:start -->\nold\n<!-- supervisor-mermaid:end -->\n\
+             <!-- supervisor-mermaid:start -->\n",
+            managed,
+            "\n",
+        );
+        assert!(
+            twice
+                .as_ref()
+                .is_err_and(|e| e.contains("a second supervisor-mermaid start marker")),
+            "{twice:?}"
+        );
+    }
+
+    #[test]
     fn markers_count_only_as_whole_lines() {
         let managed = "<!-- supervisor-mermaid:start -->\nX\n<!-- supervisor-mermaid:end -->";
         let quoted = "| `--update FILE.md` | rewrite the block between the \
@@ -309,12 +424,13 @@ mod tests {
                       `<!-- supervisor-mermaid:end -->` lines in a markdown file, \
                       touching nothing else |\n";
         assert_eq!(
-            splice(quoted, managed).unwrap(),
+            splice(quoted, managed, "\n").unwrap(),
             format!("{quoted}\n{managed}\n")
         );
         let swapped = splice(
             "<!-- supervisor-mermaid:end -->\n<!-- supervisor-mermaid:start -->\n",
             managed,
+            "\n",
         );
         assert!(
             swapped
@@ -322,7 +438,7 @@ mod tests {
                 .is_err_and(|e| e.contains("before the start")),
             "{swapped:?}"
         );
-        let lone = splice("<!-- supervisor-mermaid:start -->\n", managed);
+        let lone = splice("<!-- supervisor-mermaid:start -->\n", managed, "\n");
         assert!(
             lone.as_ref()
                 .is_err_and(|e| e.contains("without the other")),
@@ -331,7 +447,8 @@ mod tests {
         assert_eq!(
             splice(
                 "  <!-- supervisor-mermaid:start -->\nold\n<!-- supervisor-mermaid:end -->\n",
-                managed
+                managed,
+                "\n"
             )
             .unwrap(),
             format!("  {managed}\n")

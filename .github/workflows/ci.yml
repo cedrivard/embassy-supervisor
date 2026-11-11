@@ -8,10 +8,14 @@ on:
     branches: [main]
   pull_request:
 
-# Cancel superseded runs on the same ref.
+# Read-only token: no job writes to the repository.
+permissions:
+  contents: read
+
+# Cancel superseded pull-request runs on the same ref; pushes to main all run.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,54 +30,102 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the toolchain the trybuild `.stderr` snapshots are blessed
+      # with: rustc's diagnostics drift between releases (`stable-canary`
+      # below tracks stable without failing the run).
+      - uses: dtolnay/rust-toolchain@master
         with:
-          # rust-src changes how rustc renders const-eval panics whose frames land in
-          # core (with the source it prints the annotated snippet; without it, a bare
-          # `= note:` fallback). The trybuild `.stderr` snapshots for the dependency-
-          # cycle cases are blessed with the source available, so CI must match.
+          toolchain: 1.97.1
+          # rust-src changes how rustc renders const-eval panics whose frames
+          # land in core (with the source it prints the annotated snippet;
+          # without it, a bare `= note:` fallback). Three snapshot families
+          # depend on it: dependency cycles, veto capacity and the deferred
+          # const-assert panics, all blessed with the source available.
           components: rust-src
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p embassy-supervisor --target $HOST
-      - run: cargo test -p embassy-supervisor --target $HOST --no-default-features
-      - run: cargo test -p embassy-supervisor --target $HOST --all-features
-      - run: cargo test -p embassy-supervisor --target $HOST --features control,pool,trace-hooks
+      - run: cargo test -p embassy-supervisor --target "$HOST"
+      - run: cargo test -p embassy-supervisor --target "$HOST" --no-default-features
+      - run: cargo test -p embassy-supervisor --target "$HOST" --all-features
+      - run: cargo test -p embassy-supervisor --target "$HOST" --features control,pool,trace-hooks
       # The lifecycle-observability features together, without the rest of the
       # crate: events, breadcrumb, the watchdog gate, restart budget, enabled_if.
-      - run: cargo test -p embassy-supervisor --target $HOST --features lifecycle-events,breadcrumb,restart-intensity,enabled-if,liveness-monitor,control
+      - run: cargo test -p embassy-supervisor --target "$HOST" --features lifecycle-events,breadcrumb,restart-intensity,enabled-if,liveness-monitor,control
       # The sink alone, without the queue, so `lifecycle_sink` runs sink-only.
-      - run: cargo test -p embassy-supervisor --target $HOST --features macros,lifecycle-sink,control
+      - run: cargo test -p embassy-supervisor --target "$HOST" --features macros,lifecycle-sink,control
       # The name stamp without the trace layer: `--all-features` always has
       # `trace`, which takes the `adopt` path instead of `stamp_name`.
-      - run: cargo test -p embassy-supervisor --target $HOST --features metadata-names
+      - run: cargo test -p embassy-supervisor --target "$HOST" --features metadata-names
       # `supervisor_graph!` UI tests (trybuild): compile-fail cases lock the macro's
       # error contracts (cycle, unknown dep, ...); compile-pass cases run the generated
       # graph. Host-only — trybuild compiles real graphs — so `--target $HOST`.
-      - run: cargo test -p embassy-supervisor-macros --target $HOST
-      - run: cargo test -p embassy-supervisor-macros --target $HOST --all-features
+      - run: cargo test -p embassy-supervisor-macros --target "$HOST"
+      - run: cargo test -p embassy-supervisor-macros --target "$HOST" --all-features
       # The two macro features the dev-dependency does not force on: each picks a
       # different trybuild directory set in tests/ui.rs.
-      - run: cargo test -p embassy-supervisor-macros --target $HOST --features local-resources
-      - run: cargo test -p embassy-supervisor-macros --target $HOST --features heap-state
+      - run: cargo test -p embassy-supervisor-macros --target "$HOST" --features local-resources
+      - run: cargo test -p embassy-supervisor-macros --target "$HOST" --features heap-state
 
       # The graph grammar itself, which both the proc-macro and the diagram tool
       # parse with. It has no features: it always accepts the full syntax.
-      - run: cargo test -p embassy-supervisor-syntax --target $HOST
+      - run: cargo test -p embassy-supervisor-syntax --target "$HOST"
       # The observation facade: no features either, by design.
-      - run: cargo test -p embassy-supervisor-observe --target $HOST
+      - run: cargo test -p embassy-supervisor-observe --target "$HOST"
       # The host tools over that grammar: `supervisor-mermaid` and `supervisor-lint`.
-      - run: cargo test -p embassy-supervisor-tools --target $HOST
+      - run: cargo test -p embassy-supervisor-tools --target "$HOST"
       # They must also still understand the graph the firmware actually
       # declares, in both views and with the legend on.
-      - run: cargo run -q -p embassy-supervisor-tools --target $HOST --bin supervisor-mermaid -- --signals firmware/src/*.rs > /dev/null
-      - run: cargo run -q -p embassy-supervisor-tools --target $HOST --bin supervisor-mermaid -- --runtime --legend firmware/src/*.rs > /dev/null
+      - run: cargo run -q -p embassy-supervisor-tools --target "$HOST" --bin supervisor-mermaid -- --signals firmware/src/*.rs > /dev/null
+      - run: cargo run -q -p embassy-supervisor-tools --target "$HOST" --bin supervisor-mermaid -- --runtime --legend firmware/src/*.rs > /dev/null
       # And the firmware's graph and its `#[dataflow]` fns must agree: any
       # coverage warning (a bound fn no file defines, a fn nothing binds) is a
       # failure here, not a line on stderr someone has to notice.
-      - run: cargo run -q -p embassy-supervisor-tools --target $HOST --bin supervisor-mermaid -- --check firmware/src/*.rs
+      - run: cargo run -q -p embassy-supervisor-tools --target "$HOST" --bin supervisor-mermaid -- --check firmware/src/*.rs
       # The dataflow itself: a one-sided signal in the firmware's graph fails
       # here. Accepted absences would be named with `--allow`, in this line.
-      - run: cargo run -q -p embassy-supervisor-tools --target $HOST --bin supervisor-lint -- firmware/src/*.rs
+      - run: cargo run -q -p embassy-supervisor-tools --target "$HOST" --bin supervisor-lint -- firmware/src/*.rs
+
+  # The macro UI snapshots against the current stable rustc (allow-failure):
+  # an early warning that the pinned toolchain in `test` is due to move.
+  stable-canary:
+    name: macro snapshots vs stable (canary)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p embassy-supervisor-macros --target "$HOST" --all-features
+
+  # Every integration test with exactly its `required-features`: a test that
+  # only passes because `--all-features` drags in an unrelated feature fails
+  # here.
+  exact-features:
+    name: test (exact required-features, host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 ci/exact-features.py
+
+  # A target without atomic compare-and-swap: the runtime and the observation
+  # facade build with either of portable-atomic's two CAS providers.
+  no-cas:
+    name: check (thumbv6m, no CAS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv6m-none-eabi
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p embassy-supervisor --target thumbv6m-none-eabi --no-default-features --features control,pool,readiness,liveness-monitor,restart,bound-deps,portable-atomic/critical-section
+      - run: cargo check -p embassy-supervisor --target thumbv6m-none-eabi --no-default-features --features control,pool,readiness,liveness-monitor,restart,bound-deps,portable-atomic/unsafe-assume-single-core
+      - run: cargo check -p embassy-supervisor-observe --target thumbv6m-none-eabi --features portable-atomic/critical-section
 
   # `no_std` guard: the crate must still cross-compile for the MCU target (the
   # pinned default) across the feature matrix.
@@ -98,6 +150,8 @@ jobs:
   features:
     name: check (feature matrix, thumbv8m)
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -158,14 +212,20 @@ jobs:
   msrv:
     name: check (MSRV 1.88)
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
         with:
           targets: thumbv8m.main-none-eabihf
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked --workspace --exclude firmware --exclude bootloader --all-features --target $HOST
+      - run: cargo check --locked --workspace --exclude firmware --exclude bootloader --all-features --target "$HOST"
       - run: cargo check --locked -p embassy-supervisor --all-features
+      - run: cargo check --locked -p embassy-supervisor
+      - run: cargo check --locked -p embassy-supervisor --no-default-features
+      - run: cargo check --locked -p embassy-supervisor --target "$HOST"
+      - run: cargo check --locked -p embassy-supervisor --no-default-features --target "$HOST"
 
   # Canary against embassy's main branch (allow-failure): the executor's trace-hook
   # API is documented as unstable, so this job builds and tests the trace feature
@@ -198,8 +258,8 @@ jobs:
           fi
           cargo update -p embassy-executor -p embassy-time-queue-utils -p syn@3
           test "$(grep -c 'name = "embassy-executor-timer-queue"' Cargo.lock)" = 1
-      - run: cargo build -p embassy-supervisor --target $HOST --features trace-hooks,trace-names
-      - run: cargo test -p embassy-supervisor --target $HOST --features macros,trace-hooks,trace-names,trace-nested,trace-self
+      - run: cargo build -p embassy-supervisor --target "$HOST" --features trace-hooks,trace-names
+      - run: cargo test -p embassy-supervisor --target "$HOST" --features macros,trace-hooks,trace-names,trace-nested,trace-self
 
   lint:
     name: fmt + clippy
@@ -217,14 +277,14 @@ jobs:
       # `--all-targets` so the tests are linted too, not just the lib: the test
       # suite is where the graph DSL is actually exercised, and lint debt there
       # went unseen while this checked the lib alone.
-      - run: cargo clippy -p embassy-supervisor --target $HOST --all-features --all-targets -- -D warnings
+      - run: cargo clippy -p embassy-supervisor --target "$HOST" --all-features --all-targets -- -D warnings
       # The `supervisor_graph!` proc-macro crate (host-only build).
-      - run: cargo clippy -p embassy-supervisor-macros --target $HOST --all-targets -- -D warnings
+      - run: cargo clippy -p embassy-supervisor-macros --target "$HOST" --all-targets -- -D warnings
       # Host crates, so they need the same `--target $HOST` override as the tests.
-      - run: cargo clippy -p embassy-supervisor-syntax --target $HOST --all-targets -- -D warnings
-      - run: cargo clippy -p embassy-supervisor-tools --target $HOST --all-targets -- -D warnings
+      - run: cargo clippy -p embassy-supervisor-syntax --target "$HOST" --all-targets -- -D warnings
+      - run: cargo clippy -p embassy-supervisor-tools --target "$HOST" --all-targets -- -D warnings
       # The observation facade builds for both worlds; lint it as its consumers see it.
-      - run: cargo clippy -p embassy-supervisor-observe --target $HOST --all-targets -- -D warnings
+      - run: cargo clippy -p embassy-supervisor-observe --target "$HOST" --all-targets -- -D warnings
       - run: cargo clippy -p embassy-supervisor-observe -- -D warnings
 
   docs:
@@ -234,6 +294,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc -p embassy-supervisor --target $HOST --all-features --no-deps
+      - run: cargo doc -p embassy-supervisor --target "$HOST" --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo doc -p embassy-supervisor-macros --target "$HOST" --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo doc -p embassy-supervisor-syntax --target "$HOST" --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo doc -p embassy-supervisor-tools --target "$HOST" --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo doc -p embassy-supervisor-observe --target "$HOST" --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

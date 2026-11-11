@@ -8,8 +8,9 @@ Two host tools that read an `embassy-supervisor` task graph straight out of its
 Rust source:
 
 - **`supervisor-mermaid`** renders the declaration as a [Mermaid](https://mermaid.js.org) diagram;
-- **`supervisor-lint`** reports the graph's one-sided signals: read by a node
-  that nothing writes, written by a node that nothing reads.
+- **`supervisor-lint`** reports the graph's one-sided signals (read by a node
+  that nothing writes, written by a node that nothing reads) and, as
+  `public-gate`, gate statics reachable from outside their module.
 
 Both parse the same declarations and the same `#[dataflow]` fn bodies, so a
 lint finding names the same box a diagram draws.
@@ -133,7 +134,7 @@ page's browser title and heading, or `--no-title` to omit those titles.
 | `--watch` | re-run whenever an input file changes; needs `-o`, `--html`, `--render` or `--update` |
 
 `--links 'vscode://file/{file}:{line}:1'` makes each node box a link to its
-declaration (`{file}` is its canonical absolute path, `{line}` its source
+declaration (`{file}` is its absolute path, `{line}` its source
 line). Pair it with `--html FILE` and open the page in an external browser:
 VS Code's built-in Mermaid preview and GitHub disable Mermaid `click` links.
 
@@ -257,7 +258,7 @@ real absence of the build (an input this target has no producer for, a
 telemetry tap nothing consumes yet) rather than a mistake, so
 `--allow SIGNAL,…` names the accepted ones. The list lives in the invocation,
 where it is reviewed like code, and an `--allow` entry that names no one-sided
-signal is itself reported, whichever categories `--only` keeps.
+signal is itself reported whenever `--only` keeps a signal category.
 
 Drift warnings (a bound fn that no scanned file defines, a scanned fn that
 nothing binds) are printed here too when `orphan-reads` or `dead-writes` runs,
@@ -296,8 +297,9 @@ the working directory is in is scanned (its `src/` roots, expanded through
 `public-gate` alone needs none. `--allow` is how a known, accepted absence is
 written down where it gets reviewed.
 
-Exit status: 0 for no findings, 1 for findings (a stale `--allow` included),
-2 when the run itself fails (a bad option, an unreadable input, no graph).
+Exit status: 0 for no findings, 1 for findings (a stale `--allow` included)
+or an input file that does not parse, 2 when the run itself fails (a bad
+option, an unreadable input, no graph).
 
 OPTIONS:
         --deps             also scan the workspace's path dependencies (via
@@ -313,7 +315,7 @@ OPTIONS:
         --allow <SIGNALS>  accept these signals' findings (comma separated,
                            repeatable; matched like signal labels, by
                            `::`-suffix); an entry suppressing nothing is
-                           itself reported
+                           reported whenever `--only` keeps a signal category
     -h, --help             show this
     -V, --version          print the version
 ```

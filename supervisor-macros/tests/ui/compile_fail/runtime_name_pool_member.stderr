@@ -1,0 +1,5 @@
+error: runtime name `w0` is taken twice: `W[0]` and `W0` both map to it (names are lower-cased, and pool members are `<pool><index>`); rename one
+ --> tests/ui/compile_fail/runtime_name_pool_member.rs:8:10
+  |
+8 |     node W0 = Terminate, deps: [];
+  |          ^^

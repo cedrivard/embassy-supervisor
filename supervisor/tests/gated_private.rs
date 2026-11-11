@@ -1,5 +1,6 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, supervisor_graph};
@@ -48,18 +49,13 @@ async fn runner(spawner: Spawner) {
 
 #[test]
 fn a_private_signal_still_resolves_its_producer() {
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(runner(spawner).unwrap());
-        });
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(StdInstant::now() < deadline, "gate did not resolve");
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(runner(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || "gate did not resolve".to_owned(),
+    );
     assert_eq!(SAW.load(Ordering::SeqCst), 7);
 
     // The derived entry names the signal as the call site wrote it.

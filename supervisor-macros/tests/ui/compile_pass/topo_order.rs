@@ -10,7 +10,6 @@ supervisor_graph! {
 
 fn main() {
     assert_eq!(GRAPH.nodes.len(), 4);
-    assert_eq!(GRAPH.nodes.len(), 4);
     assert!(GRAPH.nodes.iter().all(|n| n.is_some()));
 
     for (pos, n) in GRAPH.order().enumerate() {

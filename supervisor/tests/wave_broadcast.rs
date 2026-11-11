@@ -1,8 +1,9 @@
 //! Two supervisors' waves parked at once on the shared gate and stop events:
 //! one event wakes both, with the clock frozen so no deadline can stand in.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
+mod support;
+
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
@@ -10,6 +11,8 @@ use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
 static UP: AtomicU32 = AtomicU32::new(0);
 static STARTED: AtomicU32 = AtomicU32::new(0);
 static STOPPED: AtomicU32 = AtomicU32::new(0);
+/// Set by the second wave to stop.
+static DONE: AtomicBool = AtomicBool::new(false);
 
 async fn worker(node: &'static TaskNode, _slot: &mut u32) {
     UP.fetch_add(1, Ordering::SeqCst);
@@ -40,7 +43,9 @@ async fn first(spawner: Spawner) {
     STARTED.fetch_add(1, Ordering::SeqCst);
     until(|| STARTED.load(Ordering::SeqCst) == 2).await;
     sup.teardown().await.expect("A's wave sees its ack");
-    STOPPED.fetch_add(1, Ordering::SeqCst);
+    if STOPPED.fetch_add(1, Ordering::SeqCst) == 1 {
+        DONE.store(true, Ordering::SeqCst);
+    }
 }
 
 #[embassy_executor::task]
@@ -52,7 +57,9 @@ async fn second(spawner: Spawner) {
     STARTED.fetch_add(1, Ordering::SeqCst);
     until(|| STARTED.load(Ordering::SeqCst) == 2).await;
     sup.teardown().await.expect("B's wave sees its ack");
-    STOPPED.fetch_add(1, Ordering::SeqCst);
+    if STOPPED.fetch_add(1, Ordering::SeqCst) == 1 {
+        DONE.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Fills both slots in one poll, once both waves are parked.
@@ -67,29 +74,24 @@ async fn provider() {
 
 #[test]
 fn one_event_wakes_every_supervisors_wave() {
-    let _clock = embassy_time::MockDriver::get(); // frozen: no deadline fires
-    let thread = std::thread::spawn(|| {
-        let executor = Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
+    // Frozen clock: no deadline fires.
+    support::run(
+        |spawner| {
             spawner.spawn(first(spawner).unwrap());
             spawner.spawn(second(spawner).unwrap());
             spawner.spawn(provider().unwrap());
-        });
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while STOPPED.load(Ordering::SeqCst) < 2 {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(
-            StdInstant::now() < deadline,
-            "a wave missed the shared event (up={}, started={}, stopped={})",
-            UP.load(Ordering::SeqCst),
-            STARTED.load(Ordering::SeqCst),
-            STOPPED.load(Ordering::SeqCst)
-        );
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+        },
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "a wave missed the shared event (up={}, started={}, stopped={})",
+                UP.load(Ordering::SeqCst),
+                STARTED.load(Ordering::SeqCst),
+                STOPPED.load(Ordering::SeqCst)
+            )
+        },
+    );
     assert_eq!(UP.load(Ordering::SeqCst), 2);
 }

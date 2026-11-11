@@ -11,11 +11,13 @@
 //! cleared the hold at spawn completion; this test reproduces the
 //! silently-unheld running member that produced.)
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{DeferredShrink, Supervisor, TaskNode, supervisor_graph};
+use support::settle;
 
 static LINK_SPAWNS: AtomicU32 = AtomicU32::new(0);
 static CREW_SPAWNS: AtomicU32 = AtomicU32::new(0);
@@ -51,16 +53,6 @@ supervisor_graph! {
         min: 0, max: 2;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
@@ -68,11 +60,14 @@ async fn driver(spawner: Spawner) {
     // Boot, grow a member by hand, then bound-stop it through a readiness flap.
     sup.start(&spawner).await.expect("bring-up");
     sup.start_node(&CREW[0], &spawner).await.expect("grow");
-    settle(|| CREW_SPAWNS.load(Ordering::SeqCst) == 1).await;
+    settle("first crew spawn", || {
+        CREW_SPAWNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
 
     LINK.clear_ready();
     sup.apply_bind(&spawner).await.expect("bound stop");
-    settle(|| !CREW[0].is_running()).await;
+    settle("member bound-stopped", || !CREW[0].is_running()).await;
     assert!(CREW[0].is_bound_stopped(), "the member bound-stopped");
 
     // The provider is still un-ready, so the recovery start_node parks inside
@@ -96,7 +91,10 @@ async fn driver(spawner: Spawner) {
 
     // The clock never moves, so the parked gate resolves only through LINK's
     // set_ready: the recovery spawn completes and its instance runs flagged.
-    settle(|| CREW_SPAWNS.load(Ordering::SeqCst) == 2).await;
+    settle("second crew spawn", || {
+        CREW_SPAWNS.load(Ordering::SeqCst) == 2
+    })
+    .await;
     assert!(
         CREW[0].is_running() && CREW[0].is_collateral(),
         "the member runs, still held by the mid-flight deactivate"
@@ -107,25 +105,20 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn mid_flight_hold_survives_the_spawn() {
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (link spawns={}, crew spawns={}, member running={})",
-            LINK_SPAWNS.load(Ordering::SeqCst),
-            CREW_SPAWNS.load(Ordering::SeqCst),
-            CREW[0].is_running(),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (link spawns={}, crew spawns={}, member running={})",
+                LINK_SPAWNS.load(Ordering::SeqCst),
+                CREW_SPAWNS.load(Ordering::SeqCst),
+                CREW[0].is_running(),
+            )
+        },
+    );
 
     assert!(LINK.is_disabled(), "the provider keeps its own latch");
     assert!(

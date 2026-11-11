@@ -4,6 +4,10 @@ use crate::{Coupling, Sig, TaskNode};
 
 #[allow(async_fn_in_trait)]
 /// A signal whose producer must be running and ready before a reader can use it.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a gated signal",
+    note = "only `Backed<T>` and `Leased<T>` statics can be opened"
+)]
 pub trait Gated {
     /// Handle returned by [`open`](TaskNode::open) after the gate passes.
     /// Counting gates return a guard; simple gates return `&'static Self`.

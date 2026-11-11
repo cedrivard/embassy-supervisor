@@ -92,9 +92,10 @@ fn respawn_after_ack_waits_for_the_task_to_return() {
         executor.run(|spawner| TIER.set(spawner.make_send()));
     });
 
-    // First stop: release only once the respawn has been retrying for 50
-    // passes of the driver's executor. The clock stands still, so the respawn
-    // cannot be waiting on a timeout: its first attempt is a guaranteed `Busy`.
+    // First stop: release only once 50 passes of the driver's executor have
+    // gone by with the respawn pending. The clock stands still, so the respawn
+    // cannot time out: its first attempt is a guaranteed `Busy`, answered with
+    // one fence pass, and every later one sleeps on the 1 ms backoff.
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
     while !RESPAWN_CALLED.load(Ordering::SeqCst) {
         assert!(StdInstant::now() < deadline, "the respawn was never called");
@@ -108,10 +109,27 @@ fn respawn_after_ack_waits_for_the_task_to_return() {
         );
         std::thread::sleep(StdDuration::from_millis(1));
     }
+    assert_eq!(
+        STARTS.load(Ordering::SeqCst),
+        1,
+        "still held by the old task"
+    );
     PROBE_STOP.store(true, Ordering::SeqCst);
     RELEASE.signal(());
 
-    // Second stop: only now does the clock move, to fault the held respawn.
+    // The old task returns on its own executor, which no event announces: the
+    // respawn goes through on its next backoff, so the clock moves 1 ms a step,
+    // far inside the 500 ms gate budget.
+    while STARTS.load(Ordering::SeqCst) < 2 {
+        assert!(
+            StdInstant::now() < deadline,
+            "the respawn never went through"
+        );
+        clock.advance(Duration::from_millis(1));
+        std::thread::sleep(StdDuration::from_millis(2));
+    }
+
+    // Second stop: the clock moves 50 ms a step, to fault the held respawn.
     while !DONE.load(Ordering::SeqCst) {
         assert!(StdInstant::now() < deadline, "did not complete");
         if FAULT_PHASE.load(Ordering::SeqCst) {

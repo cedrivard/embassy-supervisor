@@ -42,18 +42,25 @@ supervisor_graph! {
 }
 
 fn main() {
-    assert!(W.take().is_none(), "unprovided local slot must be empty");
-    W.provide(local::Widget { v: 1 });
-    let w = W.take().expect("provided value must be takeable");
-    W.restore(w);
-    assert!(W.take().is_some(), "restore must refill the local slot");
+    // SAFETY: one thread, and no executor runs the graph.
+    unsafe {
+        assert!(W.take().is_none(), "unprovided local slot must be empty");
+        W.provide(local::Widget { v: 1 });
+        let w = W.take().expect("provided value must be takeable");
+        W.restore(w);
+        assert!(W.take().is_some(), "restore must refill the local slot");
+        W.provide(local::Widget { v: 2 });
+        assert!(W.is_filled());
+        W.clear();
+        assert!(!W.is_filled(), "clear empties the slot");
 
-    B.provide(Rc::new(Cell::new(7)));
-    assert_eq!(B.take().expect("Rc must be takeable").get(), 7);
+        B.provide(Rc::new(Cell::new(7)));
+        assert_eq!(B.take().expect("Rc must be takeable").get(), 7);
 
-    S.provide((3, core::ptr::null()));
-    assert_eq!(S.get().expect("shared local get").0, 3);
-    assert!(S.get().is_some(), "shared local slot stays filled");
+        S.provide((3, core::ptr::null()));
+        assert_eq!(S.get().expect("shared local get").0, 3);
+        assert!(S.get().is_some(), "shared local slot stays filled");
+    }
 
     assert_eq!(GRAPH.nodes.len(), 3);
 }

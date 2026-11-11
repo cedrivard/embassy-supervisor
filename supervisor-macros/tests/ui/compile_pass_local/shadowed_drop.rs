@@ -11,6 +11,9 @@ supervisor_graph! {
 
 fn main() {
     drop(());
-    V.provide(7);
-    ::core::assert_eq!(V.take(), Some(7));
+    // SAFETY: one thread, and no executor runs the graph.
+    unsafe {
+        V.provide(7);
+        ::core::assert_eq!(V.take(), Some(7));
+    }
 }

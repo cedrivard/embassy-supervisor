@@ -3,9 +3,10 @@
 //! the default `slot_timeout`, so its first write asserts readiness inside
 //! its dependent's bring-up gate.
 
+mod support;
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
@@ -76,23 +77,17 @@ async fn clock_ticker() {
 
 #[test]
 fn a_late_ready_on_write_provider_gates_its_dependent_at_boot() {
-    let thread = std::thread::spawn(|| {
-        let executor = Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
+    support::run(
+        |spawner| {
             spawner.spawn(runner(spawner).unwrap());
             spawner.spawn(seeder().unwrap());
             spawner.spawn(clock_ticker().unwrap());
-        });
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(StdInstant::now() < deadline, "did not complete");
-        std::thread::sleep(StdDuration::from_millis(1));
-    }
+        },
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || "did not complete".to_owned(),
+    );
     assert_eq!(*FAULT.lock().unwrap(), None, "run() returned a fault");
     assert!(PRODUCER.is_ready(), "the first write asserted readiness");
     assert_eq!(DEP_STARTS.load(Ordering::SeqCst), 1);

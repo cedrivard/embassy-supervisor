@@ -67,8 +67,7 @@ fn node_gates(n: &NodeItem) -> Gates {
     g.within = n.slot_timeout.as_ref().map(|t| t.value.to_string());
     for (is_write, sig) in [(false, &n.reads), (true, &n.writes)] {
         for decl in sig.iter() {
-            let d = decl.display();
-            let short = d.rsplit("::").next().unwrap_or(&d).to_string();
+            let short = decl.stem();
             if is_write {
                 g.writes.push(short);
             } else {
@@ -93,8 +92,7 @@ fn pool_gates(p: &PoolItem) -> Gates {
     };
     for (is_write, sig) in [(false, &p.reads), (true, &p.writes)] {
         for decl in sig.iter() {
-            let d = decl.display();
-            let short = d.rsplit("::").next().unwrap_or(&d).to_string();
+            let short = decl.stem();
             if is_write {
                 g.writes.push(short);
             } else {

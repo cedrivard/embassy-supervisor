@@ -1,0 +1,5 @@
+error: resource name `BUS` shadows an `executor BUS;` slot — both are statics at the declaration site
+  --> tests/ui/compile_fail/resource_shadows_executor.rs:10:61
+   |
+10 |     node A = Terminate, deps: [], task: worker, resources: [BUS: Bus];
+   |                                                             ^^^

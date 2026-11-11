@@ -1,11 +1,12 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
     ControlOp, Supervisor, TaskNode, request_control, supervisor_graph, wait_control,
 };
-use embassy_time::MockDriver;
+use support::settle;
 
 supervisor_graph! {
     node NORMAL = Terminate, deps: [], spawn: normal_task;
@@ -23,7 +24,7 @@ static ONESHOT_SPAWNS: AtomicU32 = AtomicU32::new(0);
 static PHASE: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicBool = AtomicBool::new(false);
 
-#[embassy_executor::task(pool_size = 2)]
+#[embassy_executor::task]
 async fn normal_task(node: &'static TaskNode) {
     NORMAL_SPAWNS.fetch_add(1, Ordering::SeqCst);
     let _ = node
@@ -67,18 +68,6 @@ async fn oneshot_task(node: &'static TaskNode) {
     // Returns immediately — no wait_shutdown / ack_dropped.
 }
 
-/// Yield until `f()` holds (freshly-spawned tasks need to be polled before their
-/// bodies have run); panics if a generous turn budget elapses first.
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
@@ -86,7 +75,7 @@ async fn driver(spawner: Spawner) {
     // ── start(): all nodes come up; the daemon detaches itself, the one-shot
     //    disables itself and exits ──────────────────────────────────────────────
     sup.start(&spawner).await.expect("start");
-    settle(|| {
+    settle("all four nodes spawned", || {
         NORMAL_SPAWNS.load(Ordering::SeqCst) == 1
             && PAUSED_SPAWNS.load(Ordering::SeqCst) == 1
             && DAEMON_SPAWNS.load(Ordering::SeqCst) == 1
@@ -122,7 +111,10 @@ async fn driver(spawner: Spawner) {
 
     // ── resume_pausable(): resumes PAUSED in place (not respawned) ───────────
     sup.resume_pausable();
-    settle(|| PAUSED_RESUMES.load(Ordering::SeqCst) == 1).await;
+    settle("PAUSED resumed", || {
+        PAUSED_RESUMES.load(Ordering::SeqCst) == 1
+    })
+    .await;
     assert!(PAUSED.is_running(), "paused resumed");
     assert_eq!(
         PAUSED_SPAWNS.load(Ordering::SeqCst),
@@ -133,7 +125,10 @@ async fn driver(spawner: Spawner) {
 
     // ── respawn_terminate(): respawns NORMAL, skips PAUSED and detached DAEMON ─
     sup.respawn_terminate(&spawner).await.expect("respawn");
-    settle(|| NORMAL_SPAWNS.load(Ordering::SeqCst) == 2).await;
+    settle("NORMAL respawned", || {
+        NORMAL_SPAWNS.load(Ordering::SeqCst) == 2
+    })
+    .await;
     assert!(NORMAL.is_running(), "normal respawned");
     assert_eq!(
         PAUSED_SPAWNS.load(Ordering::SeqCst),
@@ -221,27 +216,19 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn detached_survives_teardown_and_respawn() {
-    let _clock = MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    // The executor thread never exits; poll the completion flag with a deadline.
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (phase={}, normal_spawns={}, daemon_spawns={}, daemon_shutdown_seen={})",
-            PHASE.load(Ordering::SeqCst),
-            NORMAL_SPAWNS.load(Ordering::SeqCst),
-            DAEMON_SPAWNS.load(Ordering::SeqCst),
-            DAEMON_SHUTDOWN_SEEN.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (phase={}, normal_spawns={}, daemon_spawns={}, daemon_shutdown_seen={})",
+                PHASE.load(Ordering::SeqCst),
+                NORMAL_SPAWNS.load(Ordering::SeqCst),
+                DAEMON_SPAWNS.load(Ordering::SeqCst),
+                DAEMON_SHUTDOWN_SEEN.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

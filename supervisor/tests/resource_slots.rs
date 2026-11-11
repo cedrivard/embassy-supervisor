@@ -1,9 +1,10 @@
+mod support;
+
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
-use embassy_time::MockDriver;
+use support::settle;
 
 struct Probe {
     runs: u32,
@@ -27,16 +28,6 @@ supervisor_graph! {
         resources: [PROBE: Probe];
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
@@ -44,7 +35,7 @@ async fn driver(spawner: Spawner) {
     // start(): the glue takes the provided Probe (runs == 0) and the shell hands
     // it to the worker.
     sup.start(&spawner).await.expect("start");
-    settle(|| OBSERVED_RUNS.load(Ordering::SeqCst) == 1).await;
+    settle("first run", || OBSERVED_RUNS.load(Ordering::SeqCst) == 1).await;
     assert_eq!(
         OBSERVED_RUNS.load(Ordering::SeqCst),
         1,
@@ -60,7 +51,7 @@ async fn driver(spawner: Spawner) {
     // glue re-takes it — the SAME instance, so the internal counter continues
     // (a re-acquired fresh Probe would report 1 again, not 2).
     sup.respawn_terminate(&spawner).await.expect("respawn");
-    settle(|| OBSERVED_RUNS.load(Ordering::SeqCst) == 2).await;
+    settle("second run", || OBSERVED_RUNS.load(Ordering::SeqCst) == 2).await;
     assert_eq!(
         OBSERVED_RUNS.load(Ordering::SeqCst),
         2,
@@ -72,10 +63,6 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn threaded_resource_round_trips_across_respawn() {
-    // Frozen mock clock: the ack-timeout / slot-wait Timers need a registered
-    // driver but never fire (acks are immediate, the slot is always filled).
-    let _clock = MockDriver::get();
-
     // Unit-level slot protocol checks (host-visible without an executor).
     assert!(PROBE.take().is_none(), "unprovided slot is empty");
     PROBE.provide(Probe { runs: 0 });
@@ -85,21 +72,18 @@ fn threaded_resource_round_trips_across_respawn() {
 
     // ^ the Probe (runs == 0) is back in the slot: this is main's provide(),
     // done BEFORE the supervisor starts; the graph takes it from here.
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (runs={})",
-            OBSERVED_RUNS.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    // Frozen mock clock: the ack-timeout / slot-wait Timers need a registered
+    // driver but never fire (acks are immediate, the slot is always filled).
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (runs={})",
+                OBSERVED_RUNS.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

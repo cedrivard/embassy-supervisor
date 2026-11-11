@@ -2,9 +2,10 @@
 //! same node run one after the other, never as two waves at once, so neither
 //! times out the instance the other respawned.
 
+mod support;
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
@@ -84,19 +85,13 @@ async fn runner(spawner: Spawner) {
 
 #[test]
 fn a_bind_and_a_restart_on_one_node_never_overlap() {
-    let _clock = MockDriver::get();
-    let thread = std::thread::spawn(|| {
-        let executor = Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| spawner.spawn(runner(spawner).unwrap()));
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(StdInstant::now() < deadline, "did not complete");
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    // Frozen mock clock: the script advances it itself.
+    support::run(
+        |spawner| spawner.spawn(runner(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || "did not complete".to_owned(),
+    );
     assert_eq!(*FAULT.lock().unwrap(), None, "run() returned a fault");
 }

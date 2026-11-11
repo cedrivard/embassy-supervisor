@@ -25,9 +25,12 @@ supervisor_graph! {
 fn main() {
     // One pool-wide slot with the ResourceSlot protocol: `get()` copies
     // without emptying, so any number of members/consumers fan out.
-    S.provide((5, core::ptr::null()));
-    assert_eq!(S.get().expect("shared local get").0, 5);
-    assert!(S.get().is_some(), "shared local slot stays filled");
+    // SAFETY: one thread, and no executor runs the graph.
+    unsafe {
+        S.provide((5, core::ptr::null()));
+        assert_eq!(S.get().expect("shared local get").0, 5);
+        assert!(S.get().is_some(), "shared local slot stays filled");
+    }
 
     // Pool + two nodes: members + PROVIDER + USER.
     assert_eq!(GRAPH.nodes.len(), 4);

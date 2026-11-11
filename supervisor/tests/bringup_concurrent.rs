@@ -1,5 +1,6 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
@@ -14,7 +15,6 @@ static DONE: AtomicBool = AtomicBool::new(false);
 
 async fn consumer_worker(node: &'static TaskNode, handle: Handle) {
     SEEN.store(handle.value, Ordering::SeqCst);
-    DONE.store(true, Ordering::SeqCst);
     let _ = node
         .run_cancellable_acked(core::future::pending::<()>())
         .await;
@@ -40,27 +40,23 @@ async fn driver(spawner: Spawner) {
     sup.start(&spawner)
         .await
         .expect("the wave spawns the provider while the consumer's gate is pending");
+    DONE.store(true, Ordering::SeqCst);
 }
 
 #[test]
 fn a_wave_reaches_a_provider_declared_after_its_consumer() {
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "bring-up did not resolve (seen={})",
-            SEEN.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(1));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "bring-up did not resolve (seen={})",
+                SEEN.load(Ordering::SeqCst)
+            )
+        },
+    );
     assert_eq!(SEEN.load(Ordering::SeqCst), 7);
     assert!(CONSUMER.is_running() && PROVIDER.is_running());
 }

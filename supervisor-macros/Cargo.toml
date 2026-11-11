@@ -4,7 +4,7 @@ name = "embassy-supervisor-macros"
 # version (`=x.y.z`): the generated code references doc(hidden) supervisor internals,
 # so only the tested pair is guaranteed compatible. Bump only when the macro changes;
 # the supervisor updates its pin to match.
-version = "0.12.0"
+version = "0.13.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -22,6 +22,7 @@ proc-macro = true
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 # Read at expansion time via `cfg!(feature = "pool")` to decide whether the
@@ -124,7 +125,7 @@ trace = ["graph-ref"]
 # not `trace` emits the name-only spawn path (no `adopt`, no id capture).
 metadata-names = []
 # Forwarded from the supervisor's `trace-hooks`: expand the supervisor's
-# `__sv_trace_hooks!` at the graph declaration site. The bodies (seven `no_mangle`
+# `__sv_trace_hooks!` at the unnamed graph's declaration site. The bodies (seven `no_mangle`
 # `_embassy_trace_*` symbols, or a `Trace` impl against embassy git main) are the
 # supervisor's: the graph site only hosts them, because the supervisor crate is
 # `forbid(unsafe_code)` and `no_mangle` cannot be written there.
@@ -136,8 +137,10 @@ trace-self = ["trace"]
 [dependencies]
 # The graph grammar, shared with the diagram tool. Pinned by EXACT version: the
 # AST is an internal contract between the two crates and changes with the syntax.
-embassy-supervisor-syntax = { version = "=0.6.0", path = "../supervisor-syntax" }
-syn = { version = "3.0.4", features = ["full"] }
+embassy-supervisor-syntax = { version = "=0.7.0", path = "../supervisor-syntax" }
+# `visit-mut`: the `observe`/`via` accessor's `it` is rewritten on the
+# expression tree, so a field or method named `it` is left alone.
+syn = { version = "3.0.4", features = ["full", "visit-mut"] }
 quote = "1.0.46"
 proc-macro2 = "1.0.106"
 
@@ -159,7 +162,7 @@ proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 # in the trybuild scratch projects and in this crate's own lib-test build: no
 # fixture and no `cfg!` can see one of them off. The rejection paths are
 # unit-tested against an explicit `gate::Features` value instead (see
-# `gate_rejects` in src/lib.rs). `pool`/`control` are named because the
+# `gate_rejects` in src/tests.rs). `pool`/`control` are named because the
 # supervisor's defaults are `macros` only and the fixtures declare pools and
 # control verbs.
 embassy-supervisor = { path = "../supervisor", features = [

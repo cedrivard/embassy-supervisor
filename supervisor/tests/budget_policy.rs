@@ -123,7 +123,7 @@ fn a_budget_divides_releases_and_clears() {
         (0, 0),
         "released: want and grant both gone"
     );
-    B.rebalance(&FairShare, t0());
+    assert!(B.rebalance(&FairShare, t0()).is_none());
     assert_eq!(two.grant(), 60, "the survivor gets its whole want");
 
     ResourceGate::clear(&B);
@@ -193,7 +193,7 @@ fn a_change_landing_mid_rebalance_re_arms_the_allocator() {
         poll_once(&mut changed).is_ready(),
         "but the allocator is re-armed for the change it published over"
     );
-    C.rebalance(&FairShare, t0());
+    assert!(C.rebalance(&FairShare, t0()).is_none());
     assert_eq!(
         (C.grant(0), C.grant(1)),
         (50, 0),
@@ -220,7 +220,7 @@ fn a_release_wakes_the_holder_parked_on_its_grant() {
     let holder = D.claimant(0);
     D.provide(10);
     holder.want(10);
-    D.rebalance(&FairShare, t0());
+    assert!(D.rebalance(&FairShare, t0()).is_none());
     assert_eq!(holder.grant(), 10);
     let woken = Arc::new(Woken(AtomicBool::new(false)));
     let waker = Waker::from(woken.clone());
@@ -252,7 +252,7 @@ impl Wake for TotalAtWake {
 fn a_rebalance_publishes_cuts_before_increases() {
     E.provide(10);
     E.claimant(1).want(10);
-    E.rebalance(&FairShare, t0());
+    assert!(E.rebalance(&FairShare, t0()).is_none());
     assert_eq!((E.grant(0), E.grant(1)), (0, 10));
     let probe = Arc::new(TotalAtWake(AtomicU32::new(u32::MAX)));
     let waker = Waker::from(probe.clone());
@@ -266,7 +266,7 @@ fn a_rebalance_publishes_cuts_before_increases() {
     );
     E.claimant(1).want(0);
     holder.want(10);
-    E.rebalance(&FairShare, t0());
+    assert!(E.rebalance(&FairShare, t0()).is_none());
     assert_eq!((E.grant(0), E.grant(1)), (10, 0));
     assert_eq!(
         probe.0.load(Ordering::SeqCst),

@@ -1,11 +1,13 @@
+mod support;
+
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{FaultKind, Supervisor, TaskNode, supervisor_graph};
-use embassy_time::{Duration, MockDriver};
+use embassy_time::Duration;
+use support::settle;
 
 struct Probe;
 
@@ -44,25 +46,19 @@ supervisor_graph! {
         resources: [COUNTER: local Rc<Cell<u32>>];
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
 
     PROBE.provide(Probe);
-    COUNTER.provide(Rc::new(Cell::new(0)));
+    // SAFETY: called on the slot's executor: `LOC` runs on this one.
+    unsafe { COUNTER.provide(Rc::new(Cell::new(0))) };
 
     sup.start(&spawner).await.expect("start");
-    settle(|| CONS_RUNS.load(Ordering::SeqCst) == 1 && LOC_RUNS.load(Ordering::SeqCst) == 1).await;
+    settle("first runs", || {
+        CONS_RUNS.load(Ordering::SeqCst) == 1 && LOC_RUNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
 
     sup.teardown().await.expect("teardown");
     assert_eq!(
@@ -83,7 +79,10 @@ async fn driver(spawner: Spawner) {
 
     PROBE.provide(Probe);
     sup.respawn_terminate(&spawner).await.expect("respawn");
-    settle(|| CONS_RUNS.load(Ordering::SeqCst) == 2 && LOC_RUNS.load(Ordering::SeqCst) == 2).await;
+    settle("second runs", || {
+        CONS_RUNS.load(Ordering::SeqCst) == 2 && LOC_RUNS.load(Ordering::SeqCst) == 2
+    })
+    .await;
     assert_eq!(
         CONS_RUNS.load(Ordering::SeqCst),
         2,
@@ -100,28 +99,20 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn resource_kinds_consume_and_local() {
-    let clock = MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
     // Tick mock time so the empty consume slot's gate wait (the 100 ms default
     // `slot_timeout`) can expire; the other waits are already satisfied and never park.
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (cons={}, loc={}, dropped={})",
-            CONS_RUNS.load(Ordering::SeqCst),
-            LOC_RUNS.load(Ordering::SeqCst),
-            DROPPED.load(Ordering::SeqCst),
-        );
-        clock.advance(Duration::from_millis(10));
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Free(Duration::from_millis(10)),
+        10,
+        || {
+            format!(
+                "did not complete (cons={}, loc={}, dropped={})",
+                CONS_RUNS.load(Ordering::SeqCst),
+                LOC_RUNS.load(Ordering::SeqCst),
+                DROPPED.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

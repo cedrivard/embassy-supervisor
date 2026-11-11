@@ -4,6 +4,8 @@
 //! `spawner.make_send()`. A `local` provider/consumer pair inherits the default
 //! too, so the slot's whole lifecycle happens off the supervisor's thread.
 
+mod support;
+
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
@@ -46,7 +48,9 @@ async fn on_sup_worker(node: &'static TaskNode) {
 
 async fn local_provider(node: &'static TaskNode) {
     LOCAL_P_TIER.store(tier(), Ordering::Release);
-    BLOB.provide(Rc::new(Cell::new(7)));
+    // SAFETY: called on the slot's executor: the graph places this provider
+    // and the slot's consumer on the default tier.
+    unsafe { BLOB.provide(Rc::new(Cell::new(7))) };
     let _ = node
         .run_cancellable_acked(core::future::pending::<()>())
         .await;
@@ -171,27 +175,24 @@ fn supervisor_on_its_own_tier_places_the_default_elsewhere() {
         executor.run(|spawner| THREAD.set(spawner.make_send()));
     });
     // Thread B: the supervisor's own executor, also published as a slot so a
-    // node can ask for it explicitly.
-    std::thread::spawn(|| {
-        TIER.with(|t| t.set(2));
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
+    // node can ask for it explicitly. `init` runs on the executor's own thread.
+    support::run(
+        |spawner| {
+            TIER.with(|t| t.set(2));
             SUP.set(spawner.make_send());
             spawner.spawn(driver(spawner).unwrap());
             spawner.spawn(pass_probe().unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::Acquire) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (tiers: thread={}, sup={}, local={})",
-            ON_THREAD_TIER.load(Ordering::Acquire),
-            ON_SUP_TIER.load(Ordering::Acquire),
-            LOCAL_TIER.load(Ordering::Acquire),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+        },
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (tiers: thread={}, sup={}, local={})",
+                ON_THREAD_TIER.load(Ordering::Acquire),
+                ON_SUP_TIER.load(Ordering::Acquire),
+                LOCAL_TIER.load(Ordering::Acquire),
+            )
+        },
+    );
 }

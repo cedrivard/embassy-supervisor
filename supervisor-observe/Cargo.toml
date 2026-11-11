@@ -4,7 +4,7 @@ name = "embassy-supervisor-observe"
 # a primitive in `Counted`) against this crate alone, so it must stay small,
 # dependency-light, and semver-stable. Depend on it by version range; it is
 # never `=`-pinned by anything.
-version = "0.1.2"
+version = "0.1.3"
 description = "Observation facade for embassy-supervisor: implement it where your signals live, without depending on the supervisor"
 edition.workspace = true
 authors.workspace = true
@@ -20,8 +20,8 @@ categories = ["embedded", "asynchronous", "no-std"]
 # No `[features]`. A facade earns adoption by having nothing to configure.
 
 [dependencies]
-# The one dependency, for targets without native atomics (thumbv6 needs the
-# critical-section fallback, which the final binary enables; `lib.rs` turns its
-# absence into a `compile_error!`). Precise minimum (the lock-proven version)
-# so minimal-versions resolution stays tested.
-portable-atomic = "1.15.0"
+# The one dependency, for targets without native atomics. `require-cas` makes
+# portable-atomic itself stop the build, with a message naming its
+# `critical-section` and `unsafe-assume-single-core` features, on a target that
+# has neither native compare-and-swap nor one of those enabled.
+portable-atomic = { version = "1.15.0", features = ["require-cas"] }

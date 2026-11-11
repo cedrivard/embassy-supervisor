@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+mod support;
+
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
@@ -12,9 +15,16 @@ supervisor_graph! {
     node CB = Pause, deps: [];
 }
 
-static FAKE_CORE: AtomicUsize = AtomicUsize::new(0);
+std::thread_local! {
+    /// The "core" the calling thread runs on: each executor thread sets its
+    /// own, so a hook polled on executor B never reads A's id.
+    static CORE_ID: Cell<usize> = const { Cell::new(0) };
+}
+fn set_core(id: usize) {
+    CORE_ID.with(|c| c.set(id));
+}
 fn fake_core() -> usize {
-    FAKE_CORE.load(Ordering::Relaxed)
+    CORE_ID.with(Cell::get)
 }
 
 static REMOTE_STARTED: AtomicBool = AtomicBool::new(false);
@@ -103,15 +113,15 @@ fn multicore() {
     CA.set_task_id(71);
     CB.set_task_id(72);
 
-    FAKE_CORE.store(0, Ordering::Relaxed);
+    set_core(0);
     trace::on_task_exec_begin(EXEC_C0, 71);
     clock.advance(Duration::from_ticks(10));
-    FAKE_CORE.store(1, Ordering::Relaxed);
+    set_core(1);
     trace::on_task_exec_begin(EXEC_C1, 72);
     clock.advance(Duration::from_ticks(20));
-    FAKE_CORE.store(0, Ordering::Relaxed);
+    set_core(0);
     trace::on_task_exec_end(EXEC_C0, 71);
-    FAKE_CORE.store(1, Ordering::Relaxed);
+    set_core(1);
     clock.advance(Duration::from_ticks(5));
     trace::on_task_exec_end(EXEC_C1, 72);
 
@@ -119,46 +129,49 @@ fn multicore() {
     assert_eq!(CB.exec_ticks(), 25, "core 1 poll exact (20 overlap + 5)");
     assert_eq!(CA.max_poll_ticks(), 30, "no cross-charge into core 0");
     assert_eq!(CB.max_poll_ticks(), 25, "no cross-charge into core 1");
-    FAKE_CORE.store(0, Ordering::Relaxed);
+    set_core(0);
     trace::on_task_exec_begin(EXEC_C0, 71);
     clock.advance(Duration::from_ticks(3));
     trace::on_task_exec_end(EXEC_C0, 71);
     assert_eq!(CA.exec_ticks(), 33, "no stolen residue on core 0");
 
-    FAKE_CORE.store(0, Ordering::Relaxed);
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver_task(spawner).unwrap());
-            spawner.spawn(pass_probe().unwrap());
-        });
-    });
     // Thread B ("core 1"): its executor's only supervisor-visible artifact is
     // the SendSpawner it publishes into the graph's CORE1 slot.
     std::thread::spawn(|| {
         wait_until_start_parked();
         let executor: &'static mut embassy_executor::Executor =
             Box::leak(Box::new(embassy_executor::Executor::new()));
+        set_core(1);
         executor.run(|spawner| {
             CORE1.set(spawner.make_send());
         });
     });
-
-    // The executor threads never exit; poll the completion flag with a deadline.
+    // Thread A ("core 0"): `init` runs on the executor's own thread.
+    support::run(
+        |spawner| {
+            set_core(0);
+            spawner.spawn(driver_task(spawner).unwrap());
+            spawner.spawn(pass_probe().unwrap());
+        },
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "cross-thread start/stop did not complete (REMOTE_STARTED = {})",
+                REMOTE_STARTED.load(Ordering::Acquire)
+            )
+        },
+    );
     let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::Acquire) {
+    // The id is cleared by `on_task_end` on executor B after REMOTE's future
+    // returns, which can trail the ack that ended `stop_node`.
+    while REMOTE.task_id() != 0 {
         assert!(
             StdInstant::now() < deadline,
-            "cross-thread start/stop did not complete (REMOTE_STARTED = {})",
-            REMOTE_STARTED.load(Ordering::Acquire)
+            "task_end never cleared REMOTE's id after the stop (id = {})",
+            REMOTE.task_id()
         );
-        std::thread::sleep(StdDuration::from_millis(5));
+        std::thread::sleep(StdDuration::from_millis(1));
     }
-    assert_eq!(
-        REMOTE.task_id(),
-        0,
-        "task_end cleared the id after the stop"
-    );
 }

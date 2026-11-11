@@ -1,9 +1,11 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{DeferredShrink, FaultKind, Supervisor, TaskNode, supervisor_graph};
-use embassy_time::{Duration, MockDriver};
+use embassy_time::Duration;
+use support::settle;
 
 #[derive(Clone, Copy)]
 struct Handle {
@@ -37,16 +39,6 @@ async fn fan_worker(node: &'static TaskNode, handle: Handle) {
     let _ = node
         .run_cancellable_acked(core::future::pending::<()>())
         .await;
-}
-
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
 }
 
 async fn drive_until<const N: usize, T: embassy_supervisor::Topology<N>>(
@@ -88,15 +80,19 @@ async fn driver(spawner: Spawner) {
         "nothing spawned unprovisioned"
     );
 
-    HANDLE.provide(Handle {
-        hits: &BACKING,
-        _local_only: core::marker::PhantomData,
-    });
+    // SAFETY: called on the slot's executor: the pool's members run on this
+    // one.
+    unsafe {
+        HANDLE.provide(Handle {
+            hits: &BACKING,
+            _local_only: core::marker::PhantomData,
+        })
+    };
     sup.start(&spawner).await.expect("start with provided slot");
-    settle(|| RUNS.load(Ordering::SeqCst) == 1).await;
+    settle("first run", || RUNS.load(Ordering::SeqCst) == 1).await;
 
     assert!(
-        HANDLE.get().is_some(),
+        HANDLE.is_filled(),
         "shared slot stays filled after the floor spawns"
     );
 
@@ -107,8 +103,8 @@ async fn driver(spawner: Spawner) {
     assert_eq!((first, second), (1, 2), "both members share ONE handle");
 
     sup.stop_node(&FAN[1]).await.expect("stop the grown member");
-    settle(|| !FAN[1].is_running()).await;
-    assert!(HANDLE.get().is_some(), "the slot survives a member exit");
+    settle("FAN[1] stopped", || !FAN[1].is_running()).await;
+    assert!(HANDLE.is_filled(), "the slot survives a member exit");
     assert_eq!(
         BACKING.load(Ordering::SeqCst),
         2,
@@ -116,7 +112,7 @@ async fn driver(spawner: Spawner) {
     );
 
     sup.start_node(&FAN[1], &spawner).await.expect("re-grow");
-    settle(|| RUNS.load(Ordering::SeqCst) == 3).await;
+    settle("third run", || RUNS.load(Ordering::SeqCst) == 3).await;
     assert_eq!(
         SEEN[1].load(Ordering::SeqCst),
         3,
@@ -128,28 +124,20 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn pool_shared_local_resource() {
-    let clock = MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
     // Tick mock time so the unprovided floor's gate timeout can expire (the
     // other waits resolve by signal and never park).
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (runs={}, seen=[{},{}])",
-            RUNS.load(Ordering::SeqCst),
-            SEEN[0].load(Ordering::SeqCst),
-            SEEN[1].load(Ordering::SeqCst),
-        );
-        clock.advance(Duration::from_millis(10));
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Free(Duration::from_millis(10)),
+        10,
+        || {
+            format!(
+                "did not complete (runs={}, seen=[{},{}])",
+                RUNS.load(Ordering::SeqCst),
+                SEEN[0].load(Ordering::SeqCst),
+                SEEN[1].load(Ordering::SeqCst),
+            )
+        },
+    );
 }

@@ -1,11 +1,14 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
+use std::time::Duration as StdDuration;
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
     ControlCommand, ControlOp, FaultKind, Supervisor, TaskNode, supervisor_graph,
 };
 use embassy_time::MockDriver;
+use support::settle;
 
 supervisor_graph! {
     node ONESHOT = Terminate, deps: [], task: oneshot_worker;
@@ -35,24 +38,17 @@ async fn wedged_task(_node: &'static TaskNode) {
     core::future::pending::<()>().await;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
 
     // ── start: ONESHOT runs and returns; the shell records the completion ───
     sup.start(&spawner).await.expect("start");
-    settle(|| ONESHOT_RUNS.load(Ordering::SeqCst) == 1).await;
-    settle(|| !ONESHOT.is_running()).await;
+    settle("first oneshot run", || {
+        ONESHOT_RUNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    settle("oneshot exited", || !ONESHOT.is_running()).await;
     assert!(ONESHOT.has_exited(), "clean return recorded by the shell");
     assert!(
         !ONESHOT.is_running(),
@@ -85,13 +81,16 @@ async fn driver(spawner: Spawner) {
     )
     .await
     .expect("activate cascade has nothing to stop");
-    settle(|| ONESHOT_RUNS.load(Ordering::SeqCst) == 2).await;
+    settle("second oneshot run", || {
+        ONESHOT_RUNS.load(Ordering::SeqCst) == 2
+    })
+    .await;
     assert_eq!(
         ONESHOT_RUNS.load(Ordering::SeqCst),
         2,
         "completed node was respawned by Activate"
     );
-    settle(|| !ONESHOT.is_running()).await;
+    settle("oneshot exited again", || !ONESHOT.is_running()).await;
     assert!(ONESHOT.has_exited(), "second run recorded too");
     PHASE.store(3, Ordering::SeqCst);
 
@@ -136,25 +135,25 @@ async fn driver(spawner: Spawner) {
 fn completion_observed_and_timeouts_are_errors() {
     let clock = MockDriver::get();
 
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if PHASE.load(Ordering::SeqCst) >= 3 {
-            clock.advance(embassy_time::Duration::from_millis(500));
+    std::thread::spawn(move || {
+        loop {
+            if PHASE.load(Ordering::SeqCst) >= 3 {
+                clock.advance(embassy_time::Duration::from_millis(500));
+            }
+            std::thread::sleep(StdDuration::from_millis(5));
         }
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (phase={}, oneshot_runs={})",
-            PHASE.load(Ordering::SeqCst),
-            ONESHOT_RUNS.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    });
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (phase={}, oneshot_runs={})",
+                PHASE.load(Ordering::SeqCst),
+                ONESHOT_RUNS.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

@@ -3,8 +3,9 @@
 //! is dropped together with its reversal, and a stop ends a stall without an
 //! event.
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{HealthKind, Supervisor, TaskNode, supervisor_graph, try_wait_health};
@@ -143,18 +144,11 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn a_full_mailbox_delays_events_but_never_loses_them() {
-    let _clock = MockDriver::get();
-    let thread = std::thread::spawn(|| {
-        let executor = Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| spawner.spawn(driver(spawner).unwrap()));
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(StdInstant::now() < deadline, "did not complete");
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || "did not complete".to_owned(),
+    );
 }

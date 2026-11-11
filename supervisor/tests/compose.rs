@@ -1,8 +1,10 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, TaskNode, compose_graph, supervisor_fragment};
+use support::settle;
 
 static NET_SPAWNS: AtomicU32 = AtomicU32::new(0);
 static HTTP_SPAWNS: AtomicU32 = AtomicU32::new(0);
@@ -57,26 +59,19 @@ compose_graph! {
     }
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
     PORT.provide(80);
     sup.start(&spawner).await.expect("start");
-    settle(|| APP_SPAWNS.load(Ordering::SeqCst) == 1).await;
+    settle("first app spawn", || APP_SPAWNS.load(Ordering::SeqCst) == 1).await;
     assert!(NET.is_running() && HTTP.is_running() && APP.is_running());
 
-    settle(|| ONESHOT_RUNS.load(Ordering::SeqCst) == 1).await;
-    settle(|| !ONESHOT.is_running()).await;
+    settle("first oneshot run", || {
+        ONESHOT_RUNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    settle("oneshot exited", || !ONESHOT.is_running()).await;
     assert!(
         ONESHOT.has_exited(),
         "composed shell recorded the clean return"
@@ -93,12 +88,18 @@ async fn driver(spawner: Spawner) {
     sup.teardown().await.expect("teardown");
     assert!(!NET.is_running() && !HTTP.is_running() && !APP.is_running());
     sup.respawn_terminate(&spawner).await.expect("respawn");
-    settle(|| APP_SPAWNS.load(Ordering::SeqCst) == 2).await;
+    settle("second app spawn", || {
+        APP_SPAWNS.load(Ordering::SeqCst) == 2
+    })
+    .await;
     assert_eq!(NET_SPAWNS.load(Ordering::SeqCst), 2);
     assert_eq!(HTTP_SPAWNS.load(Ordering::SeqCst), 2);
 
-    settle(|| ONESHOT_RUNS.load(Ordering::SeqCst) == 2).await;
-    settle(|| !ONESHOT.is_running()).await;
+    settle("second oneshot run", || {
+        ONESHOT_RUNS.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    settle("oneshot exited again", || !ONESHOT.is_running()).await;
     assert!(ONESHOT.has_exited());
 
     DONE.store(true, Ordering::SeqCst);
@@ -106,8 +107,6 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn fragments_compose_into_one_graph() {
-    let _clock = embassy_time::MockDriver::get();
-
     #[cfg(feature = "data-deps")]
     {
         let seen: Vec<&str> = APP.graph().iter().flatten().map(|n| n.name()).collect();
@@ -115,23 +114,18 @@ fn fragments_compose_into_one_graph() {
         assert!(seen.contains(&"app") && seen.contains(&"net"), "{seen:?}");
     }
 
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (net={}, http={}, app={})",
-            NET_SPAWNS.load(Ordering::SeqCst),
-            HTTP_SPAWNS.load(Ordering::SeqCst),
-            APP_SPAWNS.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (net={}, http={}, app={})",
+                NET_SPAWNS.load(Ordering::SeqCst),
+                HTTP_SPAWNS.load(Ordering::SeqCst),
+                APP_SPAWNS.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

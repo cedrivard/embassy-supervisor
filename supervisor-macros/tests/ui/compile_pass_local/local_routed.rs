@@ -32,8 +32,11 @@ supervisor_graph! {
 
 fn main() {
     assert!(HIGH.get().is_none());
-    S.provide((5, core::ptr::null()));
-    assert_eq!(S.get().expect("shared local get").0, 5);
+    // SAFETY: one thread, and no executor runs the graph.
+    unsafe {
+        S.provide((5, core::ptr::null()));
+        assert_eq!(S.get().expect("shared local get").0, 5);
+    }
     // P, N, FANS x2, USER.
     assert_eq!(GRAPH.nodes.len(), 5);
 }

@@ -1,5 +1,6 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{
@@ -7,6 +8,7 @@ use embassy_supervisor::{
     supervisor_graph,
 };
 use embassy_time::{Duration, Instant};
+use support::settle;
 
 fn t0() -> Instant {
     Instant::from_ticks(0)
@@ -24,13 +26,13 @@ fn stats(running: u8, busy: u8, min: u8, max: u8) -> PoolStats {
 #[test]
 fn grows_when_saturated_below_max() {
     let p = DeferredShrink::new(Duration::from_secs(4));
-    assert!(p.decide(stats(2, 2, 1, 4), t0()) == ScaleAction::Grow);
+    assert_eq!(p.decide(stats(2, 2, 1, 4), t0()), ScaleAction::Grow);
 }
 
 #[test]
 fn does_not_grow_at_ceiling() {
     let p = DeferredShrink::new(Duration::from_secs(4));
-    assert!(p.decide(stats(4, 4, 1, 4), t0()) == ScaleAction::None);
+    assert_eq!(p.decide(stats(4, 4, 1, 4), t0()), ScaleAction::None);
 }
 
 #[test]
@@ -39,12 +41,18 @@ fn defers_then_shrinks_after_cooldown() {
     let p = DeferredShrink::new(cooldown);
     let now = t0();
 
-    assert!(p.decide(stats(3, 1, 1, 4), now) == ScaleAction::None);
+    assert_eq!(p.decide(stats(3, 1, 1, 4), now), ScaleAction::None);
     assert_eq!(p.deferred_until(), Some(now + cooldown));
 
-    assert!(p.decide(stats(3, 1, 1, 4), now + Duration::from_secs(2)) == ScaleAction::None);
+    assert_eq!(
+        p.decide(stats(3, 1, 1, 4), now + Duration::from_secs(2)),
+        ScaleAction::None
+    );
 
-    assert!(p.decide(stats(3, 1, 1, 4), now + cooldown) == ScaleAction::Shrink);
+    assert_eq!(
+        p.decide(stats(3, 1, 1, 4), now + cooldown),
+        ScaleAction::Shrink
+    );
 }
 
 #[test]
@@ -53,10 +61,13 @@ fn cancels_pending_shrink_when_surplus_disappears() {
     let p = DeferredShrink::new(cooldown);
     let now = t0();
 
-    assert!(p.decide(stats(3, 1, 1, 4), now) == ScaleAction::None);
+    assert_eq!(p.decide(stats(3, 1, 1, 4), now), ScaleAction::None);
     assert!(p.deferred_until().is_some());
 
-    assert!(p.decide(stats(2, 1, 1, 4), now + Duration::from_secs(1)) == ScaleAction::None);
+    assert_eq!(
+        p.decide(stats(2, 1, 1, 4), now + Duration::from_secs(1)),
+        ScaleAction::None
+    );
     assert_eq!(p.deferred_until(), None);
 }
 
@@ -66,11 +77,53 @@ fn grow_clears_pending_shrink() {
     let p = DeferredShrink::new(cooldown);
     let now = t0();
 
-    assert!(p.decide(stats(3, 1, 1, 4), now) == ScaleAction::None);
+    assert_eq!(p.decide(stats(3, 1, 1, 4), now), ScaleAction::None);
     assert!(p.deferred_until().is_some());
 
-    assert!(p.decide(stats(3, 3, 1, 4), now + Duration::from_secs(1)) == ScaleAction::Grow);
+    assert_eq!(
+        p.decide(stats(3, 3, 1, 4), now + Duration::from_secs(1)),
+        ScaleAction::Grow
+    );
     assert_eq!(p.deferred_until(), None);
+}
+
+/// Every small pool shape against a fresh policy: it grows on saturation or
+/// below the floor (never past `max`), its first call never shrinks (that call
+/// only arms the cooldown), and nothing at or below the floor shrinks even
+/// once the cooldown has run out.
+#[test]
+fn decides_every_small_shape() {
+    for running in 0..=8u8 {
+        for busy in 0..=running {
+            for max in 0..=8u8 {
+                for min in 0..=max {
+                    let s = stats(running, busy, min, max);
+                    let shape = format!("running {running}, busy {busy}, min {min}, max {max}");
+                    let p = DeferredShrink::new(Duration::from_secs(1));
+                    let first = p.decide(s, t0());
+                    let grow = (s.idle() == 0 || running < min) && running < max;
+                    assert_eq!(
+                        first == ScaleAction::Grow,
+                        grow,
+                        "{shape}: Grow iff saturated or below min, and below max"
+                    );
+                    assert_ne!(
+                        first,
+                        ScaleAction::Shrink,
+                        "{shape}: the first call only arms the cooldown"
+                    );
+                    if running <= min {
+                        let later = p.decide(s, t0() + Duration::from_secs(1));
+                        assert_ne!(
+                            later,
+                            ScaleAction::Shrink,
+                            "{shape}: never shrinks at or below the floor"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 supervisor_graph! {
@@ -88,16 +141,6 @@ async fn crew_worker(node: &'static TaskNode) {
 
 static DONE: AtomicBool = AtomicBool::new(false);
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
@@ -106,18 +149,19 @@ async fn driver(spawner: Spawner) {
     // Floor up and busy → saturated, below max → evaluate picks the first
     // down OnDemand member.
     sup.start(&spawner).await.expect("start floor");
-    settle(|| CREW[0].is_running()).await;
+    settle("floor member running", || CREW[0].is_running()).await;
     CREW[0].mark_busy();
     match CREW_POOL.evaluate(now) {
         PoolAction::Start(n) => assert!(core::ptr::eq(n, &CREW[1]), "first down member"),
-        _ => panic!("expected Start"),
+        other => panic!("expected Start, got {other:?}"),
     }
 
     // Disabled members are never grow candidates: with both spares disabled the
     // saturated pool has nowhere to go.
     CREW[1].set_disabled(true);
     CREW[2].set_disabled(true);
-    assert!(matches!(CREW_POOL.evaluate(now), PoolAction::None));
+    let action = CREW_POOL.evaluate(now);
+    assert!(matches!(action, PoolAction::None), "{action:?}");
     CREW[1].set_disabled(false);
     CREW[2].set_disabled(false);
 
@@ -126,7 +170,7 @@ async fn driver(spawner: Spawner) {
     CREW[1].set_detached(true);
     match CREW_POOL.evaluate(now) {
         PoolAction::Start(n) => assert!(core::ptr::eq(n, &CREW[2]), "the next down member"),
-        _ => panic!("expected Start"),
+        other => panic!("expected Start, got {other:?}"),
     }
     CREW[1].set_detached(false);
 
@@ -135,19 +179,23 @@ async fn driver(spawner: Spawner) {
     // floor, and never a detached one, which `stop_node` would leave running.
     sup.start_node(&CREW[1], &spawner).await.expect("grow 1");
     sup.start_node(&CREW[2], &spawner).await.expect("grow 2");
-    settle(|| CREW[1].is_running() && CREW[2].is_running()).await;
+    settle("both spares running", || {
+        CREW[1].is_running() && CREW[2].is_running()
+    })
+    .await;
     CREW[0].mark_idle();
     CREW[1].set_detached(true);
+    let action = CREW_POOL.evaluate(now);
     assert!(
-        matches!(CREW_POOL.evaluate(now), PoolAction::None),
-        "first tick arms cooldown"
+        matches!(action, PoolAction::None),
+        "first tick arms cooldown, got {action:?}"
     );
     match CREW_POOL.evaluate(now + Duration::from_secs(4)) {
         PoolAction::Stop(n) => assert!(
             core::ptr::eq(n, &CREW[2]),
             "the idle OnDemand member that is not detached"
         ),
-        _ => panic!("expected Stop"),
+        other => panic!("expected Stop, got {other:?}"),
     }
     CREW[1].set_detached(false);
 
@@ -156,19 +204,11 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn evaluate_selects_members_through_real_state() {
-    let _clock = embassy_time::MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(StdInstant::now() < deadline, "did not complete");
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || "did not complete".to_owned(),
+    );
 }

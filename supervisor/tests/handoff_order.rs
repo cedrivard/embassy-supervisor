@@ -3,8 +3,9 @@
 //! and, if it already exited, stays down. A spawn closure stands in for that
 //! first poll, deterministically.
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, supervisor_graph};
@@ -47,18 +48,11 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn the_supervisor_publishes_after_the_activation_clears() {
-    let _clock = embassy_time::MockDriver::get();
-    let thread = std::thread::spawn(|| {
-        let executor = Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| spawner.spawn(driver(spawner).unwrap()));
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(StdInstant::now() < deadline, "did not complete");
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || "did not complete".to_owned(),
+    );
 }

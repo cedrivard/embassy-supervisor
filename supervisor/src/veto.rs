@@ -24,6 +24,13 @@ use crate::{Sig, TaskNode, same_signal};
 /// own [`Veto::release`], or the application through
 /// [`release_slot`](Self::release_slot). Costs one `AtomicU32` and one
 /// `Signal` per gate (plus a transition counter under `coupling-observe`).
+///
+/// All writers of one gate live in one graph: each `supervisor_graph!`
+/// numbers its own writers from slot 0 (fragments composed into it count as
+/// one graph), so writers in two graphs would share bits, and one's release
+/// could clear the other's trip. At most one task waits in
+/// [`wait_asserted`](Self::wait_asserted) / [`wait_released`](Self::wait_released)
+/// per gate.
 pub struct VetoGate<const N: usize> {
     bits: AtomicU32,
     /// Bumped on every flip of the asserted state, so a polled token moves

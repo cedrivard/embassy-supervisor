@@ -1,0 +1,5 @@
+error: duplicate resource name `LED`: resource slots are statics and must be unique across the graph (only `shared` and `divisible` entries may repeat a name)
+  --> tests/ui/compile_fail/resources_duplicate_across_nodes.rs:10:61
+   |
+10 |     node B = Terminate, deps: [], task: worker, resources: [LED: Led];
+   |                                                             ^^^

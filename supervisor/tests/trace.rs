@@ -99,11 +99,40 @@ fn trace_recorders() {
     trace::on_task_exec_end(EXEC, 303);
     assert_eq!(A.poll_count(), 3, "new id does");
 
+    // A has never acked, so its DROPPED flag is clear, as after every
+    // activation: a task end naming its id is a respawn into the same task
+    // storage that adopted the id first, and the id stays.
+    trace::on_task_end(EXEC, 303);
+    assert_eq!(A.task_id(), 303, "a live node keeps its adopted id");
+    // Once the instance has acked, the task end is its own.
+    A.ack_dropped();
     trace::on_task_end(EXEC, 303);
     assert_eq!(A.task_id(), 0, "cleared on task end");
     A.set_task_id(404);
     trace::on_task_end(EXEC, 303);
     assert_eq!(A.task_id(), 404, "stale task_end must not clear a fresh id");
+
+    // An id no node owns resolves to nobody poll after poll (the second
+    // through the executor's cached miss); an adoption invalidates the cache,
+    // so the next poll is the adopter's.
+    let (a_polls, b_polls) = (A.poll_count(), B.poll_count());
+    for _ in 0..2 {
+        trace::on_task_exec_begin(EXEC, 606);
+        trace::on_task_exec_end(EXEC, 606);
+    }
+    assert_eq!(
+        (A.poll_count(), B.poll_count()),
+        (a_polls, b_polls),
+        "606 is nobody's"
+    );
+    B.set_task_id(606);
+    trace::on_task_exec_begin(EXEC, 606);
+    trace::on_task_exec_end(EXEC, 606);
+    assert_eq!(
+        B.poll_count(),
+        b_polls + 1,
+        "the adoption reaches the next poll"
+    );
 
     assert!(trace::executors().contains(&EXEC));
     assert_eq!(trace::executor_idle_ticks(31337), 0, "untracked executor");

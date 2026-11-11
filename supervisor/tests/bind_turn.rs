@@ -5,9 +5,10 @@
 //! waits out its gate budget on AUX, and a `Deactivate` queued for OTHER must
 //! still run.
 
+mod support;
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
@@ -100,22 +101,15 @@ async fn runner(spawner: Spawner) {
 
 #[test]
 fn a_flapping_provider_cannot_starve_a_queued_command() {
-    let _clock = MockDriver::get();
-    let thread = std::thread::spawn(|| {
-        let executor = Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
+    support::run(
+        |spawner| {
             spawner.spawn(runner(spawner).unwrap());
             spawner.spawn(flapper().unwrap());
-        });
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(StdInstant::now() < deadline, "did not complete");
-        std::thread::sleep(StdDuration::from_millis(2));
-    }
+        },
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || "did not complete".to_owned(),
+    );
     assert_eq!(*FAULT.lock().unwrap(), None, "run() returned a fault");
 }

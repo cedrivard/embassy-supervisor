@@ -1,8 +1,10 @@
+mod support;
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{ControlCommand, ControlOp, Supervisor, TaskNode, supervisor_graph};
+use support::settle;
 
 supervisor_graph! {
     node MAIN = Terminate, deps: [], task: main_worker;
@@ -74,23 +76,13 @@ async fn report_worker(node: &'static TaskNode) {
     park(node).await;
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let app = Supervisor::new(&GRAPH);
     let sub = Supervisor::new(&SCAN_GRAPH);
 
     app.start(&spawner).await.expect("app start");
-    settle(|| MAIN_SPAWNS.load(Ordering::SeqCst) == 1).await;
+    settle("MAIN spawned", || MAIN_SPAWNS.load(Ordering::SeqCst) == 1).await;
     assert!(
         !WIFI.is_running() && !UPLOAD.is_running(),
         "disabled at boot"
@@ -100,7 +92,10 @@ async fn driver(spawner: Spawner) {
     //    start()/teardown() cycles, dependency-ordered both ways each time. ──
     for cycle in 1..=3u32 {
         sub.start(&spawner).await.expect("sub start");
-        settle(|| REPORT_SPAWNS.load(Ordering::SeqCst) == cycle).await;
+        settle("REPORT spawned this cycle", || {
+            REPORT_SPAWNS.load(Ordering::SeqCst) == cycle
+        })
+        .await;
         assert!(SENSOR.is_running() && REPORT.is_running() && GAUGE.is_running());
         sub.start(&spawner).await.expect("sub start again");
         assert_eq!(SENSOR_SPAWNS.load(Ordering::SeqCst), cycle);
@@ -125,11 +120,14 @@ async fn driver(spawner: Spawner) {
     assert_eq!(MAIN_SPAWNS.load(Ordering::SeqCst), 1);
 
     sub.start(&spawner).await.expect("sub start for pause test");
-    settle(|| GAUGE.is_running()).await;
+    settle("GAUGE running", || GAUGE.is_running()).await;
     sub.stop_node(&GAUGE).await.expect("pause = stop_node");
     assert!(!GAUGE.is_running());
     sub.resume_node(&GAUGE);
-    settle(|| GAUGE_RESUMES.load(Ordering::SeqCst) == 4).await;
+    settle("GAUGE resumed", || {
+        GAUGE_RESUMES.load(Ordering::SeqCst) == 4
+    })
+    .await;
     assert!(GAUGE.is_running(), "resumed in place, single node");
     assert_eq!(GAUGE_SPAWNS.load(Ordering::SeqCst), 1, "still one instance");
     sub.teardown().await.expect("clean up pause test");
@@ -148,7 +146,10 @@ async fn driver(spawner: Spawner) {
     app.activate(&UPLOAD, &spawner)
         .await
         .expect("activate app upload dependencies");
-    settle(|| UPLOAD_SPAWNS.load(Ordering::SeqCst) == 1).await;
+    settle("UPLOAD spawned", || {
+        UPLOAD_SPAWNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
     assert!(
         WIFI.is_running() && UPLOAD.is_running(),
         "Activate on the LEAF pulled its dep up, dependency-ordered"
@@ -163,24 +164,17 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn named_subgraph_cycles_and_shared_control() {
-    let _clock = embassy_time::MockDriver::get();
-
-    std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        assert!(
-            StdInstant::now() < deadline,
-            "did not complete (sensor={}, upload={})",
-            SENSOR_SPAWNS.load(Ordering::SeqCst),
-            UPLOAD_SPAWNS.load(Ordering::SeqCst),
-        );
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || {
+            format!(
+                "did not complete (sensor={}, upload={})",
+                SENSOR_SPAWNS.load(Ordering::SeqCst),
+                UPLOAD_SPAWNS.load(Ordering::SeqCst),
+            )
+        },
+    );
 }

@@ -3,12 +3,12 @@
 //! (a spawn closure standing in for a preempting first poll) is not marked
 //! running, by the wave or by a single-node start.
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, supervisor_graph};
-use embassy_time::MockDriver;
 
 supervisor_graph! {
     node HELD = Terminate, deps: [];
@@ -65,21 +65,11 @@ async fn driver(spawner: Spawner) {
 
 #[test]
 fn the_handoff_respects_the_instance() {
-    let _clock = MockDriver::get();
-    let thread = std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(StdInstant::now() < deadline, "did not complete");
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || "did not complete".to_owned(),
+    );
 }

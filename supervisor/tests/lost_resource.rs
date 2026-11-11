@@ -2,12 +2,13 @@
 //! back what the activation already took, lend and consume alike, before the
 //! exit record.
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use embassy_executor::Spawner;
 use embassy_supervisor::{Supervisor, TaskNode, supervisor_graph};
-use embassy_time::MockDriver;
+use support::settle;
 
 struct Probe(u32);
 
@@ -29,16 +30,6 @@ supervisor_graph! {
         resources: [CONSUME_A: consume Probe, CONSUME_B: Probe];
 }
 
-async fn settle(mut f: impl FnMut() -> bool) {
-    for _ in 0..10_000 {
-        if f() {
-            return;
-        }
-        embassy_futures::yield_now().await;
-    }
-    assert!(f(), "did not settle");
-}
-
 #[embassy_executor::task]
 async fn driver(spawner: Spawner) {
     let sup = Supervisor::new(&GRAPH);
@@ -56,7 +47,7 @@ async fn driver(spawner: Spawner) {
             "start_node returned after the shell's first poll; the take below would not race it"
         );
         let stolen = second.take().expect("the glue only probes");
-        settle(|| node.has_exited()).await;
+        settle("node exited", || node.has_exited()).await;
         assert!(
             !RAN.load(Ordering::SeqCst),
             "{}: the worker ran",
@@ -76,23 +67,11 @@ async fn driver(spawner: Spawner) {
 #[test]
 fn a_lost_resource_restores_the_entries_already_taken() {
     // Frozen mock clock: the gate and spawn deadlines never fire.
-    let _clock = MockDriver::get();
-
-    let thread = std::thread::spawn(|| {
-        let executor: &'static mut embassy_executor::Executor =
-            Box::leak(Box::new(embassy_executor::Executor::new()));
-        executor.run(|spawner| {
-            spawner.spawn(driver(spawner).unwrap());
-        });
-    });
-
-    let deadline = StdInstant::now() + StdDuration::from_secs(10);
-    while !DONE.load(Ordering::SeqCst) {
-        if thread.is_finished() {
-            thread.join().expect("executor assertions failed");
-            panic!("executor exited before completion");
-        }
-        assert!(StdInstant::now() < deadline, "did not complete");
-        std::thread::sleep(StdDuration::from_millis(5));
-    }
+    support::run(
+        |spawner| spawner.spawn(driver(spawner).unwrap()),
+        &DONE,
+        support::Clock::Frozen,
+        10,
+        || "did not complete".to_owned(),
+    );
 }

@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor-tools"
-version = "0.8.0"
+version = "0.9.0"
 description = "Host tools reading supervisor_graph!, supervisor_fragment! and compose_graph! declarations: Mermaid diagrams, and dataflow lints"
 edition.workspace = true
 authors.workspace = true
@@ -22,23 +22,33 @@ autobins = false
 [[bin]]
 name = "supervisor-mermaid"
 path = "src/bin/mermaid.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "supervisor-lint"
 path = "src/bin/lint.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# The two binaries and what only they need: input gathering (`cargo
+# metadata`), output writers (mermaid.live links, HTML pages, markdown
+# updates) and the `--json` model. Without it the library parses, models,
+# renders and lints from source text alone.
+cli = ["dep:flate2", "dep:serde_json"]
 
 [dependencies]
 # The graph grammar, shared with the proc-macro so the diagram cannot drift from
 # what the macro accepts. No features: the syntax crate always parses in full,
 # and which constructs a build permits is the macro's policy, not a diagram's.
-embassy-supervisor-syntax = { version = "=0.6.0", path = "../supervisor-syntax" }
+embassy-supervisor-syntax = { version = "=0.7.0", path = "../supervisor-syntax" }
 # `span-locations` is what puts a file:line on each declaration.
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 quote = "1.0.46"
 syn = { version = "3.0.4", features = ["full"] }
 # `--live-url`: the mermaid.live link is the diagram JSON, zlib-deflated and
 # base64url'd (the editor's own "pako" share scheme).
-flate2 = "1.1.9"
+flate2 = { version = "1.1.9", optional = true }
 # Parsing `cargo metadata` (the `--deps` source discovery) and emitting the
 # `--json` model dump.
-serde_json = "1.0.150"
+serde_json = { version = "1.0.150", optional = true }

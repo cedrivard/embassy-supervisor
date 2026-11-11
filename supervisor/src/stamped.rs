@@ -3,6 +3,22 @@
 use embassy_time::{Duration, Instant};
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
+/// `log2` of the ticks in one stamp unit: the largest power of two not above
+/// a millisecond's worth of ticks, one tick below 1 kHz. A shift, so a write
+/// never divides.
+const SHIFT: u32 = {
+    let per_ms = embassy_time::TICK_HZ / 1000;
+    if per_ms > 1 { per_ms.ilog2() } else { 0 }
+};
+
+/// Where an age saturates instead of wrapping, in stamp units.
+const CAP: u32 = u32::MAX / 2;
+
+/// The clock in stamp units, truncated to `u32`.
+fn now_units() -> u32 {
+    (Instant::now().as_ticks() >> SHIFT) as u32
+}
+
 /// A signal wrapper that stamps every write with the time it happened, so a
 /// reader can ask how old the value is.
 ///
@@ -21,10 +37,12 @@ use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 /// There is deliberately no `Deref`: an unstamped access is spelled out. It
 /// records the time and nothing else; compose `Stamped<Counted<T>>` when the
 /// write count matters too. Costs one `AtomicU32` and one `AtomicBool`
-/// beside the wrapped value. The stamp is `Instant` ticks truncated to
-/// `u32`, like the node heartbeat: an age saturates at `u32::MAX / 2` ticks
-/// (about 35.8 min at a 1 MHz tick) instead of wrapping, provided something
-/// asks at least that often.
+/// beside the wrapped value. The stamp is the clock in units of about a
+/// millisecond (the largest power-of-two count of ticks that fits in one,
+/// or one tick below 1 kHz), truncated to `u32`, so an age is a whole number
+/// of units. It saturates at `u32::MAX / 2` units (12 days or more at any
+/// tick rate) instead of wrapping, provided something asks at least that
+/// often; past that a dead value can read fresh once.
 pub struct Stamped<T> {
     inner: T,
     stamp: AtomicU32,
@@ -51,8 +69,7 @@ impl<T> Stamped<T> {
     }
 
     fn stamp_now(&self) {
-        self.stamp
-            .store(Instant::now().as_ticks() as u32, Ordering::Release);
+        self.stamp.store(now_units(), Ordering::Release);
         self.written.store(true, Ordering::Release);
     }
 
@@ -67,23 +84,43 @@ impl<T> Stamped<T> {
         &self.inner
     }
 
-    /// Time since the last stamped write, `None` until the first; saturates at
-    /// `u32::MAX / 2` ticks.
+    /// Age in stamp units, saturating at [`CAP`]: past it the stamp is
+    /// re-anchored to read exactly `CAP`, so the age never wraps back to
+    /// small. The stamp is loaded before the clock is read, so the one used
+    /// is never newer than `now`; one stored in between is newer still, and
+    /// the compare-exchange leaves it in place.
+    fn age_units(&self) -> u32 {
+        let last = self.stamp.load(Ordering::Acquire);
+        let now = now_units();
+        let age = now.wrapping_sub(last);
+        if age <= CAP {
+            return age;
+        }
+        let _ = self.stamp.compare_exchange(
+            last,
+            now.wrapping_sub(CAP),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+        CAP
+    }
+
+    /// Time since the last stamped write, `None` until the first: a whole
+    /// number of stamp units (see the type doc), saturating at
+    /// `u32::MAX / 2` units.
     pub fn age(&self) -> Option<Duration> {
         if !self.written.load(Ordering::Acquire) {
             return None;
         }
-        Some(Duration::from_ticks(u64::from(crate::saturating_age(
-            &self.stamp,
-        ))))
+        Some(Duration::from_ticks(u64::from(self.age_units()) << SHIFT))
     }
 
-    /// Has the signal been written within `max_age`? A `max_age` at or past
-    /// the saturation point is clamped below it, so a dead signal never reads
-    /// fresh.
+    /// Has the signal been written within `max_age`, to the stamp unit? A
+    /// `max_age` at or past the saturation point is clamped below it, so a
+    /// dead signal never reads fresh.
     pub fn is_fresh(&self, max_age: Duration) -> bool {
-        self.age()
-            .is_some_and(|age| age.as_ticks() <= crate::age_bound(max_age))
+        let bound = max_age.as_ticks().min((u64::from(CAP) << SHIFT) - 1);
+        self.age().is_some_and(|age| age.as_ticks() <= bound)
     }
 
     /// The inner signal if it was written within `max_age`, else `None`.
