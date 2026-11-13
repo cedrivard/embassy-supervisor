@@ -286,13 +286,21 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     /// # Panics
     /// Under `trace-self`, panics when polled outside an embassy executor.
     pub async fn start(&self, spawner: &Spawner) -> Result<(), NodeFault> {
-        self.bring_up(spawner, false).await
+        self.bring_up(spawner, false, &mut KeepFirst, Origin::Boot)
+            .await
     }
 
     /// The body of [`start`](Self::start). `keep_going` makes the wave
-    /// best-effort: every node that can come up does, and the first fault is
-    /// returned once the wave has settled.
-    async fn bring_up(&self, spawner: &Spawner, keep_going: bool) -> Result<(), NodeFault> {
+    /// best-effort: every node that can come up does, every fault goes to
+    /// `policy`, and the first one it takes is returned once the wave has
+    /// settled.
+    async fn bring_up(
+        &self,
+        spawner: &Spawner,
+        keep_going: bool,
+        policy: &mut dyn RunPolicy,
+        origin: Origin,
+    ) -> Result<(), NodeFault> {
         #[cfg(feature = "trace")]
         self.graph_ref.register();
 
@@ -326,6 +334,8 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                     && !node.is_detached()
             },
             keep_going,
+            policy,
+            origin,
         )
         .await
     }
@@ -342,16 +352,59 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     /// The boot wave is best-effort: a node whose gate budget expires is logged
     /// with `warn!`, reported as `LifecycleKind::Faulted` (with lifecycle
     /// events), and left down and enabled, while the rest of the graph comes
-    /// up. A failed control `Activate` is handled the same way. `run` returns
-    /// only for a missed shutdown ack ([`FaultKind::ShutdownTimeout`]) or, with
-    /// `restart-intensity`, a refused restart (`FaultKind::RestartStorm`).
+    /// up. A failed control `Activate` and a failed pool growth are handled the
+    /// same way. `run` returns only for a missed shutdown ack
+    /// ([`FaultKind::ShutdownTimeout`]) or, with `restart-intensity`, a refused
+    /// restart (`FaultKind::RestartStorm`): the [`ReturnOnHalt`] policy.
+    /// [`run_with`](Self::run_with) picks another one.
     /// Re-entering `run` after a return is safe and retries every enabled node
     /// that is down.
     pub async fn run(&self, spawner: &Spawner) -> NodeFault {
+        self.run_with(spawner, &mut ReturnOnHalt).await
+    }
+
+    #[cfg(any(feature = "pool", feature = "control"))]
+    /// [`run`](Self::run) with a [`RunPolicy`] that picks the faults it
+    /// returns.
+    ///
+    /// The policy is called once for every fault the driver meets, in the
+    /// order they happen, with the [`Origin`] that raised it: the boot wave, a
+    /// control command, a bind cascade or a pool pass. `true` makes `run_with`
+    /// return that fault. `false` keeps the driver going. Either way the fault
+    /// was already logged and reported as `Faulted`.
+    ///
+    /// - A best-effort wave (the boot wave, `Activate`, the way back up of a
+    ///   `Restart`) reports every fault and runs to the end. `run_with` then
+    ///   returns the first fault the policy took. The faults after it still
+    ///   go to the policy, the log and the lifecycle events. A policy that
+    ///   keeps them hands them to the caller after `run_with` returns.
+    /// - A fault that stops its step (a missed ack, a refused restart, a pool
+    ///   growth) ends that step whatever the policy says. A taken fault ends
+    ///   `run_with` too.
+    /// - An absorbed `ShutdownTimeout` leaves the wedged node marked running
+    ///   until it acks. Only the log and the lifecycle events show it.
+    ///
+    /// The policy runs inside the wave, between two awaits. It must only
+    /// observe: to act on a fault, send a command with
+    /// [`try_request_control`], which the driver applies after the wave.
+    ///
+    /// Re-entering `run_with` after a return is safe and retries every enabled
+    /// node that is down. With a policy that returns bring-up faults, a node
+    /// that keeps faulting is retried once per `slot_timeout` by such a loop.
+    ///
+    /// ```ignore
+    /// let mut policy = FailFast;
+    /// loop {
+    ///     let fault = SUP.run_with(&spawner, &mut policy).await;
+    ///     escalate(fault).await;
+    /// }
+    /// ```
+    pub async fn run_with(&self, spawner: &Spawner, policy: &mut dyn RunPolicy) -> NodeFault {
         let drive = async {
-            // Best-effort: the wave logs and notes every fault itself.
-            let _ = self.bring_up(spawner, true).await;
-            self.run_driver(spawner).await
+            if let Err(e) = self.bring_up(spawner, true, policy, Origin::Boot).await {
+                return e;
+            }
+            self.run_driver(spawner, policy).await
         };
         #[cfg(feature = "liveness-monitor")]
         return match select(drive, self.monitor()).await {
@@ -367,12 +420,12 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     /// cancels a pool stop in progress and a bound stop never overlaps another
     /// wave on the same node.
     #[cfg(any(feature = "pool", feature = "control"))]
-    async fn run_driver(&self, spawner: &Spawner) -> NodeFault {
+    async fn run_driver(&self, spawner: &Spawner, policy: &mut dyn RunPolicy) -> NodeFault {
         use embassy_futures::select::{Either3, select3};
         loop {
             #[cfg(feature = "pool")]
             let deadline = if Self::has(shape::POOLS) {
-                match self.pool_pass(spawner).await {
+                match self.pool_pass_with(spawner, policy).await {
                     Ok(next) => next,
                     Err(e) => return e,
                 }
@@ -406,38 +459,42 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             let wake = match select3(bind, control, pools).await {
                 Either3::First(w) | Either3::Second(w) | Either3::Third(w) => w,
             };
+            // Every fault went to `policy` where it was raised; an `Err` here
+            // is one the policy took.
             let applied: Result<(), NodeFault> = match wake {
                 // `select3` polls the bind wait first, and a flapping provider
                 // re-latches it during every cascade: one queued command gets
                 // its turn after each, so bind changes cannot starve control.
                 #[cfg(feature = "bound-deps")]
-                DriverWake::Bind => match self.apply_bind(spawner).await {
+                DriverWake::Bind => match self.apply_bind_with(spawner, policy).await {
                     Ok(()) => match CONTROL_REQ.try_receive() {
-                        Ok(cmd) => self.drive_control(cmd, spawner).await,
+                        Ok(cmd) => self.drive_control(cmd, spawner, policy).await,
                         Err(_) => Ok(()),
                     },
                     e => e,
                 },
                 #[cfg(feature = "control")]
-                DriverWake::Control(cmd) => self.drive_control(cmd, spawner).await,
+                DriverWake::Control(cmd) => self.drive_control(cmd, spawner, policy).await,
                 #[cfg(feature = "pool")]
                 DriverWake::Pools => Ok(()),
             };
-            // A bring-up fault was logged and noted by the wave that raised it; the
-            // node stays down and enabled, and the next `Activate` retries it.
-            if let Err(e) = applied
-                && !e.kind.is_bring_up()
-            {
+            if let Err(e) = applied {
                 return e;
             }
         }
     }
 
-    /// Apply a command the driver received. A command for a node outside this
-    /// graph is logged and dropped; [`apply_control`](Self::apply_control)
-    /// itself treats one as a silent no-op.
+    /// Apply a command the driver received, reporting each fault. A command
+    /// for a node outside this graph is logged and dropped;
+    /// [`apply_control`](Self::apply_control) itself treats one as a silent
+    /// no-op.
     #[cfg(feature = "control")]
-    async fn drive_control(&self, cmd: ControlCommand, spawner: &Spawner) -> Result<(), NodeFault> {
+    async fn drive_control(
+        &self,
+        cmd: ControlCommand,
+        spawner: &Spawner,
+        policy: &mut dyn RunPolicy,
+    ) -> Result<(), NodeFault> {
         if self.index_of(cmd.node).is_none() {
             warn!(
                 "supervisor: control command for {} ignored: not a node of this graph",
@@ -445,7 +502,12 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             );
             return Ok(());
         }
-        self.apply_control(cmd, spawner).await
+        match cmd.op {
+            ControlOp::Deactivate => self.deactivate_with(cmd.node, policy).await,
+            ControlOp::Activate => self.activate_with(cmd.node, spawner, policy).await,
+            #[cfg(feature = "restart")]
+            ControlOp::Restart => self.restart_with(cmd.node, spawner, policy).await,
+        }
     }
 
     #[cfg(feature = "liveness-monitor")]
@@ -466,8 +528,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                 .any(|n| n.beat_timeout().is_some())
         {
             info!("supervisor: liveness monitor idle (no node declares beat_timeout)");
-            let never: core::convert::Infallible = core::future::pending().await;
-            match never {}
+            core::future::pending::<()>().await;
         }
 
         loop {
@@ -736,6 +797,8 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         spawner: &Spawner,
         select: &mut dyn FnMut(usize, &'static TaskNode) -> bool,
         keep_going: bool,
+        policy: &mut dyn RunPolicy,
+        origin: Origin,
     ) -> Result<(), NodeFault> {
         let mut pending = [false; N];
         for j in self.order_iter() {
@@ -835,7 +898,9 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                         return Err(fault);
                     }
                     warn!("supervisor: {}", fault);
-                    if first_err.is_ok() {
+                    // Every fault is reported, also after the first taken one,
+                    // so a counting policy sees them all.
+                    if policy.returns(&fault, origin) && first_err.is_ok() {
                         first_err = Err(fault);
                     }
                     Ok(false)
@@ -1102,6 +1167,8 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                     && !node.is_running()
             },
             false,
+            &mut KeepFirst,
+            Origin::Boot,
         )
         .await
     }
@@ -1208,6 +1275,15 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
 
     /// Deactivate the target node and all of its dependents.
     pub async fn deactivate(&self, target: &'static TaskNode) -> Result<(), NodeFault> {
+        self.deactivate_with(target, &mut KeepFirst).await
+    }
+
+    /// [`deactivate`](Self::deactivate), with a missed ack sent to `policy`.
+    async fn deactivate_with(
+        &self,
+        target: &'static TaskNode,
+        policy: &mut dyn RunPolicy,
+    ) -> Result<(), NodeFault> {
         let mut seed = [false; N];
         self.seed(target, &mut seed);
         let mut set = seed;
@@ -1242,6 +1318,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             false,
         )
         .await
+        .or_else(|f| taken(policy, f, Origin::Deactivate))
     }
 
     /// Bring `target`, its pool and every transitive dependency up in topological
@@ -1257,6 +1334,17 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         &self,
         target: &'static TaskNode,
         spawner: &Spawner,
+    ) -> Result<(), NodeFault> {
+        self.activate_with(target, spawner, &mut KeepFirst).await
+    }
+
+    /// [`activate`](Self::activate), reporting each fault of its wave and
+    /// returning the first one `policy` takes.
+    async fn activate_with(
+        &self,
+        target: &'static TaskNode,
+        spawner: &Spawner,
+        policy: &mut dyn RunPolicy,
     ) -> Result<(), NodeFault> {
         let mut set = [false; N];
         self.seed(target, &mut set);
@@ -1313,6 +1401,8 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                         && !(Self::has(shape::ON_DEMAND) && matches!(node.mode(), Mode::OnDemand))
                 },
                 true,
+                policy,
+                Origin::Activate,
             )
             .await;
         #[cfg(feature = "pool")]
@@ -1331,7 +1421,19 @@ pub(crate) fn is_serving(node: &TaskNode) -> bool {
 #[cfg(feature = "bound-deps")]
 impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     /// React to bound-dependency readiness changes by stopping or resuming nodes.
+    ///
+    /// Returns a missed ack of the stop half. A node that cannot be brought
+    /// back is logged and left down.
     pub async fn apply_bind(&self, spawner: &Spawner) -> Result<(), NodeFault> {
+        self.apply_bind_with(spawner, &mut ReturnOnHalt).await
+    }
+
+    /// [`apply_bind`](Self::apply_bind), with each fault sent to `policy`.
+    pub(crate) async fn apply_bind_with(
+        &self,
+        spawner: &Spawner,
+        policy: &mut dyn RunPolicy,
+    ) -> Result<(), NodeFault> {
         if !Self::has(shape::BOUND_DEPS) {
             return Ok(());
         }
@@ -1362,21 +1464,25 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             stopping[j] = down;
         }
 
-        self.stop_nodes(
-            &mut |j, node| {
-                if !stopping[j] {
-                    return false;
-                }
-                info!(
-                    "supervisor: bound-stop {} (a bound provider withdrew readiness)",
-                    node.name()
-                );
-                node.handle.flag_set(flag::BOUND_STOPPED);
-                true
-            },
-            false,
-        )
-        .await?;
+        if let Err(f) = self
+            .stop_nodes(
+                &mut |j, node| {
+                    if !stopping[j] {
+                        return false;
+                    }
+                    info!(
+                        "supervisor: bound-stop {} (a bound provider withdrew readiness)",
+                        node.name()
+                    );
+                    node.handle.flag_set(flag::BOUND_STOPPED);
+                    true
+                },
+                false,
+            )
+            .await
+        {
+            return taken(policy, f, Origin::Bind);
+        }
 
         for j in self.order_iter() {
             let Some(node) = self.nodes[j] else {
@@ -1403,7 +1509,10 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                 // before it ever ran, starts through the full gate sequence.
                 Mode::Terminate | Mode::Pause => {
                     info!("supervisor: bound-restart {}", node.name());
-                    if self.start_node(node, spawner).await.is_err() {
+                    if let Err(f) = self.start_node(node, spawner).await {
+                        if policy.returns(&f, Origin::Bind) {
+                            return Err(f);
+                        }
                         warn!("supervisor: {} could not be bound-restarted", node.name());
                     }
                 }
@@ -1443,6 +1552,17 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         target: &'static TaskNode,
         spawner: &Spawner,
     ) -> Result<(), NodeFault> {
+        self.restart_with(target, spawner, &mut KeepFirst).await
+    }
+
+    /// [`restart`](Self::restart), reporting each fault: a refused restart, a
+    /// missed ack of the stop half, every fault of the way back up.
+    async fn restart_with(
+        &self,
+        target: &'static TaskNode,
+        spawner: &Spawner,
+        policy: &mut dyn RunPolicy,
+    ) -> Result<(), NodeFault> {
         // Outside this graph: nothing to count or cycle, so one driver can
         // apply a Restart to every supervisor in turn.
         if self.index_of(target).is_none() {
@@ -1473,10 +1593,11 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                     node: target,
                     kind: LifecycleKind::Faulted(FaultKind::RestartStorm),
                 });
-                return Err(NodeFault {
+                let fault = NodeFault {
                     node: target,
                     kind: FaultKind::RestartStorm,
-                });
+                };
+                return taken(policy, fault, Origin::Restart);
             } else {
                 h.restarts.store(count + 1, Ordering::Relaxed);
             }
@@ -1501,17 +1622,21 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         // Down, dependents first. No `disabled` latch: this is a cycle, not a
         // stop, and a concurrent observer must never see the subtree as
         // deliberately disabled.
-        self.stop_nodes(
-            &mut |j, node| {
-                if !set[j] || node.is_detached() || !node.is_running() {
-                    return false;
-                }
-                info!("supervisor: stopping {}", node.name());
-                true
-            },
-            false,
-        )
-        .await?;
+        if let Err(f) = self
+            .stop_nodes(
+                &mut |j, node| {
+                    if !set[j] || node.is_detached() || !node.is_running() {
+                        return false;
+                    }
+                    info!("supervisor: stopping {}", node.name());
+                    true
+                },
+                false,
+            )
+            .await
+        {
+            return taken(policy, f, Origin::Restart);
+        }
 
         // Up, dependencies first, each through the full gate sequence, as a
         // best-effort wave: every member that can come back does, and the first
@@ -1530,6 +1655,8 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
                                     && matches!(node.mode(), Mode::OnDemand))))
                 },
                 true,
+                policy,
+                Origin::Restart,
             )
             .await;
         #[cfg(feature = "pool")]
@@ -1538,5 +1665,103 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
         }
 
         r
+    }
+}
+
+/// Where `Supervisor::run_with` met a fault, as its [`RunPolicy`] sees it.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Origin {
+    /// The boot wave at the start of `run_with`.
+    Boot,
+    /// A control `Activate` (feature `control`).
+    Activate,
+    /// A control `Deactivate` (feature `control`).
+    Deactivate,
+    /// A control `Restart` (feature `restart`): the refused restart, the stop
+    /// half or the way back up.
+    Restart,
+    /// A bind cascade after a bound provider changed readiness (feature
+    /// `bound-deps`).
+    Bind,
+    /// A pool pass growing a member (feature `pool`).
+    PoolGrow,
+    /// A pool pass stopping a member (feature `pool`).
+    PoolShrink,
+}
+
+/// The policy of the public verbs: every fault is taken, so each verb
+/// returns its first.
+struct KeepFirst;
+
+impl RunPolicy for KeepFirst {
+    fn returns(&mut self, _: &NodeFault, _: Origin) -> bool {
+        true
+    }
+}
+
+/// A fault that ends its step: `Err` when `policy` takes it, `Ok` when it is
+/// absorbed.
+#[cfg(feature = "control")]
+fn taken(policy: &mut dyn RunPolicy, fault: NodeFault, origin: Origin) -> Result<(), NodeFault> {
+    if policy.returns(&fault, origin) {
+        Err(fault)
+    } else {
+        Ok(())
+    }
+}
+
+/// Which faults end `Supervisor::run_with`.
+///
+/// `returns` is called once for every fault the driver meets, in order, with
+/// where it happened. `true` ends `run_with` with that fault. `false` keeps the
+/// driver going: the fault is still logged and reported as `Faulted`.
+/// [`FaultKind::is_bring_up`] separates the faults that leave a node down
+/// from the ones about a node that is still running.
+///
+/// The policy is a value, so it can count or carry settings. It runs inside
+/// the driver's waves and must only observe: to act on a fault, send a
+/// command with `try_request_control`, which the driver applies afterwards.
+///
+/// ```
+/// use embassy_supervisor::{FaultKind, NodeFault, Origin, RunPolicy};
+///
+/// /// Return a halt at once, and a bring-up fault on its third occurrence.
+/// struct ThreeStrikes {
+///     bring_up_faults: u8,
+/// }
+/// impl RunPolicy for ThreeStrikes {
+///     fn returns(&mut self, fault: &NodeFault, _origin: Origin) -> bool {
+///         if !fault.kind.is_bring_up() {
+///             return true;
+///         }
+///         self.bring_up_faults += 1;
+///         self.bring_up_faults >= 3
+///     }
+/// }
+/// ```
+pub trait RunPolicy {
+    /// True when `run_with` returns this fault.
+    fn returns(&mut self, fault: &NodeFault, origin: Origin) -> bool;
+}
+
+/// The policy of `Supervisor::run`: return only when a node halts, that is
+/// a missed shutdown ack (`ShutdownTimeout`) or a refused restart
+/// (`RestartStorm`). Bring-up faults are logged and absorbed.
+pub struct ReturnOnHalt;
+
+impl RunPolicy for ReturnOnHalt {
+    fn returns(&mut self, fault: &NodeFault, _: Origin) -> bool {
+        !fault.kind.is_bring_up()
+    }
+}
+
+/// Return on every fault, bring-up faults included.
+pub struct FailFast;
+
+impl RunPolicy for FailFast {
+    fn returns(&mut self, _: &NodeFault, _: Origin) -> bool {
+        true
     }
 }

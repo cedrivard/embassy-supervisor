@@ -31,6 +31,7 @@ The full verb surface, with signatures (every error type is `Debug`, so `.unwrap
 |---|---|---|
 | `start` | `async fn(&self, &Spawner) -> Result<(), NodeFault>`: quiescent → running, any state | |
 | `run` | `async fn(&self, &Spawner) -> NodeFault`: `start` (best-effort) + the driver loop; returns only on a missed shutdown ack or a refused restart | `control` or `pool` |
+| `run_with` | `async fn(&self, &Spawner, &mut dyn RunPolicy) -> NodeFault`: `run` with a policy that picks the faults it returns: `ReturnOnHalt` (what `run` uses), `FailFast`, or your own | `control` or `pool` |
 | `teardown` / `teardown_continue` | `async fn(&self) -> Result<(), NodeFault>` | |
 | `respawn_terminate` | `async fn(&self, &Spawner) -> Result<(), NodeFault>`: wake pair, with... | |
 | `resume_pausable` | `fn(&self)`: ...this (sync: parked tasks pick up immediately) | |
@@ -55,6 +56,29 @@ message. `Aborted`, `Resumed`, `ControlQueueFull` (feature `control`) and `Injec
 `embassy_executor` and appears only inside `FaultKind::Spawn`. All the guarantees here
 are cross-thread (release/acquire atomics); a host test's main thread reads them as
 safely as another task.
+
+To pick which faults end the driver, call `run_with` with a `RunPolicy`. It is a trait
+with one method, `returns(&mut self, &NodeFault, Origin) -> bool`.
+
+- `ReturnOnHalt` is what `run` uses. It returns a missed ack or a refused restart.
+- `FailFast` returns every fault, bring-up faults included.
+- Your own policy can look at the kind, the node and the `Origin`: `Boot`, `Activate`,
+  `Deactivate`, `Restart`, `Bind`, `PoolGrow` or `PoolShrink`. `FaultKind::is_bring_up`
+  tells the faults that leave a node down from the ones about a running node.
+- A policy is a value, so it can count faults or carry settings.
+
+The policy is called once for every fault the driver meets, in the order they happen.
+A fault it does not return is still logged and reported as `Faulted`.
+
+- A best-effort wave (the boot wave, `Activate`, the way back up of a `Restart`) reports
+  every fault and runs to the end. `run_with` then returns the first fault the policy
+  took. The faults after it still go to the policy, the log and the lifecycle events.
+  A policy that keeps them hands them to the caller after `run_with` returns.
+- A missed ack, a refused restart or a failed pool growth ends its step whatever the
+  policy says.
+
+The policy runs inside the driver's waves and must only observe. To act on a fault,
+send a command with `try_request_control`; the driver applies it after the wave.
 
 The control mailbox (feature `control`) is two free functions and two small types:
 `async fn request_control(&'static TaskNode, ControlOp)` (lossless: awaits mailbox

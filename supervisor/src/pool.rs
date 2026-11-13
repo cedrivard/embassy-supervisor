@@ -200,17 +200,39 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     /// call it after each wake, then wait on `select(wait_scale(), Timer::at(next))`,
     /// or on `wait_scale()` alone when it returns `Ok(None)`.
     pub async fn pool_pass(&self, spawner: &Spawner) -> Result<Option<Instant>, crate::NodeFault> {
+        self.pool_pass_with(spawner, &mut crate::ReturnOnHalt).await
+    }
+
+    /// [`pool_pass`](Self::pool_pass) with each fault sent to `policy`, which
+    /// decides whether the pass returns it. An absorbed fault ends only its
+    /// own pool's action.
+    pub(crate) async fn pool_pass_with(
+        &self,
+        spawner: &Spawner,
+        policy: &mut dyn crate::RunPolicy,
+    ) -> Result<Option<Instant>, crate::NodeFault> {
+        use crate::supervisor::Origin;
         let now = Instant::now();
         let mut next: Option<Instant> = None;
         for pool in self.pools {
             match pool.evaluate(now) {
-                PoolAction::Start(n) => {
-                    if self.deps_running(n) && n.ready_deps_ok() {
-                        let _ = self.start_node(n, spawner).await;
+                PoolAction::Start(n) if self.deps_running(n) && n.ready_deps_ok() => {
+                    if let Err(f) = self.start_node(n, spawner).await {
+                        if policy.returns(&f, Origin::PoolGrow) {
+                            return Err(f);
+                        }
+                        // A missed ack warns in the stop; a failed growth here.
+                        warn!("supervisor: {}", f);
                     }
                 }
-                PoolAction::Stop(n) => self.stop_node(n).await?,
-                PoolAction::None => {}
+                PoolAction::Start(_) | PoolAction::None => {}
+                PoolAction::Stop(n) => {
+                    if let Err(f) = self.stop_node(n).await
+                        && policy.returns(&f, Origin::PoolShrink)
+                    {
+                        return Err(f);
+                    }
+                }
             }
             if let Some(d) = pool.deferred_until() {
                 next = Some(next.map_or(d, |c| c.min(d)));
@@ -222,8 +244,7 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     /// Drive all elastic pools forever, returning only on a fault.
     pub async fn run_pools(&self, spawner: &Spawner) -> crate::NodeFault {
         if !Self::has(crate::shape::POOLS) {
-            let never: core::convert::Infallible = core::future::pending().await;
-            match never {}
+            core::future::pending::<()>().await;
         }
         loop {
             let next = match self.pool_pass(spawner).await {

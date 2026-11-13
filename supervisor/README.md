@@ -266,6 +266,18 @@ update, all driven by this supervisor.
 
 ## Migration
 
+### 0.14.0 → 0.14.1
+
+Ships with the same `embassy-supervisor-macros` 0.13.0 and `embassy-supervisor-syntax`
+0.7.0. Purely additive: no code edit is needed. The new public items are
+`Supervisor::run_with`, `RunPolicy`, `Origin`, `ReturnOnHalt`, `FailFast` and
+`FaultKind::is_bring_up`. A crate that glob-imports `embassy_supervisor::*` together
+with another crate exporting one of those names gets an ambiguity error where it uses
+the name; import that name explicitly.
+
+Behavioural change needing no code edit: `pool_pass` and `run_pools` log a failed pool
+growth with `warn!`.
+
 ### 0.13 → 0.14
 
 Ships with `embassy-supervisor-macros` 0.13.0 on `embassy-supervisor-syntax` 0.7.0 (both

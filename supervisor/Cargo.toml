@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.14.0"
+version = "0.14.1"
 description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
@@ -843,6 +843,21 @@ required-features = ["macros", "control"]
 [[test]]
 name = "activate_errors"
 required-features = ["macros", "control"]
+
+# `run_with::<P>()` returns what its policy accepts: boot, pool growth, Activate.
+[[test]]
+name = "run_policy"
+required-features = ["macros", "control", "pool"]
+
+# An absorbed ShutdownTimeout on a wedged pool member: one retry per wake.
+[[test]]
+name = "run_policy_wedged"
+required-features = ["macros", "control", "pool"]
+
+# Every fault of an Activate or Restart cascade reaches the run_with policy once.
+[[test]]
+name = "run_policy_cascade"
+required-features = ["macros", "control", "restart", "readiness"]
 
 # `activate` requests pool scaling even when its wave returns a fault: the
 # pool of the provider it did bring up grows with no other wake.
