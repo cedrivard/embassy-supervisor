@@ -4,6 +4,30 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] - 2026-11-12
+
+`Supervisor::run_with` takes a `RunPolicy` that picks the faults the driver returns.
+Companion crate versions are unchanged: macros 0.13.0, syntax 0.7.0, tools 0.9.0,
+observe 0.1.3.
+
+### Added
+
+- `Supervisor::run_with(&spawner, &mut policy)`: `run()` with a `RunPolicy` that picks
+  the faults it returns. The policy is called once for every fault the driver meets,
+  with the `NodeFault` and its `Origin` (`Boot`, `Activate`, `Deactivate`, `Restart`,
+  `Bind`, `PoolGrow`, `PoolShrink`). `ReturnOnHalt` is what `run()` uses (a missed ack
+  or a refused restart). `FailFast` returns every fault. A fault the policy does not
+  return is logged and reported as `Faulted`, and the driver keeps going. A wave runs to
+  the end and returns the first fault the policy took; the policy still sees every
+  later fault of that wave.
+- `FaultKind::is_bring_up()` is public: true for `ReadyDepTimeout`, `ResourceMissing`,
+  `ExecutorSlotEmpty` and `Spawn`.
+
+### Changed
+
+- `pool_pass` and `run_pools` log a failed pool growth with `warn!`. Their return
+  contract is unchanged.
+
 ## [0.14.0] - 2026-11-11
 
 `run()` keeps driving through bring-up faults, `restart` brings back what was running,
@@ -1393,7 +1417,8 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.14.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.14.1...HEAD
+[0.14.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.14.0...embassy-supervisor-v0.14.1
 [0.14.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.13.0...embassy-supervisor-v0.14.0
 [0.13.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.12.0...embassy-supervisor-v0.13.0
 [0.12.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.11.0...embassy-supervisor-v0.12.0

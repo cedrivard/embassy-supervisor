@@ -79,11 +79,13 @@ impl core::fmt::Debug for FaultKind {
     }
 }
 
-#[cfg(any(feature = "pool", feature = "control"))]
 impl FaultKind {
     /// A bring-up fault: the node did not start, and nothing else changed.
-    /// `Supervisor::run` logs these and keeps driving.
-    pub(crate) const fn is_bring_up(&self) -> bool {
+    /// `ReadyDepTimeout`, `ResourceMissing`, `ExecutorSlotEmpty` and `Spawn`
+    /// are bring-up faults. `ShutdownTimeout` and `RestartStorm` are not: they
+    /// are about a node that is still running. `Supervisor::run` logs bring-up
+    /// faults and keeps driving.
+    pub const fn is_bring_up(&self) -> bool {
         match self {
             Self::ReadyDepTimeout { .. }
             | Self::ResourceMissing

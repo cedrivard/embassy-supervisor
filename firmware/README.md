@@ -767,11 +767,11 @@ The device acks `receiving image`, drops off (decode + reset), and comes back ru
 What each of the five opt-in features costs this firmware, measured with
 `arm-none-eabi-size -A` on the release ELF (rustc 1.97.1, the workspace release
 profile: `opt-level = "s"`, fat LTO, one codegen unit). The baseline is
-`cargo build --release -p firmware --no-default-features`: flash 171,812 B
+`cargo build --release -p firmware --no-default-features`: flash 172,472 B
 (`.vector_table` + `.text` + `.rodata`), `.data` 352 B (RAM initialised from
 flash: embassy-rp's RAM-resident flash routine, the executor slots, the pool,
 the graph reference, the OTA target and defmt's RTT block; the node statics
-are flash and their handles `.bss`), `.bss` 47,468 B. Each row adds one
+are flash and their handles `.bss`), `.bss` 47,524 B. Each row adds one
 feature to it (`--no-default-features --features F`); the `all five` row is
 the default build, and the `dns` row is measured over the default build.
 The deltas include the firmware's own use of the feature (the event ring and
@@ -780,13 +780,13 @@ The deltas include the firmware's own use of the feature (the event ring and
 
 | feature | Δflash | Δ.data | Δ.bss | runtime cost |
 | --- | ---: | ---: | ---: | --- |
-| `lifecycle-sink` | +1,892 | 0 | +204 | one critical section + the sink call per lifecycle transition |
-| `breadcrumb` | +1,480 | 0 | +4 | two relaxed stores per transition; 1 B per node + 4 B global |
+| `lifecycle-sink` | +1,648 | 0 | +204 | one critical section + the sink call per lifecycle transition |
+| `breadcrumb` | +1,512 | 0 | +4 | two relaxed stores per transition; 1 B per node + 4 B global |
 | `feed-gate` | +168 | 0 | 0 | one clock read + N atomic loads per feed (every 2 s) |
-| `restart-intensity` | +316 | 0 | +72 | one clock read and relaxed loads and stores of the window per counted `restart()`; nothing at steady state; 8 B per node handle |
-| `enabled-if` | +1,200 | 0 | +40 | one fn call per node per `start()` |
-| all five (default) | +5,120 | 0 | +320 | |
-| `dns` (over default) | +7,008 | 0 | 0 | none: the OTA target is an IPv4 literal, so the socket never runs |
+| `restart-intensity` | +392 | 0 | +72 | one clock read and relaxed loads and stores of the window per counted `restart()`; nothing at steady state; 8 B per node handle |
+| `enabled-if` | +1,132 | 0 | +40 | one fn call per node per `start()` |
+| all five (default) | +4,916 | 0 | +320 | |
+| `dns` (over default) | +7,004 | 0 | 0 | none: the OTA target is an IPv4 literal, so the socket never runs |
 
 ```sh
 cargo build --release -p firmware --no-default-features
