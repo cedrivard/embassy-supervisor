@@ -32,3 +32,9 @@ macro_rules! warn {
 macro_rules! warn {
     ($s:literal $(, $a:expr)* $(,)?) => {{ $( let _ = &$a; )* }};
 }
+
+// With both backends on an embedded target the `defmt` arms above win and
+// nothing names the `log` crate. Name it here, so Cargo's
+// `unused_dependencies` lint does not report the dependency in that build.
+#[cfg(all(feature = "log", feature = "defmt", target_os = "none"))]
+use log as _;
