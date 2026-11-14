@@ -152,6 +152,28 @@ multi-graph binary cannot tell which graph's slot it names; the per-node `crumb(
 stores throughout: a diagnostic, not a synchronisation point. Costs one `AtomicU8` per
 node, one `AtomicU32`, and one store pair per transition.
 
+A reset the hardware watchdog takes because a feed gate (`GRAPH.all_fresh()`) withheld
+the feed is not a lifecycle transition, so `crumb_word()` names whatever the supervisor
+last did, not the node that stopped beating. With `liveness-monitor` too,
+`GRAPH.stale_crumb()` builds the word that blames it: phase `CrumbPhase::Stale` and the
+slot of the first stale policed node, `None` while every one is fresh. Stash it in place
+of `crumb_word()` from the pass that withholds the feed until a feed lands again:
+
+```rust,ignore
+if GRAPH.all_fresh() {
+    wd.feed(timeout);
+    blame = None;
+} else {
+    blame = GRAPH.stale_crumb().or(blame);
+}
+pac::WATCHDOG.scratch(6).write_value(blame.unwrap_or_else(embassy_supervisor::crumb_word));
+```
+
+On the next boot, a `Stale` crumb naming a node with an `enabled_if:` predicate lets that
+predicate keep it down for one boot, so a node that stalls on every boot cannot reset the
+chip in a loop: see the
+[watchdog recipe](crate::guide::recipes#watchdog-reset-that-names-the-stalled-node-without-a-reset-loop).
+
 # Fault injection
 
 `fault-inject` lets tests or dashboards inject faults into a node without worker

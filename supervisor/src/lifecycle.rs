@@ -186,6 +186,11 @@ pub enum CrumbPhase {
     Faulted = 5,
     /// A parked `Pause` instance was resumed.
     Resumed = 6,
+    /// Running past its `beat_timeout:` while a watchdog feed was withheld for
+    /// it. No supervisor records this phase: it is never a node's
+    /// [`TaskNode::crumb`] nor in [`crumb_word`], only in the word
+    /// [`Graph::stale_crumb`] builds for a feeder to stash.
+    Stale = 7,
 }
 
 #[cfg(feature = "breadcrumb")]
@@ -199,6 +204,7 @@ impl CrumbPhase {
             4 => CrumbPhase::Stopped,
             5 => CrumbPhase::Faulted,
             6 => CrumbPhase::Resumed,
+            7 => CrumbPhase::Stale,
             _ => return None,
         })
     }
@@ -213,6 +219,7 @@ impl CrumbPhase {
             CrumbPhase::Stopped => "stopped",
             CrumbPhase::Faulted => "faulted",
             CrumbPhase::Resumed => "resumed",
+            CrumbPhase::Stale => "stale",
         }
     }
 }
@@ -231,6 +238,12 @@ static LAST_CRUMB: AtomicU32 = AtomicU32::new(0);
 /// Slot field of a crumb word whose node is not in the driving graph.
 #[cfg(feature = "breadcrumb")]
 const CRUMB_NO_SLOT: u16 = u16::MAX;
+
+/// Pack `phase` and `slot` into the word [`decode_crumb`] splits.
+#[cfg(feature = "breadcrumb")]
+pub(crate) const fn crumb(phase: CrumbPhase, slot: u16) -> u32 {
+    0x8000_0000 | (phase as u32) << 16 | slot as u32
+}
 
 /// The most recent lifecycle transition any supervisor drove, as one word:
 /// bit 31 = valid, bits 16..24 = [`CrumbPhase`], bits 0..16 = the node's slot
@@ -297,10 +310,7 @@ pub(crate) fn note(node: &'static TaskNode, slot: Option<usize>, t: Transition) 
         };
         node.handle.crumb.store(phase as u8, Ordering::Relaxed);
         let slot = slot.map_or(CRUMB_NO_SLOT, |i| i as u16);
-        LAST_CRUMB.store(
-            0x8000_0000 | (phase as u32) << 16 | u32::from(slot),
-            Ordering::Relaxed,
-        );
+        LAST_CRUMB.store(crumb(phase, slot), Ordering::Relaxed);
     }
     #[cfg(any(feature = "lifecycle-events", feature = "lifecycle-sink"))]
     {

@@ -21,6 +21,8 @@ pub(crate) async fn bench_task(node: &'static TaskNode) -> u32 {
         // Keep the value observable so the loop cannot be optimized out.
         core::hint::black_box(x);
         slices = slices.wrapping_add(1);
+        // One beat per slice keeps it inside its `beat_timeout:`.
+        node.beat();
         embassy_futures::yield_now().await;
     }
 }

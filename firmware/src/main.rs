@@ -42,6 +42,7 @@ embassy_supervisor::compose_graph! {
 
         node BENCH = Terminate, deps: [HEARTBEAT ready bound], executor: CORE1,
             task: crate::bench::bench_task, exit: u32,
+            beat_timeout: 1000,
             #[cfg(not(feature = "enabled-if"))] disabled,
             #[cfg(feature = "enabled-if")] enabled_if: crate::bootflag::bench_enabled;
 
@@ -180,6 +181,27 @@ pub(crate) fn decode_crumb(word: u32) -> Option<(&'static str, embassy_superviso
     let (phase, slot) = embassy_supervisor::decode_crumb(word)?;
     let node = GRAPH.nodes.get(usize::from(slot)).copied().flatten()?;
     Some((node.name(), phase))
+}
+
+/// Did the previous boot end with the watchdog resetting the chip because
+/// `node` stopped beating? That is a [`CrumbPhase::Stale`] crumb naming its
+/// slot, which `watchdog` stashes only under `feed-gate`.
+///
+/// [`CrumbPhase::Stale`]: embassy_supervisor::CrumbPhase::Stale
+#[cfg(all(feature = "breadcrumb", feature = "enabled-if"))]
+pub(crate) fn reset_blamed(node: &embassy_supervisor::TaskNode) -> bool {
+    let prev = PREV_CRUMB.load(Ordering::Relaxed);
+    let Some((embassy_supervisor::CrumbPhase::Stale, slot)) =
+        embassy_supervisor::decode_crumb(prev)
+    else {
+        return false;
+    };
+    GRAPH
+        .nodes
+        .get(usize::from(slot))
+        .copied()
+        .flatten()
+        .is_some_and(|n| core::ptr::eq(n, node))
 }
 
 static mut CORE1_STACK: embassy_rp::multicore::Stack<4096> = embassy_rp::multicore::Stack::new();

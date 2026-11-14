@@ -4,6 +4,20 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.2] - 2026-11-14
+
+`Graph::stale_crumb` names the node a watchdog reset was for. Companion crate versions
+are unchanged: macros 0.13.0, syntax 0.7.0, tools 0.9.0, observe 0.1.3.
+
+### Added
+
+- `Graph::stale_crumb()` (`liveness-monitor` + `breadcrumb`): a crumb word that names the
+  first stale policed node's slot with the new phase `CrumbPhase::Stale`, or `None` while
+  `all_fresh()` holds. A watchdog feeder that withholds the feed stashes it in place of
+  `crumb_word()`, so the next boot's `decode_crumb()` names the node the watchdog reset
+  the chip for. No supervisor records `Stale`: it is never a node's `crumb()` nor in
+  `crumb_word()`.
+
 ## [0.14.1] - 2026-11-12
 
 `Supervisor::run_with` takes a `RunPolicy` that picks the faults the driver returns.
@@ -1417,7 +1431,8 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.14.1...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.14.2...HEAD
+[0.14.2]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.14.1...embassy-supervisor-v0.14.2
 [0.14.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.14.0...embassy-supervisor-v0.14.1
 [0.14.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.13.0...embassy-supervisor-v0.14.0
 [0.13.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.12.0...embassy-supervisor-v0.13.0

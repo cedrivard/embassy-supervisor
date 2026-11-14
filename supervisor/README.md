@@ -212,7 +212,7 @@ in-browser [playground](https://embassy-supervisor.github.io/playground/).
 | `budget` | | the `divisible` resource kind: a graph-sized `Budget<K>` of units, a `Claimant` per holder, `FairShare`/`ShrinkFastGrowSlow` policies, and a holder's share released by the supervisor when it stops, including a wedged holder that misses its ack |
 | `readiness` | | task-asserted readiness: `set_ready`/`wait_ready`/`clear_ready` + the `ready` dep marker (bring-up + pool-growth gating) |
 | `liveness` | | per-node heartbeat: `beat()` raises a flag that `ticks_since_beat() -> u32` converts using the clock read it already makes, plus `is_stale(max_age)`: alive-but-stalled detection without `trace`. A fresh spawn counts as a beat, so a node is never instantly stale. The age saturates at `u32::MAX / 2` ticks (about 35.8 min at a 1 MHz tick) while something checks it at least that often, so a stalled node stays stale; a `max_age` past that is clamped just below it, and a `beat_timeout:` at or past it is refused at compile time. The `beat_put`/`beat_writer` verbs exist only with this on |
-| `liveness-monitor` | | the sweep over those heartbeats: `beat_timeout:` / `beat_window:` clauses, `Supervisor::monitor`, `HealthEvent` on `wait_health()`; plus `GRAPH.all_fresh()` / `GRAPH.stale_nodes()`, the synchronous hardware-watchdog feed gate. **Report-only**: escalation is the application's call (implies `liveness`) |
+| `liveness-monitor` | | the sweep over those heartbeats: `beat_timeout:` / `beat_window:` clauses, `Supervisor::monitor`, `HealthEvent` on `wait_health()`; plus `GRAPH.all_fresh()` / `GRAPH.stale_nodes()`, the synchronous hardware-watchdog feed gate, and with `breadcrumb` `GRAPH.stale_crumb()`, the word that names the stale node for a withheld feed. **Report-only**: escalation is the application's call (implies `liveness`) |
 | `epochs` | | per-node activation generation (`epoch()`, `wait_epoch_change()`), so an *already-running* dependent can notice that a provider was restarted underneath it. Pure status. `wait_epoch_change()` serves one waiter at a time; other dependents compare `epoch()` |
 | `coupling` | | declared dataflow: `reads:` / `writes:` naming real signal statics, and the signal-indexed queries; `Stamped<T>`, the read-side write-freshness wrapper (`age`, `read_fresh`) |
 | `coupling-observe` | | the `observed` entry marker and its accessor (`via`, graph default, or the `Observable` facade): a way to ask whether a signal moved. `beat` is what currently asks: with `liveness-monitor` it drives the heartbeat and `ready_on_write` by polling, nothing asked of the task (implies `coupling`) |
@@ -226,7 +226,7 @@ in-browser [playground](https://embassy-supervisor.github.io/playground/).
 | `enabled-if` | | the `enabled_if: fn() -> bool` clause: `start()` evaluates it for each down node and latches `disabled` on `false`: settings-gated bring-up |
 | `lifecycle-events` | | `wait_lifecycle()` / `try_wait_lifecycle()`: a lossy 8-slot queue of `LifecycleEvent { node, kind }` for every driven transition, with a drop counter |
 | `lifecycle-sink` | | `set_lifecycle_sink(fn(LifecycleEvent))`: the same events, pushed synchronously to an app callback on the supervisor task; no queue, no drops |
-| `breadcrumb` | | `node.crumb()` and the packed `crumb_word()` / `decode_crumb()`: the last lifecycle phase, per node and binary-wide, for postmortem stashing |
+| `breadcrumb` | | `node.crumb()` and the packed `crumb_word()` / `decode_crumb()`: the last lifecycle phase, per node and binary-wide, for postmortem stashing; with `liveness-monitor`, `GRAPH.stale_crumb()` blames a stale node instead |
 | `bound-deps` | | the `bound` dep marker: opt-in contract change where `clear_ready()` stops the dependent and a spent readiness budget parks it instead of faulting (implies `readiness` + `control`) |
 | `heap-state` | | `state: Type = expr` / `state: zeroed Type` per-activation boxed state, freed when each activation ends. ⚠ opt-in: emits a small fallible-boxing `unsafe` helper per `state:` form into your crate (the `zeroed` one relies on your `Zeroable` impl); needs a `#[global_allocator]`; pulls `bytemuck` for `Zeroable` |
 | `fault-inject` | | `TaskNode::inject(Fault::{Stall, Wedge, Crash, Hog(..)})` / `clear_fault()` / `fault()`: faults done TO a task (the shell withholds polls, drops the future or busy-spins; the node hides a stop and swallows the ack), see [Fault injection](https://docs.rs/embassy-supervisor/latest/embassy_supervisor/guide/observability/index.html#fault-injection). A bench, test and demo feature |
@@ -265,6 +265,13 @@ elastic worker pool, multi-executor tiers on both cores, trace observability, an
 update, all driven by this supervisor.
 
 ## Migration
+
+### 0.14.1 → 0.14.2
+
+Ships with the same `embassy-supervisor-macros` 0.13.0 and `embassy-supervisor-syntax`
+0.7.0. Purely additive: no code edit is needed. The new public items are
+`Graph::stale_crumb` and the `CrumbPhase::Stale` variant; `CrumbPhase` is
+`#[non_exhaustive]`, so every `match` on it already has a wildcard arm.
 
 ### 0.14.0 → 0.14.1
 
