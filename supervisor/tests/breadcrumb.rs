@@ -190,6 +190,7 @@ fn every_phase_round_trips_through_the_word() {
         (CrumbPhase::Stopped, 4),
         (CrumbPhase::Faulted, 5),
         (CrumbPhase::Resumed, 6),
+        (CrumbPhase::Stale, 7),
     ];
     for (phase, v) in phases {
         for slot in [0u16, 7, u16::MAX] {

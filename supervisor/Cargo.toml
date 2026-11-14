@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.14.1"
+version = "0.14.2"
 description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
@@ -1108,6 +1108,13 @@ required-features = ["macros", "breadcrumb"]
 [[test]]
 name = "watchdog_gate"
 required-features = ["macros", "liveness-monitor"]
+
+# The stale-node crumb: `stale_crumb` names the first stale policed node's
+# slot with phase `Stale`, moves on when that node beats, and is `None` once
+# no policed node is stale; the supervisor itself never records `Stale`.
+[[test]]
+name = "stale_crumb"
+required-features = ["macros", "liveness-monitor", "breadcrumb"]
 
 # `restart_budget:`: the storm fault inside the window (nothing stopped), a
 # fresh window afterwards, budget-less nodes unlimited, and the control path

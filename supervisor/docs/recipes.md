@@ -381,6 +381,62 @@ async fn ready_probe_worker(node: &'static embassy_supervisor::TaskNode) {
 detaching is still what makes it run once **ever**; without it, `respawn_terminate` on
 the next wake cycle would re-run the completed node.
 
+### Watchdog reset that names the stalled node, without a reset loop
+
+Needs `liveness-monitor`, `breadcrumb` and `enabled-if`.
+
+```rust,ignore
+supervisor_graph! {
+    node FEEDER  = Terminate, task: feeder_worker, resources: [WD: Watchdog];
+    node CORE    = Terminate, task: core_worker, beat_timeout: 2000;
+    node OPTIONAL = Terminate, task: optional_worker, beat_timeout: 1000,
+        enabled_if: optional_enabled;
+}
+
+// Survives a watchdog reset: no-init RAM or a watchdog scratch register.
+fn stash(word: u32) { /* ... */ }
+// Read once at boot, before `start()`, then cleared.
+static PREV: AtomicU32 = AtomicU32::new(0);
+
+async fn feeder_worker(node: &'static TaskNode, wd: &mut Watchdog) {
+    node.set_detached(true);
+    let mut blame = None;
+    loop {
+        if GRAPH.all_fresh() {
+            wd.feed(Duration::from_secs(8));
+            blame = None;
+        } else {
+            // Keep the last blame if the node beat again between passes.
+            blame = GRAPH.stale_crumb().or(blame);
+        }
+        stash(blame.unwrap_or_else(embassy_supervisor::crumb_word));
+        Timer::after_secs(2).await;
+    }
+}
+
+/// Down for one boot after the watchdog reset the chip because OPTIONAL stopped beating.
+fn optional_enabled() -> bool {
+    let blamed = matches!(
+        decode_crumb(PREV.load(Ordering::Relaxed)),
+        Some((CrumbPhase::Stale, slot))
+            if GRAPH.nodes.get(usize::from(slot)).copied().flatten()
+                .is_some_and(|n| core::ptr::eq(n, &OPTIONAL))
+    );
+    !blamed && settings::optional_on()
+}
+```
+
+A node past its `beat_timeout:` withholds the feed, and the hardware watchdog resets the
+chip. That reset is not a lifecycle transition, so `crumb_word()` would name whatever the
+supervisor last did. While a feed is withheld the feeder stashes `GRAPH.stale_crumb()`
+instead: phase `Stale` and the stale node's slot. On the next boot `decode_crumb` names
+that node, and an `enabled_if:` predicate can keep it down for that boot, so a node that
+stalls on every boot cannot reset the chip in a loop. `CORE` has no predicate: the
+system cannot run without it, so a stall there keeps resetting. The quarantine lasts one
+boot. Any later reset stashes an ordinary crumb, and the node comes back. To bring it up
+sooner, `request_control(&OPTIONAL, ControlOp::Activate)`. The feeder is detached so no
+teardown or cascade ever stops it.
+
 ### Composite: sensor tier + parked diagnostics + power coordinator
 
 ```rust,ignore

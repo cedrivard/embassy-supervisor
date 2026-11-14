@@ -16,10 +16,20 @@ use embassy_rp::pac::WATCHDOG;
 #[cfg(feature = "enabled-if")]
 const BENCH_ON: u32 = 0xBE9C_0001;
 
-/// `bench`'s `enabled_if:` predicate: is the boot flag set?
+/// `bench`'s `enabled_if:` predicate: is the boot flag set? Under
+/// `breadcrumb`, not when the previous boot ended in a watchdog reset because
+/// `bench` stopped beating: a node that stalls on every boot would otherwise
+/// reset the chip in a loop. The flag stays set, so a later boot that does not
+/// follow such a reset brings `bench` up again, and `op=start` brings it up now.
 #[cfg(feature = "enabled-if")]
 pub fn bench_enabled() -> bool {
-    WATCHDOG.scratch5().read() == BENCH_ON
+    let on = WATCHDOG.scratch5().read() == BENCH_ON;
+    #[cfg(feature = "breadcrumb")]
+    if on && crate::reset_blamed(&crate::BENCH) {
+        defmt::warn!("bench: the watchdog reset the last boot for it; not starting it");
+        return false;
+    }
+    on
 }
 
 /// Set or clear the boot flag; takes effect at the next boot.

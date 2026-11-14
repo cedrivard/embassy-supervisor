@@ -39,10 +39,25 @@ pub(crate) async fn watchdog_task(
     // The feed runs on its own deadline, not on a timer re-armed per wake, so
     // a stream of events cannot postpone it.
     let mut next_feed = Instant::now();
+    // Under `feed-gate`, the crumb naming the stale node a withheld feed waits
+    // on: stashed in place of the supervisor's last transition until a feed
+    // lands again, so the next boot names the node the watchdog reset for.
+    #[cfg(all(feature = "breadcrumb", feature = "feed-gate"))]
+    let mut blame: Option<u32> = None;
     loop {
         if Instant::now() >= next_feed {
             next_feed = Instant::now() + FEED_EVERY;
-            feed(wd);
+            let fed = feed(wd);
+            #[cfg(all(feature = "breadcrumb", feature = "feed-gate"))]
+            {
+                blame = if fed {
+                    None
+                } else {
+                    GRAPH.stale_crumb().or(blame)
+                };
+            }
+            #[cfg(not(all(feature = "breadcrumb", feature = "feed-gate")))]
+            let _ = fed;
             for id in embassy_supervisor::trace::executors() {
                 if id == 0 {
                     continue;
@@ -68,7 +83,12 @@ pub(crate) async fn watchdog_task(
         // What the supervisor is doing right now survives a reset that cuts
         // this pass short; the next boot reports it.
         #[cfg(feature = "breadcrumb")]
-        crate::bootflag::stash_crumb(embassy_supervisor::crumb_word());
+        {
+            let word = embassy_supervisor::crumb_word();
+            #[cfg(feature = "feed-gate")]
+            let word = blame.unwrap_or(word);
+            crate::bootflag::stash_crumb(word);
+        }
 
         let Either::Second(wake) = select(Timer::at(next_feed), next_wake()).await else {
             continue;
@@ -96,15 +116,17 @@ pub(crate) async fn watchdog_task(
 
 /// Reload the hardware watchdog. Under `feed-gate`, only while every policed
 /// node (`beat_timeout:`) is fresh: a stale one is left for the watchdog to
-/// reset, and a stopped, paused or detached node is never stale.
-fn feed(wd: &mut embassy_rp::watchdog::Watchdog) {
+/// reset, and a stopped, paused or detached node is never stale. Returns
+/// whether the feed landed.
+fn feed(wd: &mut embassy_rp::watchdog::Watchdog) -> bool {
     #[cfg(feature = "feed-gate")]
     if !GRAPH.all_fresh() {
         let stale = GRAPH.stale_nodes().next().map_or("?", |n| n.name());
         defmt::error!("watchdog: feed withheld, stale: {}", stale);
-        return;
+        return false;
     }
     wd.feed(WD_TIMEOUT);
+    true
 }
 
 /// The next health report or reboot request, whichever comes first.

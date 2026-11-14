@@ -261,10 +261,42 @@ impl<const N: usize, T: Topology<N>> Graph<N, T> {
     /// neither does a stopped, paused or detached one.
     #[cfg(feature = "liveness-monitor")]
     pub fn stale_nodes(&self) -> impl Iterator<Item = &'static TaskNode> + '_ {
-        self.nodes.iter().flatten().copied().filter(|n| {
-            n.beat_timeout()
-                .is_some_and(|budget| !n.is_detached() && n.is_stale(budget))
-        })
+        self.nodes
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|n| policed_stale(n))
+    }
+
+    /// The [`crumb_word`]-format word that blames the first node
+    /// [`stale_nodes`](Self::stale_nodes) yields: phase [`CrumbPhase::Stale`]
+    /// and the node's slot in this graph. `None` while
+    /// [`all_fresh`](Self::all_fresh) holds.
+    ///
+    /// [`crumb_word`] names the last lifecycle transition, which says nothing
+    /// about a node that stopped beating while running. A feeder that withholds
+    /// the feed stashes this word instead, until a feed lands again, and the
+    /// next boot's [`decode_crumb`] names the node the watchdog reset the chip
+    /// for:
+    ///
+    /// ```ignore
+    /// let mut blame = None;
+    /// loop {
+    ///     if GRAPH.all_fresh() {
+    ///         wd.feed(Duration::from_secs(8));
+    ///         blame = None;
+    ///     } else {
+    ///         blame = GRAPH.stale_crumb().or(blame);
+    ///     }
+    ///     stash(blame.unwrap_or_else(embassy_supervisor::crumb_word));
+    ///     Timer::after_secs(2).await;
+    /// }
+    /// ```
+    #[cfg(all(feature = "liveness-monitor", feature = "breadcrumb"))]
+    pub fn stale_crumb(&self) -> Option<u32> {
+        self.iter_nodes()
+            .find(|(_, n)| policed_stale(n))
+            .map(|(i, _)| crumb(CrumbPhase::Stale, u16::from(i)))
     }
 
     /// `true` when no policed node is stale ([`stale_nodes`](Self::stale_nodes)
@@ -287,6 +319,13 @@ impl<const N: usize, T: Topology<N>> Graph<N, T> {
     pub fn all_fresh(&self) -> bool {
         self.stale_nodes().next().is_none()
     }
+}
+
+/// [`Graph::stale_nodes`]'s filter: policed, not detached, past its budget.
+#[cfg(feature = "liveness-monitor")]
+fn policed_stale(n: &TaskNode) -> bool {
+    n.beat_timeout()
+        .is_some_and(|budget| !n.is_detached() && n.is_stale(budget))
 }
 
 // ─── Topological sort (Kahn's algorithm, const) ───────────────────────────
