@@ -6,6 +6,26 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project ad
 independently of `embassy-supervisor`, which pins it by exact version; see the
 supervisor's CHANGELOG for the surrounding API history.
 
+## [0.14.0] - 2026-11-25
+
+Pins `embassy-supervisor-syntax` 0.8.0. Pinned by `embassy-supervisor` 0.15.0.
+
+### Added
+
+- A `task-priority` feature, forwarded from the supervisor's. It accepts the
+  `priority:` clause and the `supervisor priority:` statement and emits
+  `.with_priority(..)` and `.with_shell()` on the node config, a priority stamp on each
+  resident spawn token, and `.with_supervisor_priority(..)` on the graph static (a
+  `#[cfg]` block when the statement is gated).
+- Without the feature, either construct is a span-attached compile error naming it.
+  Under a `#[cfg]` on its item or clause the error is deferred, like the other gated
+  clauses.
+
+### Changed
+
+- Diagnostics that list the clauses a `#[cfg]` may gate, and the node and pool clause
+  names, include `priority:`. Emitted code without the feature is unchanged.
+
 ## [0.13.0] - 2026-11-11
 
 Pins `embassy-supervisor-syntax` 0.7.0; pinned by `embassy-supervisor` 0.14.0.
@@ -667,7 +687,8 @@ First published version (previously an unpublished workspace member).
   (`min <= max <= member count`) at expansion time.
 - The `pool` feature (forwarded by `embassy-supervisor`) gates pool emission.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.13.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.14.0...HEAD
+[0.14.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.13.0...embassy-supervisor-macros-v0.14.0
 [0.13.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.12.0...embassy-supervisor-macros-v0.13.0
 [0.12.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.11.0...embassy-supervisor-macros-v0.12.0
 [0.11.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-macros-v0.10.0...embassy-supervisor-macros-v0.11.0

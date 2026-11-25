@@ -89,6 +89,7 @@ supervisor_graph! {
     name: IDENT;                        // optional first item: rename the GRAPH static
     executor NAME;                      // a runtime-filled spawner slot (other core / IRQ tier)
     default executor NAME;              // ..and the tier every task:/spawn:-fn item without executor: inherits
+    supervisor priority: N;             // 0..=255, the supervisor task's priority (feature task-priority, 255 unless declared)
 
     node NAME = Mode,                   // Mode: Terminate | Pause | OnDemand
         deps: [A, POOL, NET ready]      // bring-up order; `ready` also waits for set_ready()
@@ -107,10 +108,11 @@ supervisor_graph! {
         , dataflow: [crate::setter]     //   adopt an accessor fn's #[dataflow] tables
         , beat_timeout: MS , ready_on_write //   every value-level clause (the timeouts, beats,
                                         //     ready_on_write, disabled, discover, enabled_if:,
-                                        //     restart_budget:) takes a #[cfg(...)] gate
+                                        //     restart_budget:, priority:) takes a #[cfg(...)] gate
         , beat_window: N                //   1..=255 consecutive stale sweeps before a report
         , enabled_if: crate::settings::lora_on //   fn() -> bool; false at start() latches disabled
         , restart_budget: MAX in MS     //   restart() refuses the MAX+1th inside the window
+        , priority: N                   //   0..=255, higher polled first (task: only, feature task-priority)
         , executor: NAME , slot_timeout: MS , ack_timeout: MS , disabled;
 
     pool NAME = [Mode, ..],             // one Mode per member, floor first
@@ -118,6 +120,7 @@ supervisor_graph! {
         resources: [..],                //   take kinds become per-member slot arrays
         policy: DeferredShrink::new(..),// scaling policy (required)
         min: EXPR, max: EXPR            //   required; any order, like every clause
+        , priority: N                   //   every member's starting priority (task: only)
         , cancel;                       //   same flag, applied to every member
 }
 ```
@@ -125,7 +128,7 @@ supervisor_graph! {
 Reading rules, all regular: node and pool clauses may appear **in any order**
 (only the mode after `=` is positional; for a pool, the mode list); a repeated
 clause is a compile error; list entries are separated by commas (a trailing one is
-fine); the timeouts and `restart_budget:` take plain integer literals (no `ms`, `s` or
+fine); the timeouts, `restart_budget:` and `priority:` take plain integer literals (no `ms`, `s` or
 type suffix); every clause is **inline on
 its item** (there are no block forms and no top-level `resources { }` section); a
 pool always names its `policy:`; take-kind resource names are **globally unique**
@@ -224,6 +227,7 @@ in-browser [playground](https://embassy-supervisor.github.io/playground/).
 | `restart` | | `Supervisor::restart` (rest_for_one): cycle a node and its transitive dependents, re-gating them on the way back up (implies `control`) |
 | `restart-intensity` | | the `restart_budget: MAX in MS` clause: `restart` refuses the MAX+1th restart of a node inside the window with `FaultKind::RestartStorm`, before stopping anything, and `apply_control` propagates it (implies `restart`) |
 | `enabled-if` | | the `enabled_if: fn() -> bool` clause: `start()` evaluates it for each down node and latches `disabled` on `false`: settings-gated bring-up |
+| `task-priority` | | the `priority: N` clause and the `supervisor priority: N;` statement, 0..=255 with higher polled first: a `task:` node or pool member starts at its declared priority, and a value stored with `TaskNode::set_priority` is taken by the node's own task at its next start or resume. The supervisor's loops that never return (`run()`, `run_with()`, `run_pools()`, `monitor()`) raise their task to the graph's supervisor priority (255 unless declared). A priority orders the ready tasks of one executor, whatever its kind, strictly: a task that never goes idle starves every lower one. Switches every executor of the binary to embassy-executor's priority-sorted run queue (`scheduler-priority`) and costs a priority byte per embassy task header |
 | `lifecycle-events` | | `wait_lifecycle()` / `try_wait_lifecycle()`: a lossy 8-slot queue of `LifecycleEvent { node, kind }` for every driven transition, with a drop counter |
 | `lifecycle-sink` | | `set_lifecycle_sink(fn(LifecycleEvent))`: the same events, pushed synchronously to an app callback on the supervisor task; no queue, no drops |
 | `breadcrumb` | | `node.crumb()` and the packed `crumb_word()` / `decode_crumb()`: the last lifecycle phase, per node and binary-wide, for postmortem stashing; with `liveness-monitor`, `GRAPH.stale_crumb()` blames a stale node instead |
@@ -265,6 +269,23 @@ elastic worker pool, multi-executor tiers on both cores, trace observability, an
 update, all driven by this supervisor.
 
 ## Migration
+
+### 0.14 → 0.15
+
+Ships with `embassy-supervisor-macros` 0.14.0 on `embassy-supervisor-syntax` 0.8.0 (both
+pinned by exact version, no action needed). Without the new `task-priority` feature
+nothing changes and no code edit is needed. The new public items are
+`TaskNode::priority`, `TaskNode::set_priority`, `PriorityError`,
+`Graph::supervisor_priority`, `Graph::with_supervisor_priority` and
+`NodeCfg::with_priority`, all under `task-priority`.
+
+Turning `task-priority` on changes scheduling for the whole binary. Every executor
+switches to embassy-executor's priority-sorted run queue, and `run()`, `run_with()`,
+`run_pools()` and `monitor()` raise their task to 255 unless the graph declares
+`supervisor priority: N;`. Code that shares that task (a `select` or `join` with one of
+them) runs at that priority too, and a loop there that yields starves the lower tasks it
+waits for: declare a lower supervisor priority for such a graph. See
+[the DSL guide](https://docs.rs/embassy-supervisor/latest/embassy_supervisor/guide/dsl/index.html#priority-and-supervisor-priority-task-priorities).
 
 ### 0.14.1 → 0.14.2
 

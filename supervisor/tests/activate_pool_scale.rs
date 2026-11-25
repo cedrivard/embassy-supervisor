@@ -36,6 +36,7 @@ async fn crew(node: &'static TaskNode) {
 }
 
 supervisor_graph! {
+    #[cfg(feature = "task-priority")] supervisor priority: 0;
     node PROVIDER = Terminate, deps: [], task: provider, disabled;
     node BROKEN = Terminate, deps: [PROVIDER], task: broken, disabled,
         resources: [MISSING: u32];

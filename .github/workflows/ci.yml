@@ -53,8 +53,9 @@ jobs:
       # The sink alone, without the queue, so `lifecycle_sink` runs sink-only.
       - run: cargo test -p embassy-supervisor --target "$HOST" --features macros,lifecycle-sink,control
       # The name stamp without the trace layer: `--all-features` always has
-      # `trace`, which takes the `adopt` path instead of `stamp_name`.
-      - run: cargo test -p embassy-supervisor --target "$HOST" --features metadata-names
+      # `trace`, which takes the `adopt` path instead of `stamp_name`. With
+      # `task-priority`, the priority stamp in that same spawn path.
+      - run: cargo test -p embassy-supervisor --target "$HOST" --features metadata-names,task-priority
       # `supervisor_graph!` UI tests (trybuild): compile-fail cases lock the macro's
       # error contracts (cycle, unknown dep, ...); compile-pass cases run the generated
       # graph. Host-only — trybuild compiles real graphs — so `--target $HOST`.
@@ -183,6 +184,7 @@ jobs:
                    local-resources fault-inject macros,fault-inject coupling-observe \
                    metadata-names macros,metadata-names macros,trace macros,trace-hooks trace-nested \
                    lifecycle-events,breadcrumb,restart-intensity,enabled-if,liveness-monitor,macros \
+                   task-priority macros,task-priority macros,task-priority,pool macros,task-priority,control \
                    control,pool,macros,readiness,liveness,epochs,liveness-monitor,coupling,restart,bound-deps,budget,veto,lifecycle-events,lifecycle-sink,breadcrumb,restart-intensity,enabled-if; do
             echo "::group::features=[${f:-none}]"
             cargo check -p embassy-supervisor --no-default-features ${f:+--features "$f"}
@@ -205,6 +207,8 @@ jobs:
       - run: cargo build --release -p firmware --no-default-features
       - run: cargo clippy -p firmware -- -D warnings
       - run: cargo build --release -p bootloader
+      # Each opt-in feature against its flash and RAM ceiling (ci/footprint.py).
+      - run: python3 ci/footprint.py --check
 
   # The declared `rust-version` (root Cargo.toml) is a promise for the five
   # published crates: check them on exactly that toolchain, against the committed
@@ -259,6 +263,7 @@ jobs:
           cargo update -p embassy-executor -p embassy-time-queue-utils -p syn@3
           test "$(grep -c 'name = "embassy-executor-timer-queue"' Cargo.lock)" = 1
       - run: cargo build -p embassy-supervisor --target "$HOST" --features trace-hooks,trace-names
+      - run: cargo build -p embassy-supervisor --target "$HOST" --features macros,task-priority
       - run: cargo test -p embassy-supervisor --target "$HOST" --features macros,trace-hooks,trace-names,trace-nested,trace-self
 
   lint:

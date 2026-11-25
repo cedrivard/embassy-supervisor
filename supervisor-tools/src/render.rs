@@ -167,7 +167,17 @@ pub fn render(decl: &Decl, opts: &Options) -> String {
         if opts.executors {
             Some(match executor_of(item) {
                 Some(e) => format!("@{e}"),
-                None => "supervisor's executor".to_string(),
+                None => match &decl.spec.supervisor_priority {
+                    Some(g) => format!(
+                        "supervisor's executor · {}",
+                        gated_fact(
+                            format!("supervisor prio {}", g.value),
+                            &g.cfg,
+                            opts.show_cfg
+                        )
+                    ),
+                    None => "supervisor's executor".to_string(),
+                },
             })
         } else if opts.fragments {
             fragment_of(item).map(str::to_string)
@@ -969,6 +979,9 @@ fn node_label(n: &NodeItem, opts: &Options) -> String {
     {
         facts.push(format!("@{e}"));
     }
+    if let Some(g) = &n.priority {
+        facts.push(gated_fact(format!("prio {}", g.value), &g.cfg, show_cfg));
+    }
     if let Some(bt) = &n.beat_timeout {
         let ms = &bt.value;
         facts.push(gated_fact(format!("beat {ms}"), &bt.cfg, show_cfg));
@@ -1012,6 +1025,13 @@ fn pool_label(p: &PoolItem, opts: &Options) -> String {
         && !(p.executor_defaulted && opts.executors)
     {
         facts.push(format!("@{e}"));
+    }
+    if let Some(g) = &p.priority {
+        facts.push(gated_fact(
+            format!("prio {}", g.value),
+            &g.cfg,
+            opts.show_cfg,
+        ));
     }
     if p.cancel {
         facts.push("cancel".to_string());

@@ -486,6 +486,73 @@ it like a startup fault. Only the verb's target counts: dependents cycled with i
 opens a fresh window, however long ago the last one opened. `MAX` must be in 1..=65535
 and `WINDOW_MS` at least 1.
 
+### `priority:` and `supervisor priority:` (task priorities)
+
+*(feature `task-priority`)*
+
+```rust,ignore
+supervisor_graph! {
+    supervisor priority: 250;
+    node WATCHDOG = Terminate, task: watchdog, priority: 200;
+    node NET = Terminate, task: net_task, priority: 100;
+}
+```
+
+`priority: N` (0..=255) is the priority a `task:` node's task runs at, stamped before
+its first poll. A higher value is polled first among the ready tasks of the node's own
+executor, whatever its kind: the thread-mode `Executor` and an `InterruptExecutor` order
+them the same way. Between executors the interrupt level or the core decides. The order
+is strict, with no fairness between priorities: a task that never goes idle starves
+every lower task on its executor. A pool's `priority:` applies to every member. Without
+the clause a `task:` node runs at 0.
+
+The order is cooperative. A higher priority is polled first, and it does not interrupt
+a poll that is running. A task that must preempt others belongs on its own executor:
+see [`executor:`](#executor-name-and-executor-name).
+
+`TaskNode::set_priority(N)` stores a new value, from any task or interrupt, before the
+node first starts or while it runs. The node's own task takes it at its next start, or
+at its next resume for a `Pause` node. A running activation keeps the priority it has:
+restart the node, or pause and resume it, to apply the value. The value replaces the
+declared `priority:` and survives restarts until the next call. `TaskNode::priority()`
+reads it back. Both need the generated shell, which gives its task the priority: a
+`spawn:` node or a parked one answers `None` and `PriorityError::NoShell`, and
+`priority:` on it is a compile error. A hand-written task sets its own priority with
+`embassy_executor::Metadata::for_current_task()`.
+
+`supervisor priority: N;` is a graph-level statement, 255 unless declared, and may carry a
+`#[cfg(...)]` (a fragment cannot set it). The supervisor's loops that never return on
+their own, `run()`, `run_with()`, `run_pools()` and `monitor()`, raise the task that
+calls them to that priority and leave it there: that task is the supervisor's.
+
+- It is ahead of every node below it on its executor, not of a node declared at or
+  above it.
+- The loops never lower a task. One task that drives two graphs runs at the higher of
+  their two priorities.
+- Every verb that returns (`start()`, `stop_node()`, `pool_pass()`, `apply_control()`
+  and the rest) runs at its caller's priority. A driver built only from those gives its
+  task the priority it needs:
+  `Metadata::for_current_task().await.set_priority(GRAPH.supervisor_priority)`.
+- Code that shares the task with one of the loops (a `select` or `join`) runs at that
+  priority too, and keeps it once the loop is dropped. A loop that yields there starves
+  the lower tasks it waits for, so such a graph declares a lower supervisor priority.
+- After a `Busy` spawn on its own executor the supervisor keeps its priority. A stopped
+  `spawn:` task below it that is still in its final poll is waited out by the 1 ms
+  backoff, within the node's `slot_timeout`.
+
+With the feature on, the four loops panic when polled outside an embassy executor.
+
+A `#[cfg(feature = "task-priority")]` on a clause or on the statement is evaluated in the
+crate that invokes the macro. The application therefore needs a feature of its own that
+forwards to `embassy-supervisor/task-priority`, as the demo firmware has. Without one
+the gate is always false: rustc warns about an unexpected cfg and the priority stays at
+its default.
+
+The feature switches every executor in the binary to embassy-executor's
+priority-sorted run queue (`scheduler-priority`). A wake stays a constant-time push, and
+the executor sorts each woken task into its pending list before it polls the next one.
+Each embassy task header gains a priority byte.
+
 ### `executor NAME;` and `executor: NAME`
 
 `executor NAME;` declares a `SpawnerSlot` that the app fills with a `SendSpawner`.
@@ -544,8 +611,9 @@ and are skipped everywhere at runtime.
 
 A construct that needs a Cargo feature (a `ready` or `bound` dep, `reads:`/`writes:`, an
 `observed` or `veto` entry, `discover`, a `dataflow:` entry, `local`, `divisible`,
-`state:`, and the `beat_timeout:`, `beat_window:`, `enabled_if:`, `restart_budget:` and
-`ready_on_write` clauses) is rejected at expansion only when no `#[cfg]` gates it. Under
+`state:`, the `beat_timeout:`, `beat_window:`, `enabled_if:`, `restart_budget:`,
+`priority:` and `ready_on_write` clauses, and `supervisor priority:`) is rejected at
+expansion only when no `#[cfg]` gates it. Under
 a `#[cfg]` on its item, its entry or its clause, the macro leaves it out and emits the
 rejection as a `compile_error!` under the same cfgs, so a build that compiles the
 construct out does not need the feature.
@@ -649,8 +717,11 @@ offending token:
   and the compose site pastes every fragment into one graph
 - **`slot_timeout: 0` / `ack_timeout: 0`**: would reject every spawn or stop
 - **a suffixed integer literal** (`slot_timeout: 5s`, `restart_budget: 3u8 in 1000`): the
-  timeouts, `beat_window:` and `restart_budget:` take plain integers, since the diagram
-  tool reads only the digits and the build and the diagram must not disagree
+  timeouts, `beat_window:`, `restart_budget:` and `priority:` take plain integers, since the
+  diagram tool reads only the digits and the build and the diagram must not disagree
+- **`priority:` or `supervisor priority:` above 255**: a task priority is a `u8`
+- **`priority:` without `task:`**: only the generated shell gives its task the priority
+- **a second `supervisor priority`, or one in a fragment**: it is graph-wide
 - **an item named like a derived one**: `X_EXIT` beside node `X` with `exit:`, or `P_MAX`
   beside pool `P`; both would be items of the declaring module
 - **[`cancel`](#cancel-supervisor-unaware-workers) without `task:`**: the flag only

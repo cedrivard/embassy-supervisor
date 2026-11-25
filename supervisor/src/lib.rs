@@ -42,6 +42,13 @@ use core::pin::Pin;
 use core::sync::atomic::Ordering;
 use core::task::{Context, Poll};
 
+/// The executor's handle on a task's metadata: `for_current_task()`,
+/// `priority()` and `set_priority()`. embassy-executor 0.10 hands out
+/// `&'static Metadata`, its git main a `MetadataRef` value.
+#[cfg(all(feature = "task-priority", not(embassy_supervisor_trace_v2)))]
+use embassy_executor::Metadata as TaskMeta;
+#[cfg(all(feature = "task-priority", embassy_supervisor_trace_v2))]
+use embassy_executor::MetadataRef as TaskMeta;
 use embassy_executor::{SendSpawner, SpawnError, Spawner};
 use embassy_futures::select::select;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;

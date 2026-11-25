@@ -16,7 +16,8 @@ syntax does. Depend on it directly only if you are willing to track it.
 **Feature gating.** This crate carries no features and accepts the grammar in
 full: `ready`/`bound` dep markers, `reads:`/`writes:`, `observed`/`beat`/`via`,
 `veto`, `discover`, `dataflow:`, `local`, `divisible`, `state:`, `beat_timeout:`,
-`beat_window:`, `enabled_if:`, `restart_budget:`, `ready_on_write` always parse.
+`beat_window:`, `enabled_if:`, `restart_budget:`, `priority:`, `ready_on_write` and
+the `supervisor priority:` statement always parse.
 Whether a build permits a construct is policy, applied by the caller:
 `embassy-supervisor-macros` rejects a construct whose feature is off in its `gate`
 pass, or defers the rejection to a `compile_error!` when a `#[cfg]` gates the
@@ -43,17 +44,19 @@ are span-attached:
   an entry with no marker (nodes and pools alike).
 - Numeric ranges: `slot_timeout:`/`ack_timeout:`/`beat_timeout:`
   at least 1, `beat_window:` in 1..=255, `restart_budget: MAX in WINDOW_MS` with
-  `MAX` in 1..=65535 and `WINDOW_MS` at least 1, and a pool's literal
+  `MAX` in 1..=65535 and `WINDOW_MS` at least 1, `priority:` and
+  `supervisor priority:` in 0..=255, and a pool's literal
   `min:`/`max:` with `min <= max <= members`. The three timeouts,
-  `beat_window:` and both `restart_budget:` numbers carry no suffix
-  (`slot_timeout: 5s` is an error).
+  `beat_window:`, both `restart_budget:` numbers and both priorities carry no
+  suffix (`slot_timeout: 5s` is an error).
 - A pool lists at least one member mode, and no member carries a `#[cfg]` of
   its own (gate the pool).
 - Clause combinations: `task:` vs `spawn:`, clauses that require `task:` (on a
-  node `resources:`, `state:`, `exit:`, `cancel`; on a pool `resources:`,
-  `state:`, `cancel`), the removed `pool_size:`, `cancel` with mode `Pause`,
-  `exit:` on a `pool`, `ready_on_write` without `beat_timeout:` or without an
-  `observed beat` write that is gated like it or not at all.
+  node `resources:`, `state:`, `exit:`, `cancel`, `priority:`; on a pool
+  `resources:`, `state:`, `cancel`, `priority:`), the removed `pool_size:`,
+  `cancel` with mode `Pause`, `exit:` on a `pool`, `ready_on_write` without
+  `beat_timeout:` or without an `observed beat` write that is gated like it or
+  not at all.
 - A repeated clause or marker, `exit:` and `provides:` included, a dep
   repeated in one `deps:` list under the same `#[cfg]`s, a resource name
   repeated in one `resources:` list; list entries separated by commas (a
@@ -64,10 +67,12 @@ are span-attached:
   resolves across them at the compose site). Whether a `local` slot's
   declarations share one executor is checked by `embassy-supervisor-macros`,
   not here.
+- `supervisor priority` shape: one per graph, only `#[cfg(...)]` attributes,
+  never inside `@fragment` markers.
 - Fragment bodies: an `observe` default inside `@fragment` markers is refused,
   and [`check_fragment_body`] refuses a `supervisor_fragment!` body that sets
-  `name:`, an `observe` default or a `default executor`, all of which are
-  graph-wide.
+  `name:`, an `observe` default, a `default executor` or a
+  `supervisor priority:`, all of which are graph-wide.
 
 ## Usage
 

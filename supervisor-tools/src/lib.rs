@@ -988,6 +988,8 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                         "beat_timeout_cfg": lit_cfg(&n.beat_timeout_ms),
                         "beat_window": lit_json(&n.beat_window),
                         "beat_window_cfg": lit_cfg(&n.beat_window),
+                        "priority": lit_json(&n.priority),
+                        "priority_cfg": lit_cfg(&n.priority),
                         "ready_on_write": n.ready_on_write.is_some(),
                         "ready_on_write_cfg": n.ready_on_write.clone().unwrap_or_default(),
                         "enabled_if": n.enabled_if.as_ref().map(|e| e.predicate.text.clone()),
@@ -1026,6 +1028,8 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                         "slot_timeout_cfg": lit_cfg(&p.slot_timeout_ms),
                         "ack_timeout_ms": lit_json(&p.ack_timeout_ms),
                         "ack_timeout_cfg": lit_cfg(&p.ack_timeout_ms),
+                        "priority": lit_json(&p.priority),
+                        "priority_cfg": lit_cfg(&p.priority),
                         "state": state_json(&p.state),
                         "cancel": p.cancel,
                         "fragment": p.fragment,
@@ -1046,6 +1050,8 @@ pub fn model_json(decls: &[Decl], discovered: &[Discovered]) -> serde_json::Valu
                 "cfg": g.cfg,
                 "observe_writes": g.observe_writes.as_ref().map(|e| e.text.clone()),
                 "observe_reads": g.observe_reads.as_ref().map(|e| e.text.clone()),
+                "supervisor_priority": lit_json(&g.supervisor_priority),
+                "supervisor_priority_cfg": lit_cfg(&g.supervisor_priority),
                 "items": items,
             })
         })

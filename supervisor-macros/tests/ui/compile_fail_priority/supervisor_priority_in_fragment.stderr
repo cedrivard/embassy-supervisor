@@ -1,0 +1,5 @@
+error: a fragment cannot set the supervisor's priority. Declare `supervisor priority:` at the compose site
+ --> tests/ui/compile_fail_priority/supervisor_priority_in_fragment.rs:7:5
+  |
+7 |     supervisor priority: 3;
+  |     ^^^^^^^^^^

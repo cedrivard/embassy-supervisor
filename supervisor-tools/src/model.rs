@@ -261,6 +261,8 @@ pub struct NodeModel {
     pub beat_timeout_ms: Option<LitValue>,
     /// The `beat_window:` value.
     pub beat_window: Option<LitValue>,
+    /// The `priority:` value.
+    pub priority: Option<LitValue>,
     /// The `ready_on_write` marker: `Some(gates)` when present.
     pub ready_on_write: Option<CfgTexts>,
     /// The `enabled_if:` clause, if any.
@@ -312,6 +314,8 @@ pub struct PoolModel {
     pub slot_timeout_ms: Option<LitValue>,
     /// The `ack_timeout:` value in milliseconds.
     pub ack_timeout_ms: Option<LitValue>,
+    /// The `priority:` value.
+    pub priority: Option<LitValue>,
     /// The `reads:` list.
     pub reads: Vec<SignalModel>,
     /// The `writes:` list.
@@ -372,6 +376,8 @@ pub struct GraphModel {
     pub observe_writes: Option<ExprValue>,
     /// The `observe reads:` default accessor, if any.
     pub observe_reads: Option<ExprValue>,
+    /// The `supervisor priority:` value.
+    pub supervisor_priority: Option<LitValue>,
     /// The declared items, in order.
     pub items: Vec<ItemModel>,
 }
@@ -485,6 +491,10 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                             .beat_window
                             .as_ref()
                             .map(|g| LitValue::new(cfg_texts(&g.cfg), &g.value)),
+                        priority: n
+                            .priority
+                            .as_ref()
+                            .map(|g| LitValue::new(cfg_texts(&g.cfg), &g.value)),
                         ready_on_write: n.ready_on_write.as_ref().map(|g| cfg_texts(&g.cfg)),
                         enabled_if: n.enabled_if.as_ref().map(|g| EnabledIfModel {
                             cfg: cfg_texts(&g.cfg),
@@ -523,6 +533,10 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                             .ack_timeout
                             .as_ref()
                             .map(|g| LitValue::new(cfg_texts(&g.cfg), &g.value)),
+                        priority: p
+                            .priority
+                            .as_ref()
+                            .map(|g| LitValue::new(cfg_texts(&g.cfg), &g.value)),
                         reads: p.reads.iter().map(signal_model).collect(),
                         writes: p.writes.iter().map(signal_model).collect(),
                         min: ExprValue::new(&p.min),
@@ -556,6 +570,11 @@ pub fn full_model(decls: &[Decl]) -> FullModel {
                     .observe_reads
                     .as_ref()
                     .map(|(_, e)| ExprValue::new(e)),
+                supervisor_priority: d
+                    .spec
+                    .supervisor_priority
+                    .as_ref()
+                    .map(|g| LitValue::new(cfg_texts(&g.cfg), &g.value)),
                 items,
             }
         })

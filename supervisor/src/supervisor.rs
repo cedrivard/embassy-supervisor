@@ -8,6 +8,21 @@ use super::*;
 /// yielding, so the retry sleeps instead of spinning.
 const BUSY_BACKOFF: embassy_time::Duration = embassy_time::Duration::from_millis(1);
 
+/// Raise the calling task to `priority` when it is below it. One copy for
+/// every graph and every driver loop.
+#[cfg(all(
+    feature = "task-priority",
+    any(feature = "pool", feature = "control", feature = "liveness-monitor")
+))]
+#[inline(never)]
+fn raise_task(priority: u8, cx: &mut Context<'_>) {
+    if let Poll::Ready(task) = core::pin::pin!(TaskMeta::for_current_task()).poll(cx)
+        && task.priority() < priority
+    {
+        task.set_priority(priority);
+    }
+}
+
 // ─── Supervisor ──────────────────────────────────────────────────────────
 
 /// What woke the driver loop.
@@ -30,6 +45,14 @@ enum DriverWake {
 /// mailbox ([`request_control`]) or through each [`TaskNode`]'s own atomic
 /// state, never through the `Supervisor` struct. It copies nothing out of the
 /// graph but references, so building one is free.
+///
+/// With `task-priority`, the loops that never return on their own (`run()`,
+/// `run_with()`, `run_pools()`, `monitor()`) raise the calling task to the
+/// graph's supervisor priority (`supervisor priority:`, 255 unless declared)
+/// and leave it there, ahead of every node below it on its executor. They
+/// never lower a task. Code sharing the task runs at that priority too. Every
+/// verb that returns runs at its caller's priority. The four loops then panic
+/// when polled outside an embassy executor.
 pub struct Supervisor<const N: usize, T: Topology<N> = Ordered<N, { shape::ALL }>> {
     /// Node slots, one per declared node. `None` marks a slot whose node was
     /// `#[cfg]`-ed out of the build (feature-gated); every method skips those.
@@ -53,6 +76,13 @@ pub struct Supervisor<const N: usize, T: Topology<N> = Ordered<N, { shape::ALL }
     /// one of its nodes.
     #[cfg(feature = "trace")]
     graph_ref: &'static GraphRef,
+    /// The priority the driver loops give their task: the graph's
+    /// `supervisor priority:`.
+    #[cfg(all(
+        feature = "task-priority",
+        any(feature = "pool", feature = "control", feature = "liveness-monitor")
+    ))]
+    priority: u8,
 }
 
 /// Wait until `cond` holds or `deadline` passes, re-checking on every gate
@@ -83,10 +113,12 @@ pub(crate) const fn ceil_ms(d: embassy_time::Duration) -> u64 {
 }
 
 /// One pass of the executor `node` spawns on, after a `Busy` spawn: its slot's
-/// fence when it has one, else — the node spawns on the supervisor's own
-/// executor — a yield, which lets every queued task finish its poll first. A
-/// slot without a fence has no pass to offer; the retry then waits for the
-/// next gate event or the deadline.
+/// fence when it has one, else (the node spawns on the supervisor's own
+/// executor) a yield, which lets every queued task at or above the caller's
+/// priority finish its poll first. Under `task-priority` a caller above the
+/// dying task, such as a `run()` task, is polled again first, so that task is
+/// waited out by the backoff instead. A slot without a fence has no pass to offer.
+/// The retry then waits for the next gate event or the deadline.
 async fn executor_pass(node: &'static TaskNode, deadline: embassy_time::Instant) {
     match node.cfg.spawn_slot {
         Some(slot) => {
@@ -225,7 +257,26 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             pools: graph.pools,
             #[cfg(feature = "trace")]
             graph_ref: graph.graph_ref,
+            #[cfg(all(
+                feature = "task-priority",
+                any(feature = "pool", feature = "control", feature = "liveness-monitor")
+            ))]
+            priority: graph.supervisor_priority,
         }
+    }
+
+    /// Make the calling task the supervisor's: raise it to the graph's
+    /// supervisor priority and leave it there. Never lowers it.
+    #[cfg(all(
+        feature = "task-priority",
+        any(feature = "pool", feature = "control", feature = "liveness-monitor")
+    ))]
+    pub(crate) fn adopt_task(&self) -> impl Future<Output = ()> {
+        let priority = self.priority;
+        core::future::poll_fn(move |cx| {
+            raise_task(priority, cx);
+            Poll::Ready(())
+        })
     }
 
     /// Does this graph's shape carry `bit` (see [`shape`])? `T::SHAPE` is an
@@ -359,6 +410,10 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     /// [`run_with`](Self::run_with) picks another one.
     /// Re-entering `run` after a return is safe and retries every enabled node
     /// that is down.
+    ///
+    /// With `task-priority`, raises the calling task to the graph's supervisor
+    /// priority and leaves it there. Panics when polled outside an embassy
+    /// executor.
     pub async fn run(&self, spawner: &Spawner) -> NodeFault {
         self.run_with(spawner, &mut ReturnOnHalt).await
     }
@@ -399,7 +454,13 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     ///     escalate(fault).await;
     /// }
     /// ```
+    ///
+    /// With `task-priority`, raises the calling task to the graph's supervisor
+    /// priority and leaves it there. Panics when polled outside an embassy
+    /// executor.
     pub async fn run_with(&self, spawner: &Spawner, policy: &mut dyn RunPolicy) -> NodeFault {
+        #[cfg(feature = "task-priority")]
+        self.adopt_task().await;
         let drive = async {
             if let Err(e) = self.bring_up(spawner, true, policy, Origin::Boot).await {
                 return e;
@@ -519,7 +580,13 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     ///
     /// To make a hardware watchdog honour the same policing, gate its feed on
     /// [`Graph::all_fresh`] rather than feeding unconditionally.
+    ///
+    /// With `task-priority`, raises the calling task to the graph's supervisor
+    /// priority and leaves it there. Panics when polled outside an embassy
+    /// executor.
     pub async fn monitor(&self) -> core::convert::Infallible {
+        #[cfg(feature = "task-priority")]
+        self.adopt_task().await;
         if !Self::has(shape::BEATS)
             || !self
                 .nodes
@@ -1018,7 +1085,10 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
             }
             if own_pass {
                 // First `Busy` of a streak on the supervisor's own executor: one
-                // yield lets the previous instance's final poll return.
+                // yield lets the previous instance's final poll return. Under
+                // `task-priority` a caller above the dying task, such as a
+                // `run()` task, is polled again first, so that task is waited
+                // out by the backoff instead.
                 busy_streak = true;
                 embassy_futures::yield_now().await;
                 continue;

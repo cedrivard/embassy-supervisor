@@ -4,6 +4,43 @@ All notable changes to `embassy-supervisor` are documented here. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-11-25
+
+Task priorities: the `task-priority` feature. Ships with macros 0.14.0, syntax 0.8.0
+and tools 0.10.0. observe 0.1.3 is unchanged.
+
+### Added
+
+- A `task-priority` feature, off by default. It turns on
+  `embassy-executor/scheduler-priority`, which switches every executor of the binary to
+  the priority-sorted run queue, and the macros' `task-priority` feature.
+- The `priority: N` clause (0..=255, higher polled first) on `task:` nodes and pools: the
+  priority the node's task, or each member's, starts at. It may carry a `#[cfg(...)]`.
+  On a `spawn:` node or pool it is a compile error.
+- The `supervisor priority: N;` graph statement: the priority the supervisor's loops that
+  never return (`run()`, `run_with()`, `run_pools()`, `monitor()`) raise their task to,
+  255 unless declared. They never lower a task, and every verb that returns runs at its
+  caller's priority. It may carry a `#[cfg(...)]` and cannot appear in a fragment.
+- `TaskNode::priority()` and `TaskNode::set_priority()`, with `PriorityError::NoShell`
+  for a node without a `task:` shell. `set_priority` stores the value. The node's own
+  task takes it at its next start or resume, and it survives restarts.
+- `Graph::supervisor_priority`, `Graph::with_supervisor_priority`,
+  `NodeCfg::with_priority`, and `NodeCfg::with_shell` under `task-priority` as well as
+  `fault-inject`.
+- Guide: a `priority:` and `supervisor priority:` section in the DSL chapter, and notes
+  in the executors, model and tasks chapters.
+- Demo firmware: a `task-priority` feature (default). `watchdog` runs at 200 and `net`
+  at 100. `/api/tasks` reports each task's priority, `POST /api/priority?node=N&value=V`
+  stores a new one, and the dashboard has a `prio` column.
+
+### Changed
+
+- Requires `embassy-supervisor-macros` 0.14.0 (exact pin).
+- `fault-inject`: the fault handling of a `task:` shell is one shared function instead
+  of a copy inlined into every shell.
+- CI checks each demo firmware feature against a flash and RAM budget
+  (`ci/footprint.py`).
+
 ## [0.14.2] - 2026-11-14
 
 `Graph::stale_crumb` names the node a watchdog reset was for. Companion crate versions
@@ -1431,7 +1468,8 @@ Initial release.
   `control` feature.
 - Optional `defmt` logging behind the `defmt` feature (no-op otherwise).
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.14.2...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.15.0...HEAD
+[0.15.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.14.2...embassy-supervisor-v0.15.0
 [0.14.2]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.14.1...embassy-supervisor-v0.14.2
 [0.14.1]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.14.0...embassy-supervisor-v0.14.1
 [0.14.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-v0.13.0...embassy-supervisor-v0.14.0

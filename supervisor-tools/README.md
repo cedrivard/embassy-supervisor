@@ -100,6 +100,15 @@ Nodes sharing a lifecycle shape share one composite state. Add
 concrete gates (the slots its spawn takes, the readiness it waits on, the
 slots a stop clears) and its declared reads/writes in the title.
 
+A `priority:` is a `prio N` fact in its node's or pool's label, after the
+executor. The graph's `supervisor priority:` is drawn only with `--executors`,
+in the title of the supervisor's own executor box. That box exists only when
+some items spawn on the supervisor's executor and others through named ones.
+`--json` always carries both:
+`priority` and `priority_cfg` on each node and pool, `supervisor_priority` and
+`supervisor_priority_cfg` on the graph. Lifecycles show no priority, which is
+not a lifecycle fact.
+
 A `#[cfg]`-gated node, dep, signal entry, `discover` clause, `dataflow:` entry
 or `#[dataflow]` call site draws like any other, with the predicate in its
 label or on its edge: the diagram shows every build, and the `cfg(…)` text

@@ -46,6 +46,7 @@ async fn late(node: &'static TaskNode) {
 }
 
 supervisor_graph! {
+    #[cfg(feature = "task-priority")] supervisor priority: 0;
     pool WORKERS = [OnDemand], deps: [],
         task: wedged,
         policy: AlwaysShrink = AlwaysShrink,

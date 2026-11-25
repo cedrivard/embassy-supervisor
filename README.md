@@ -211,6 +211,7 @@ Rows marked *default* need no extra Cargo feature.
 | Restart | `restart` | Restarts a node together with its dependents |
 | Restart budget | `restart-intensity` | `restart_budget: 3 in 60000` faults a crash loop |
 | Settings-gated bring-up | `enabled-if` | `enabled_if:` decides at `start()` if a node comes up |
+| Task priorities | `task-priority` | `priority: 200` polls a task ahead of lower ones on its executor |
 | Declared dataflow | `coupling` | `reads:` and `writes:` name the signals tasks exchange |
 | Derived dataflow | `dataflow` | `#[dataflow]` derives the tables from the task body |
 | Polled liveness | `coupling-observe` | A declared write is polled as the node's heartbeat |

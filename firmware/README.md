@@ -23,13 +23,13 @@ flowchart TD
   accDescr: supervisor task graph declared at firmware/src/main.rs:23
   subgraph f_NET_FRAG["NET_FRAG"]
     direction TD
-    n_NET["NET<br/>Terminate · task · @THREAD · restarts 3/60000ms <small>cfg(feature = #quot;restart-intensity#quot;)</small>"]
+    n_NET["NET<br/>Terminate · task · @THREAD · prio 100 <small>cfg(feature = #quot;task-priority#quot;)</small> · restarts 3/60000ms <small>cfg(feature = #quot;restart-intensity#quot;)</small>"]
   end
   subgraph f_HTTP_FRAG["HTTP_FRAG"]
     direction TD
     n_HTTP[["HTTP<br/>pool ×2 · task · HTTP_FLOOR..HTTP_CEIL · @THREAD"]]
   end
-  n_WATCHDOG["WATCHDOG<br/>Terminate · task · @THREAD"]
+  n_WATCHDOG["WATCHDOG<br/>Terminate · task · @THREAD · prio 200 <small>cfg(feature = #quot;task-priority#quot;)</small>"]
   n_HEARTBEAT["HEARTBEAT<br/>Pause · task · @HIGH · beat 15000"]
   n_OTA["OTA<br/>Terminate · task · @THREAD"]
   n_BENCH["BENCH<br/>Terminate · task · @CORE1 · beat 1000 · if bench_enabled <small>cfg(feature = #quot;enabled-if#quot;)</small> · disabled <small>cfg(not (feature = #quot;enabled-if#quot;))</small>"]
@@ -163,6 +163,7 @@ itself on the wrong core, rings the other core's doorbell, and that core's
 | Derived dataflow | `heartbeat` carries `discover`; no `reads:`/`writes:` lists anywhere in the graph |
 | Adopted dataflow | `http` adopts `set_period_ms`, `net` adopts `publish_stack`, `ota` adopts `lease_stack`, `ota-confirm` adopts `stack_ready` |
 | Node status (`node-status`) | `ota` reports its phase; the dashboard JSON carries it per node |
+| Task priorities (`task-priority`) | `watchdog` declares `priority: 200` and `net` `priority: 100`. The other tasks stay at 0 and the supervisor at its default 255. `/api/tasks` reports each task's priority, and `POST /api/priority` or the dashboard's `prio` column stores a new one, applied at the node's next start or resume |
 | `restart` | the dashboard restart button (`ControlOp::Restart`): cycles a node and its transitive dependents, re-gating them |
 | Bound readiness edge (`bound-deps`) | `bench` declares `heartbeat ready bound` |
 | Gated reads + leases (`data-deps`) | `stack_ready` (waiting) and `lease_stack` (non-waiting), both under a `StackLease` scoped to the use |
@@ -268,14 +269,15 @@ steps 2-3 is also the recovery path if a bad image bricks the boot.
 | `feed-gate` | on | Demo-only, no supervisor feature: feed the hardware watchdog only while `GRAPH.all_fresh()`. A stale `heartbeat` or `bench` resets the chip. |
 | `restart-intensity` | on | `embassy-supervisor/restart-intensity`: `net`'s `restart_budget: 3 in 60000`. |
 | `enabled-if` | on | `embassy-supervisor/enabled-if`: `bench` boots enabled when the boot flag in watchdog scratch 5 is set; adds `POST /api/bootflag` and `POST /api/reboot`. Without it `bench` is plainly `disabled`. |
-| `dns` | off | Link embassy-net's real `DnsSocket` in place of the parse-only `ota::IpDns`. The OTA target is still an IPv4 literal (`set_target` parses nothing else), so the feature measures the socket's cost: it pulls `embassy-net/dns`, adds a `StackResources` slot (`net::SOCKET_BUDGET`) whose query table lives in `net`'s heap box, and costs about 7.0 KB of flash; its OTA image still fits `OTA_SCRATCH`. |
+| `task-priority` | on | `embassy-supervisor/task-priority`: `watchdog` declares `priority: 200` and `net` `priority: 100`, so the thread executor polls them ahead of the `http` workers, `ota` and `ota-confirm`. `/api/tasks` reports each task's priority and `POST /api/priority` stores a new one. Without it every task runs at the same priority. |
+| `dns` | off | Link embassy-net's real `DnsSocket` in place of the parse-only `ota::IpDns`. The OTA target is still an IPv4 literal (`set_target` parses nothing else), so the feature measures the socket's cost: it pulls `embassy-net/dns`, adds a `StackResources` slot (`net::SOCKET_BUDGET`) whose query table lives in `net`'s heap box, and costs about 7.3 KB of flash; its OTA image still fits `OTA_SCRATCH`. |
 
 ```sh
 cargo build --release -p firmware --features dns
-cargo build --release -p firmware --no-default-features   # none of the five
+cargo build --release -p firmware --no-default-features   # none of the six
 ```
 
-The five default features exist so each one's cost can be measured on its own; see [Footprint](#footprint). `--no-default-features` builds the firmware without any of them: no event ring, no breadcrumb, an unconditional watchdog feed, unlimited `net` restarts, and a plainly `disabled` `bench`.
+The six default features exist so each one's cost can be measured on its own; see [Footprint](#footprint). `--no-default-features` builds the firmware without any of them: no event ring, no breadcrumb, an unconditional watchdog feed, unlimited `net` restarts, a plainly `disabled` `bench`, and every task at one priority.
 
 ### Supervisor features this firmware enables
 
@@ -295,8 +297,9 @@ embassy-supervisor = { path = "../supervisor", features = [
 
 `macros` comes from the crate's defaults and `control` via `restart`. Dropping
 any opt-in compiles the corresponding clause out of the graph.
-`lifecycle-sink`, `breadcrumb`, `restart-intensity` and `enabled-if` arrive
-through this crate's features of the same names (above).
+`lifecycle-sink`, `breadcrumb`, `restart-intensity`, `enabled-if` and
+`task-priority` arrive through this crate's features of the same names
+(above).
 
 ## Host network setup (USB-net)
 
@@ -447,6 +450,11 @@ xdg-open http://10.42.0.61/             # task view + stop/start/pause/resume/re
     curl -XPOST 'http://10.42.0.61/api/fault?node=heartbeat&kind=hog'
     curl -XPOST 'http://10.42.0.61/api/fault?node=http0&kind=hog&ms=2000'
     ```
+- **Task priority:** the dashboard's `prio` column, or `POST /api/priority?node=NAME&value=N` with `N` in 0..=255. A higher value is polled first among the ready tasks of the node's own executor, strictly: a task that never goes idle starves the lower ones. The value replaces the declared `priority:` and survives restarts. The node's own task takes it at its next start or resume: restart the node, or pause and resume `heartbeat`, to apply it. The supervisor row shows its priority read-only, and the `http (pool)` row its members' priorities, which `node=http0` or `node=http1` changes one by one. Every answer is HTTP 200 with a JSON body: `{"accepted":true,"node":"net","priority":50}`, or `{"accepted":false,"error":E}` with `E` one of `"unknown node"` (also for `node=supervisor`), `"value must be 0..=255"` and `"no shell"` (a node without a `task:` shell, which this firmware does not have).
+  ```sh
+  curl -XPOST 'http://10.42.0.61/api/priority?node=net&value=50'
+  curl 'http://10.42.0.61/api/tasks' | jq '.tasks[] | {name, priority}'
+  ```
 - **Breadcrumb + feed gate:** stall `heartbeat` and leave it. After its 15 s
   budget `watchdog` logs `watchdog: feed withheld, stale: heartbeat` every 2 s
   and the hardware watchdog resets the chip about 8 s later; the bootloader
@@ -548,14 +556,19 @@ invisible (it inflates whichever node was mid-poll, else lands in overhead).
 ### Per-task
 
 Each task reports `name, mode, running, busy, disabled, collateral, detached,
-ready, bound_stopped, epoch, exec_ticks, polls, max_poll_ticks, fault, status,
-deps`; the `http` workers also report `served`, after `max_poll_ticks`.
+ready, bound_stopped, epoch, exec_ticks, polls, max_poll_ticks, priority,
+fault, status, deps`. `priority` is present only with `task-priority`. The
+`http` workers also report `served`, before `fault`.
 
 - `collateral` is a node held stopped because a node it depends on was
   deactivated (the dashboard's `held`); `fault` is the injected fault
   (`stall`, `wedge`, `crash`, `hog`) or `null`; `served` counts the requests
   that worker has answered, 404s included, and survives a shrink and regrow
   through the member's `HTTP_STATS` slot.
+- `priority` is a task's executor priority: its declared `priority:` (0
+  without one), replaced by the last `POST /api/priority`. The supervisor row
+  reports the priority `run()` gave the supervisor's task (255 here). A node
+  without a `task:` shell reports `null`.
 - `ready`, `bound_stopped`, and `epoch` separate states a bare `running` flag
   conflates. `running && !ready` is up but not yet serving; `bound_stopped`
   is down because a bound provider withdrew readiness (lifts by itself when
@@ -780,39 +793,38 @@ The device acks `receiving image`, drops off (decode + reset), and comes back ru
 
 ## Footprint
 
-What each of the five opt-in features costs this firmware, measured with
-`arm-none-eabi-size -A` on the release ELF (rustc 1.97.1, the workspace release
+What each of the six opt-in features costs this firmware, measured by
+`ci/footprint.py` on the release ELF (rustc 1.97.1, the workspace release
 profile: `opt-level = "s"`, fat LTO, one codegen unit). The baseline is
-`cargo build --release -p firmware --no-default-features`: flash 172,296 B
+`cargo build --release -p firmware --no-default-features`: flash 170,040 B
 (`.vector_table` + `.text` + `.rodata`), `.data` 352 B (RAM initialised from
 flash: embassy-rp's RAM-resident flash routine, the executor slots, the pool,
 the graph reference, the OTA target and defmt's RTT block; the node statics
 are flash and their handles `.bss`), `.bss` 47,524 B. Each row adds one
-feature to it (`--no-default-features --features F`); the `all five` row is
+feature to it (`--no-default-features --features F`); the `all six` row is
 the default build, and the `dns` row is measured over the default build.
 The deltas include the firmware's own use of the feature (the event ring and
 `/api/events`, the scratch stash and boot log, `/api/bootflag` and
-`/api/reboot`), not only the supervisor's side.
+`/api/reboot`, the `priority` field and `/api/priority`), not only the
+supervisor's side.
 
 | feature | Δflash | Δ.data | Δ.bss | runtime cost |
 | --- | ---: | ---: | ---: | --- |
-| `lifecycle-sink` | +1,652 | 0 | +204 | one critical section + the sink call per lifecycle transition |
-| `breadcrumb` | +1,464 | 0 | +4 | two relaxed stores per transition; 1 B per node + 4 B global |
-| `feed-gate` | +132 | 0 | 0 | one clock read + N atomic loads per feed (every 2 s); with `breadcrumb`, one more walk over the nodes per withheld feed |
+| `lifecycle-sink` | +1,612 | 0 | +204 | one critical section + the sink call per lifecycle transition |
+| `breadcrumb` | +1,480 | 0 | +4 | two relaxed stores per transition; 1 B per node + 4 B global |
+| `feed-gate` | +140 | 0 | 0 | one clock read + N atomic loads per feed (every 2 s); with `breadcrumb`, one more walk over the nodes per withheld feed |
 | `restart-intensity` | +392 | 0 | +72 | one clock read and relaxed loads and stores of the window per counted `restart()`; nothing at steady state; 8 B per node handle |
-| `enabled-if` | +1,136 | 0 | +40 | one fn call per node per `start()` |
-| all five (default) | +5,016 | 0 | +328 | |
-| `dns` (over default) | +7,008 | 0 | 0 | none: the OTA target is an IPv4 literal, so the socket never runs |
+| `enabled-if` | +1,108 | 0 | +40 | one fn call per node per `start()` |
+| `task-priority` | +1,660 | 0 | +120 | the executor sorts each woken task into its pending list, on every executor. One relaxed load and one store when a node starts or resumes. A priority byte in each embassy task header |
+| all six (default) | +6,832 | 0 | +480 | |
+| `dns` (over default) | +7,312 | 0 | 0 | none: the OTA target is an IPv4 literal, so the socket never runs |
 
 ```sh
-cargo build --release -p firmware --no-default-features
-for f in lifecycle-sink breadcrumb feed-gate restart-intensity enabled-if; do
-  cargo build --release -p firmware --no-default-features --features $f
-  arm-none-eabi-size -A target/thumbv8m.main-none-eabihf/release/firmware | grep -E '^\.(vector_table|text|rodata|data|bss)'
-done
-cargo build --release -p firmware
-cargo build --release -p firmware --features dns
+CARGO="cargo +1.97.1" python3 ci/footprint.py
 ```
+
+CI runs `python3 ci/footprint.py --check`, which fails when a feature grows past one
+and a half times its measured cost on the stable toolchain.
 
 ### `lifecycle-sink` by symbol
 

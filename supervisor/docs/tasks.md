@@ -160,6 +160,11 @@ and reads these; all are cheap atomic loads):
 | `is_ready()` *(feature `readiness`)* | the task asserted `set_ready()` |
 | `is_stale(max_age)` *(feature `liveness`)* | running but no `beat()` within `max_age` |
 
+With `task-priority`, `priority()` reads a `task:` node's own priority (`None` without a
+`task:` shell) and `set_priority(n)` stores a new one, from any task or interrupt, and
+the node's own task takes it at its next start or resume; see
+[`priority:`](crate::guide::dsl#priority-and-supervisor-priority-task-priorities).
+
 Useful compositions: **down** = `!is_running()`; **parked `Pause`** = mode `Pause` +
 `!is_running()` + `shutdown_requested()`; **autonomous completion** = `has_exited() &&
 !shutdown_requested()`. A spawn that fail-closed (a `NodeFault` from a gate) leaves the

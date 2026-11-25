@@ -139,6 +139,11 @@ pub struct Graph<const N: usize, T: Topology<N> = Ordered<N, { shape::ALL }>> {
     #[cfg(feature = "graph-ref")]
     /// A reference used to enumerate the graph at runtime.
     pub graph_ref: &'static GraphRef,
+    #[cfg(feature = "task-priority")]
+    /// The priority the supervisor's driver loops (`run()`, `run_with()`,
+    /// `run_pools()`, `monitor()`) give their task (`supervisor priority:` in
+    /// the graph), `u8::MAX` unless declared.
+    pub supervisor_priority: u8,
 }
 
 impl<const N: usize, T: Topology<N>> Graph<N, T> {
@@ -152,6 +157,8 @@ impl<const N: usize, T: Topology<N>> Graph<N, T> {
             pools: &[],
             #[cfg(feature = "graph-ref")]
             graph_ref: &graph_ref::NO_GRAPH,
+            #[cfg(feature = "task-priority")]
+            supervisor_priority: u8::MAX,
         }
     }
 
@@ -159,6 +166,15 @@ impl<const N: usize, T: Topology<N>> Graph<N, T> {
     #[cfg(feature = "pool")]
     pub const fn with_pools(mut self, pools: &'static [&'static dyn Pool]) -> Self {
         self.pools = pools;
+        self
+    }
+
+    /// The priority the supervisor's driver loops (`run()`, `run_with()`,
+    /// `run_pools()`, `monitor()`) give their task (`supervisor priority:` in
+    /// the graph), `u8::MAX` unless declared.
+    #[cfg(feature = "task-priority")]
+    pub const fn with_supervisor_priority(mut self, priority: u8) -> Self {
+        self.supervisor_priority = priority;
         self
     }
 

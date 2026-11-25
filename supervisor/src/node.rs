@@ -235,6 +235,9 @@ pub struct TaskHandle {
     /// too wide to swap atomically.
     #[cfg(feature = "node-status")]
     status: BlockingMutex<CriticalSectionRawMutex, Cell<Option<&'static str>>>,
+    /// `set_priority`'s request: bit 8 marks a value, the low byte holds it.
+    #[cfg(feature = "task-priority")]
+    priority: AtomicU16,
     /// Encoded current fault.
     #[cfg(feature = "fault-inject")]
     pub(crate) fault: AtomicU8,
@@ -309,6 +312,8 @@ impl TaskHandle {
             pending_beat: AtomicBool::new(false),
             #[cfg(feature = "node-status")]
             status: BlockingMutex::new(Cell::new(None)),
+            #[cfg(feature = "task-priority")]
+            priority: AtomicU16::new(0),
             #[cfg(feature = "fault-inject")]
             fault: AtomicU8::new(0),
             #[cfg(feature = "fault-inject")]
@@ -548,9 +553,13 @@ pub struct NodeCfg {
     /// no graph, which simply has no peers to answer about.
     #[cfg(feature = "data-deps")]
     graph: &'static GraphRef,
-    /// `fault-inject`: true if the node uses a `task:` shell wrapped by [`Injected`].
-    #[cfg(feature = "fault-inject")]
+    /// True if the node uses a `task:` shell: fault injection wraps it in
+    /// `Injected`, and its task takes the node's priority.
+    #[cfg(any(feature = "fault-inject", feature = "task-priority"))]
     shelled: bool,
+    /// `priority:` in the graph: the priority a shell's task starts at.
+    #[cfg(feature = "task-priority")]
+    priority: u8,
     /// `disabled` in the graph: the node starts down and waits for a control
     /// `Activate` (or an explicit `start_node`).
     disabled_at_boot: bool,
@@ -625,8 +634,10 @@ impl NodeCfg {
             bound_deps: &[],
             #[cfg(feature = "data-deps")]
             graph: &graph_ref::NO_GRAPH,
-            #[cfg(feature = "fault-inject")]
+            #[cfg(any(feature = "fault-inject", feature = "task-priority"))]
             shelled: false,
+            #[cfg(feature = "task-priority")]
+            priority: 0,
             disabled_at_boot: false,
             #[cfg(feature = "enabled-if")]
             enabled_if: None,
@@ -696,8 +707,18 @@ impl NodeCfg {
         self
     }
 
-    /// Mark the node as a `task:` shell. Only shells can be stalled, crashed or hogged.
-    #[cfg(feature = "fault-inject")]
+    /// The priority the node's `task:` shell starts at (`priority:` in the
+    /// graph). Higher is polled first. `const` and chainable in a `static`
+    /// initializer. Emitted by [`supervisor_graph!`].
+    #[cfg(feature = "task-priority")]
+    pub const fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Mark the node as a `task:` shell. Only shells can be stalled, crashed,
+    /// hogged or re-prioritized.
+    #[cfg(any(feature = "fault-inject", feature = "task-priority"))]
     pub const fn with_shell(mut self) -> Self {
         self.shelled = true;
         self
@@ -870,6 +891,36 @@ impl NodeCfg {
         self
     }
 }
+
+/// Why [`TaskNode::set_priority`] was refused.
+#[cfg(feature = "task-priority")]
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PriorityError {
+    /// The node has no `task:` shell, so the supervisor holds no handle on its task.
+    NoShell,
+}
+
+#[cfg(all(feature = "task-priority", feature = "defmt"))]
+impl defmt::Format for PriorityError {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "no shell: only a `task:` node can be re-prioritized");
+    }
+}
+
+#[cfg(feature = "task-priority")]
+impl core::fmt::Display for PriorityError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PriorityError::NoShell => {
+                f.write_str("no shell: only a `task:` node can be re-prioritized")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "task-priority")]
+impl core::error::Error for PriorityError {}
 
 impl TaskNode {
     /// A node over its flash-resident [`NodeCfg`] and its [`TaskHandle`]. A
@@ -1493,8 +1544,24 @@ impl TaskNode {
     ///
     /// Single waiter: the node's own task. The wake is a one-waker `Signal`, so
     /// a second task waiting on the same node evicts the first on every poll.
+    /// With `task-priority`, a `task:` node takes its priority here, so its own
+    /// embassy task must be the one that polls it.
     pub async fn wait_resume(&self) {
-        self.handle.resume_wake.wait().await;
+        core::future::poll_fn(|cx| self.poll_resume(cx)).await
+    }
+
+    /// [`wait_resume`](Self::wait_resume)'s poll: one copy for every caller.
+    #[inline(never)]
+    fn poll_resume(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if core::pin::pin!(self.handle.resume_wake.wait())
+            .poll(cx)
+            .is_pending()
+        {
+            return Poll::Pending;
+        }
+        #[cfg(feature = "task-priority")]
+        self.take_priority(cx);
+        Poll::Ready(())
     }
 
     /// Run `fut` until it completes or the node is stopped, returning [`Aborted`] on stop.
@@ -1642,10 +1709,24 @@ impl TaskNode {
         __sv_gate_event();
         // Wait first: a start that landed between the two lines above latched its
         // signal, and consuming it here keeps it out of the next pause.
+        core::future::poll_fn(|cx| self.poll_park(cx)).await
+    }
+
+    /// [`__sv_park`](Self::__sv_park)'s wait for the next start: one copy for
+    /// every shell.
+    #[inline(never)]
+    fn poll_park(&self, cx: &mut Context<'_>) -> Poll<()> {
         loop {
-            self.handle.resume_wake.wait().await;
+            if core::pin::pin!(self.handle.resume_wake.wait())
+                .poll(cx)
+                .is_pending()
+            {
+                return Poll::Pending;
+            }
             if !self.handle.flag(flag::IDLE) {
-                break;
+                #[cfg(feature = "task-priority")]
+                self.take_priority(cx);
+                return Poll::Ready(());
             }
         }
     }
@@ -1688,6 +1769,73 @@ impl TaskNode {
     pub fn stamp_name<S>(&self, token: &embassy_executor::SpawnToken<S>) {
         if let Some(name) = self.cfg.trace_name {
             token.metadata().set_name(name);
+        }
+    }
+
+    /// The priority the node's task takes at its next start or resume: the
+    /// declared `priority:` (0 without one), replaced by the last
+    /// [`set_priority`](Self::set_priority). `None` without a `task:` shell.
+    #[cfg(feature = "task-priority")]
+    pub fn priority(&self) -> Option<u8> {
+        self.cfg.shelled.then(|| self.effective_priority())
+    }
+
+    #[cfg(feature = "task-priority")]
+    fn effective_priority(&self) -> u8 {
+        let v = self.handle.priority.load(Ordering::Relaxed);
+        if v & 0x100 != 0 {
+            v as u8
+        } else {
+            self.cfg.priority
+        }
+    }
+
+    /// Set the priority of the node's `task:` shell. Higher is polled first
+    /// among the ready tasks of the node's own executor, whatever its kind.
+    /// Between executors the interrupt level or the core decides. The order is
+    /// strict: a task that never goes idle starves every lower one on its
+    /// executor.
+    ///
+    /// The call only stores the value, so it is safe from any task or
+    /// interrupt and may come before the node first starts. The node's own
+    /// task takes the value at its next start, or at its next resume for a
+    /// `Pause` node. A running activation keeps the priority it has: restart
+    /// the node, or pause and resume it, to apply the value. The value
+    /// replaces the declared `priority:` and survives restarts.
+    ///
+    /// Refused with [`PriorityError::NoShell`] for a node without a `task:`
+    /// shell. A hand-written `spawn:` task sets its own priority with
+    /// `embassy_executor::Metadata::for_current_task()`.
+    #[cfg(feature = "task-priority")]
+    pub fn set_priority(&self, priority: u8) -> Result<(), PriorityError> {
+        if !self.cfg.shelled {
+            return Err(PriorityError::NoShell);
+        }
+        self.handle
+            .priority
+            .store(0x100 | priority as u16, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Stamp the node's priority into a spawn token's task metadata. Embassy
+    /// resets a task's priority to 0 when the token is created, so this makes
+    /// the shell's first poll run at the right priority.
+    #[cfg(feature = "task-priority")]
+    #[doc(hidden)]
+    pub fn __sv_stamp_priority<S>(&self, token: &embassy_executor::SpawnToken<S>) {
+        token.metadata().set_priority(self.effective_priority());
+    }
+
+    /// Give the calling task, the node's shell, the node's priority. A node
+    /// without a shell is left alone. One copy for every shell.
+    #[cfg(feature = "task-priority")]
+    #[inline(never)]
+    pub(crate) fn take_priority(&self, cx: &mut Context<'_>) {
+        if !self.cfg.shelled {
+            return;
+        }
+        if let Poll::Ready(task) = core::pin::pin!(TaskMeta::for_current_task()).poll(cx) {
+            task.set_priority(self.effective_priority());
         }
     }
 

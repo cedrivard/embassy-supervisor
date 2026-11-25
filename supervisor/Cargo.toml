@@ -1,6 +1,6 @@
 [package]
 name = "embassy-supervisor"
-version = "0.14.2"
+version = "0.15.0"
 description = "A generic, HAL-agnostic run-time supervisor for the embassy async embedded framework: dependency-ordered bring-up/teardown, lifecycle modes, elastic task pools, runtime start/stop/pause/resume control, and a declared-and-verified dataflow layer between the tasks."
 edition.workspace = true
 authors.workspace = true
@@ -42,7 +42,7 @@ log = { version = "0.4.33", optional = true, default-features = false }
 # `state: zeroed Type` (heap-state): `Zeroable` is the all-zero-is-valid contract.
 bytemuck = { version = "1.25.0", optional = true, default-features = false }
 # The `supervisor_graph!` proc-macro (single-source, compile-time graph).
-embassy-supervisor-macros = { version = "=0.13.0", path = "../supervisor-macros", optional = true }
+embassy-supervisor-macros = { version = "=0.14.0", path = "../supervisor-macros", optional = true }
 
 [features]
 # Just the graph macro: everything the supervisor can DO is opt-in, matching the
@@ -483,6 +483,19 @@ trace = [
 metadata-names = [
     "embassy-executor/metadata-name",
     "embassy-supervisor-macros?/metadata-names",
+]
+# Task priorities: permits the `priority: N` node and pool clause and the
+# graph-level `supervisor priority: N;` statement. Every `task:` node gets
+# `TaskNode::set_priority`, whose value the node's own task takes at its next
+# start or resume. `run()`, `run_with()`, `run_pools()` and `monitor()` raise
+# their task to the graph's supervisor priority, 255 unless declared, and must
+# then be polled by an embassy executor task. Switches every executor of the
+# binary to embassy-executor's priority-sorted run queue, which sorts each woken
+# task into its pending list. Costs a priority byte per embassy task header on a
+# 32-bit target.
+task-priority = [
+    "embassy-executor/scheduler-priority",
+    "embassy-supervisor-macros?/task-priority",
 ]
 # Batteries-included: `supervisor_graph!` expands the hook definitions
 # (`__sv_trace_hooks!`: the seven `no_mangle` `_embassy_trace_*` symbols, or
@@ -1229,3 +1242,53 @@ required-features = ["macros", "liveness-monitor"]
 [[test]]
 name = "hog_regrace"
 required-features = ["macros", "fault-inject"]
+
+# `task-priority` on the supervisor's own executor: a declared priority is
+# stamped before the shell's first poll, wakes are polled by priority,
+# `set_priority` is taken at the node's next start, and a plain verb leaves its
+# caller's priority alone.
+[[test]]
+name = "task_priority"
+required-features = ["macros", "task-priority"]
+
+# `task-priority` on pool members routed through a named executor slot, with a
+# declared `supervisor priority:`.
+[[test]]
+name = "task_priority_pool"
+required-features = ["macros", "pool", "task-priority"]
+
+# The default supervisor priority keeps the supervisor ahead of a node that
+# never stops yielding at a lower priority.
+[[test]]
+name = "task_priority_supervisor"
+required-features = ["macros", "control", "task-priority"]
+
+# A `Busy` respawn of a `spawn:` task below a driver at the supervisor's
+# priority backs off at that priority until the task has returned.
+[[test]]
+name = "task_priority_respawn"
+required-features = ["macros", "task-priority"]
+
+# A `Busy` respawn keeps the supervisor ahead of a node that never stops
+# yielding, so a later control command still applies.
+[[test]]
+name = "task_priority_busy_spawn"
+required-features = ["macros", "restart", "task-priority"]
+
+# The loops that never return (`run()`, `run_pools()`, `monitor()`) raise their
+# task to the supervisor priority, keep it, and never lower a task.
+[[test]]
+name = "task_priority_run"
+required-features = ["macros", "control", "pool", "liveness-monitor", "task-priority"]
+
+# `set_priority` on a task that waits in the executor's pending list leaves the
+# poll order of the others intact.
+[[test]]
+name = "task_priority_order"
+required-features = ["macros", "task-priority"]
+
+# A `Pause` node's task takes a `set_priority` value at its next resume, through
+# `wait_resume()` and through `run_pausable`.
+[[test]]
+name = "task_priority_pause"
+required-features = ["macros", "task-priority"]

@@ -3,6 +3,25 @@
 All notable changes to `embassy-supervisor-tools` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.0] - 2026-11-25
+
+Pins `embassy-supervisor-syntax` 0.8.0.
+
+### Added
+
+- `NodeModel::priority`, `PoolModel::priority` and `GraphModel::supervisor_priority`.
+- `--json` carries `"priority"` and `"priority_cfg"` on each node and pool, and
+  `"supervisor_priority"` and `"supervisor_priority_cfg"` on each graph. `"schema"`
+  stays 1.
+- Flowchart labels show a `prio N` fact after the executor fact. Under `--executors`,
+  the supervisor's executor box is titled with `supervisor prio N` when the graph
+  declares one.
+
+### Changed
+
+- **Breaking:** the new public fields break struct literals of `NodeModel`, `PoolModel`
+  and `GraphModel`.
+
 ## [0.9.0] - 2026-11-11
 
 Pins `embassy-supervisor-syntax` 0.7.0.
@@ -175,7 +194,8 @@ Pins `embassy-supervisor-syntax = "=0.3.0"`.
 
 Baseline for this changelog.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.9.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.10.0...HEAD
+[0.10.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.9.0...embassy-supervisor-tools-v0.10.0
 [0.9.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.8.0...embassy-supervisor-tools-v0.9.0
 [0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.7.0...embassy-supervisor-tools-v0.8.0
 [0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-tools-v0.6.0...embassy-supervisor-tools-v0.7.0

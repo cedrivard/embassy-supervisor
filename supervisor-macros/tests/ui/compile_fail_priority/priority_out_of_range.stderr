@@ -1,0 +1,5 @@
+error: `priority:` must be in 0..=255: a task priority is a `u8`, and a higher value is polled first
+ --> tests/ui/compile_fail_priority/priority_out_of_range.rs:6:45
+  |
+6 |     node A = Terminate, deps: [], priority: 256, task: worker;
+  |                                             ^^^

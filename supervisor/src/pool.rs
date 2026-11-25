@@ -198,7 +198,8 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     /// return the earliest instant a pool asks to be re-evaluated at. The building
     /// block of [`run_pools`](Self::run_pools) for a driver that adds wake sources:
     /// call it after each wake, then wait on `select(wait_scale(), Timer::at(next))`,
-    /// or on `wait_scale()` alone when it returns `Ok(None)`.
+    /// or on `wait_scale()` alone when it returns `Ok(None)`. Runs at its
+    /// caller's priority.
     pub async fn pool_pass(&self, spawner: &Spawner) -> Result<Option<Instant>, crate::NodeFault> {
         self.pool_pass_with(spawner, &mut crate::ReturnOnHalt).await
     }
@@ -242,7 +243,13 @@ impl<const N: usize, T: Topology<N>> Supervisor<N, T> {
     }
 
     /// Drive all elastic pools forever, returning only on a fault.
+    ///
+    /// With `task-priority`, raises the calling task to the graph's supervisor
+    /// priority and leaves it there. Panics when polled outside an embassy
+    /// executor.
     pub async fn run_pools(&self, spawner: &Spawner) -> crate::NodeFault {
+        #[cfg(feature = "task-priority")]
+        self.adopt_task().await;
         if !Self::has(crate::shape::POOLS) {
             core::future::pending::<()>().await;
         }

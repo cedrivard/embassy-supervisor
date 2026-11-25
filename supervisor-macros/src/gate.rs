@@ -33,6 +33,7 @@ pub(crate) struct Features {
     pub(crate) fault_inject: bool,
     pub(crate) local_resources: bool,
     pub(crate) heap_state: bool,
+    pub(crate) task_priority: bool,
 }
 
 #[cfg(test)]
@@ -70,6 +71,7 @@ impl Features {
             fault_inject: on,
             local_resources: on,
             heap_state: on,
+            task_priority: on,
         }
     }
 }
@@ -97,6 +99,7 @@ pub(crate) const ENABLED: Features = Features {
     fault_inject: cfg!(feature = "fault-inject"),
     local_resources: cfg!(feature = "local-resources"),
     heap_state: cfg!(feature = "heap-state"),
+    task_priority: cfg!(feature = "task-priority"),
 };
 
 /// Check `spec`'s feature-gated constructs against `f`. A construct with no
@@ -116,6 +119,12 @@ pub fn gate(spec: &mut GraphSpec, f: &Features) -> SynResult<TokenStream2> {
         }
     }
     let mut deferred = TokenStream2::new();
+    if let Some(g) = &spec.supervisor_priority
+        && !f.task_priority
+    {
+        unavailable(&mut deferred, &[], &g.cfg, &g.kw, SUPERVISOR_PRIORITY_NEEDS)?;
+        spec.supervisor_priority = None;
+    }
     for item in &mut spec.items {
         match item {
             Item::Node(n) => gate_node(&mut deferred, n, f)?,
@@ -146,6 +155,14 @@ pub(crate) const READY_ON_WRITE_NEEDS: &str = "`ready_on_write` requires the \
      `coupling-observe` and `readiness` features (embassy-supervisor features of the \
      same names) — readiness is asserted by the monitor sweep seeing an `observed beat` \
      write advance";
+pub(crate) const PRIORITY_NEEDS: &str = "`priority:` requires the `task-priority` feature \
+     (embassy-supervisor feature `task-priority`): the node's task is then polled ahead of \
+     every lower-priority task of its executor";
+
+/// Not a builder the emitter defers: [`gate`] drops the statement instead.
+const SUPERVISOR_PRIORITY_NEEDS: &str = "`supervisor priority:` requires the `task-priority` \
+     feature (embassy-supervisor feature `task-priority`): the supervisor's driver loops \
+     then raise their task to that priority instead of the default 255";
 
 /// Not a builder the emitter defers: [`gate_node`] drops the clause instead.
 const READY_ON_WRITE_MONITOR_NEEDS: &str = "`ready_on_write` requires the \
@@ -305,6 +322,9 @@ fn gate_node(deferred: &mut TokenStream2, n: &mut NodeItem, f: &Features) -> Syn
             RESTART_BUDGET_NEEDS,
         )?;
     }
+    if let Some(g) = &n.priority {
+        require_feature_ungated(item_cfg, &g.cfg, &g.kw, f.task_priority, PRIORITY_NEEDS)?;
+    }
     Ok(())
 }
 
@@ -331,6 +351,10 @@ fn gate_pool(deferred: &mut TokenStream2, p: &mut PoolItem, f: &Features) -> Syn
     gate_dataflow(deferred, item_cfg, &mut p.dataflow, f)?;
     gate_resource_list(deferred, item_cfg, &mut p.resources, f)?;
     gate_state(deferred, item_cfg, &mut p.state, f)?;
+    // The emitter defers a gated `priority:` itself, like a node's.
+    if let Some(g) = &p.priority {
+        require_feature_ungated(item_cfg, &g.cfg, &g.kw, f.task_priority, PRIORITY_NEEDS)?;
+    }
     Ok(())
 }
 

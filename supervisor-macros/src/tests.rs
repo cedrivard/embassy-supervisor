@@ -100,6 +100,32 @@ fn cfg_gated_clauses_defer_to_rustc() {
             },
             "__SV_DATAFLOW_",
         ),
+        (
+            "node A = Terminate, deps: [], task: w, #[cfg(feature = \"x\")] priority: 3;",
+            Features {
+                task_priority: false,
+                ..ALL
+            },
+            "with_priority (3u8",
+        ),
+        (
+            "pool P = [Terminate], deps: [], task: w, #[cfg(feature = \"x\")] priority: 3, \
+             policy: DeferredShrink::new(d), min: 1, max: 1;",
+            Features {
+                task_priority: false,
+                ..ALL
+            },
+            "with_priority (3u8",
+        ),
+        (
+            "#[cfg(feature = \"x\")] supervisor priority: 3;\n\
+             node A = Terminate, deps: [], task: w;",
+            Features {
+                task_priority: false,
+                ..ALL
+            },
+            "with_supervisor_priority",
+        ),
     ] {
         let spec = parse_gated(src, &ALL).expect("a gated clause passes the gate");
         let out = expand(spec, &ALL).expect("expansion succeeds").to_string();
@@ -753,6 +779,33 @@ fn item_cfg_defers_feature_rejections() {
             },
             "with_restart_budget",
         ),
+        (
+            node(X, "task: f, priority: 3"),
+            Features {
+                task_priority: false,
+                ..ALL
+            },
+            "with_priority",
+        ),
+        (
+            node("", &format!("task: f, {X} priority: 3")),
+            Features {
+                task_priority: false,
+                ..ALL
+            },
+            "with_priority",
+        ),
+        (
+            format!(
+                "{X} pool P = [Terminate], deps: [], task: w, priority: 3, \
+                 policy: DeferredShrink::new(d), min: 1, max: 1;"
+            ),
+            Features {
+                task_priority: false,
+                ..ALL
+            },
+            "with_priority",
+        ),
         // `ready_on_write` without the monitor: deferred and dropped,
         // gated on its item or on itself.
         (
@@ -995,6 +1048,52 @@ fn emitted_glue_follows_the_feature_set() {
 }
 
 #[test]
+fn priority_requires_feature() {
+    let off = || Features {
+        task_priority: false,
+        ..ALL
+    };
+    gate_rejects(
+        "node A = Terminate, deps: [], priority: 3, task: w;",
+        off(),
+        "requires the `task-priority` feature",
+    );
+    gate_rejects(
+        "supervisor priority: 3; node A = Terminate, deps: [], task: w;",
+        off(),
+        "`supervisor priority:` requires",
+    );
+}
+
+#[test]
+fn priority_glue_follows_the_feature() {
+    let expand_with = |src: &str, f: &Features| {
+        let spec = parse_gated(src, f).expect("passes the gate");
+        expand(spec, f).expect("expansion succeeds").to_string()
+    };
+    let glue = [". with_priority (", ". with_shell (", "__sv_stamp_priority"];
+    let on = expand_with(
+        "node A = Terminate, deps: [], priority: 3, task: w;",
+        &Features {
+            task_priority: true,
+            ..NONE
+        },
+    );
+    for g in glue {
+        assert!(on.contains(g), "`{g}` missing under `task-priority`: {on}");
+    }
+    let off = expand_with("node A = Terminate, deps: [], task: w;", &NONE);
+    for g in glue {
+        assert!(!off.contains(g), "`{g}` without its feature: {off}");
+    }
+    let sup = expand_with(
+        "supervisor priority: 3; node A = Terminate, deps: [], task: w;",
+        &ALL,
+    );
+    assert!(sup.contains(". with_supervisor_priority ("), "{sup}");
+}
+
+#[test]
 fn struct_literal_field_calls_are_rewritten() {
     let item = quote! {
         async fn f(node: &'static TaskNode) -> R {
@@ -1059,6 +1158,39 @@ fn a_deferred_feature_error_points_at_its_clause() {
     let out = expand(spec, &off).expect("expansion succeeds");
     let at = compile_error_span(out).expect("a deferred error");
     assert_eq!(at.start(), kw.start(), "the error is spanned on `discover`");
+
+    let off = Features {
+        task_priority: false,
+        ..ALL
+    };
+    let src = "node A = Terminate, deps: [], task: w, #[cfg(feature = \"x\")] priority: 3;";
+    let spec = parse_gated(src, &off).expect("a gated clause passes the gate");
+    let Item::Node(n) = &spec.items[0] else {
+        panic!("node")
+    };
+    let kw = n.priority.as_ref().expect("priority").kw.span;
+    let out = expand(spec, &off).expect("expansion succeeds");
+    let at = compile_error_span(out).expect("a deferred error");
+    assert_eq!(at.start(), kw.start(), "the error is spanned on `priority`");
+
+    // The gate drops a deferred statement, so its keyword is read from a
+    // plain parse of the same source.
+    let src = "#[cfg(feature = \"x\")] supervisor priority: 3;\n\
+               node A = Terminate, deps: [], task: w;";
+    let kw = syn::parse_str::<GraphSpec>(src)
+        .expect("parses")
+        .supervisor_priority
+        .expect("the statement")
+        .kw
+        .span;
+    let out =
+        expand(parse_gated(src, &off).expect("passes the gate"), &off).expect("expansion succeeds");
+    let at = compile_error_span(out).expect("a deferred error");
+    assert_eq!(
+        at.start(),
+        kw.start(),
+        "the error is spanned on `supervisor`"
+    );
 }
 
 #[test]

@@ -27,7 +27,8 @@ embassy_supervisor::compose_graph! {
         executor HIGH;
         executor CORE1;
         node WATCHDOG = Terminate, task: crate::watchdog::watchdog_task,
-            resources: [WD_DEV: embassy_rp::watchdog::Watchdog];
+            resources: [WD_DEV: embassy_rp::watchdog::Watchdog],
+            #[cfg(feature = "task-priority")] priority: 200;
 
         node HEARTBEAT = Pause, executor: HIGH,
             task: crate::heartbeat::heartbeat_task,

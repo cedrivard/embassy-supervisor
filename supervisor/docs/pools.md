@@ -26,7 +26,8 @@ waits would otherwise starve control), with `monitor()` beside them under
 `select(sup.run_pools(&spawner), wait_control())` drops `run_pools` mid-action when a
 command arrives, so a member being stopped at that moment gets no `Stopped` event and no
 ack-timeout check; `pool_pass` returns between actions, which is why a hand-written loop
-uses it.
+uses it. With `task-priority`, `run_pools()` raises its task to the supervisor priority
+like `run()`. `pool_pass()` runs at its caller's priority.
 
 The built-in `DeferredShrink` policy grows immediately when saturated (no idle member, below
 `max`) and shrinks only after an idle surplus has persisted for a configurable cooldown:
