@@ -112,6 +112,81 @@ struct HogState {
     bound: embassy_time::Duration,
 }
 
+/// Grace period before a `Hog` spin begins.
+#[cfg(feature = "fault-inject")]
+const HOG_GRACE: embassy_time::Duration = embassy_time::Duration::from_millis(250);
+
+/// What an injected fault leaves of one poll.
+#[cfg(feature = "fault-inject")]
+enum FaultStep {
+    /// Poll the worker.
+    Run,
+    /// Return `Pending` without polling the worker.
+    Park,
+    /// Drop the worker and return `Ready(None)`.
+    Crash,
+}
+
+/// The part of [`Injected`]'s poll that does not depend on the worker's
+/// type: one copy for every shell.
+#[cfg(feature = "fault-inject")]
+#[inline(never)]
+fn poll_fault(node: &TaskNode, hog: &mut Option<HogState>, cx: &mut Context<'_>) -> FaultStep {
+    node.handle.fault_waker.register(cx.waker());
+    loop {
+        match node.fault() {
+            Fault::Stall if !node.handle.flag(flag::SHUTDOWN) => {
+                // A stall ends any armed hog grace: a later Hog starts its own.
+                *hog = None;
+                if core::pin::pin!(node.handle.shutdown_wake.wait())
+                    .poll(cx)
+                    .is_ready()
+                {
+                    continue;
+                }
+                return FaultStep::Park;
+            }
+            Fault::Crash => {
+                let _ =
+                    node.handle
+                        .fault
+                        .compare_exchange(3, 0, Ordering::AcqRel, Ordering::Relaxed);
+                warn!("supervisor: {} crashed (injected)", node.name());
+                return FaultStep::Crash;
+            }
+            Fault::Hog(bound) => {
+                if !matches!(&*hog, Some(h) if h.bound == bound) {
+                    *hog = Some(HogState {
+                        grace: Timer::after(HOG_GRACE),
+                        bound,
+                    });
+                }
+                let h = hog.as_mut().unwrap();
+                if Pin::new(&mut h.grace).poll(cx).is_pending() {
+                    return FaultStep::Park;
+                }
+                let bound = h.bound;
+                *hog = None;
+                warn!(
+                    "supervisor: {} hogging its executor for {} ms (injected)",
+                    node.name(),
+                    bound.as_millis()
+                );
+                let deadline = embassy_time::Instant::now() + bound;
+                while embassy_time::Instant::now() < deadline {
+                    core::hint::spin_loop();
+                }
+                let _ =
+                    node.handle
+                        .fault
+                        .compare_exchange(4, 0, Ordering::AcqRel, Ordering::Relaxed);
+            }
+            _ => *hog = None,
+        }
+        return FaultStep::Run;
+    }
+}
+
 /// Wrapper for `task:` worker futures. Returns `Some(output)` on completion,
 /// or `None` if [`Fault::Crash`] dropped the worker.
 #[cfg(feature = "fault-inject")]
@@ -125,7 +200,7 @@ pub struct Injected<'a, F> {
 #[cfg(feature = "fault-inject")]
 impl<'a, F: Future + Unpin> Injected<'a, F> {
     /// Grace period before a `Hog` spin begins.
-    pub const HOG_GRACE: embassy_time::Duration = embassy_time::Duration::from_millis(250);
+    pub const HOG_GRACE: embassy_time::Duration = HOG_GRACE;
 
     #[doc(hidden)]
     pub fn new(node: &'a TaskNode, inner: F) -> Self {
@@ -143,64 +218,13 @@ impl<F: Future + Unpin> Future for Injected<'_, F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let node = this.node;
-        node.handle.fault_waker.register(cx.waker());
-        loop {
-            match node.fault() {
-                Fault::Stall if !node.handle.flag(flag::SHUTDOWN) => {
-                    // A stall ends any armed hog grace: a later Hog starts its own.
-                    this.hog = None;
-                    if core::pin::pin!(node.handle.shutdown_wake.wait())
-                        .poll(cx)
-                        .is_ready()
-                    {
-                        continue;
-                    }
-                    return Poll::Pending;
-                }
-                Fault::Crash => {
-                    this.inner = None;
-                    let _ = node.handle.fault.compare_exchange(
-                        3,
-                        0,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    );
-                    warn!("supervisor: {} crashed (injected)", node.name());
-                    return Poll::Ready(None);
-                }
-                Fault::Hog(bound) => {
-                    if !matches!(&this.hog, Some(h) if h.bound == bound) {
-                        this.hog = Some(HogState {
-                            grace: Timer::after(Injected::<F>::HOG_GRACE),
-                            bound,
-                        });
-                    }
-                    let hog = this.hog.as_mut().unwrap();
-                    if Pin::new(&mut hog.grace).poll(cx).is_pending() {
-                        return Poll::Pending;
-                    }
-                    let bound = hog.bound;
-                    this.hog = None;
-                    warn!(
-                        "supervisor: {} hogging its executor for {} ms (injected)",
-                        node.name(),
-                        bound.as_millis()
-                    );
-                    let deadline = embassy_time::Instant::now() + bound;
-                    while embassy_time::Instant::now() < deadline {
-                        core::hint::spin_loop();
-                    }
-                    let _ = node.handle.fault.compare_exchange(
-                        4,
-                        0,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    );
-                }
-                _ => this.hog = None,
+        match poll_fault(this.node, &mut this.hog, cx) {
+            FaultStep::Park => return Poll::Pending,
+            FaultStep::Crash => {
+                this.inner = None;
+                return Poll::Ready(None);
             }
-            break;
+            FaultStep::Run => {}
         }
         let Some(inner) = this.inner.as_mut() else {
             return Poll::Pending;

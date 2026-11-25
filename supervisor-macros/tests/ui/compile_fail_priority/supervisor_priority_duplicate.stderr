@@ -1,0 +1,5 @@
+error: duplicate `supervisor priority`
+ --> tests/ui/compile_fail_priority/supervisor_priority_duplicate.rs:7:5
+  |
+7 |     supervisor priority: 4;
+  |     ^^^^^^^^^^

@@ -16,6 +16,7 @@ struct Handle {
 static BACKING: AtomicU32 = AtomicU32::new(0);
 
 supervisor_graph! {
+    #[cfg(feature = "task-priority")] supervisor priority: 0;
     pool FAN = [Terminate, OnDemand], deps: [],
         task: fan_worker,
         resources: [HANDLE: shared local Handle],

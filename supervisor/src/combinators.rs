@@ -155,6 +155,8 @@ impl<F: Future> Future for RunPausable<'_, F> {
             .poll(cx)
             .is_ready()
         {
+            #[cfg(feature = "task-priority")]
+            this.node.take_priority(cx);
             return Poll::Ready(Err(Resumed));
         }
         Poll::Pending

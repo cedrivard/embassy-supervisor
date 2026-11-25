@@ -458,6 +458,23 @@ fn timeout_clauses(
     ]
 }
 
+/// The `priority:` builder call. Nodes and pools both take it.
+fn priority_clause(
+    priority: Option<&embassy_supervisor_syntax::Gated<kw::priority, LitInt>>,
+    f: &Features,
+) -> Option<GatedBuilder> {
+    priority.map(|g| {
+        let p = LitInt::new(&format!("{}u8", g.value.base10_digits()), g.value.span());
+        GatedBuilder {
+            cfg: g.cfg.clone(),
+            tokens: quote!( .with_priority(#p) ),
+            available: f.task_priority,
+            err: gate::PRIORITY_NEEDS,
+            span: g.kw.span,
+        }
+    })
+}
+
 /// `.with_trace_name("<name>\0")` under `metadata-names`: the NUL-terminated
 /// copy for the executor metadata (SystemView reads C strings).
 fn trace_name_tokens(f: &Features, name: &str) -> Option<TokenStream2> {
@@ -847,7 +864,13 @@ fn node_spawn(
                 None => {
                     // Mixed-site: a `spawn:` argument cannot name the spawner.
                     let s = Ident::new("s", proc_macro2::Span::mixed_site());
-                    let body = launch(spawn_stmts(&call, &quote!(&#ident), &quote!(#s), f));
+                    let body = launch(spawn_stmts(
+                        &call,
+                        &quote!(&#ident),
+                        &quote!(#s),
+                        f,
+                        f.task_priority && resident,
+                    ));
                     quote!(::core::option::Option::Some(
                         (|#s| {
                             #body
@@ -856,7 +879,13 @@ fn node_spawn(
                     ))
                 }
                 Some(ex) => {
-                    let body = launch(spawn_stmts(&call, &quote!(&#ident), &quote!(__sp), f));
+                    let body = launch(spawn_stmts(
+                        &call,
+                        &quote!(&#ident),
+                        &quote!(__sp),
+                        f,
+                        f.task_priority && resident,
+                    ));
                     quote!(::core::option::Option::Some(
                         (|_s| {
                             // The supervisor waits for this slot to fill before
@@ -939,16 +968,23 @@ fn state_box_stmt(ty: &syn::Type, init: &StateInit, helpers: &HelperIdents) -> T
 ///   the node name reaches the task Metadata (for rtos-trace/SystemView) with no id
 ///   capture and no dependency on the `_embassy_trace_*` hooks.
 /// * neither → plain infallible spawn.
+///
+/// `prioritized` (a resident shell under `task-priority`) binds the token in
+/// every shape and stamps the node's priority into it: embassy resets a task's
+/// priority to 0 when the token is created.
 fn spawn_stmts(
     call: &TokenStream2,
     node_ref: &TokenStream2,
     sp: &TokenStream2,
     f: &Features,
+    prioritized: bool,
 ) -> TokenStream2 {
+    let stamp = prioritized.then(|| quote!((#node_ref).__sv_stamp_priority(&__token);));
     if f.trace {
         // `adopt` = set_task_id + (under metadata-names) Metadata name stamp.
         quote! {
             let __token = #call?;
+            #stamp
             (#node_ref).adopt(&__token);
             #sp.spawn(__token);
         }
@@ -956,7 +992,14 @@ fn spawn_stmts(
         // Name-only path: stamp the node name into the task Metadata, nothing else.
         quote! {
             let __token = #call?;
+            #stamp
             (#node_ref).stamp_name(&__token);
+            #sp.spawn(__token);
+        }
+    } else if prioritized {
+        quote! {
+            let __token = #call?;
+            #stamp
             #sp.spawn(__token);
         }
     } else {
@@ -1470,8 +1513,9 @@ fn emit_node(
         None => quote!(),
     };
     // With `fault-inject`, shelled `task:` nodes can be stalled, crashed or hogged.
-    // Hand-written `spawn:` tasks only support wedge.
-    if f.fault_inject && matches!(n.source, Some(TaskSource::Shell(_))) {
+    // Hand-written `spawn:` tasks only support wedge. With `task-priority`, only
+    // a shell's task can be re-prioritized.
+    if (f.fault_inject || f.task_priority) && matches!(n.source, Some(TaskSource::Shell(_))) {
         with_exec.extend(quote!( .with_shell() ));
     }
     // `resources: [NAME: Type, ..]` — one `pub static NAME: ResourceSlot<Type>`
@@ -1608,6 +1652,7 @@ fn emit_node(
                     err: gate::READY_ON_WRITE_NEEDS,
                     span: g.kw.span(),
                 }),
+                priority_clause(n.priority.as_ref(), f),
             ])
             .flatten(),
     );
@@ -1862,7 +1907,13 @@ fn emit_pool(
     // of each take-kind array and the pool-wide `shared`/`divisible` statics;
     // a pool without take-kind entries shares one table (`__SV_GATES_<tag>`).
     let get_prelude = gates_probe(&p.resources, &quote!(&#ident[#i]));
-    let pool_spawn_stmts = spawn_stmts(&call, &quote!(&#ident[#i]), &sp_tokens, f);
+    let pool_spawn_stmts = spawn_stmts(
+        &call,
+        &quote!(&#ident[#i]),
+        &sp_tokens,
+        f,
+        f.task_priority && resident,
+    );
     let body = if resident {
         quote! {
             let __resident = #ident[#i].__sv_resident()?;
@@ -1915,7 +1966,7 @@ fn emit_pool(
         Some(ex) => quote!( .with_executor(&#ex) ),
         None => quote!(),
     };
-    if f.fault_inject && matches!(p.source, TaskSource::Shell(_)) {
+    if (f.fault_inject || f.task_priority) && matches!(p.source, TaskSource::Shell(_)) {
         member_with_exec.extend(quote!( .with_shell() ));
     }
     for r in p
@@ -2104,6 +2155,7 @@ fn emit_pool(
         cfg,
         timeout_clauses(p.slot_timeout.as_ref(), p.ack_timeout.as_ref(), cr)
             .into_iter()
+            .chain([priority_clause(p.priority.as_ref(), f)])
             .flatten(),
     );
     defs.push(member_clause_errors);
@@ -3316,6 +3368,27 @@ fn expand(mut graph: GraphSpec, f: &Features) -> SynResult<TokenStream2> {
     } else {
         (quote!(), quote!())
     };
+    // `supervisor priority: N;`: the gate dropped it when the feature is off.
+    let supervisor_priority_field = match &graph.supervisor_priority {
+        Some(g) if f.task_priority => {
+            let v = LitInt::new(&format!("{}u8", g.value.base10_digits()), g.value.span());
+            let value = match cfg_predicate(&g.cfg) {
+                None => quote!(#v),
+                Some(pred) => quote!({
+                    #[cfg(#pred)]
+                    {
+                        #v
+                    }
+                    #[cfg(not(#pred))]
+                    {
+                        ::core::primitive::u8::MAX
+                    }
+                }),
+            };
+            quote!( .with_supervisor_priority(#value) )
+        }
+        _ => quote!(),
+    };
     let topo_alias = format_ident!("{}_TOPOLOGY", graph_ident);
     let (topo_ty, topo_val, deps_def) = if flat {
         (
@@ -3344,7 +3417,8 @@ fn expand(mut graph: GraphSpec, f: &Features) -> SynResult<TokenStream2> {
         pub type #topo_alias = #topo_ty;
 
         pub static #graph_ident: #cr::Graph<#m, #topo_alias> =
-            #cr::Graph::new(&#nodes_ident, #topo_val) #pools_field #graph_ref_field;
+            #cr::Graph::new(&#nodes_ident, #topo_val) #pools_field #graph_ref_field
+                #supervisor_priority_field;
 
         #trace_hooks
 
@@ -3717,6 +3791,7 @@ fn dataflow_expand(
 ///     name: IDENT;                        // optional first item: rename the GRAPH static
 ///     executor NAME;                      // a runtime-filled spawner slot (other core / IRQ tier)
 ///     default executor NAME;              // ..and the tier every task:/spawn:-fn item without executor: inherits
+///     supervisor priority: N;             // 0..=255, the supervisor task's priority (feature task-priority, 255 unless declared)
 ///
 ///     node NAME = Mode,                   // Mode: Terminate | Pause | OnDemand
 ///         deps: [A, POOL, NET ready]      // bring-up order; `ready` also waits for set_ready()
@@ -3735,10 +3810,11 @@ fn dataflow_expand(
 ///         , dataflow: [crate::setter]     //   adopt an accessor fn's #[dataflow] tables
 ///         , beat_timeout: MS , ready_on_write //   every value-level clause (the timeouts, beats,
 ///                                         //     ready_on_write, disabled, discover, enabled_if:,
-///                                         //     restart_budget:) takes a #[cfg(...)] gate
+///                                         //     restart_budget:, priority:) takes a #[cfg(...)] gate
 ///         , beat_window: N                //   1..=255 consecutive stale sweeps before a report
 ///         , enabled_if: crate::settings::lora_on //   fn() -> bool; false at start() latches disabled
 ///         , restart_budget: MAX in MS     //   restart() refuses the MAX+1th inside the window
+///         , priority: N                   //   0..=255, higher polled first (task: only, feature task-priority)
 ///         , executor: NAME , slot_timeout: MS , ack_timeout: MS , disabled;
 ///
 ///     pool NAME = [Mode, ..],             // one Mode per member, floor first
@@ -3769,8 +3845,8 @@ pub fn supervisor_graph(input: TokenStream) -> TokenStream {
 /// `embassy_supervisor::compose_graph!` feeds every listed relay into one
 /// `supervisor_graph!` expansion, where names resolve and every static is
 /// emitted. A fragment cannot set what belongs to the whole graph: a `name:`
-/// in its body, an `observe` default or a `default executor`. Needs no
-/// feature beyond those its items use.
+/// in its body, an `observe` default, a `default executor` or a
+/// `supervisor priority:`. Needs no feature beyond those its items use.
 #[proc_macro]
 pub fn supervisor_fragment(input: TokenStream) -> TokenStream {
     fragment_expand(input.into(), &ENABLED)
@@ -3801,8 +3877,8 @@ fn fragment_expand(input: TokenStream2, f: &Features) -> SynResult<TokenStream2>
 
     let substituted = substitute_dollar_crate(items.clone(), &quote!(__sv_fragment_crate));
     let mut spec_parsed = syn::parse2::<GraphSpec>(substituted)?;
-    // A body `name:`, an `observe` default or a default executor would set it
-    // for the whole composed graph.
+    // A body `name:`, an `observe` default, a default executor or a supervisor
+    // priority would set it for the whole composed graph.
     check_fragment_body(&spec_parsed)?;
     // Ungated rejections surface at the fragment; the compose site gates the
     // relayed items again and emits the deferred ones.

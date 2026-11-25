@@ -2294,6 +2294,61 @@ fn start_conditions_and_restart_budgets_reach_the_model_json_and_diagram() {
 }
 
 #[test]
+fn priorities_reach_the_model_json_and_diagram() {
+    let src = r#"
+        embassy_supervisor::supervisor_graph! {
+            executor HIGH;
+            supervisor priority: 9;
+            node A = Terminate, task: a, priority: 7;
+            node B = Terminate, deps: [A], executor: HIGH, task: b,
+                #[cfg(feature = "x")] priority: 3;
+            pool W = [Terminate], task: w, priority: 5, policy: P::new(), min: 1, max: 1;
+        }
+    "#;
+    let d = parse_source(src, "t.rs").unwrap();
+
+    let out = render(&d[0], &Options::default());
+    assert!(
+        out.contains("n_A[\"A<br/>Terminate · task · prio 7\"]"),
+        "{out}"
+    );
+    assert!(
+        out.contains("@HIGH · prio 3 <small>cfg(feature = #quot;x#quot;)</small>"),
+        "{out}"
+    );
+    assert!(out.contains("1..1 · prio 5"), "{out}");
+
+    let out = render(
+        &d[0],
+        &Options {
+            executors: true,
+            ..Options::default()
+        },
+    );
+    assert!(
+        out.contains("[\"supervisor's executor · supervisor prio 9\"]"),
+        "{out}"
+    );
+
+    let j = model_json(&d, &[]);
+    let g = &j["graphs"][0];
+    assert_eq!(g["supervisor_priority"], 9);
+    assert!(g["supervisor_priority_cfg"].as_array().unwrap().is_empty());
+    let item = |name: &str| {
+        g["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == name)
+            .unwrap()
+    };
+    assert_eq!(item("A")["priority"], 7);
+    assert_eq!(item("B")["priority"], 3);
+    assert_eq!(item("B")["priority_cfg"][0], "feature=\"x\"");
+    assert_eq!(item("W")["priority"], 5);
+}
+
+#[test]
 fn a_predicate_fact_keeps_what_is_not_a_plain_path() {
     let src = r#"
         embassy_supervisor::supervisor_graph! {

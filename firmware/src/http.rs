@@ -76,6 +76,9 @@ embassy_supervisor::supervisor_fragment! {
 // - `document.activeElement` guard in `load`: an open menu lives in this table:
 //   rewriting it would close the menu, so hold the redraw while one has focus
 //   (the choice blurs it and redraws).
+// - `pc`: the priority cell, an input that posts on change and blurs. The
+//   redraw guard covers it like a menu. The supervisor row shows its priority
+//   read-only, the pool row its members' priorities joined by `/`.
 const INDEX_HTML: &str = "<!doctype html><meta charset=utf-8><title>task supervisor</title>\
 <style>body{font-family:monospace;background:#111;color:#0f0;padding:1em}\
 table{border-collapse:collapse}td,th{border:1px solid #333;padding:4px 8px;text-align:left}\
@@ -91,6 +94,7 @@ option{background:#1a1a1a;color:#0f0}button,select{cursor:pointer}</style>\
 async function ctl(n,o){await fetch('/api/control?node='+n+'&op='+o,{method:'POST'});\
 load();setTimeout(load,400);}\
 async function hb(ms){await fetch('/api/heartbeat?ms='+ms,{method:'POST'});}\
+async function prio(n,v){await fetch('/api/priority?node='+n+'&value='+v,{method:'POST'});load();}\
 async function flt(n,k){if(!k)return;await fetch('/api/fault?node='+n+'&kind='+k,{method:'POST'});\
 load();setTimeout(load,400);}\
 const fmenu=n=>'<select onchange=\"flt(\\''+n+'\\',this.value);this.value=\\'\\';this.blur()\">'+\
@@ -114,12 +118,16 @@ document.getElementById('lf').textContent=d.last_fault?'last supervisor fault: '
 const cpu=(n,tk)=>(!prev||prev.m[n]==null)?'-':\
 (100*sub(tk,prev.m[n])/sub(d.now_ticks,prev.now)).toFixed(1)+'%';\
 const us=t=>Math.round(t*1e6/d.tick_hz)+'us';\
-let h='<tr><th>task<th>mode<th>state<th>gen<th>cpu<th>max poll<th>deps<th>';\
+const hp=d.tasks.some(t=>t.priority!=null);\
+const pc=t=>t.priority==null?'-':t.name=='supervisor'?t.priority:\
+'<input type=number min=0 max=255 value='+t.priority+' style=width:4em \
+onchange=\"prio(\\''+t.name+'\\',this.value);this.blur()\">';\
+let h='<tr><th>task<th>mode<th>state<th>gen<th>cpu<th>max poll'+(hp?'<th>prio':'')+'<th>deps<th>';\
 let pool=null;\
 for(let t of d.tasks){\
 if(/^http[0-9]+$/.test(t.name)){\
-pool=pool||{n:0,r:0,b:0,dis:true,deps:t.deps,e:0,mp:0};\
-pool.n++;if(t.running)pool.r++;if(t.busy)pool.b++;if(!t.disabled)pool.dis=false;\
+pool=pool||{n:0,r:0,b:0,dis:true,deps:t.deps,e:0,mp:0,pr:[]};\
+pool.n++;if(t.running)pool.r++;if(t.busy)pool.b++;if(!t.disabled)pool.dis=false;pool.pr.push(t.priority);\
 pool.e=(pool.e+t.exec_ticks)>>>0;pool.mp=Math.max(pool.mp,t.max_poll_ticks);continue;}\
 let st=t.detached?'detached':t.disabled?'disabled':t.collateral?'held':\
 t.bound_stopped?'link-stopped':\
@@ -128,14 +136,15 @@ if(t.fault)st+=' ⚡'+t.fault;\
 let pause=t.mode=='pause';let act=t.disabled||!t.running;\
 let op=act?(pause?'resume':'start'):(pause?'pause':'stop');\
 h+='<tr><td>'+t.name+'<td>'+t.mode+'<td>'+st+'<td>'+t.epoch+'<td>'+cpu(t.name,t.exec_ticks)+\
-'<td>'+us(t.max_poll_ticks)+'<td>'+t.deps.join(',')+\
+'<td>'+us(t.max_poll_ticks)+(hp?'<td>'+pc(t):'')+'<td>'+t.deps.join(',')+\
 '<td>'+(t.detached?'':'<button onclick=\"ctl(\\''+t.name+'\\',\\''+op+'\\')\">'+op+'</button>'+\
 '<button onclick=\"ctl(\\''+t.name+'\\',\\'restart\\')\">restart</button>'+fmenu(t.name));}\
 if(pool){let op=pool.dis?'start':'stop';\
 h+='<tr><td>http (pool)<td>elastic<td>'+pool.r+'/'+pool.n+' up, '+pool.b+' busy<td>-<td>'+\
-cpu('_pool',pool.e)+'<td>'+us(pool.mp)+'<td>'+pool.deps.join(',')+\
+cpu('_pool',pool.e)+'<td>'+us(pool.mp)+(hp?'<td>'+pool.pr.join('/'):'')+'<td>'+pool.deps.join(',')+\
 '<td><button onclick=\"ctl(\\'http0\\',\\''+op+'\\')\">'+op+'</button>'+fmenu('http0');}\
-const ae=document.activeElement;if(ae&&ae.tagName=='SELECT'&&ae.closest('#t'))return;\
+const ae=document.activeElement;\
+if(ae&&(ae.tagName=='SELECT'||ae.tagName=='INPUT')&&ae.closest('#t'))return;\
 document.getElementById('t').innerHTML=h;\
 let m={};for(let t of d.tasks)m[t.name]=t.exec_ticks;if(pool)m['_pool']=pool.e;\
 let x={};for(let e of d.executors||[])x[e.id]={i:e.idle_ticks,e:e.exec_ticks,p:e.polls};\
@@ -269,6 +278,11 @@ async fn serve_connection(
                     send_status(socket, "400 Bad Request", "application/json", &body, keep).await
                 }
             },
+            #[cfg(feature = "task-priority")]
+            ("POST", p) if p.starts_with("/api/priority") => {
+                let body = handle_priority(p);
+                send(socket, "application/json", &body, keep).await;
+            }
             ("POST", p) if p.starts_with("/api/ota") => {
                 match crate::ota::set_target(query(p, "ip="), query(p, "port="), query(p, "path="))
                 {
@@ -573,6 +587,19 @@ fn write_task(json: &mut String, node: &'static TaskNode, deps: &'static [u8]) {
         node.poll_count(),
         node.max_poll_ticks()
     );
+    #[cfg(feature = "task-priority")]
+    {
+        let priority = match crate::GRAPH.graph_ref.self_node() {
+            Some(sup) if core::ptr::eq(node, sup) => Some(crate::GRAPH.supervisor_priority),
+            _ => node.priority(),
+        };
+        match priority {
+            Some(p) => {
+                let _ = write!(json, "\"priority\":{p},");
+            }
+            None => json.push_str("\"priority\":null,"),
+        }
+    }
     if let Some(n) = crate::HTTP_POOL
         .member_index(node)
         .and_then(|i| SERVED.get(i))
@@ -695,6 +722,38 @@ fn handle_fault(path: &str) -> Result<String, String> {
         _ => out.push_str("{\"accepted\":false,\"error\":\"unknown node or kind\"}"),
     }
     Ok(out)
+}
+
+/// `POST /api/priority?node=NAME&value=N`. Store a task's priority, 0..=255,
+/// which the node's own task takes at its next start or resume.
+#[cfg(feature = "task-priority")]
+fn handle_priority(path: &str) -> String {
+    let node_name = query(path, "node=");
+    let node = crate::GRAPH
+        .nodes
+        .iter()
+        .copied()
+        .flatten()
+        .find(|n| n.name() == node_name);
+    let mut out = String::with_capacity(80);
+    match (node, query(path, "value=").parse::<u8>()) {
+        (None, _) => out.push_str("{\"accepted\":false,\"error\":\"unknown node\"}"),
+        (Some(_), Err(_)) => {
+            out.push_str("{\"accepted\":false,\"error\":\"value must be 0..=255\"}")
+        }
+        (Some(node), Ok(value)) => match node.set_priority(value) {
+            Ok(()) => {
+                let _ = write!(
+                    out,
+                    "{{\"accepted\":true,\"node\":\"{}\",\"priority\":{}}}",
+                    node.name(),
+                    value
+                );
+            }
+            Err(_) => out.push_str("{\"accepted\":false,\"error\":\"no shell\"}"),
+        },
+    }
+    out
 }
 
 fn handle_heartbeat(path: &str, node: &'static TaskNode) -> String {

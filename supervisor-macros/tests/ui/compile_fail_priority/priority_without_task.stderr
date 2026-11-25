@@ -1,0 +1,5 @@
+error: `priority:` requires `task:`: the generated shell gives its task the priority at each start. A `spawn:` task fn can call `embassy_executor::Metadata::for_current_task()` itself
+ --> tests/ui/compile_fail_priority/priority_without_task.rs:7:35
+  |
+7 |     node A = Terminate, deps: [], priority: 3, spawn: hand;
+  |                                   ^^^^^^^^

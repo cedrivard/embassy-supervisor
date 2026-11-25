@@ -120,10 +120,17 @@ cortex-m = "0.7"
 cortex-m-rt = "0.7"
 
 [features]
-# The five opt-in features this demo exercises (four supervisor features plus
+# The six opt-in features this demo exercises (five supervisor features plus
 # the demo-only `feed-gate`), each a separate flag so it can be turned off on
 # its own; all on by default so `cargo run -p firmware` demonstrates everything.
-default = ["lifecycle-sink", "breadcrumb", "feed-gate", "restart-intensity", "enabled-if"]
+default = [
+    "lifecycle-sink",
+    "breadcrumb",
+    "feed-gate",
+    "restart-intensity",
+    "enabled-if",
+    "task-priority",
+]
 # The supervisor's lifecycle sink logs every transition and records it in the
 # ring behind `GET /api/events`.
 lifecycle-sink = ["embassy-supervisor/lifecycle-sink"]
@@ -140,10 +147,13 @@ restart-intensity = ["embassy-supervisor/restart-intensity"]
 # (`POST /api/bootflag`, `POST /api/reboot`), except after a reset the
 # watchdog took because `bench` went stale (with `breadcrumb`).
 enabled-if = ["embassy-supervisor/enabled-if"]
+# `watchdog` and `net` declare `priority:`, `/api/tasks` reports each task's
+# priority and `POST /api/priority` changes one.
+task-priority = ["embassy-supervisor/task-priority"]
 # Link embassy-net's real DNS socket in place of the parse-only `ota::IpDns`. Off by
 # default: the OTA target stays a literal IPv4, so `dns` links smoltcp's DNS socket and
 # reserves a `StackResources` slot for it (`net::SOCKET_BUDGET`) in `net`'s heap box, all
 # for code that never runs. Measured on this firmware:
-# 7,004 bytes of flash (4.0%). Everything the switch touches is `cfg`'d on it:
+# 7,240 bytes of flash (4.0%). Everything the switch touches is `cfg`'d on it:
 #   cargo build --release -p firmware --features dns
 dns = ["embassy-net/dns"]

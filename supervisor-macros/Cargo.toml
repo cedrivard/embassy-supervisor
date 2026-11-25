@@ -4,7 +4,7 @@ name = "embassy-supervisor-macros"
 # version (`=x.y.z`): the generated code references doc(hidden) supervisor internals,
 # so only the tested pair is guaranteed compatible. Bump only when the macro changes;
 # the supervisor updates its pin to match.
-version = "0.13.0"
+version = "0.14.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -124,6 +124,12 @@ trace = ["graph-ref"]
 # `adopt` under `trace`). Independent of `trace`: a graph built with names but
 # not `trace` emits the name-only spawn path (no `adopt`, no id capture).
 metadata-names = []
+# Forwarded from the supervisor's `task-priority` feature: permits the
+# `priority:` clause and the `supervisor priority:` statement, and emits the
+# `.with_priority(..)` / `.with_supervisor_priority(..)` builder calls plus the
+# spawn token's priority stamp. Without it either is a span-attached compile
+# error naming the feature.
+task-priority = []
 # Forwarded from the supervisor's `trace-hooks`: expand the supervisor's
 # `__sv_trace_hooks!` at the unnamed graph's declaration site. The bodies (seven `no_mangle`
 # `_embassy_trace_*` symbols, or a `Trace` impl against embassy git main) are the
@@ -137,7 +143,7 @@ trace-self = ["trace"]
 [dependencies]
 # The graph grammar, shared with the diagram tool. Pinned by EXACT version: the
 # AST is an internal contract between the two crates and changes with the syntax.
-embassy-supervisor-syntax = { version = "=0.7.0", path = "../supervisor-syntax" }
+embassy-supervisor-syntax = { version = "=0.8.0", path = "../supervisor-syntax" }
 # `visit-mut`: the `observe`/`via` accessor's `it` is rewritten on the
 # expression tree, so a field or method named `it` is left alone.
 syn = { version = "3.0.4", features = ["full", "visit-mut"] }
@@ -192,6 +198,8 @@ embassy-supervisor = { path = "../supervisor", features = [
     "fault-inject",
     "budget",
     "veto",
+    # The pass fixtures call `.with_priority(..)` and `.with_supervisor_priority(..)`.
+    "task-priority",
 ] }
 # `platform-std` + `executor-thread` give embassy-executor a host Pender/executor so a
 # compile-pass case that uses real `#[embassy_executor::task]`s can link on the host.

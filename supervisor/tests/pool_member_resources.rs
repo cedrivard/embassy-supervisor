@@ -16,6 +16,7 @@ struct Conn {
 }
 
 supervisor_graph! {
+    #[cfg(feature = "task-priority")] supervisor priority: 0;
     pool WORKERS = [Terminate, OnDemand], deps: [],
         task: worker,
         resources: [CONN: Conn],

@@ -95,7 +95,10 @@ supervisor never sleeps or spins on it instead:
   `set()`. A `Busy` respawn asks it for one pass and retries when it reports. An executor
   polls one task at a time, so by the time the fence runs, the old task's poll has
   returned. A node with no `executor:` spawns on the supervisor's own executor, where a
-  yield is that pass.
+  yield is that pass. With `task-priority` a `run()` task yields at the supervisor's
+  priority, which lets only tasks at or above it finish their poll. A task below it that
+  is still in its final poll is waited out by a 1 ms backoff instead, within its
+  `slot_timeout`. A fence runs at priority 0, after every queued task above it.
 
 One pass suffices when a `spawn:` task acks as its last act (`mark_exited`/`ack_dropped`,
 then return). A body that awaits something after its ack costs one pass per retry until

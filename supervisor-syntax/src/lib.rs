@@ -45,6 +45,8 @@ pub mod kw {
     syn::custom_keyword!(cancel);
     syn::custom_keyword!(fragment);
     syn::custom_keyword!(endfragment);
+    syn::custom_keyword!(priority);
+    syn::custom_keyword!(supervisor);
 }
 
 /// How a node's `state:` initial value is specified.
@@ -610,6 +612,8 @@ pub struct NodeItem {
     pub beat_timeout: Option<Gated<kw::beat_timeout, LitInt>>,
     /// The `beat_window:` value, with any `#[cfg(...)]` gate.
     pub beat_window: Option<Gated<kw::beat_window, LitInt>>,
+    /// The `priority:` value (0..=255), with any `#[cfg(...)]` gate.
+    pub priority: Option<Gated<kw::priority, LitInt>>,
     /// The `enabled_if:` predicate (an expression coercible to
     /// `fn() -> bool`), with any `#[cfg(...)]` gate.
     pub enabled_if: Option<Gated<kw::enabled_if, Expr>>,
@@ -679,6 +683,8 @@ pub struct PoolItem {
     pub slot_timeout: Option<Gated<kw::slot_timeout, LitInt>>,
     /// The `ack_timeout:` value in milliseconds, with any `#[cfg(...)]` gate.
     pub ack_timeout: Option<Gated<kw::ack_timeout, LitInt>>,
+    /// The `priority:` value (0..=255), with any `#[cfg(...)]` gate.
+    pub priority: Option<Gated<kw::priority, LitInt>>,
     /// The `reads:` signal list.
     pub reads: Vec<SignalDecl>,
     /// The `writes:` signal list.
@@ -723,6 +729,8 @@ pub struct GraphSpec {
     /// The `default executor NAME;` declaration, if any. Already applied to
     /// `items` by the parser (see [`apply_default_executor`]).
     pub default_executor: Option<Ident>,
+    /// The `supervisor priority: N;` statement, with any `#[cfg(...)]` gate.
+    pub supervisor_priority: Option<Gated<kw::supervisor, LitInt>>,
     /// The nodes, pools, and executors declared in the graph.
     pub items: Vec<Item>,
 }
@@ -813,6 +821,7 @@ impl Parse for GraphSpec {
         let mut items = Vec::new();
         let mut default_executor: Option<Ident> = None;
         let mut current_fragment: Option<String> = None;
+        let mut supervisor_priority: Option<Gated<kw::supervisor, LitInt>> = None;
         while !input.is_empty() {
             if input.peek(Token![@]) {
                 input.parse::<Token![@]>()?;
@@ -901,10 +910,30 @@ impl Parse for GraphSpec {
                     ident,
                     default: true,
                 }));
+            } else if input.peek(kw::supervisor) && input.peek2(kw::priority) {
+                let k = input.parse::<kw::supervisor>()?;
+                input.parse::<kw::priority>()?;
+                input.parse::<Token![:]>()?;
+                for a in &cfg {
+                    require_cfg_list(a, "`supervisor priority`")?;
+                }
+                if current_fragment.is_some() {
+                    return Err(syn::Error::new_spanned(k, FRAGMENT_SUPERVISOR_PRIORITY));
+                }
+                if supervisor_priority.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        k,
+                        "duplicate `supervisor priority`",
+                    ));
+                }
+                let value = parse_priority(input, "`supervisor priority:`")?;
+                input.parse::<Token![;]>()?;
+                supervisor_priority = Some(Gated { cfg, kw: k, value });
             } else {
                 return Err(input.error(
-                    "expected `node`, `pool`, `executor`, `default executor`, or \
-                     `observe` (optionally `#[cfg(...)]`-prefixed)",
+                    "expected `node`, `pool`, `executor`, `default executor`, \
+                     `supervisor priority`, or `observe` (optionally \
+                     `#[cfg(...)]`-prefixed)",
                 ));
             }
         }
@@ -916,6 +945,7 @@ impl Parse for GraphSpec {
             observe_writes,
             observe_reads,
             default_executor,
+            supervisor_priority,
             items,
         })
     }
@@ -927,11 +957,13 @@ const FRAGMENT_OBSERVE: &str = "`observe` defaults belong to the composing graph
      fragment cannot set them for other fragments";
 const FRAGMENT_DEFAULT_EXECUTOR: &str = "a fragment cannot declare the graph's default \
      executor; declare it at the compose site";
+const FRAGMENT_SUPERVISOR_PRIORITY: &str = "a fragment cannot set the supervisor's priority. \
+     Declare `supervisor priority:` at the compose site";
 
 /// Reject what a `supervisor_fragment!` body may not set: a graph `name:`,
-/// the `observe` defaults, and the default executor. Each is graph-wide, and
-/// the compose site pastes every fragment into one graph, so a fragment
-/// setting one would set it for all the others.
+/// the `observe` defaults, the default executor, and the supervisor's
+/// priority. Each is graph-wide, and the compose site pastes every fragment
+/// into one graph, so a fragment setting one would set it for all the others.
 pub fn check_fragment_body(spec: &GraphSpec) -> SynResult<()> {
     if let Some(name) = &spec.name {
         return Err(syn::Error::new_spanned(name, FRAGMENT_NAME));
@@ -941,6 +973,9 @@ pub fn check_fragment_body(spec: &GraphSpec) -> SynResult<()> {
     }
     if let Some(ex) = &spec.default_executor {
         return Err(syn::Error::new_spanned(ex, FRAGMENT_DEFAULT_EXECUTOR));
+    }
+    if let Some(g) = &spec.supervisor_priority {
+        return Err(syn::Error::new_spanned(g.kw, FRAGMENT_SUPERVISOR_PRIORITY));
     }
     Ok(())
 }
@@ -968,6 +1003,8 @@ pub struct CommonClauses {
     pub slot_timeout: Option<Gated<kw::slot_timeout, LitInt>>,
     /// The `ack_timeout:` value in milliseconds, with any `#[cfg(...)]` gate.
     pub ack_timeout: Option<Gated<kw::ack_timeout, LitInt>>,
+    /// The `priority:` value (0..=255), with any `#[cfg(...)]` gate.
+    pub priority: Option<Gated<kw::priority, LitInt>>,
     /// Present when the item is marked `cancel`.
     pub cancel: Option<kw::cancel>,
     /// The `discover` marker, if present, with any `#[cfg(...)]` gate.
@@ -976,9 +1013,9 @@ pub struct CommonClauses {
     pub dataflow: Option<(kw::dataflow, Vec<AdoptedFn>)>,
 }
 
-const COMMON_CLAUSE_NAMES: &str = "`task:`, `spawn:`, `executor:`, `resources:`, \
-     `reads:`, `writes:`, `discover`, `dataflow:`, `state:`, `slot_timeout:`, \
-     `ack_timeout:`, `cancel`";
+const COMMON_CLAUSE_NAMES: &str = "`task:`, `spawn:`, `executor:`, `priority:`, \
+     `resources:`, `reads:`, `writes:`, `discover`, `dataflow:`, `state:`, \
+     `slot_timeout:`, `ack_timeout:`, `cancel`";
 
 fn dup_clause<T: quote::ToTokens>(tok: &T, name: &str) -> syn::Error {
     syn::Error::new_spanned(
@@ -998,6 +1035,21 @@ fn parse_unsuffixed(input: ParseStream, what: &str) -> SynResult<LitInt> {
             format!(
                 "{what} takes an unsuffixed integer literal; remove the `{}` suffix",
                 lit.suffix()
+            ),
+        ));
+    }
+    Ok(lit)
+}
+
+/// Parse a task priority literal: unsuffixed and within a `u8`.
+fn parse_priority(input: ParseStream, what: &str) -> SynResult<LitInt> {
+    let lit = parse_unsuffixed(input, what)?;
+    if lit.base10_parse::<u8>().is_err() {
+        return Err(syn::Error::new_spanned(
+            &lit,
+            format!(
+                "{what} must be in 0..=255: a task priority is a `u8`, and a higher \
+                 value is polled first"
             ),
         ));
     }
@@ -1042,8 +1094,10 @@ fn parse_clause_cfg(input: ParseStream, host: ClauseHost) -> SynResult<Vec<Attri
     for a in &attrs {
         require_cfg_list(a, "clause")?;
     }
-    let common =
-        input.peek(kw::slot_timeout) || input.peek(kw::ack_timeout) || input.peek(kw::discover);
+    let common = input.peek(kw::slot_timeout)
+        || input.peek(kw::ack_timeout)
+        || input.peek(kw::priority)
+        || input.peek(kw::discover);
     let gateable = match host {
         ClauseHost::Node => {
             common
@@ -1060,14 +1114,15 @@ fn parse_clause_cfg(input: ParseStream, host: ClauseHost) -> SynResult<Vec<Attri
         return Err(input.error(match host {
             ClauseHost::Node => {
                 "`#[cfg(...)]` may only gate `slot_timeout:`, `ack_timeout:`, \
-                 `beat_timeout:`, `beat_window:`, `enabled_if:`, `restart_budget:`, \
-                 `ready_on_write`, `disabled`, \
+                 `priority:`, `beat_timeout:`, `beat_window:`, `enabled_if:`, \
+                 `restart_budget:`, `ready_on_write`, `disabled`, \
                  or `discover` — gate the whole node, or a single entry inside \
                  `deps:`/`resources:`/`reads:`/`writes:`/`dataflow:`/`provides:`, \
                  for anything structural"
             }
             ClauseHost::Pool => {
-                "`#[cfg(...)]` may only gate `slot_timeout:`, `ack_timeout:`, or \
+                "`#[cfg(...)]` may only gate `slot_timeout:`, `ack_timeout:`, \
+                 `priority:`, or \
                  `discover` — gate the whole pool, or a single entry inside \
                  `deps:`/`resources:`/`reads:`/`writes:`/`dataflow:`, for \
                  anything structural"
@@ -1105,6 +1160,18 @@ impl CommonClauses {
                 return Err(dup_clause(&k, "executor"));
             }
             self.executor = Some(input.parse::<Ident>()?);
+        } else if input.peek(kw::priority) {
+            let k = input.parse::<kw::priority>()?;
+            input.parse::<Token![:]>()?;
+            if self.priority.is_some() {
+                return Err(dup_clause(&k, "priority"));
+            }
+            let value = parse_priority(input, "`priority:`")?;
+            self.priority = Some(Gated {
+                cfg: core::mem::take(clause_cfg),
+                kw: k,
+                value,
+            });
         } else if input.peek(kw::resources) {
             let k = input.parse::<kw::resources>()?;
             input.parse::<Token![:]>()?;
@@ -1514,6 +1581,7 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
         state,
         slot_timeout,
         ack_timeout,
+        priority,
         cancel,
         discover,
         dataflow,
@@ -1649,6 +1717,16 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
              task fn can Box its own state",
         ));
     }
+    if let Some(g) = &priority
+        && task.is_none()
+    {
+        return Err(syn::Error::new_spanned(
+            g.kw,
+            "`priority:` requires `task:`: the generated shell gives its task the \
+             priority at each start. A `spawn:` task fn can call \
+             `embassy_executor::Metadata::for_current_task()` itself",
+        ));
+    }
     if let Some((k, _)) = &exit
         && task.is_none()
     {
@@ -1692,6 +1770,7 @@ pub fn parse_node(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<NodeItem
         resources: resources.map(|(_, decls)| decls).unwrap_or_default(),
         slot_timeout,
         ack_timeout,
+        priority,
         beat_timeout,
         beat_window,
         enabled_if,
@@ -1797,6 +1876,7 @@ pub fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem
         state,
         slot_timeout,
         ack_timeout,
+        priority,
         cancel,
         discover,
         dataflow,
@@ -1912,6 +1992,14 @@ pub fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem
              state across the worker call; a `spawn:` task fn can Box its own",
         ));
     }
+    if let (Some(g), TaskSource::Spawn(_)) = (&priority, &source) {
+        return Err(syn::Error::new_spanned(
+            g.kw,
+            "pool `priority:` requires `task:`: each member's generated shell \
+             gives its task the priority at each start. A `spawn:` member fn can \
+             call `embassy_executor::Metadata::for_current_task()` itself",
+        ));
+    }
     Ok(PoolItem {
         cfg,
         ident,
@@ -1925,6 +2013,7 @@ pub fn parse_pool(input: ParseStream, cfg: Vec<Attribute>) -> SynResult<PoolItem
         resources,
         slot_timeout,
         ack_timeout,
+        priority,
         reads,
         writes,
         min,
@@ -4239,6 +4328,103 @@ mod tests {
                 .to_string();
             assert!(err.contains(needle), "{src}: {err}");
         }
+    }
+
+    #[test]
+    fn priority_clause_and_supervisor_priority_parse() {
+        let spec = syn::parse_str::<GraphSpec>(
+            "supervisor priority: 4; \
+             node N = Terminate, deps: [], #[cfg(feature = \"x\")] priority: 7, task: f; \
+             pool P = [Terminate], deps: [], priority: 0, task: f, policy: p, min: 1, max: 1;",
+        )
+        .unwrap();
+        let sp = spec.supervisor_priority.as_ref().expect("statement");
+        assert_eq!(sp.value.base10_digits(), "4");
+        assert!(sp.cfg.is_empty());
+        let Item::Node(n) = &spec.items[0] else {
+            panic!("node")
+        };
+        let p = n.priority.as_ref().expect("node priority");
+        assert_eq!(p.value.base10_digits(), "7");
+        assert_eq!(p.cfg.len(), 1);
+        let Item::Pool(pool) = &spec.items[1] else {
+            panic!("pool")
+        };
+        assert_eq!(
+            pool.priority
+                .as_ref()
+                .expect("pool priority")
+                .value
+                .base10_digits(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn priority_rejects_bad_values_and_placements() {
+        let cases = [
+            (
+                "node A = Terminate, deps: [], priority: 256, task: f;",
+                "`priority:` must be in 0..=255",
+            ),
+            (
+                "node A = Terminate, deps: [], priority: -1, task: f;",
+                "`priority:` must be in 0..=255",
+            ),
+            (
+                "node A = Terminate, deps: [], priority: 99999999999999999999999999, task: f;",
+                "`priority:` must be in 0..=255",
+            ),
+            (
+                "node A = Terminate, deps: [], priority: 3u8, task: f;",
+                "remove the `u8` suffix",
+            ),
+            (
+                "node A = Terminate, deps: [], priority: 3, priority: 4, task: f;",
+                "duplicate `priority:` clause",
+            ),
+            (
+                "node A = Terminate, deps: [], priority: 3, spawn: f;",
+                "`priority:` requires `task:`",
+            ),
+            (
+                "pool P = [Terminate], deps: [], priority: 3, spawn: f, policy: p, \
+                 min: 1, max: 1;",
+                "pool `priority:` requires `task:`",
+            ),
+            (
+                "supervisor priority: 256;",
+                "`supervisor priority:` must be in 0..=255",
+            ),
+            (
+                "supervisor priority: -1;",
+                "`supervisor priority:` must be in 0..=255",
+            ),
+            (
+                "supervisor priority: 1; supervisor priority: 2;",
+                "duplicate `supervisor priority`",
+            ),
+            (
+                "@fragment F; supervisor priority: 1; @endfragment;",
+                "a fragment cannot set the supervisor's priority",
+            ),
+            (
+                "#[doc = \"x\"] supervisor priority: 1;",
+                "only `#[cfg(...)]` attributes may gate a `supervisor priority`",
+            ),
+        ];
+        for (src, needle) in cases {
+            let err = parse_err(src);
+            assert!(err.contains(needle), "{src}: {err}");
+        }
+        let spec = syn::parse_str::<GraphSpec>("supervisor priority: 1;").unwrap();
+        let err = check_fragment_body(&spec)
+            .expect_err("rejected")
+            .to_string();
+        assert!(
+            err.contains("a fragment cannot set the supervisor's priority"),
+            "{err}"
+        );
     }
 
     #[test]

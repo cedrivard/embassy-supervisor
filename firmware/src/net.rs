@@ -16,7 +16,8 @@ embassy_supervisor::supervisor_fragment! {
         dataflow: [crate::net::publish_stack],
         provides: [NET_STACK],
         resources: [USB_DEV: embassy_rp::Peri<'static, embassy_rp::peripherals::USB>],
-        #[cfg(feature = "restart-intensity")] restart_budget: 3 in 60000;
+        #[cfg(feature = "restart-intensity")] restart_budget: 3 in 60000,
+        #[cfg(feature = "task-priority")] priority: 100;
 }
 
 use alloc::boxed::Box;

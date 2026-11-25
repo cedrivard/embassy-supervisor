@@ -19,6 +19,7 @@ static DONE: AtomicBool = AtomicBool::new(false);
 static FAULT: Mutex<Option<String>> = Mutex::new(None);
 
 supervisor_graph! {
+    #[cfg(feature = "task-priority")] supervisor priority: 0;
     observe writes: it.load(core::sync::atomic::Ordering::Relaxed);
     node PRODUCER = Terminate, deps: [], task: producer, beat_timeout: 1000, ready_on_write,
         resources: [SEED: u32], slot_timeout: 500, writes: [crate::PRODUCED observed beat];

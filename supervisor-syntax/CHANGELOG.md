@@ -7,6 +7,28 @@ This crate is pinned by exact version from `embassy-supervisor-macros`: its AST 
 internal contract between the two, not a stable public API, and it changes whenever the
 graph syntax does. Publish it before the macro crate that depends on it.
 
+## [0.8.0] - 2026-11-25
+
+The `priority:` clause and the `supervisor priority:` statement. Requires
+`embassy-supervisor-macros` 0.14.0 and `embassy-supervisor-tools` 0.10.0.
+
+### Added
+
+- `kw::priority` and `kw::supervisor`.
+- `priority: Option<Gated<kw::priority, LitInt>>` on `NodeItem`, `PoolItem` and
+  `CommonClauses`: an unsuffixed integer in 0..=255, at most once, gateable by
+  `#[cfg]`, and only with `task:`.
+- `GraphSpec::supervisor_priority: Option<Gated<kw::supervisor, LitInt>>`: the
+  `supervisor priority: N;` statement, at most once per graph, with only `#[cfg]`
+  attributes. `check_fragment_body` and the fragment parser reject it.
+
+### Changed
+
+- **Breaking:** the new public fields break struct literals of `NodeItem`, `PoolItem`,
+  `CommonClauses` and `GraphSpec`.
+- Error messages that list clauses or graph items include `priority:` and
+  `supervisor priority`.
+
 ## [0.7.0] - 2026-11-11
 
 Pool and fragment rules checked by the parser, `cfg_if!`-shaped chains, and a shared
@@ -237,7 +259,8 @@ tooling that wants it.
   against a whole graph by the macro. A fragment legitimately names nodes it does not
   contain, so parsing one in isolation has to succeed.
 
-[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.7.0...HEAD
+[Unreleased]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.8.0...HEAD
+[0.8.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.7.0...embassy-supervisor-syntax-v0.8.0
 [0.7.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.6.0...embassy-supervisor-syntax-v0.7.0
 [0.6.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.5.0...embassy-supervisor-syntax-v0.6.0
 [0.5.0]: https://github.com/cedrivard/embassy-supervisor/compare/embassy-supervisor-syntax-v0.4.0...embassy-supervisor-syntax-v0.5.0

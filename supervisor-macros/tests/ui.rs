@@ -16,6 +16,8 @@ fn ui() {
     t.pass("tests/ui/compile_pass_veto/*.rs");
     t.pass("tests/ui/compile_pass_enabled_if/*.rs");
     t.pass("tests/ui/compile_pass_restart_intensity/*.rs");
+    t.compile_fail("tests/ui/compile_fail_priority/*.rs");
+    t.pass("tests/ui/compile_pass_priority/*.rs");
     // The dev-dependency leaves these two off, so a row picks a side.
     #[cfg(feature = "local-resources")]
     {

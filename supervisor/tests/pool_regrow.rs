@@ -61,6 +61,7 @@ async fn crew_worker(node: &'static TaskNode) {
 }
 
 supervisor_graph! {
+    #[cfg(feature = "task-priority")] supervisor priority: 0;
     node LINK = Terminate, deps: [], task: link_worker;
     pool SESSIONS = [OnDemand, OnDemand], deps: [LINK ready bound],
         task: session_worker,

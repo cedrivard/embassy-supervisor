@@ -13,6 +13,7 @@ use embassy_supervisor::{ControlOp, Supervisor, TaskNode, supervisor_graph, try_
 use embassy_time::{Duration, MockDriver};
 
 supervisor_graph! {
+    #[cfg(feature = "task-priority")] supervisor priority: 0;
     node LINK = Terminate, deps: [], task: link;
     node SESSION = Terminate, deps: [LINK ready bound], task: session, slot_timeout: 5000;
 }

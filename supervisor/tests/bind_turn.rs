@@ -16,6 +16,7 @@ use embassy_supervisor::{ControlOp, Supervisor, TaskNode, supervisor_graph, try_
 use embassy_time::{Duration, MockDriver};
 
 supervisor_graph! {
+    #[cfg(feature = "task-priority")] supervisor priority: 0;
     node LINK = Terminate, deps: [], task: provider;
     node AUX = Terminate, deps: [], task: provider;
     node SESSION = Terminate, deps: [LINK ready bound, AUX ready], task: parked,

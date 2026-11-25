@@ -1,0 +1,5 @@
+error: pool `priority:` requires `task:`: each member's generated shell gives its task the priority at each start. A `spawn:` member fn can call `embassy_executor::Metadata::for_current_task()` itself
+ --> tests/ui/compile_fail_priority/priority_pool_with_spawn.rs:7:47
+  |
+7 |     pool P = [Terminate, OnDemand], deps: [], priority: 3, spawn: member,
+  |                                               ^^^^^^^^

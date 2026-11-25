@@ -51,8 +51,9 @@ Error provenance: every lifecycle failure is one `NodeFault { node, kind: FaultK
 (`ExecutorSlotEmpty`, `ResourceMissing`, `ReadyDepTimeout { dep }`, `Spawn(SpawnError)`,
 `ShutdownTimeout`, or with `restart-intensity` `RestartStorm`) with an unconditional
 `Display` that names the node and the cause, so `{fault}` is enough for an escalation
-message. `Aborted`, `Resumed`, `ControlQueueFull` (feature `control`) and `InjectError`
-(feature `fault-inject`) are the other crate error types; `SpawnError` is re-used from
+message. `Aborted`, `Resumed`, `ControlQueueFull` (feature `control`), `InjectError`
+(feature `fault-inject`) and `PriorityError` (feature `task-priority`) are the other
+crate error types; `SpawnError` is re-used from
 `embassy_executor` and appears only inside `FaultKind::Spawn`. All the guarantees here
 are cross-thread (release/acquire atomics); a host test's main thread reads them as
 safely as another task.
@@ -177,4 +178,6 @@ verbs bound each gate separately (override with `slot_timeout:`; timeout = a
 `NodeFault` naming the gate); control mailbox depth **4** (`request_control`
 awaits capacity, `try_request_control` reports `ControlQueueFull`); trace
 registries track up to **4** executors and any number of graphs (an intrusive
-chain through each graph's `GraphRef`).
+chain through each graph's `GraphRef`); with `task-priority`, a `task:` node's
+priority **0** (override with `priority:`) and the supervisor's priority **255**
+(override with `supervisor priority:`).

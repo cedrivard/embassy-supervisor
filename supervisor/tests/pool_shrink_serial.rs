@@ -15,6 +15,7 @@ use embassy_supervisor::{
 use embassy_time::{Duration, MockDriver};
 
 supervisor_graph! {
+    #[cfg(feature = "task-priority")] supervisor priority: 0;
     node OTHER = Terminate, deps: [], task: other;
     pool CREW = [Terminate, OnDemand], deps: [], task: crew,
         policy: DeferredShrink::new(embassy_time::Duration::from_millis(100)), min: 1, max: 2;

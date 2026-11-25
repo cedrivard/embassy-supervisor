@@ -23,6 +23,7 @@ async fn idle_worker(node: &'static TaskNode, _slot: &mut u32) {
 }
 
 supervisor_graph! {
+    #[cfg(feature = "task-priority")] supervisor priority: 0;
     node BOOT = Terminate, task: idle_worker,
         resources: [BOOT_SLOT: u32], slot_timeout: 50;
     node LATE = Terminate, task: idle_worker, disabled,
